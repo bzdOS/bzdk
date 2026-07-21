@@ -94,7 +94,16 @@ def main():
     last_state = None
     cand = None; cand_n = 0          # debounce: require N consecutive readings
     wedge_since = None
-    loaded_once = False
+    uboot_handled = False            # BUGFIX (2026-07-22): latches per raw UBOOT
+    # sighting, independent of the debounced `state`. The old code gated
+    # do_load() on the DEBOUNCED state staying "UBOOT", which lingers for one
+    # extra poll after a successful load (debounce needs 2 confirmations to
+    # leave UBOOT once entered) — that extra poll re-triggered do_load() on an
+    # already-healthy HV. reliable_load then saw a non-U-Boot gadget, assumed
+    # "need reset", and reset a perfectly fine board — an infinite self-
+    # inflicted reload loop with no hardware fault involved. Fix: gate the
+    # ACTION on the raw (undebounced) vidpid latch below; keep debounce only
+    # for WEDGED/GONE, which are the states actually prone to flappy reads.
     while True:
         vp = vidpid()
         if vp == "1f3a:efe8":
@@ -106,9 +115,11 @@ def main():
         else:
             raw = f"OTHER({vp})"
 
-        # Debounce: a new state must persist 2 polls before we act/announce,
-        # so a single flappy EMAC read never drives the machine. UBOOT is
-        # taken immediately (the gadget VID:PID is unambiguous, no flap).
+        if raw != "UBOOT":
+            uboot_handled = False    # reset the latch once we've left U-Boot
+
+        # Debounce: a new state must persist 2 polls before we ANNOUNCE it or
+        # act on WEDGED/GONE, so a single flappy EMAC read never drives those.
         if raw == last_state:
             cand = None; cand_n = 0
         elif raw == cand:
@@ -117,22 +128,20 @@ def main():
             cand = raw; cand_n = 1
         confirmed = (raw == "UBOOT") or (cand_n >= 2)
 
-        state = last_state
         if confirmed and raw != last_state:
             emit(f"state: {last_state} -> {raw}")
             last_state = raw
-            state = raw
             cand = None; cand_n = 0
-            if state != "WEDGED":
+            if last_state != "WEDGED":
                 wedge_since = None
 
-        if state == "UBOOT":
+        if raw == "UBOOT" and not uboot_handled:
             do_load()
-            loaded_once = True
+            uboot_handled = True
             time.sleep(POLL_S)
             continue
 
-        if state == "WEDGED":
+        if last_state == "WEDGED":
             if wedge_since is None:
                 wedge_since = time.monotonic()
             elif time.monotonic() - wedge_since > WEDGE_GRACE_S:
@@ -141,7 +150,7 @@ def main():
                     time.sleep(20)   # let the WDOG fire + U-Boot come up
                     continue
 
-        if state == "GONE":
+        if last_state == "GONE":
             # only real "please power-cycle" case; nag at most every ~2 min
             if wedge_since is None or time.monotonic() - wedge_since > 120:
                 emit("⚠ board OFF the USB bus — this is the ONE case needing a physical power-cycle")
