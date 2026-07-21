@@ -1,0 +1,674 @@
+/* gic_timer.c — GICv2 (GIC-400) + ARM Generic Timer EL2-physical-timer tick.
+ * See gic_timer.h for the API contract and what this module deliberately
+ * does NOT do (unmask PSTATE.I, touch HCR_EL2).
+ *
+ * ------------------------------------------------------------------
+ * GIC-400 MMIO bases — cited, not guessed.
+ * ------------------------------------------------------------------
+ * /opt/bzdos/build/u-boot/arch/arm/dts/sun50i-a64.dtsi:1163-1172
+ *
+ *     gic: interrupt-controller@1c81000 {
+ *             compatible = "arm,gic-400";
+ *             reg = <0x01c81000 0x1000>,   // GICD (distributor)
+ *                   <0x01c82000 0x2000>,   // GICC (CPU interface)
+ *                   <0x01c84000 0x2000>,   // GICH (hyp control) - unused here
+ *                   <0x01c86000 0x2000>;   // GICV (virtual CPU i/f) - unused
+ *             ...
+ *     };
+ *
+ * So GICD_BASE = 0x01c81000, GICC_BASE = 0x01c82000, matching the "typical
+ * A64" values given in the task brief — verified against this DTS rather
+ * than assumed. GICH/GICV (virtualization extensions) are not touched:
+ * this driver delivers the tick as a plain physical IRQ to EL2, no
+ * virtual-interrupt list registers involved.
+ *
+ * ------------------------------------------------------------------
+ * Which timer PPI, and why it's the one usable at EL2.
+ * ------------------------------------------------------------------
+ * /opt/bzdos/build/u-boot/arch/arm/dts/sun50i-a64.dtsi:199-211
+ *
+ *     timer {
+ *             compatible = "arm,armv8-timer";
+ *             ...
+ *             interrupts = <GIC_PPI 13 ...>,   // secure physical   (CNTPS)
+ *                          <GIC_PPI 14 ...>,   // non-secure phys.  (CNTP)
+ *                          <GIC_PPI 11 ...>,   // virtual           (CNTV)
+ *                          <GIC_PPI 10 ...>;   // hypervisor phys.  (CNTHP)
+ *
+ * The arm,armv8-timer binding fixes that interrupt order (secure-phys,
+ * non-secure-phys, virtual, hyp-phys), and GIC_PPI n = INTID (16 + n), so:
+ *   PPI13 -> INTID 29  CNTPS (secure physical)
+ *   PPI14 -> INTID 30  CNTP  (non-secure EL1 physical)  <-- USED (v3)
+ *   PPI11 -> INTID 27  CNTV  (virtual)
+ *   PPI10 -> INTID 26  CNTHP (EL2 physical)  <-- tried in v1/v2, UNUSABLE
+ *
+ * CHOICE (v3): CNTP, INTID 30. Earlier revisions used CNTHP (INTID 26, the
+ * EL2 physical timer) on the reasoning that, since everything runs at EL2,
+ * the EL2-banked timer is the "native" pick. That was architecturally tidy
+ * but WRONG for this board: two hardware tests proved CNTHP/INTID 26 never
+ * reaches us. The decisive evidence (2nd test) was GICC_PMR reading back
+ * 0xf0 after we wrote 0xff, plus GICD_IGROUPR0 bit 26 being RAZ/WI - both
+ * are the signature of the NON-SECURE banked view of a two-security-state
+ * GIC-400. In that configuration ATF/BL31 owns INTID 26 as a SECURE Group 0
+ * interrupt; it is delivered to the secure world (EL3/secure FIQ) and can
+ * NEVER be seen by our non-secure EL2, no matter how DAIF is set.
+ *
+ * CNTP (INTID 30) is the NON-SECURE physical timer that firmware assigns to
+ * the non-secure OS as a Group 1 interrupt (this is the timer Linux uses on
+ * the A64), so it is delivered to us as an IRQ. It is programmed via the
+ * EL0/EL1 physical-timer registers CNTP_CVAL_EL0 / CNTP_CTL_EL0, which are
+ * accessible from EL2 with no trap (we are above EL1; CNTHCTL_EL2 gating
+ * only affects EL0/EL1 accesses, not EL2's own), against the same CNTPCT
+ * physical counter - so the period math is unchanged.
+ *
+ * ------------------------------------------------------------------
+ * Bits that must be set to actually TAKE this IRQ at EL2 — who sets what.
+ * ------------------------------------------------------------------
+ * Set BY THIS MODULE (gic_timer_init), all documented inline below:
+ *   - CNTP_CVAL_EL0 : timer deadline (now + period, absolute).
+ *   - CNTP_CTL_EL0.ENABLE=1, .IMASK=0 : timer counts and asserts its
+ *     interrupt line when CNTPCT >= CVAL (IMASK=0 means "don't mask the
+ *     timer's own output" - separate from PSTATE.I).
+ *   - GICD_CTLR / GICC_CTLR = 0x3 : enable Group 1 forwarding (bit0 in the
+ *     non-secure view is EnableGrp1); INTID 30 is already Group 1, so we do
+ *     NOT reprogram its group (that write is RAZ/WI for us anyway).
+ *   - GICD_ISENABLER0 bit 30 : enable forwarding of INTID 30 specifically.
+ *   - GICD_IPRIORITYR[30] : give it a real (non-reset-garbage) priority.
+ *   - GICC_PMR=0xff : priority mask wide open (reads back ~0xf0 in the NS
+ *     view, still far above our priority 0x80) so our priority gets through.
+ *
+ * NOT set by this module - MUST be set by the integration lane
+ * (exceptions.S / el2_install / main_repl.c), because it is a scheduling
+ * decision this driver has no basis to make on its own:
+ *   - PSTATE.I (the DAIF I bit) must be 0 for the core to accept IRQs at
+ *     all, in any exception level. INTID 30 (CNTP) is a non-secure Group 1
+ *     interrupt, delivered to us as an IRQ, so unmasking I is the correct
+ *     trigger. Concretely: after el2_install() and after gic_timer_init(),
+ *     the integrator unmasks with
+ *         asm volatile("msr daifclr, #2");   // clears I (IRQ)
+ *     -- OR, still RECOMMENDED, `msr daifclr, #3` (clears BOTH I and F) as
+ *     cheap insurance: el2_trap already routes FIQ->gic_timer_irq, so even
+ *     a board that somehow delivered this as FIQ would still tick. Until
+ *     the unmask runs, gic_timer_init() has armed the timer and the GIC
+ *     will latch/forward INTID 30, but the core will not vector for it - it
+ *     stays pending at the CPU interface (harmless, no data loss: GICC_IAR
+ *     hands it out the instant the mask is cleared).
+ *   - Whatever SPSR_EL2 value is used for any `eret` back to a running
+ *     context must likewise have its I bit clear if that context should
+ *     be preemptible; el2_install()'s vector table itself doesn't need
+ *     changes for this - it is purely a PSTATE concern at the point of
+ *     entry/return, not a vector-table concern.
+ *   - HCR_EL2.IMO: REQUIRED = 1, and now SET BY THIS MODULE (v4). Earlier
+ *     revisions wrongly claimed IMO was unnecessary "because nothing runs
+ *     below EL2". The truth is the opposite and it is why v1-v3 never took
+ *     the IRQ: with IMO=0 a physical IRQ is routed to EL1, and an async
+ *     exception targeting a LOWER EL than the current one is not taken - it
+ *     stays pending. Running at EL2, we must route the IRQ to EL2 (IMO=1)
+ *     for it to be taken here at all (then PSTATE.I gates it). gic_timer_init
+ *     now sets IMO via read-modify-write. HCR_EL2 is really EL2-setup that
+ *     could live in el2_install() instead; setting it here is idempotent
+ *     (OR of one bit) so the integration lane may relocate it freely.
+ *     FMO (FIQ->EL2) / AMO (SError->EL2) are left as-is: the tick is a
+ *     Group 1 IRQ so IMO suffices; set FMO too only if some source is ever
+ *     delivered as FIQ.
+ *
+ * Group assignment (v3, after two hardware tests): we rely on INTID 30
+ * (CNTP) ALREADY being a non-secure Group 1 interrupt (firmware/ATF set it
+ * up that way for the non-secure OS), rather than trying to move it - the
+ * v2 attempt to reprogram INTID 26's group was RAZ/WI because that
+ * interrupt is secure-owned. A non-secure Group 1 interrupt is delivered to
+ * us (non-secure EL2) as an IRQ, matching the I bit the integrator unmasks.
+ * We enable Group 1 forwarding on the distributor and CPU interface
+ * (GICD_CTLR = GICC_CTLR = 0x3; bit0 is EnableGrp1 in the non-secure view,
+ * already reading back 0x1 in the v2 test). The init-time breadcrumb words
+ * 8..18 (CNTP_CTL, GICD/GICC_CTLR, IGROUPR0, CVAL vs CNTPCT, PMR,
+ * ISENABLER0, and the decisive post-arm ISPENDR0 + CNTP ISTATUS) let a
+ * hardware read confirm every link in the chain actually took.
+ *
+ * ------------------------------------------------------------------
+ * How gic_timer_irq() must be called from el2_trap()'s IRQ case:
+ * ------------------------------------------------------------------
+ *     void el2_trap(struct el2_frame *frame, unsigned long kind)
+ *     {
+ *             ...
+ *             if ((kind & 3u) == EL2_KIND_IRQ) {
+ *                     gic_timer_irq(frame);
+ *                     return;   // do NOT advance frame->elr for IRQ/FIQ
+ *             }
+ *             ...
+ *     }
+ * (el2_exc.c already gets this right: it only advances elr for
+ * EL2_KIND_SYNC. gic_timer_irq() just needs to be called somewhere in the
+ * kind&3==1 arm, before or after the existing breadcrumb recording - order
+ * doesn't matter, gic_timer_irq() touches only its own state + the GIC/
+ * timer registers + the shared jitter breadcrumb window at 0x50000500.)
+ *
+ * ------------------------------------------------------------------
+ * Breadcrumb window: 0x00018200 ("GICT"), distinct from MUSB (0x50000000),
+ * EMAC (0x50000100), REPL (0x50000300), EL2 exceptions (0x00018100),
+ * jitter/TIMR (0x50000500).
+ *   [0]  magic       0x47494354 ("GICT")
+ *   [1]  ticks_lo    low 32 bits of the tick counter
+ *   [2]  ticks_hi    high 32 bits of the tick counter
+ *   [3]  last_iar    last raw GICC_IAR value read (INTID + CPUID field)
+ *   [4]  period_lo   low 32 bits of the programmed period, in ticks
+ *   [5]  mismatches  count of acked INTIDs that were NOT ours (30)
+ *   [6]  init_done   1 once gic_timer_init() has completed
+ *   [7]  ctl_live    CNTP_CTL_EL0 readback sampled in the IRQ handler
+ *                    (bit0=ENABLE, bit1=IMASK, bit2=ISTATUS/firing)
+ *   --- init-time diagnostic readbacks (written once by gic_timer_init) --
+ *   [8]  cntp_ctl    CNTP_CTL_EL0 right after arming (expect ENABLE=1)
+ *   [9]  gicd_ctlr   GICD_CTLR readback (group-enable bits; NS view => 0x1)
+ *   [10] gicc_ctlr   GICC_CTLR readback (group-enable bits; NS view => 0x1)
+ *   [11] igroupr0    GICD_IGROUPR0 readback (bit30 should be 1 => Grp1/IRQ)
+ *   [12] cntpct_now  CNTPCT_EL0 at arm time (lo) - compare vs [13]
+ *   [13] cval_lo     CNTP_CVAL deadline (lo); must be > [12] (future)
+ *   [14] gicc_pmr    GICC_PMR readback (NS view halves it: 0xff => ~0xf0)
+ *   [15] isenabler0  GICD_ISENABLER0 readback (bit30 must be 1)
+ *   --- decisive post-arm diagnostic (bounded busy-wait, IRQs masked) ---
+ *   [16] ispendr0    GICD_ISPENDR0 after deadline passed (bit30 => CNTP
+ *                    latched pending in the GIC; whole word recorded so a
+ *                    surprise on another PPI bit is visible too)
+ *   [17] cntp_ctl2   CNTP_CTL_EL0 after deadline (bit2 ISTATUS => the timer
+ *                    condition actually fired)
+ *   [18] poll_ok     1 = observed CNTPCT >= CVAL during the bounded wait;
+ *                    0 = hit the iteration cap (counter not advancing)
+ *   --- v4 routing fix + CPU-interface probe (init, IRQs masked) --------
+ *   [19] hcr_before  HCR_EL2 (lo) before we OR in IMO
+ *   [20] hcr_after   HCR_EL2 (lo) after: bit4 (IMO) MUST read 1
+ *   [21] rpr_before  GICC_RPR before the IAR probe (0xff = idle)
+ *   [22] iar_probe   GICC_IAR: 30 => CPU-if would forward (routing was the
+ *                    fault); 1023 => CPU-if masking it (GIC-side fault)
+ *   [23] rpr_active  GICC_RPR while the probed IRQ is active
+ *   [24] rpr_after   GICC_RPR after our balancing EOI: MUST be 0xff (idle);
+ *                    anything else means a stuck running priority
+ * Written once at init (words 4,6,8..24) and every REPORT_EVERY ticks
+ * (words 0-3,5,7) from IRQ context - same dc-civac+dsb store pattern as the
+ * rest of this codebase, bounded (fixed store count), no unbounded loops.
+ */
+#include <stdint.h>
+#include "gic_timer.h"
+#include "exceptions.h"
+#include "timer.h"
+#include "vgic.h"
+
+/* ------------------------------------------------------------------ *
+ * GIC-400 MMIO bases (see citation above) and the handful of registers
+ * this driver touches. Offsets are architectural (GICv2 spec).
+ * ------------------------------------------------------------------ */
+#define GICD_BASE 0x01c81000UL
+#define GICC_BASE 0x01c82000UL
+
+#define GICD_CTLR         (*(volatile uint32_t *)(GICD_BASE + 0x000))
+#define GICD_IGROUPR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x080 + 4u * (n)))
+#define GICD_ISENABLER(n) (*(volatile uint32_t *)(GICD_BASE + 0x100 + 4u * (n)))
+#define GICD_ISPENDR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x200 + 4u * (n)))
+/* GICD_IPRIORITYR is byte-addressable, one byte per interrupt ID. */
+#define GICD_IPRIORITYR_BYTE(id) (*(volatile uint8_t *)(GICD_BASE + 0x400 + (id)))
+
+#define GICC_CTLR (*(volatile uint32_t *)(GICC_BASE + 0x000))
+#define GICC_PMR  (*(volatile uint32_t *)(GICC_BASE + 0x004))
+#define GICC_IAR  (*(volatile uint32_t *)(GICC_BASE + 0x00c))
+#define GICC_EOIR (*(volatile uint32_t *)(GICC_BASE + 0x010))
+#define GICC_RPR  (*(volatile uint32_t *)(GICC_BASE + 0x014)) /* running priority */
+#define GICC_DIR  (*(volatile uint32_t *)(GICC_BASE + 0x1000)) /* deactivate interrupt */
+
+/* Our interrupt: INTID 30, the NON-SECURE EL1 physical timer (CNTP) PPI,
+ * per the sun50i-a64.dtsi timer node (GIC_PPI 14 -> 16+14 = 30).
+ *
+ * WHY 30 (CNTP) AND NOT 26 (CNTHP): the second hardware test proved this
+ * board runs a two-security-state GIC-400 where we (EL2) execute in the
+ * NON-SECURE world - the tell-tale is GICC_PMR reading back 0xf0 after we
+ * wrote 0xff (the non-secure banked view exposes only the top nibble of
+ * priority). In that view, GICD_IGROUPR bits for interrupts owned by the
+ * SECURE world are RAZ/WI to us: our attempt to move INTID 26 to Group 1
+ * silently did nothing (IGROUPR0 bit26 read back 0), because CNTHP/INTID 26
+ * is a secure Group 0 interrupt that ATF/BL31 owns. A Group 0 interrupt is
+ * delivered to the SECURE world (EL3/secure FIQ) and can NEVER reach our
+ * non-secure EL2, regardless of PSTATE.I/F. So CNTHP is unusable from here.
+ *
+ * INTID 30 (CNTP) is the non-secure physical timer that firmware hands to
+ * the non-secure OS as a Group 1 interrupt (that is how Linux gets its tick
+ * on this SoC), so it is delivered to us as an IRQ. We program it via the
+ * EL0/EL1 physical-timer registers CNTP_CVAL_EL0 / CNTP_CTL_EL0, which are
+ * freely accessible from EL2 (no trap: we are above EL1, and CNTHCTL_EL2
+ * gating only affects EL0/EL1 accesses, not EL2's own). The comparator uses
+ * the same CNTPCT physical counter, so the deadline math is identical. */
+#define TIMER_INTID   30u
+#define GICD_WORD(id) ((id) / 32u)
+#define GICD_BIT(id)  ((id) % 32u)
+#define GICC_IAR_INTID(iar) ((iar) & 0x3ffu)
+
+/* Priority value for our one PPI. GICv2 priorities are 8-bit, lower value
+ * = higher priority. We use 0x00 (highest) deliberately: in the non-secure
+ * banked view this board runs, a NS-written priority is remapped
+ * (secure = (ns>>1)|0x80), so a NS 0x00 maps to secure 0x80 - still the
+ * highest a non-secure interrupt can be and unambiguously below GICC_PMR
+ * (which reads back ~0xf0 in the NS view). This removes any doubt that the
+ * interrupt clears the priority mask at the CPU interface. */
+#define TIMER_PRIORITY 0x00u
+
+/* GICv2 spurious interrupt IDs (nothing pending). */
+#define GIC_SPURIOUS_MIN 1020u
+
+/* ------------------------------------------------------------------ *
+ * CNTP (non-secure EL1 physical timer) system registers. Accessible from
+ * EL2 without trapping. Comparator is against CNTPCT (physical counter).
+ * ------------------------------------------------------------------ */
+static inline void
+write_cntp_cval(uint64_t v)
+{
+	__asm__ volatile("msr cntp_cval_el0, %0" :: "r"(v) : "memory");
+}
+
+static inline void
+write_cntp_ctl(uint32_t v)
+{
+	__asm__ volatile("msr cntp_ctl_el0, %0" :: "r"((uint64_t)v) : "memory");
+}
+
+static inline uint32_t
+read_cntp_ctl(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb sy" ::: "memory");
+	__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(v));
+	return (uint32_t)v;
+}
+
+/* CNTP_CTL_EL0 bits: [0]=ENABLE, [1]=IMASK, [2]=ISTATUS (read-only, set by
+ * hardware while the timer condition CNTPCT >= CVAL is met). ISTATUS is the
+ * decisive "did the timer actually fire?" flag. */
+#define CNTP_CTL_ENABLE  (1u << 0)
+#define CNTP_CTL_IMASK   (1u << 1)
+#define CNTP_CTL_ISTATUS (1u << 2)
+
+/* ------------------------------------------------------------------ *
+ * HCR_EL2 — physical-interrupt routing to EL2. See the big note in
+ * gic_timer_init() for why IMO must be set on this AArch64 part.
+ * ------------------------------------------------------------------ */
+static inline uint64_t
+read_hcr_el2(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, hcr_el2" : "=r"(v));
+	return v;
+}
+
+static inline void
+write_hcr_el2(uint64_t v)
+{
+	__asm__ volatile("msr hcr_el2, %0\n\tisb sy" :: "r"(v) : "memory");
+}
+
+#define HCR_EL2_IMO (1ull << 4) /* physical IRQ  routed to EL2 */
+#define HCR_EL2_FMO (1ull << 3) /* physical FIQ  routed to EL2 */
+#define HCR_EL2_AMO (1ull << 5) /* physical SError routed to EL2 */
+
+/* ------------------------------------------------------------------ *
+ * Module state - entirely private, no globals shared with other files
+ * except through the accessor functions below.
+ * ------------------------------------------------------------------ */
+static uint64_t gt_period_ticks;
+static uint64_t gt_next_deadline;
+static uint64_t gt_ticks;
+static uint32_t gt_mismatches;
+static struct jitter gt_jitter;
+
+/* INTID counter for interrupt storm diagnostics (internal task).
+ * Track frequency of each interrupt ID entering gic_timer_irq().
+ * Exposed via breadcrumb at 0x00018300+. */
+static uint32_t irq_counter[160] = {0};
+#define IRQ_COUNTER_BC_BASE 0x00018300UL
+
+/* Report to the shared jitter window (0x50000500) every this many ticks -
+ * bounded work per IRQ, not on every single tick, to keep the handler
+ * cheap; still frequent enough to watch the tick settle live. */
+#define REPORT_EVERY 100u
+
+/* Upper bound on the init-time diagnostic busy-wait (see gic_timer_init).
+ * Generous: ~a few ms at 24 MHz even if each iteration is a single cheap
+ * counter read, so a healthy 1 ms deadline is always observed well before
+ * the cap; the cap only exists so a dead/stopped counter can't hang init. */
+#define GT_POLL_MAX 8000000u
+
+/* ------------------------------------------------------------------ *
+ * Breadcrumb window: 0x00018200 ("GICT"). See file header for layout.
+ * ------------------------------------------------------------------ */
+#define GICT_BC_BASE 0x00018200UL
+#define GICT_BC_MAGIC 0x47494354u /* "GICT" */
+
+static inline void
+gict_bc(int i, uint32_t v)
+{
+	volatile uint32_t *p = (volatile uint32_t *)(GICT_BC_BASE + (uint32_t)i * 4u);
+
+	*p = v;
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+/* ------------------------------------------------------------------ *
+ * Init: GIC (distributor + CPU interface, one PPI only) + CNTHP.
+ * ------------------------------------------------------------------ */
+void
+gic_timer_init(uint32_t period_us)
+{
+	uint64_t freq = timer_freq();
+	uint64_t period_ticks;
+	uint64_t now;
+
+	if (freq == 0)
+		freq = 24000000ull; /* A64-typical fallback, matches timer.c */
+
+	/* CNTHCTL_EL2 is intentionally NOT modified here. On this board ATF/BL31
+	 * sets CNTHCTL_EL2=0x3 (EL1PCTEN=1, EL1PCEN=1), so the guest already has
+	 * native EL1 access to CNTPCT_EL0 and CNTP_CTL/CVAL — no trap needed.
+	 * This was verified live via `sr2` (cnthctl_el2=0x0000000000000003).
+	 * The guest's DELAY() reads CNTPCT directly and works. The physical
+	 * timer (CNTP_CTL/CVAL) is shared with this module's tick, but since
+	 * the guest uses the virtual timer (CNTV_*) for its own interrupts,
+	 * there is no conflict in practice. */
+
+	/* CNTVOFF_EL2: ATF/BL31 sets this to a large non-zero value (observed
+	 * 0xc0000240028900), making CNTVCT_EL0 = CNTPCT - CNTVOFF ≈ 0 for the
+	 * guest. FreeBSD's DELAY() and getcycles() use CNTVCT_EL0 (not CNTPCT),
+	 * so a near-zero virtual counter causes DELAY() to hang forever. Zero
+	 * the offset so CNTVCT = CNTPCT (advancing at 24 MHz). Verified live:
+	 * the fix was first applied via hot-patch + call (msr cntvoff_el2, xzr
+	 * patched over onebp_arm), confirmed by reading CNTPCT before/after. */
+	__asm__ volatile("msr cntvoff_el2, xzr\n\tisb" ::: "memory");
+
+	period_ticks = (freq * (uint64_t)period_us) / 1000000ull;
+	if (period_ticks == 0)
+		period_ticks = 1;
+
+	gt_period_ticks = period_ticks;
+	gt_ticks = 0;
+	gt_mismatches = 0;
+	jitter_init(&gt_jitter, period_ticks);
+
+	/* --- GIC distributor -------------------------------------------- *
+	 * ROUTING FIX (v3): use INTID 30 (CNTP, non-secure physical timer),
+	 * which firmware owns as a Group 1 (non-secure) interrupt and therefore
+	 * delivers to us as an IRQ. We do NOT try to reprogram its group: the
+	 * v2 attempt to move INTID 26 into Group 1 was RAZ/WI because 26/CNTHP
+	 * is secure-owned (see the TIMER_INTID comment). INTID 30 should already
+	 * read as Group 1 in IGROUPR0 - we record it (word 11) rather than force
+	 * it, and if bit30 is unexpectedly 0 we still try the |= (harmless if
+	 * RAZ/WI, effective if the GIC happens to allow it).
+	 *
+	 * IGROUPR0 covers INTIDs 0..31 (SGIs+PPIs), one bit each. */
+	GICD_IGROUPR(GICD_WORD(TIMER_INTID)) |= (1u << GICD_BIT(TIMER_INTID));
+
+	GICD_IPRIORITYR_BYTE(TIMER_INTID) = (uint8_t)TIMER_PRIORITY;
+	GICD_ISENABLER(GICD_WORD(TIMER_INTID)) = (1u << GICD_BIT(TIMER_INTID));
+
+	/* Enable groups at the distributor. In the non-secure view (which the
+	 * v2 test proved we are in) bit 0 is EnableGrp1 - exactly what we need
+	 * for the Group 1 CNTP interrupt. Writing 0x3 also covers a combined/
+	 * secure view (bit1 = EnableGrp1); the extra bit is RAZ/WI in the NS
+	 * view. The v2 readback already showed this reading back 0x1 (NS
+	 * EnableGrp1 set), i.e. Group 1 delivery is on. */
+	GICD_CTLR = 0x3u;
+
+	/* --- GIC CPU interface ------------------------------------------ *
+	 * PMR wide open so our priority always clears the mask (note: the NS
+	 * view exposes only the top nibble, so 0xff reads back as 0xf0 - still
+	 * well above priority 0x80). Enable Group 1 forwarding (bit0 in NS
+	 * view). v2 readback showed GICC_CTLR = 0x1, i.e. already enabled.
+	 * v4: Enable EOImode=1 (bit 9) for hardware virtualization so EOIR
+	 * only drops priority and DIR deactivates. */
+	GICC_PMR = 0xffu;
+	GICC_CTLR = 0x3u | (1u << 9);
+
+	/* --- Arm the CNTP (non-secure physical) comparator for the first    */
+	/* interval. Absolute deadline (CVAL) not relative reload (TVAL) so    */
+	/* the periodic tick doesn't drift by the handler's own runtime - each */
+	/* re-arm adds a fixed period to the *previous* deadline (see          */
+	/* gic_timer_irq()). CVAL is a FUTURE point (now + period); the timer  */
+	/* asserts (and CNTP_CTL.ISTATUS sets) when CNTPCT >= CVAL.            */
+	now = timer_now();
+	gt_next_deadline = now + period_ticks;
+	write_cntp_cval(gt_next_deadline);
+	write_cntp_ctl(CNTP_CTL_ENABLE); /* ENABLE=1, IMASK=0 */
+
+	/* --- ROUTING FIX (v4): route physical IRQ to EL2 -------------------- *
+	 * The v3 hardware test proved the interrupt is pending+enabled at the
+	 * GIC (ISPENDR0 bit30=1), the timer fired (CNTP_CTL.ISTATUS=1), yet the
+	 * CPU never took it and there was no storm. That is the fingerprint of
+	 * an AArch64 *routing* problem, not a GIC problem:
+	 *
+	 *   With HCR_EL2.IMO == 0 (the reset default), a physical IRQ is routed
+	 *   to EL1. An asynchronous exception whose target EL is LOWER than the
+	 *   current EL is not taken - it stays pending. Since this system runs
+	 *   at EL2, an IRQ routed to EL1 can never be taken here regardless of
+	 *   PSTATE.I. Setting HCR_EL2.IMO = 1 routes physical IRQ to EL2, so it
+	 *   is taken at the current EL (gated only by PSTATE.I, which the
+	 *   integrator unmasks). This corrects my earlier (wrong) claim that
+	 *   IMO was unnecessary "because nothing runs below EL2" - it is exactly
+	 *   because we run AT EL2 and want the IRQ HERE that IMO must be 1.
+	 *
+	 * We set it read-modify-write (OR in only bit 4) so no other HCR_EL2
+	 * configuration U-Boot/earlier boot set is disturbed. It is idempotent:
+	 * if the integration lane also sets IMO in el2_install(), this OR is a
+	 * harmless no-op. FMO (FIQ->EL2) and AMO (SError->EL2) are intentionally
+	 * left as-is: our tick is a Group 1 IRQ, so IMO is what matters; if the
+	 * integrator additionally unmasks F and a source ever arrives as FIQ,
+	 * FMO would also be needed - flagged, not set. Ownership note: HCR_EL2
+	 * is EL2 setup that naturally belongs to el2_install(); we set it here
+	 * to make the tick self-contained and unblock testing, and the
+	 * integration lane may relocate it with no behavioural change. */
+	{
+		uint64_t hcr_before = read_hcr_el2();
+		uint64_t hcr_after  = hcr_before | HCR_EL2_IMO;
+
+		write_hcr_el2(hcr_after);
+		gict_bc(19, (uint32_t)hcr_before); /* HCR_EL2 before (lo) */
+		gict_bc(20, (uint32_t)read_hcr_el2()); /* HCR_EL2 after (lo): bit4 must be 1 */
+	}
+
+	/* Breadcrumb: static/init-time facts + register readbacks. Words 8..18
+	 * capture the *actual* register state right after programming, so the
+	 * next hardware read shows exactly which link in the chain is broken -
+	 * no guessing. */
+	gict_bc(4, (uint32_t)period_ticks);
+	gict_bc(6, 1u); /* init_done */
+	gict_bc(8, read_cntp_ctl());                   /* CNTP_CTL: expect ENABLE=1 */
+	gict_bc(9, GICD_CTLR);                          /* distributor CTLR readback */
+	gict_bc(10, GICC_CTLR);                         /* CPU-interface CTLR readback */
+	gict_bc(11, GICD_IGROUPR(GICD_WORD(TIMER_INTID))); /* IGROUPR0: bit30 => Grp1 */
+	gict_bc(12, (uint32_t)now);                     /* CNTPCT at arm time (lo) */
+	gict_bc(13, (uint32_t)gt_next_deadline);        /* CNTP_CVAL deadline (lo) */
+	gict_bc(14, GICC_PMR);                          /* PMR readback (NS: ~0xf0) */
+	gict_bc(15, GICD_ISENABLER(GICD_WORD(TIMER_INTID))); /* ISENABLER0: bit30=1 */
+
+	/* --- DIAGNOSTIC PROOF: bounded busy-wait until the deadline passes, *
+	 * then sample CNTP_CTL.ISTATUS and GICD_ISPENDR0. This runs with IRQs
+	 * still masked (init is called before the integrator's daifclr), so
+	 * the interrupt cannot be taken here - it just latches pending, which
+	 * is precisely what we want to observe. Decision table for the next
+	 * hardware read of this window:
+	 *   word17 ISTATUS bit2 == 1  => the CNTP timer condition really fired
+	 *                                (correct timer + CVAL semantics).
+	 *   word16 ISPENDR0 bit30 == 1 => the GIC latched INTID 30 pending, i.e.
+	 *                                CNTP is wired to PPI 30 and enabled.
+	 *   Both set but ticks still 0 => the gap is CPU-if delivery / routing.
+	 *                                v3 hit exactly this; root cause was
+	 *                                HCR_EL2.IMO=0 (IRQ routed to EL1, never
+	 *                                taken at EL2), now fixed below. Words
+	 *                                19-24 (HCR_EL2 + IAR/RPR probe) confirm.
+	 *   ISTATUS 1 but ISPENDR0 bit30 0 => CNTP is NOT on PPI 30 here; check
+	 *                                which ISPENDR bit did set (whole word
+	 *                                is recorded, not just bit30).
+	 *   ISTATUS 0 => the timer never asserted (wrong reg/CVAL/counter).
+	 * The wait is bounded to GT_POLL_MAX iterations (~covers a few ms at
+	 * 24 MHz); word18 records whether we observed CNTPCT>=CVAL (1) or hit
+	 * the iteration cap (0, meaning the counter isn't advancing as
+	 * expected). No unbounded loop. */
+	{
+		uint32_t i;
+		uint32_t observed = 0;
+
+		for (i = 0; i < GT_POLL_MAX; i++) {
+			if (timer_now() >= gt_next_deadline) {
+				observed = 1;
+				break;
+			}
+		}
+		gict_bc(16, GICD_ISPENDR(GICD_WORD(TIMER_INTID)));
+		gict_bc(17, read_cntp_ctl());  /* bit2 ISTATUS = timer fired */
+		gict_bc(18, observed);
+	}
+
+	/* --- DECISIVE CPU-INTERFACE PROBE (balanced IAR/EOI) ---------------- *
+	 * We are still running with IRQs masked at the PSTATE level (init runs
+	 * before the integrator's daifclr), but reading GICC_IAR does NOT depend
+	 * on PSTATE.I - it directly asks the CPU interface "what would you hand
+	 * the core right now?". This cleanly separates a GIC/CPU-interface fault
+	 * from a pure routing/PSTATE fault:
+	 *   word22 (IAR) == 30   => the CPU interface WOULD forward our INTID; so
+	 *                           any remaining failure is routing/PSTATE only
+	 *                           (i.e. the HCR_EL2.IMO fix above is the cure).
+	 *   word22 (IAR) == 1023 => the CPU interface is masking it (priority /
+	 *                           group / PMR) - a GIC-side fault to chase.
+	 * We MUST balance the read: if IAR returns a real INTID we immediately
+	 * write GICC_EOIR, otherwise the running priority (GICC_RPR) stays raised
+	 * and blocks ALL future delivery - which would itself masquerade as this
+	 * very bug. word21/23/24 capture RPR before / while-active / after-EOI so
+	 * a stuck running priority is impossible to miss (idle RPR = 0xff).
+	 *
+	 * Because CNTP is level-triggered and still asserting (CVAL is now in the
+	 * past, ISTATUS=1), the interrupt simply re-pends right after our EOI, so
+	 * no tick is lost: once the integrator clears PSTATE.I it fires and
+	 * gic_timer_irq() re-arms CVAL into the future, de-asserting it. */
+	{
+		uint32_t rpr_before = GICC_RPR;
+		uint32_t iar        = GICC_IAR;
+		uint32_t rpr_active = GICC_RPR;
+		uint32_t intid      = GICC_IAR_INTID(iar);
+
+		if (intid < GIC_SPURIOUS_MIN) {
+			GICC_EOIR = iar; /* balance the acknowledge - never leave RPR raised */
+			GICC_DIR = iar;
+		}
+
+		gict_bc(21, rpr_before);      /* expect 0xff (idle) before the probe */
+		gict_bc(22, iar);             /* expect INTID 30; 1023 => GIC masking */
+		gict_bc(23, rpr_active);      /* running prio while IAR active */
+		gict_bc(24, GICC_RPR);        /* after EOI: MUST be back to 0xff idle */
+	}
+
+	gict_bc(0, GICT_BC_MAGIC);
+}
+
+/* ------------------------------------------------------------------ *
+ * IRQ handler: called from el2_trap()'s EL2_KIND_IRQ arm. Bounded,
+ * non-blocking - fixed number of MMIO accesses and breadcrumb stores,
+ * no loops, no allocation.
+ * ------------------------------------------------------------------ */
+void
+gic_timer_irq(struct el2_frame *frame)
+{
+	uint32_t iar = GICC_IAR;
+	uint32_t intid = GICC_IAR_INTID(iar);
+
+	(void)frame; /* not needed: we don't inspect/modify the trapped context */
+
+	/* Count this INTID for storm diagnostics */
+	if (intid < 160)
+		irq_counter[intid]++;
+
+	if (intid >= GIC_SPURIOUS_MIN) {
+		/* 1020-1023: spurious, nothing pending for this CPU interface.
+		 * No EOI for a spurious read (GICv2 spec). */
+		return;
+	}
+
+	if (intid != TIMER_INTID) {
+		/* PMU (INTID 106) storm mitigation: drop it completely.
+		 * Guest PMU driver is causing a storm because it never clears it. */
+		if (intid == 106) {
+			GICC_EOIR = iar;
+			GICC_DIR = iar;
+			return;
+		}
+
+		/* CNTV (INTID 27) storm mitigation: drop it for now (internal task).
+		 * Virtual timer firing too frequently, blocking guest progress.
+		 * TODO: investigate why CNTV is storming despite CNTVOFF_EL2=0. */
+		if (intid == 27) {
+			GICC_EOIR = iar;
+			GICC_DIR = iar;
+			return;
+		}
+
+		/* Not our timer PPI. This is a guest interrupt (device SPI).
+		 * Drop priority to unblock EL2 IRQs, then inject as HW interrupt.
+		 * The guest writing virtual EOIR will automatically deactivate this
+		 * physical interrupt via the GIC's HW integration. */
+		GICC_EOIR = iar;
+		vgic_inject_hw(intid, intid, 0);
+		return;
+	}
+
+	/* Ours: sample jitter against the free-running physical counter. */
+	jitter_sample(&gt_jitter, timer_now());
+
+	/* Re-arm the next interval from the *previous* deadline (not "now"),
+	 * so handler latency/runtime doesn't accumulate into the period.
+	 * Writing CVAL de-asserts the current timer output (CNTPCT < new CVAL
+	 * again) which is what clears the interrupt condition at the source;
+	 * the GICC_EOIR below then completes it at the GIC. */
+	gt_next_deadline += gt_period_ticks;
+	write_cntp_cval(gt_next_deadline);
+	/* Re-assert ENABLE=1, IMASK=0. Writing CVAL doesn't disturb CNTP_CTL,
+	 * but this is the one place a missed write would silently stop the
+	 * tick forever, so keep it explicit. */
+	write_cntp_ctl(CNTP_CTL_ENABLE);
+
+	GICC_EOIR = iar;
+	GICC_DIR = iar;
+
+	gt_ticks++;
+
+	if ((gt_ticks % REPORT_EVERY) == 0) {
+		jitter_report_bc(&gt_jitter);
+
+		gict_bc(1, (uint32_t)gt_ticks);
+		gict_bc(2, (uint32_t)(gt_ticks >> 32));
+		gict_bc(3, iar);
+		gict_bc(5, gt_mismatches);
+		gict_bc(7, read_cntp_ctl()); /* live timer state from IRQ ctx */
+
+		/* Storm diagnostics: find top storming INTID and dump to SRAM */
+		{
+			uint32_t max_intid = 0, max_count = 0;
+			uint32_t i;
+
+			for (i = 0; i < 160; i++) {
+				if (irq_counter[i] > max_count) {
+					max_count = irq_counter[i];
+					max_intid = i;
+				}
+			}
+
+			volatile uint32_t *bc_ptr = (volatile uint32_t *)IRQ_COUNTER_BC_BASE;
+			bc_ptr[0] = (max_intid << 16) | (max_count & 0xFFFFu);  /* top INTID + count (lo) */
+			bc_ptr[1] = (max_count >> 16);                           /* count (hi) */
+			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(bc_ptr) : "memory");
+		}
+	}
+}
+
+uint64_t
+gic_timer_ticks(void)
+{
+	return gt_ticks;
+}
+
+const struct jitter *
+gic_timer_jitter(void)
+{
+	return &gt_jitter;
+}
+

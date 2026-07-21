@@ -1,0 +1,1063 @@
+/* emac.c — sun8i-emac (Allwinner A64) driver + raw-Ethernet console for the
+ * bzdOS microkernel. Implements emac.h. Freestanding, bare-metal AArch64,
+ * MMIO via volatile pointers built from ABSOLUTE physical addresses (U-Boot
+ * leaves the MMU on with a flat device mapping — same contract as musb.c).
+ *
+ * EVERYTHING here (register offsets, bit definitions, syscon value, CCU
+ * gate/reset bits, the bring-up SEQUENCE) is ported VERBATIM from the
+ * known-good U-Boot driver for THIS silicon:
+ *     /opt/bzdos/build/u-boot/drivers/net/sun8i_emac.c
+ * and the board DTS
+ *     .../arch/arm/dts/sun50i-a64.dtsi  (+ ...-bananapi-m64.dts)
+ * NOT guessed from generic datasheets (that trap cost the USB lane weeks).
+ * File:line citations are in the comments next to each constant.
+ *
+ * DMA coherency: the D-cache is ON, so DMA descriptor rings and packet
+ * buffers (in a fixed scratch DRAM region) are kept coherent by hand — clean
+ * (dc civac) before handing memory to the EMAC, invalidate (dc ivac) before
+ * reading what the EMAC wrote, each bracketed by a dsb. Generalized from
+ * musb.c's bc_write "dc civac + dsb sy" pattern.
+ */
+#include <stdint.h>
+#include "emac.h"
+#include "wdt.h"   /* pet the 16 s WDT during the multi-second autoneg wait —
+                    * emac_init() runs BEFORE main_net.c's pet loop, so a
+                    * naked seconds-long wait here would trip the watchdog. */
+#include "timer.h" /* timer_now()/timer_freq() — emac_link_watchdog()'s own
+                    * rate limit; same timebase the CPU1 loop already uses. */
+
+/* ------------------------------------------------------------------ */
+/* Physical bases (DTS-verified)                                       */
+/* ------------------------------------------------------------------ */
+/* EMAC MMIO: sun50i-a64.dtsi ethernet@1c30000 "reg = <0x01c30000 0x10000>"
+ * (dtsi line ~1121-1124). */
+#define EMAC_BASE      0x01C30000UL
+/* SYS_CON EMAC clock register: syscon@1c00000 (dtsi ~393) + a64 variant
+ * syscon_offset 0x30 (sun8i_emac.c emac_variant_a64, line ~893-896). */
+#define SYSCON_EMAC    0x01C00030UL
+/* CCU (clock/reset). CLK_BUS_EMAC = GATE(0x060, BIT(17)); RST_BUS_EMAC =
+ * RESET(0x2c0, BIT(17)) — u-boot drivers/clk/sunxi/clk_a64.c lines 23 & 79. */
+#define CCU_BASE       0x01C20000UL
+#define CCU_BUS_GATE0  0x060u
+#define CCU_BUS_RST0   0x2C0u
+#define CCU_EMAC_BIT   (1u << 17)
+/* PIO (GPIO/pinmux) controller — the PD bank carries the RGMII pins. */
+#define PIO_BASE       0x01C20800UL
+
+/* ------------------------------------------------------------------ */
+/* EMAC register offsets (sun8i_emac.c lines 81-125, verbatim)          */
+/* ------------------------------------------------------------------ */
+#define EMAC_CTL0            0x00
+#define  EMAC_CTL0_FULL_DUPLEX   (1u << 0)
+#define  EMAC_CTL0_SPEED_MASK    (3u << 2)
+#define  EMAC_CTL0_SPEED_10      (0x2u << 2)
+#define  EMAC_CTL0_SPEED_100     (0x3u << 2)
+#define  EMAC_CTL0_SPEED_1000    (0x0u << 2)
+#define EMAC_CTL1            0x04
+#define  EMAC_CTL1_SOFT_RST      (1u << 0)
+#define  EMAC_CTL1_BURST_LEN_SHIFT 24
+#define EMAC_INT_STA         0x08
+#define EMAC_INT_EN          0x0c
+#define EMAC_TX_CTL0         0x10
+#define  EMAC_TX_CTL0_TX_EN      (1u << 31)
+#define EMAC_TX_CTL1         0x14
+#define  EMAC_TX_CTL1_TX_MD        (1u << 1)
+#define  EMAC_TX_CTL1_TX_DMA_EN    (1u << 30)
+#define  EMAC_TX_CTL1_TX_DMA_START (1u << 31)
+#define EMAC_TX_FLOW_CTL     0x1c
+#define EMAC_TX_DMA_DESC     0x20
+#define EMAC_RX_CTL0         0x24
+#define  EMAC_RX_CTL0_RX_EN      (1u << 31)
+#define EMAC_RX_CTL1         0x28
+#define  EMAC_RX_CTL1_RX_MD        (1u << 1)
+#define  EMAC_RX_CTL1_RX_RUNT_FRM  (1u << 2)
+#define  EMAC_RX_CTL1_RX_ERR_FRM   (1u << 3)
+#define  EMAC_RX_CTL1_RX_DMA_EN    (1u << 30)
+#define  EMAC_RX_CTL1_RX_DMA_START (1u << 31)
+#define EMAC_RX_DMA_DESC     0x34
+#define EMAC_MII_CMD         0x48
+#define EMAC_MII_DATA        0x4c
+#define EMAC_ADDR0_HIGH      0x50
+#define EMAC_ADDR0_LOW       0x54
+
+/* Descriptor status/ctl bits (sun8i_emac.c lines 120-125). */
+#define EMAC_DESC_OWN_DMA      (1u << 31)
+#define EMAC_DESC_LAST_DESC    (1u << 30)
+#define EMAC_DESC_FIRST_DESC   (1u << 29)
+#define EMAC_DESC_CHAIN_SECOND (1u << 24)
+#define EMAC_DESC_RX_ERROR_MASK 0x400068dbu
+
+/* MDIO command bits (sun8i_emac.c lines 33-44). */
+#define MDIO_CMD_MII_BUSY           (1u << 0)
+#define MDIO_CMD_MII_WRITE          (1u << 1)
+#define MDIO_CMD_MII_PHY_REG_SHIFT  4
+#define MDIO_CMD_MII_PHY_ADDR_SHIFT 12
+#define MDIO_CMD_MII_CLK_CSR_DIV_128 0x3u
+#define MDIO_CMD_MII_CLK_CSR_SHIFT  20
+
+/* SYS_CON EMAC-clock register fields (sun8i_emac.c lines 60-75). */
+#define H3_EPHY_SHUTDOWN   (1u << 16)  /* 1 = internal PHY off (we use ext) */
+#define SC_RMII_EN         (1u << 13)
+#define SC_EPIT            (1u << 2)   /* 1 = RGMII, 0 = MII */
+#define SC_ETCS_INT_GMII   0x2u        /* clock source = internal GMII */
+
+/* ------------------------------------------------------------------ */
+/* Config                                                              */
+/* ------------------------------------------------------------------ */
+#define PHY_ADDR        1              /* .config CONFIG_PHY_ADDR=1; DTS
+                                        * ext_rgmii_phy reg = <1> (RTL8211E) */
+#define N_TX_DESC       8
+#define N_RX_DESC       8
+#define ETH_BUFSIZE     2048           /* per-descriptor buffer */
+#define ETH_RXSIZE      2044           /* sun8i_emac.c CFG_ETH_RXSIZE */
+
+/* Our locally-administered MAC and console EtherType. */
+static const uint8_t OUR_MAC[6] = { 0x02, 0xbd, 0x05, 0x00, 0x00, 0x01 };
+#define ETHERTYPE_CONSOLE 0x88B5u
+/* Reliable-datagram (netcon) EtherType — a SECOND, independent channel from
+ * the console. Frames on this EtherType are demuxed away from the console
+ * byte ring in emac_poll() and handed to netcon_rx_frame() instead (see
+ * "RX demux hook" below). Kept as a plain broadcast dst byte to reuse the
+ * exact same TX descriptor path as the console (see tx_frame_raw()). */
+#define ETHERTYPE_NETCON  0x88B6u
+static const uint8_t BCAST_MAC[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+/* netcon.c provides the real implementation when linked in; the weak no-op
+ * fallback here lets emac.c (and anything built without netcon.c, e.g. the
+ * plain console-only images) link cleanly. */
+extern void netcon_rx_frame(const uint8_t *payload, uint16_t len);
+__attribute__((weak)) void netcon_rx_frame(const uint8_t *payload, uint16_t len)
+{
+    (void)payload; (void)len;   /* no netcon linked in: drop silently */
+}
+
+/* ------------------------------------------------------------------ */
+/* Scratch DRAM layout for DMA (rings + buffers). 0x50100000 onward is    */
+/* clear of the image (0x42000000..0x42800000), of musb.c's breadcrumb    */
+/* (0x50000000) and of our own breadcrumb window (0x50000100). All under  */
+/* 4 GiB, as the EMAC DMA engine is 32-bit. Each descriptor gets its own   */
+/* 64-byte cache line so per-descriptor clean/invalidate never disturbs a  */
+/* neighbour.                                                              */
+/* ------------------------------------------------------------------ */
+#define SCRATCH_BASE    0x50100000UL
+#define TX_DESC_BASE    (SCRATCH_BASE + 0x0000UL)   /* 8 * 64 = 512 B */
+#define RX_DESC_BASE    (SCRATCH_BASE + 0x0200UL)   /* 8 * 64 = 512 B */
+#define TX_BUF_BASE     (SCRATCH_BASE + 0x1000UL)   /* 8 * 2048 = 16 KiB */
+#define RX_BUF_BASE     (SCRATCH_BASE + 0x5000UL)   /* 8 * 2048 = 16 KiB */
+#define DESC_STRIDE     64u                          /* one cache line each */
+
+/* A single hardware DMA descriptor. Only the first 16 bytes are meaningful
+ * to the EMAC; we access them at their absolute physical addresses. */
+struct emac_desc {
+    uint32_t status;    /* +0  OWN(31); RX: length[29:16] */
+    uint32_t ctl_size;  /* +4  buffer size / TX flags+len  */
+    uint32_t buf_addr;  /* +8  physical buffer address (32-bit) */
+    uint32_t next;      /* +12 physical addr of next descriptor */
+};
+
+static inline volatile struct emac_desc *tx_desc(int i)
+{ return (volatile struct emac_desc *)(TX_DESC_BASE + (uint32_t)i * DESC_STRIDE); }
+static inline volatile struct emac_desc *rx_desc(int i)
+{ return (volatile struct emac_desc *)(RX_DESC_BASE + (uint32_t)i * DESC_STRIDE); }
+static inline uint32_t tx_buf(int i) { return (uint32_t)(TX_BUF_BASE + (uint32_t)i * ETH_BUFSIZE); }
+static inline uint32_t rx_buf(int i) { return (uint32_t)(RX_BUF_BASE + (uint32_t)i * ETH_BUFSIZE); }
+
+/* ------------------------------------------------------------------ */
+/* Low-level MMIO                                                       */
+/* ------------------------------------------------------------------ */
+static inline uint32_t rd(uint32_t off)
+{ return *(volatile uint32_t *)(EMAC_BASE + off); }
+static inline void wr(uint32_t off, uint32_t v)
+{ *(volatile uint32_t *)(EMAC_BASE + off) = v; }
+static inline void setbits(uint32_t off, uint32_t m) { wr(off, rd(off) | m); }
+
+/* ------------------------------------------------------------------ */
+/* Cache maintenance (D-cache is ON — generalized from musb.c bc_write)  */
+/* ------------------------------------------------------------------ */
+static inline void cache_clean(uintptr_t addr, uint32_t size)
+{
+    uintptr_t p = addr & ~63UL, end = addr + size;
+    for (; p < end; p += 64)
+        __asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+static inline void cache_inval(uintptr_t addr, uint32_t size)
+{
+    uintptr_t p = addr & ~63UL, end = addr + size;
+    for (; p < end; p += 64)
+        __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static inline void udelay_spin(uint32_t n)
+{
+    /* No timer; crude bounded busy-spin (~n loop iterations). */
+    for (volatile uint32_t i = 0; i < n; i++)
+        __asm__ volatile("nop");
+}
+
+/* ------------------------------------------------------------------ */
+/* Breadcrumb telemetry — SECOND window at 0x50000100 (musb.c owns       */
+/* 0x50000000). Same cache-coherent store pattern as musb.c: a plain      */
+/* store dies in cache across a WDT reset. Read after a run with          */
+/*     md.l 0x50000100 16                                                 */
+/* Layout (word index -> 0x50000100 + i*4):                               */
+/*   [0] 0xE3AC0DE1  magic (proves emac.c wrote this)                      */
+/*   [1] stage       max checkpoint reached (BC_STAGE_* below)            */
+/*   [2] clk_ungated 1 once CCU gate set + reset deasserted               */
+/*   [3] phy_reset   1 once PHY soft-reset completed                       */
+/*   [4] link_up     1 once PHY reported link                              */
+/*   [5] link_speed  10 / 100 / 1000 (0 if unknown)                        */
+/*   [6] tx_count    frames handed to TX DMA                               */
+/*   [7] rx_count    frames accepted from RX DMA                           */
+/*   [8] last_int    last EMAC_INT_STA value observed in emac_poll()       */
+/*   [9] phy_id      (PHYID1<<16)|PHYID2 read over MDIO (diagnostic)        */
+/*  [10] bmcr_rb     PHY BMCR (reg 0) read back after enabling autoneg      */
+/*  [11] bmsr_rb     PHY BMSR (reg 1) — last value seen in the link wait    */
+/*  [12] physr_rb    RTL8211E PHYSR (reg 0x11) — resolved speed/duplex/link
+ *  [13] link_down_events  count of up->down transitions seen by emac_poll()
+ *  [14] link_up_events    count of down->up transitions (initial link plus
+ *                         every flap recovery) seen by emac_poll()
+ *  [15] tx_drops     frames dropped by tx_frame() (link down, or a TX
+ *                     descriptor stayed busy past the bounded wait)
+ *  [16] force_link   1 if built with EMAC_FORCE_LINK (fixed speed/duplex,
+ *                     autoneg disabled), 0 if running autoneg
+ *  [17] mdio_valid   1 if the PHY answered a sane ID over MDIO before we
+ *                     committed to resetting/programming it (0 = retry gave
+ *                     up and we pressed on against a maybe-phantom PHY)
+ *  [18] wd_reinits   emac_link_watchdog() bounded self-heal attempt count —
+ *                     nonzero means EMAC never saw an RX frame and CPU1 is
+ *                     retrying the PHY/rings bring-up
+ *  [19] first_rx     latches to 1 the FIRST time a frame is ever accepted
+ * [5] link_speed is kept LIVE (rewritten on every debounced link check in
+ * emac_poll()), not just set once at init.
+ * Read after a run with  md.l 0x50000100 24                                */
+/* ------------------------------------------------------------------ */
+#define BC_BASE  0x50000100UL
+#define BC_MAGIC 0xE3AC0DE1u
+enum {
+    BC_STAGE_ENTER   = 1,   /* entered emac_init() */
+    BC_STAGE_CLK     = 2,   /* CCU gate on + reset deasserted */
+    BC_STAGE_SYSCON  = 3,   /* SYS_CON EMAC clk reg programmed */
+    BC_STAGE_PINMUX  = 4,   /* PD RGMII pins muxed */
+    BC_STAGE_RESET   = 5,   /* EMAC soft reset complete */
+    BC_STAGE_MDIO    = 6,   /* PHY ID read over MDIO */
+    BC_STAGE_PHYRST  = 7,   /* PHY soft-reset complete */
+    BC_STAGE_LINK    = 8,   /* link up, speed/duplex resolved */
+    BC_STAGE_RINGS   = 9,   /* DMA rings initialised */
+    BC_STAGE_ENABLED = 10,  /* RX/TX DMA + MAC enabled (init done) */
+    BC_STAGE_LOOP    = 11,  /* emac_poll() serviced at least once */
+    BC_STAGE_WD_GAVEUP = 98, /* emac_link_watchdog() exhausted its retries */
+    BC_STAGE_NOLINK  = 99,  /* gave up: no link within bounded wait */
+};
+
+static inline void bc(int i, uint32_t v)
+{
+    volatile uint32_t *p = (volatile uint32_t *)(BC_BASE + (uint32_t)i * 4u);
+    *p = v;
+    __asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+/* ------------------------------------------------------------------ */
+/* Driver state                                                         */
+/* ------------------------------------------------------------------ */
+static int      g_link_up;       /* LIVE, debounced — refreshed in emac_poll() */
+static uint32_t g_speed;         /* 10/100/1000 */
+static int      g_tx_slot;       /* next TX descriptor to use */
+static int      g_rx_slot;       /* next RX descriptor to inspect */
+static uint32_t g_tx_count, g_rx_count;
+static uint32_t g_poll_calls;         /* throttles MDIO link-status polling */
+static int      g_link_down_streak;   /* consecutive "not up" reads while up,
+                                       * OR consecutive polls while down
+                                       * (reused for the autoneg re-kick) */
+static uint32_t g_link_up_events;     /* down->up transition count */
+static uint32_t g_link_down_events;   /* up->down transition count */
+static uint32_t g_tx_drops;           /* frames dropped by tx_frame() */
+static uint32_t g_first_rx_latched;   /* one-shot: has ANY frame ever arrived */
+
+/* emac_poll() throttling/debounce constants for live link monitoring. */
+#define LINK_CHECK_INTERVAL     256   /* polls between MDIO BMSR reads (power
+                                       * of two — used as a mask) */
+#define LINK_DOWN_DEBOUNCE      3     /* consecutive down-reads (each
+                                       * LINK_CHECK_INTERVAL polls apart)
+                                       * before declaring the link down —
+                                       * absorbs a brief autoneg re-handshake
+                                       * blip instead of reading it as loss */
+#define LINK_RENEG_KICK_STREAK  40    /* consecutive down-reads while already
+                                       * down before nudging autoneg restart
+                                       * (a register write only — never a
+                                       * full MAC/DMA reinit); autoneg-only */
+
+/* TX line staging (flushed as one frame on '\n' or when full). */
+#define TX_LINE_MAX 512
+static uint8_t  tx_line[TX_LINE_MAX];
+static int      tx_line_len;
+
+/* RX byte ring feeding emac_getc(). */
+#define RX_RING_SIZE 1024            /* power of two */
+static uint8_t  rx_ring[RX_RING_SIZE];
+static unsigned rx_head, rx_tail;
+
+static void rx_push(uint8_t b)
+{
+    unsigned next = (rx_head + 1) & (RX_RING_SIZE - 1);
+    if (next == rx_tail)
+        return;                      /* full: drop rather than hang */
+    rx_ring[rx_head] = b;
+    rx_head = next;
+}
+
+/* Count an accepted RX frame + latch the one-shot "link proven alive" marker
+ * (word [19]) the first time any frame ever arrives. */
+static inline void note_rx_frame(void)
+{
+    bc(7, ++g_rx_count);
+    if (!g_first_rx_latched) {
+        g_first_rx_latched = 1;
+        bc(19, 1);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* MDIO (sun8i_emac.c sun8i_mdio_read/write, external-PHY path)          */
+/* ------------------------------------------------------------------ */
+static int mdio_read(int phy, int reg)
+{
+    uint32_t cmd = ((uint32_t)reg << MDIO_CMD_MII_PHY_REG_SHIFT) & 0x000001f0u;
+    cmd |= ((uint32_t)phy << MDIO_CMD_MII_PHY_ADDR_SHIFT) & 0x0001f000u;
+    cmd |= MDIO_CMD_MII_CLK_CSR_DIV_128 << MDIO_CMD_MII_CLK_CSR_SHIFT;
+    cmd |= MDIO_CMD_MII_BUSY;
+
+    wr(EMAC_MII_CMD, cmd);
+    for (int t = 0; t < 100000; t++) {
+        if (!(rd(EMAC_MII_CMD) & MDIO_CMD_MII_BUSY))
+            return (int)(rd(EMAC_MII_DATA) & 0xffffu);
+    }
+    return -1;                       /* bounded timeout */
+}
+
+static void mdio_write(int phy, int reg, uint16_t val)
+{
+    uint32_t cmd = ((uint32_t)reg << MDIO_CMD_MII_PHY_REG_SHIFT) & 0x000001f0u;
+    cmd |= ((uint32_t)phy << MDIO_CMD_MII_PHY_ADDR_SHIFT) & 0x0001f000u;
+    cmd |= MDIO_CMD_MII_CLK_CSR_DIV_128 << MDIO_CMD_MII_CLK_CSR_SHIFT;
+    cmd |= MDIO_CMD_MII_WRITE | MDIO_CMD_MII_BUSY;
+
+    wr(EMAC_MII_DATA, val);
+    wr(EMAC_MII_CMD, cmd);
+    for (int t = 0; t < 100000; t++)
+        if (!(rd(EMAC_MII_CMD) & MDIO_CMD_MII_BUSY))
+            return;
+    /* bounded timeout — best effort */
+}
+
+/* Standard IEEE 802.3 clause-22 PHY registers. */
+#define MII_BMCR   0x00
+#define  BMCR_RESET      0x8000
+#define  BMCR_ANENABLE   0x1000
+#define  BMCR_ANRESTART  0x0200
+#define MII_BMSR   0x01
+#define  BMSR_LSTATUS    0x0004
+#define  BMSR_ANEGDONE   0x0020
+#define MII_PHYID1 0x02
+#define MII_PHYID2 0x03
+/* RTL8211E PHY-Specific Status Register (vendor reg 0x11): resolved link. */
+#define RTL_PHYSR  0x11
+#define  PHYSR_SPEED_SHIFT 14
+#define  PHYSR_SPEED_MASK  0x3
+#define  PHYSR_DUPLEX      (1u << 13)
+#define  PHYSR_LINK        (1u << 11)
+/* Clause-22 BMCR speed/duplex fields, used only for the forced-link path
+ * below (autoneg path never touches these directly). */
+#define  BMCR_DUPLEX_FULL  0x0100
+#define  BMCR_SPEED_LSB    0x2000   /* bit13 */
+#define  BMCR_SPEED_MSB    0x0040   /* bit6  */
+
+/* ------------------------------------------------------------------ *
+ * Forced link mode vs. autoneg — see the "flap" root-cause discussion
+ * in the report. Root cause under investigation: the SYS_CON EMAC clock
+ * register here has BOTH TX/RX delay fields at 0 (CONFIG_GMAC_TX_DELAY=0,
+ * board DTS has no allwinner,tx/rx-delay-ps), meaning correct RGMII
+ * clock-to-data timing depends ENTIRELY on the RTL8211E's internal
+ * "rgmii-id" delay being enabled by its RXD1/RXD0 strap pins at PHY
+ * power-on/reset. If those straps are marginal (weak/wrong pull, PD-bank
+ * drive strength too low for the trace load), gigabit's tight skew budget
+ * is the first thing to suffer — signal integrity errors show up to
+ * software as spurious link renegotiation (the "flap": link comes up,
+ * a few frames get through before a burst of bit errors triggers the link
+ * partner or the PHY to drop and retrain). 100 Mbit's slower edge rate has
+ * roughly an order of magnitude more setup/hold margin, so it tends to
+ * "just work" even with marginal delay strapping.
+ *
+ * Trade-off: forcing speed/duplex does NOT fix a genuine strap/skew fault
+ * — it sidesteps it by using a slower, more tolerant rate, and it gives up
+ * autoneg's ability to adapt to whatever the far end actually supports
+ * (a forced PHY on an autoneg-only partner may fail to link at all, or
+ * link in the wrong duplex under parallel detection — this board's far
+ * end is a fixed switch port we control, so that risk is low here).
+ * Given this REPL is now the primary debug channel and the reported
+ * failure mode is "link flaps then drops to 0" rather than "never links",
+ * we default to FORCED 100/full as the more conservative choice until the
+ * hardware lane can confirm the RTL8211E's delay straps directly. Flip
+ * EMAC_FORCE_LINK to 0 to go back to full autoneg (with the new debounce
+ * logic below, occasional autoneg blips no longer read as permanent loss
+ * either way). */
+#define EMAC_FORCE_LINK         1
+#define EMAC_FORCE_SPEED        100   /* 10, 100, or 1000 — only used if
+                                       * EMAC_FORCE_LINK is 1 */
+#define EMAC_FORCE_FULL_DUPLEX  1
+
+/* Bring the PHY up: read ID, soft-reset, enable+restart autoneg, then wait
+ * (bounded) for link. Resolves speed/duplex from the RTL8211E PHYSR. Returns
+ * 1 if link came up, 0 on bounded timeout. Sets g_speed / duplex-in-*dup. */
+/* How many BMSR poll passes to wait for link. Each pass performs ~2 MDIO
+ * transactions (real, MDIO-clock-bounded time, ~30-60 us each) plus a short
+ * spin, so a pass is ~O(100 us) of WALL time largely independent of CPU
+ * speed. ~120000 passes therefore covers well over the 2-5 s a gigabit
+ * switch needs to auto-negotiate, while still finishing in a handful of
+ * seconds. We wdt_pet() every pass so this seconds-long wait cannot trip the
+ * 16 s watchdog (emac_init runs before main_net.c's pet loop); the loop is
+ * still hard-bounded, so on genuine no-link it exits and the caller lets the
+ * WDT reset us. */
+#define LINK_WAIT_PASSES 120000
+
+static int phy_startup(int *duplex_full)
+{
+    int id1, id2, bmsr = 0, bmcr_rb;
+
+    id1 = mdio_read(PHY_ADDR, MII_PHYID1);
+    id2 = mdio_read(PHY_ADDR, MII_PHYID2);
+    /* Bounded retry: on some cold boots the external PHY hasn't finished its
+     * own power-on-reset by the time we first poke MDIO, and a premature
+     * transaction reads back garbage (all-1s / all-0s / timed-out -1).
+     * Soft-resetting and programming BMCR against a PHY that never really
+     * answered leaves the link untrained for the rest of the boot. Retry for
+     * a bounded ~1 s before pressing on anyway (a genuinely absent PHY can't
+     * be fixed from software; a merely-slow one now gets a real chance). */
+    {
+        int tries, valid = 0;
+        for (tries = 0; tries < 500; tries++) {
+            valid = (id1 >= 0 && id2 >= 0) &&
+                    !((id1 & 0xffff) == 0xffff && (id2 & 0xffff) == 0xffff) &&
+                    !(id1 == 0 && id2 == 0);
+            if (valid)
+                break;
+            wdt_pet();
+            udelay_spin(2000);
+            id1 = mdio_read(PHY_ADDR, MII_PHYID1);
+            id2 = mdio_read(PHY_ADDR, MII_PHYID2);
+        }
+        bc(17, (uint32_t)valid);
+    }
+    bc(9, ((uint32_t)(id1 & 0xffff) << 16) | (uint32_t)(id2 & 0xffff));
+    bc(1, BC_STAGE_MDIO);
+
+    /* Soft-reset the PHY and wait (bounded) for BMCR.RESET to self-clear.
+     * After the reset the PHY needs a short settle before it responds
+     * reliably to further MDIO writes. */
+    mdio_write(PHY_ADDR, MII_BMCR, BMCR_RESET);
+    for (int t = 0; t < 100000; t++) {
+        int v = mdio_read(PHY_ADDR, MII_BMCR);
+        wdt_pet();
+        if (v >= 0 && !(v & BMCR_RESET))
+            break;
+        udelay_spin(2000);
+    }
+    udelay_spin(200000);   /* post-reset settle */
+    bc(3, 1);
+    bc(1, BC_STAGE_PHYRST);
+
+#if EMAC_FORCE_LINK
+    /* Forced speed/duplex: autoneg (BMCR_ANENABLE) is left OFF entirely. Set
+     * the clause-22 speed-select bits + duplex directly. See the trade-off
+     * discussion above EMAC_FORCE_LINK for why this is the current default. */
+    {
+        uint16_t bmcr = 0;
+        if (EMAC_FORCE_FULL_DUPLEX) bmcr |= BMCR_DUPLEX_FULL;
+        if (EMAC_FORCE_SPEED == 1000) bmcr |= BMCR_SPEED_MSB;
+        else if (EMAC_FORCE_SPEED == 100) bmcr |= BMCR_SPEED_LSB;
+        /* 10 Mbps: both speed bits stay clear. */
+        mdio_write(PHY_ADDR, MII_BMCR, bmcr);
+    }
+#else
+    /* Explicitly enable + restart auto-negotiation (BMCR bit12 ANENABLE +
+     * bit9 ANRESTART). The BMCR_RESET above returns advertisement registers
+     * to their defaults (advertise 10/100/1000), so a plain restart is all
+     * that's needed. */
+    mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
+#endif
+    bmcr_rb = mdio_read(PHY_ADDR, MII_BMCR);
+    bc(10, (uint32_t)(bmcr_rb & 0xffff));
+
+    /* Bounded wait for link. BMSR.LSTATUS (bit2) is latched-low, so read
+     * twice per pass and use the second read. We key on LINK (not ANEGDONE)
+     * as the primary condition — some switches raise link slightly before
+     * the PHY latches aneg-complete; speed/duplex are then read from the
+     * RTL8211E PHYSR. */
+    g_link_up = 0;
+    for (uint32_t t = 0; t < LINK_WAIT_PASSES; t++) {
+        wdt_pet();                                   /* keep the WDT at bay */
+        (void)mdio_read(PHY_ADDR, MII_BMSR);         /* clear the latch */
+        bmsr = mdio_read(PHY_ADDR, MII_BMSR);
+        if ((t & 0x3ffu) == 0)                       /* throttle the BC write */
+            bc(11, (uint32_t)(bmsr & 0xffff));
+        if (bmsr >= 0 && (bmsr & BMSR_LSTATUS)) {
+            g_link_up = 1;
+            break;
+        }
+        udelay_spin(2000);
+    }
+    bc(11, (uint32_t)(bmsr & 0xffff));               /* final BMSR */
+    if (!g_link_up)
+        return 0;
+
+#if EMAC_FORCE_LINK
+    /* Speed/duplex are whatever we forced — no PHYSR resolution needed, but
+     * still read it for the breadcrumb (diagnostic only). */
+    g_speed = EMAC_FORCE_SPEED;
+    *duplex_full = EMAC_FORCE_FULL_DUPLEX;
+    bc(12, (uint32_t)(mdio_read(PHY_ADDR, RTL_PHYSR) & 0xffff));
+#else
+    /* Give aneg a brief bounded moment to finish resolving after link, then
+     * read speed/duplex from the RTL8211E PHYSR (vendor reg 0x11). */
+    for (int t = 0; t < 20000; t++) {
+        wdt_pet();
+        if (mdio_read(PHY_ADDR, MII_BMSR) & BMSR_ANEGDONE)
+            break;
+        udelay_spin(2000);
+    }
+    {
+        int physr = mdio_read(PHY_ADDR, RTL_PHYSR);
+        uint32_t sp = ((uint32_t)physr >> PHYSR_SPEED_SHIFT) & PHYSR_SPEED_MASK;
+        bc(12, (uint32_t)(physr & 0xffff));
+        /* PHYSR speed field: 2 = 1000, 1 = 100, 0 = 10. Handle all. */
+        g_speed = (sp == 2) ? 1000u : (sp == 1) ? 100u : 10u;
+        *duplex_full = (physr & PHYSR_DUPLEX) ? 1 : 0;
+    }
+#endif
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* MAC address + link programming                                       */
+/* ------------------------------------------------------------------ */
+static void write_hwaddr(void)
+{
+    uint32_t lo = OUR_MAC[0] | (OUR_MAC[1] << 8) | (OUR_MAC[2] << 16) | ((uint32_t)OUR_MAC[3] << 24);
+    uint32_t hi = OUR_MAC[4] | (OUR_MAC[5] << 8);
+    wr(EMAC_ADDR0_HIGH, hi);
+    wr(EMAC_ADDR0_LOW, lo);
+}
+
+static void adjust_link(int duplex_full)
+{
+    uint32_t v = rd(EMAC_CTL0);
+    if (duplex_full) v |= EMAC_CTL0_FULL_DUPLEX;
+    else             v &= ~EMAC_CTL0_FULL_DUPLEX;
+    v &= ~EMAC_CTL0_SPEED_MASK;
+    switch (g_speed) {
+    case 1000: v |= EMAC_CTL0_SPEED_1000; break;
+    case 100:  v |= EMAC_CTL0_SPEED_100;  break;
+    default:   v |= EMAC_CTL0_SPEED_10;   break;
+    }
+    wr(EMAC_CTL0, v);
+}
+
+/* ------------------------------------------------------------------ */
+/* Live link monitoring — called (throttled) from emac_poll(). Ride out a
+ * flap WITHOUT touching MAC/DMA state: only EMAC_CTL0 (speed/duplex) is ever
+ * reprogrammed here, and only on a confirmed down->up recovery. A momentary
+ * BMSR blip (e.g. a fast autoneg re-handshake) is debounced and must NOT
+ * read as a permanent drop — see LINK_DOWN_DEBOUNCE. */
+/* ------------------------------------------------------------------ */
+static void link_recheck(void)
+{
+    int bmsr, up;
+
+    (void)mdio_read(PHY_ADDR, MII_BMSR);      /* BMSR.LSTATUS is latched-low:
+                                               * throw away the stale read */
+    bmsr = mdio_read(PHY_ADDR, MII_BMSR);
+    bc(11, (uint32_t)(bmsr & 0xffff));
+    up = (bmsr >= 0) && (bmsr & BMSR_LSTATUS);
+
+    if (up) {
+        g_link_down_streak = 0;
+        if (!g_link_up) {
+            /* Recovering from a drop. Re-resolve speed/duplex and reprogram
+             * EMAC_CTL0 ONLY — no soft reset, no ring reinit, no RX/TX
+             * DMA disable. In-flight rings and counters are untouched. */
+            int duplex_full;
+#if EMAC_FORCE_LINK
+            g_speed = EMAC_FORCE_SPEED;
+            duplex_full = EMAC_FORCE_FULL_DUPLEX;
+            bc(12, (uint32_t)(mdio_read(PHY_ADDR, RTL_PHYSR) & 0xffff));
+#else
+            {
+                int physr = mdio_read(PHY_ADDR, RTL_PHYSR);
+                uint32_t sp = ((uint32_t)physr >> PHYSR_SPEED_SHIFT) & PHYSR_SPEED_MASK;
+                bc(12, (uint32_t)(physr & 0xffff));
+                g_speed = (sp == 2) ? 1000u : (sp == 1) ? 100u : 10u;
+                duplex_full = (physr & PHYSR_DUPLEX) ? 1 : 0;
+            }
+#endif
+            adjust_link(duplex_full);
+            g_link_up = 1;
+            bc(4, 1);
+            bc(14, ++g_link_up_events);
+        }
+        bc(5, g_speed);                       /* keep the live-speed word fresh */
+    } else if (g_link_up) {
+        /* Was up, this sample says down: debounce before believing it. */
+        if (++g_link_down_streak >= LINK_DOWN_DEBOUNCE) {
+            g_link_up = 0;
+            bc(4, 0);
+            bc(13, ++g_link_down_events);
+            g_link_down_streak = 0;
+        }
+    } else {
+#if !EMAC_FORCE_LINK
+        /* Already down (autoneg mode only): if it's been down a long while,
+         * nudge autoneg to restart. Cheap register write, not a reinit —
+         * just gives the PHY another shot at training. */
+        if (++g_link_down_streak >= LINK_RENEG_KICK_STREAK) {
+            mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
+            g_link_down_streak = 0;
+        }
+#endif
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* DMA ring init (sun8i_emac.c rx_descs_init/tx_descs_init)              */
+/* ------------------------------------------------------------------ */
+static void rings_init(void)
+{
+    int i;
+
+    for (i = 0; i < N_RX_DESC; i++) {
+        volatile struct emac_desc *d = rx_desc(i);
+        d->buf_addr = rx_buf(i);
+        d->next     = (uint32_t)(RX_DESC_BASE + (uint32_t)((i + 1) % N_RX_DESC) * DESC_STRIDE);
+        d->ctl_size = ETH_RXSIZE;
+        d->status   = EMAC_DESC_OWN_DMA;   /* owned by DMA, ready to receive */
+        cache_clean((uintptr_t)d, sizeof(*d));
+        cache_inval((uintptr_t)d->buf_addr, ETH_BUFSIZE);
+    }
+
+    for (i = 0; i < N_TX_DESC; i++) {
+        volatile struct emac_desc *d = tx_desc(i);
+        d->buf_addr = tx_buf(i);
+        d->next     = (uint32_t)(TX_DESC_BASE + (uint32_t)((i + 1) % N_TX_DESC) * DESC_STRIDE);
+        d->ctl_size = 0;
+        d->status   = 0;                   /* owned by CPU */
+        cache_clean((uintptr_t)d, sizeof(*d));
+    }
+
+    wr(EMAC_RX_DMA_DESC, (uint32_t)RX_DESC_BASE);
+    wr(EMAC_TX_DMA_DESC, (uint32_t)TX_DESC_BASE);
+    g_rx_slot = 0;
+    g_tx_slot = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bring-up (sequence ported from sun8i_emac.c probe + eth_start)        */
+/* ------------------------------------------------------------------ */
+int emac_init(void)
+{
+    int duplex_full = 1;
+    int linked;
+    volatile uint32_t *reg;
+
+    /* Reset live state / lay down the breadcrumb magic. */
+    bc(0, BC_MAGIC);
+    bc(1, BC_STAGE_ENTER);
+    bc(2, 0); bc(3, 0); bc(4, 0); bc(5, 0); bc(6, 0); bc(7, 0); bc(8, 0); bc(9, 0);
+    bc(10, 0); bc(11, 0); bc(12, 0);
+    bc(13, 0); bc(14, 0); bc(15, 0); bc(16, EMAC_FORCE_LINK);
+    bc(17, 0); bc(18, 0); bc(19, 0);
+    g_link_up = 0; g_speed = 0;
+    g_tx_count = g_rx_count = 0;
+    g_poll_calls = 0; g_link_down_streak = 0;
+    g_link_up_events = 0; g_link_down_events = 0; g_tx_drops = 0;
+    g_first_rx_latched = 0;
+    tx_line_len = 0; rx_head = rx_tail = 0;
+
+    /* 1. CCU: ungate EMAC bus clock + deassert EMAC bus reset. */
+    reg = (volatile uint32_t *)(CCU_BASE + CCU_BUS_GATE0);
+    *reg |= CCU_EMAC_BIT;
+    reg = (volatile uint32_t *)(CCU_BASE + CCU_BUS_RST0);
+    *reg |= CCU_EMAC_BIT;
+    __asm__ volatile("dsb sy" ::: "memory");
+    bc(2, 1);
+    bc(1, BC_STAGE_CLK);
+
+    /* 2. SYS_CON EMAC clock register: external PHY, RGMII, internal-GMII clk.
+     * Value derived exactly as sun8i_emac_set_syscon() does for the A64 +
+     * rgmii-id, tx/rx delay 0 (bananapi-m64.dts sets no allwinner,*-delay-ps;
+     * .config CONFIG_GMAC_TX_DELAY=0):
+     *   H3_EPHY_SHUTDOWN | SC_EPIT | SC_ETCS_INT_GMII = 0x10000|0x4|0x2 = 0x10006 */
+    *(volatile uint32_t *)SYSCON_EMAC =
+        H3_EPHY_SHUTDOWN | SC_EPIT | SC_ETCS_INT_GMII;
+    __asm__ volatile("dsb sy" ::: "memory");
+    bc(1, BC_STAGE_SYSCON);
+
+    /* 3. Pinmux: PD RGMII pins -> function 4 ("emac"). Pin set from
+     * sun50i-a64.dtsi rgmii_pins (~815-820): PD8-PD13, PD15-PD23 (PD14
+     * skipped). Mux value 4 from pinctrl-sunxi.c sun50i_a64 table (line
+     * ~629: {"emac", 4} PD8-PD23). PIO PD bank = index 3, CFG regs at
+     * PIO_BASE + 3*0x24; 4 bits/pin. Drive strength set to level 3 (DTS
+     * drive-strength=<40>). */
+    {
+        static const uint8_t pd_pins[] = { 8, 9, 10, 11, 12, 13, 15, 16,
+                                           17, 18, 19, 20, 21, 22, 23 };
+        const uint32_t bank_off = 3u * 0x24u;           /* PD bank */
+        for (unsigned k = 0; k < sizeof(pd_pins); k++) {
+            unsigned pin = pd_pins[k];
+            volatile uint32_t *cfg =
+                (volatile uint32_t *)(PIO_BASE + bank_off + (pin / 8u) * 4u);
+            unsigned sh = (pin % 8u) * 4u;
+            uint32_t v = *cfg;
+            v = (v & ~(0xFu << sh)) | (0x4u << sh);      /* function 4 */
+            *cfg = v;
+            /* Drive strength (2 bits/pin), DRV0=+0x14 pins0-15, DRV1=+0x18 16-31 */
+            volatile uint32_t *drv =
+                (volatile uint32_t *)(PIO_BASE + bank_off + 0x14u + (pin / 16u) * 4u);
+            unsigned dsh = (pin % 16u) * 2u;
+            uint32_t dv = *drv;
+            dv = (dv & ~(0x3u << dsh)) | (0x3u << dsh);  /* level 3 */
+            *drv = dv;
+        }
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+    bc(1, BC_STAGE_PINMUX);
+
+    /* 4. EMAC soft reset (EMAC_CTL1 SOFT_RST, poll for self-clear, bounded). */
+    wr(EMAC_CTL1, EMAC_CTL1_SOFT_RST);
+    {
+        int ok = 0;
+        for (int t = 0; t < 1000000; t++) {
+            if (!(rd(EMAC_CTL1) & EMAC_CTL1_SOFT_RST)) { ok = 1; break; }
+        }
+        (void)ok;   /* even on timeout we press on; breadcrumb shows stage */
+    }
+    bc(1, BC_STAGE_RESET);
+
+    /* MAC config: store-and-forward for TX and RX, DMA burst length 8. */
+    setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_MD);
+    setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_MD);
+    wr(EMAC_CTL1, 8u << EMAC_CTL1_BURST_LEN_SHIFT);
+
+    /* Set our MAC address. */
+    write_hwaddr();
+
+    /* 5. MDIO / PHY: reset, autoneg, resolve speed.
+     *
+     * ROOT-CAUSE FIX for the "dbgmon never comes up, everything else alive"
+     * boots: this used to `return -1` HERE on a failed phy_startup(), before
+     * rings_init() and the RX/TX/MAC enables below ever ran — and nothing in
+     * the tree ever revisited that omission: link_recheck() (the only other
+     * place a late link is noticed) assumes rings/DMA/MAC are already live
+     * and only reprograms EMAC_CTL0 on a down->up transition. A PHY that
+     * trained slower than the bounded LINK_WAIT_PASSES window left EMAC
+     * permanently dark for that whole boot even once the wire linked fine.
+     * Fix: ALWAYS arm rings + DMA + MAC below (enabling with no line signal
+     * is harmless — nothing moves until the PHY links), so a late-training
+     * link is picked up for free by link_recheck()/emac_link_watchdog(). */
+    linked = phy_startup(&duplex_full);
+    bc(4, linked ? 1 : 0);
+    if (linked) {
+        bc(5, g_speed);
+        bc(14, ++g_link_up_events);      /* count the initial link too */
+        bc(1, BC_STAGE_LINK);
+        adjust_link(duplex_full);        /* program EMAC_CTL0 speed/duplex */
+    } else {
+        bc(1, BC_STAGE_NOLINK);          /* diagnostic only — press on below */
+    }
+
+    /* 6/7. DMA rings + buffers — UNCONDITIONAL now, see the fix note above. */
+    rings_init();
+    bc(1, BC_STAGE_RINGS);
+
+    /* 8. Enable RX/TX DMA, then MAC RX/TX — UNCONDITIONAL, same reason. */
+    setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
+                          EMAC_RX_CTL1_RX_RUNT_FRM);
+    setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
+    setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
+    setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
+    __asm__ volatile("dsb sy" ::: "memory");
+    bc(1, BC_STAGE_ENABLED);
+
+    /* Callers still get the same "no link yet" signal as before; EMAC itself
+     * is now always armed regardless. */
+    return linked ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* CPU1 link watchdog — self-heal for "EMAC never delivered a single RX  */
+/* frame". Called every CPU1 debug-loop iteration; internally rate-      */
+/* limited (one real check per LINK_WD_CHECK_PERIOD_S), so the healthy   */
+/* path costs ~one branch. Returns 1 exactly once — on the iteration     */
+/* where it gives up — so the caller may escalate (e.g. opt-in reboot);  */
+/* 0 on every other call.                                                */
+/* ------------------------------------------------------------------ */
+#define LINK_WD_CHECK_PERIOD_S   8u   /* how often we re-check             */
+#define LINK_WD_MAX_ATTEMPTS     6u   /* ~48 s of retries before giving up */
+
+static uint64_t g_wd_last_check_ticks;
+static uint32_t g_wd_attempts;
+static uint32_t g_wd_gave_up;
+
+int emac_link_watchdog(void)
+{
+    uint64_t freq = timer_freq();
+    uint64_t now  = timer_now();
+    uint64_t period_ticks;
+
+    if (freq == 0)
+        freq = 24000000ull;
+    period_ticks = freq * (uint64_t)LINK_WD_CHECK_PERIOD_S;
+
+    if (g_wd_gave_up)
+        return 0;
+    if (g_wd_last_check_ticks == 0)
+        g_wd_last_check_ticks = now;      /* first call: establish baseline */
+    if (now - g_wd_last_check_ticks < period_ticks)
+        return 0;                         /* not due yet — cheap common path */
+    g_wd_last_check_ticks = now;
+
+    if (g_rx_count != 0)
+        return 0;           /* healthy: at least one frame has ever arrived */
+
+    g_wd_attempts++;
+    bc(18, g_wd_attempts);
+    if (g_wd_attempts > LINK_WD_MAX_ATTEMPTS) {
+        g_wd_gave_up = 1;
+        bc(1, BC_STAGE_WD_GAVEUP);
+        return 1;           /* one-shot: tell the caller to consider escalating */
+    }
+
+    /* Bounded re-kick: re-run PHY bring-up, then unconditionally re-arm the
+     * rings and RX/TX/MAC enables — safe by construction, since this only
+     * ever runs while g_rx_count==0 (no in-flight traffic to clobber).
+     * phy_startup() pets the WDT throughout and is itself bounded. */
+    {
+        int duplex_full = 1;
+        int linked = phy_startup(&duplex_full);
+        bc(4, linked ? 1 : 0);
+        if (linked) {
+            bc(5, g_speed);
+            adjust_link(duplex_full);
+        }
+        rings_init();
+        setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
+                              EMAC_RX_CTL1_RX_RUNT_FRM);
+        setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
+        setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
+        setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* TX — build and send one raw Ethernet frame (shared by the console line  */
+/* flusher and emac_send_frame()). Returns 1 if the frame was queued to    */
+/* TX DMA, 0 if it was dropped (link down, or TX ring stayed busy past the */
+/* bounded wait) — the caller (netcon, in the send-frame case) decides     */
+/* whether/how to retry; this function itself never blocks unboundedly.   */
+/* ------------------------------------------------------------------ */
+static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
+                         const uint8_t *payload, int plen)
+{
+    volatile struct emac_desc *d;
+    uint8_t *buf;
+    int total, i, to;
+
+    if (!g_link_up) {
+        /* No point queuing onto a dead link — count the drop instead of
+         * silently swallowing it, so the host lane can see loss happening
+         * instead of just a gap in the log. */
+        bc(15, ++g_tx_drops);
+        return 0;
+    }
+
+    if (plen > (ETH_BUFSIZE - 14 - 4))
+        plen = ETH_BUFSIZE - 14 - 4;
+
+    d = tx_desc(g_tx_slot);
+
+    /* Make sure this descriptor is free (OWN clear) — bounded wait. Nudge
+     * TX DMA periodically in case it stalled rather than being legitimately
+     * busy with a prior frame still in flight. */
+    cache_inval((uintptr_t)d, sizeof(*d));
+    to = 200000;
+    while (--to > 0 && (d->status & EMAC_DESC_OWN_DMA)) {
+        if ((to & 0x3fffu) == 0)
+            setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
+        cache_inval((uintptr_t)d, sizeof(*d));
+    }
+    if (to <= 0) {
+        /* Previous TX still in flight after the bounded wait: drop this
+         * frame, count it, but STILL advance g_tx_slot so a single wedged
+         * descriptor doesn't retry the same slot forever and wedge the
+         * whole channel — the next call gets a fresh descriptor to try. */
+        bc(15, ++g_tx_drops);
+        if (++g_tx_slot >= N_TX_DESC)
+            g_tx_slot = 0;
+        return 0;
+    }
+
+    buf = (uint8_t *)(uintptr_t)d->buf_addr;
+
+    for (i = 0; i < 6; i++) buf[i] = dst[i];           /* dst */
+    for (i = 0; i < 6; i++) buf[6 + i] = OUR_MAC[i];   /* src */
+    buf[12] = (uint8_t)(ethertype >> 8);
+    buf[13] = (uint8_t)(ethertype & 0xff);
+    for (i = 0; i < plen; i++) buf[14 + i] = payload[i];
+
+    total = 14 + plen;
+    if (total < 60) {                 /* pad to the 60-byte min (pre-CRC) */
+        for (i = total; i < 60; i++) buf[i] = 0;
+        total = 60;
+    }
+
+    cache_clean((uintptr_t)buf, (uint32_t)total);
+
+    d->ctl_size = (uint32_t)total | EMAC_DESC_CHAIN_SECOND |
+                  EMAC_DESC_FIRST_DESC | EMAC_DESC_LAST_DESC;
+    d->status = EMAC_DESC_OWN_DMA;
+    cache_clean((uintptr_t)d, sizeof(*d));
+
+    /* Kick the TX DMA. */
+    setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
+
+    if (++g_tx_slot >= N_TX_DESC)
+        g_tx_slot = 0;
+    bc(6, ++g_tx_count);
+    return 1;
+}
+
+/* Console TX kept byte-identical in behavior: broadcast dst, ETHERTYPE_CONSOLE. */
+static void tx_frame(const uint8_t *payload, int plen)
+{
+    (void)tx_frame_raw(BCAST_MAC, ETHERTYPE_CONSOLE, payload, plen);
+}
+
+void emac_flush(void)
+{
+    if (tx_line_len == 0)
+        return;
+    tx_frame(tx_line, tx_line_len);
+    tx_line_len = 0;
+}
+
+/* Public: send ONE raw frame on an arbitrary EtherType (used by netcon.c).
+ * Broadcast dst — same as the console, and simplest/most robust for a
+ * point-to-point debug link with exactly one host peer. Zero-padded to the
+ * 60-byte minimum by tx_frame_raw(). Returns 1 if queued, 0 if dropped. */
+int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len)
+{
+    return tx_frame_raw(BCAST_MAC, ethertype, payload, (int)len);
+}
+
+void emac_putc(int c)
+{
+    if (tx_line_len < TX_LINE_MAX)
+        tx_line[tx_line_len++] = (uint8_t)c;
+    if (c == '\n' || tx_line_len >= TX_LINE_MAX)
+        emac_flush();
+}
+
+void emac_puts(const char *s)
+{
+    while (*s)
+        emac_putc((unsigned char)*s++);
+}
+
+/* ------------------------------------------------------------------ */
+/* RX — drain the ring into the getc byte buffer                        */
+/* ------------------------------------------------------------------ */
+void emac_poll(void)
+{
+    bc(1, BC_STAGE_LOOP);
+    bc(8, rd(EMAC_INT_STA));
+
+    /* Throttled live link check: MDIO transactions are relatively slow
+     * (tens of us each), so we don't want one on every single poll — but we
+     * do want emac_link_up() to reflect reality within a fraction of a
+     * second, not just at emac_init() time. */
+    if ((++g_poll_calls & (LINK_CHECK_INTERVAL - 1u)) == 0)
+        link_recheck();
+
+    for (int guard = 0; guard < N_RX_DESC; guard++) {
+        volatile struct emac_desc *d = rx_desc(g_rx_slot);
+        uint32_t status;
+        int length;
+        const uint8_t *buf;
+
+        cache_inval((uintptr_t)d, sizeof(*d));
+        status = d->status;
+        if (status & EMAC_DESC_OWN_DMA)
+            break;                    /* still owned by DMA — nothing new */
+
+        length = (int)((status >> 16) & 0x3fff);
+        buf = (const uint8_t *)(uintptr_t)d->buf_addr;
+
+        if (!(status & EMAC_DESC_RX_ERROR_MASK) && length >= 14 &&
+            length <= ETH_RXSIZE) {
+            cache_inval((uintptr_t)buf, (uint32_t)length);
+
+            /* Filter: our EtherType, addressed to our MAC or broadcast. */
+            uint16_t et = (uint16_t)((buf[12] << 8) | buf[13]);
+            int to_us = 1, bcast = 1;
+            for (int i = 0; i < 6; i++) {
+                if (buf[i] != OUR_MAC[i]) to_us = 0;
+                if (buf[i] != 0xff)       bcast = 0;
+            }
+            if (et == ETHERTYPE_CONSOLE && (to_us || bcast)) {
+                for (int i = 14; i < length; i++) {
+                    uint8_t b = buf[i];
+                    if (b == 0)           /* stop at zero padding */
+                        break;
+                    rx_push(b);
+                }
+                note_rx_frame();
+            } else if (et == ETHERTYPE_NETCON && (to_us || bcast)) {
+                /* Reliable-datagram channel: NEVER feed these bytes into the
+                 * console ring (they are binary, not zero-terminated ASCII).
+                 * Hand the whole payload to netcon.c's parser instead. The
+                 * netcon frame header carries its own chunk_len, so — unlike
+                 * the console path — we pass the full Ethernet payload
+                 * (length - 14) and let netcon_rx_frame() figure out how much
+                 * of it (including the zero-padding tail) is real. */
+                netcon_rx_frame(buf + 14, (uint16_t)(length - 14));
+                note_rx_frame();
+            }
+        }
+
+        /* Hand the descriptor back to the DMA. */
+        d->status = EMAC_DESC_OWN_DMA;
+        cache_clean((uintptr_t)d, sizeof(*d));
+
+        if (++g_rx_slot >= N_RX_DESC)
+            g_rx_slot = 0;
+    }
+
+    /* Keep RX DMA pumping in case it stalled at the ring tail. */
+    setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_START);
+}
+
+int emac_getc(void)
+{
+    int c;
+    if (rx_head == rx_tail)
+        return -1;
+    c = rx_ring[rx_tail];
+    rx_tail = (rx_tail + 1) & (RX_RING_SIZE - 1);
+    return c;
+}
+
+int emac_link_up(void)
+{
+    return g_link_up;
+}
