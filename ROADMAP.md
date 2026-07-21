@@ -1,88 +1,194 @@
-# Chimp — beyond bring-up: capability roadmap
+# bzdOS microkernel — Roadmap to v1
 
-Speculative/forward-looking notes, separate from PROGRESS.md (which tracks the
-current bring-up state) and DEBUG_RULES.md (which governs how to work day to
-day). This file is about what the trap-and-emulate substrate is *for*, once
-FreeBSD boots reliably — ranked by how directly it builds on code already in
-this tree, not by how impressive it sounds.
+**Дата:** 2026-07-22
+**Статус базы:** FreeBSD arm64 грузится как EL1-гость под самописным EL2-гипервизором на Banana Pi M64 (Allwinner A64, 4× Cortex-A53), доведён до `login:` prompt. Отладка целиком по сети (EMAC) + USB-OTG, физического UART на плате нет.
+**Связанные доки:** [`SESSION-STATUS-2026-07-22.md`](SESSION-STATUS-2026-07-22.md) (текущий срез), [`README.md`](README.md), `hv-feature-designs` (дизайн-доки: virtio-blk ✅ / snapshot / GDB-stub / software-BMC).
 
-## Tier 1 — cheap, direct extensions of what already exists
+> **История файла:** прежний `ROADMAP.md` был forward-looking доком «для чего нужен trap-and-emulate субстрат». Его исследовательские ставки перенесены в §6, обновлённые под текущее состояние (virtio-blk уже доведён, RAM-disk virtio-стек удалён). Этот файл — конкретный путь к v1.
 
-1. **Network-backed root filesystem via virtio-blk.** `virtio.c`/`virtio_blk.c`
-   already exist in the tree (see PROGRESS.md's "delivered modules awaiting
-   integration"), just not wired up. Finishing this means FreeBSD can mount
-   root from a file on the host over the network — no SD card writes during
-   iteration. Highest ratio of (boot-speed win) to (new code needed).
-2. **Generalize vconsole's trap-and-log pattern to arbitrary MMIO ranges.**
-   `vconsole_handle_fault`/`gtrace_handle_sysreg` are each a clean
-   "syndrome → record + emulate" function. Add a config table of
-   (PA-range → logger) instead of one hardcoded UART case, and you get
-   free, no-guest-recompile instrumentation of any driver's register
-   traffic — this is what made the two UART bugs findable this session; make
-   it general-purpose.
-3. **Fix the CNTP timer-sharing bug properly** (already delegated to a
-   sub-agent this session — see its report). Prerequisite for anything below
-   that needs the guest's clock/callout subsystem to actually work
-   post-cold-boot.
+---
 
-## Tier 2 — needs new infrastructure, but is a natural next step
+## 0. Идентичность проекта
 
-4. **Record/replay of the full trap stream.** Once traps are logged
-   generically (#2), persist the sequence (addr, dir, value, cycle count) to
-   a ring or over the network. Replaying it byte-for-byte reproduces an
-   intermittent boot bug deterministically, on a machine that doesn't even
-   have the board attached. Foundation for #5 and #7.
-5. **Symbolic execution over a recorded trap trace.** Feed the recorded
-   sequence from #4 into something like `angr`: "what if THR read X instead
-   of Y — which code path does the guest take?" — answered offline, without
-   touching hardware. This is the direct fix for this session's actual
-   pain point (every hypothesis cost a board cycle to check).
-6. **Live kernel patching via stage-2 unmap.** `stage2_unmap_guest_vector()`
-   already proves the technique (unmap a guest page, catch execution on it,
-   redirect). Generalize it to redirect a *specific hot function's* page to
-   a hypervisor-resident replacement — a from-scratch, minimal DTrace/eBPF
-   for the guest, no FreeBSD source changes.
-7. **Fault injection for driver robustness testing.** Once #2 exists,
-   deliberately return corrupted/delayed/error responses from emulated
-   devices and watch whether FreeBSD's drivers degrade gracefully — testable
-   failure modes real silicon can't be made to produce on demand.
+Не «ещё один гипервизор». Ниша, в которой у проекта уже есть фора и которую надо осознанно сделать флагманом:
 
-## Tier 3 — the actual research-frontier bets
+> **Гипервизор, у которого «плату невозможно потерять» и «в упавшую ОС можно заглянуть дебаггером» — это фичи №1, а не побочка.**
 
-8. **Agentic debugging loop.** What happened in this session — read
-   breadcrumb rings, form a hypothesis, verify against exact source, patch,
-   reflash, repeat — done by an agent that decides *where to look next*
-   itself, using #2's generic instrumentation and #5's offline
-   hypothesis-checking to avoid burning board cycles on dead ends. The
-   structured (ring-buffer, not free-text-log) interface to guest state is
-   what makes this tractable here; most bring-up projects only have serial
-   console text to feed a model.
-9. **Verify the trap-handler perimeter, not the whole hypervisor.** Full
-   seL4-style verification of everything is not in scope. But each handler
-   (`vconsole_handle_fault`, `gtrace_handle_sysreg`, …) is already a small,
-   pure "syndrome in → emulated ARM-architectural effect out" function —
-   right-sized for a modern model checker to prove against the ARM ARM's
-   actual encoding tables, one handler at a time. Cheap relative to full
-   hypervisor verification because the TCB is already small by construction.
-10. **Capability-hardware framing (CHERI-style), as a design lens, not a
-    port.** The A64 has no capability hardware — this isn't buildable here.
-    But it's worth periodically asking, per new trap handler: "would this
-    trap disappear if pointers carried hardware-enforced bounds/permissions
-    instead of being caught after the fact by stage-2?" — useful for judging
-    which traps are inherent to the emulation and which are compensating for
-    the CPU's lack of finer-grained hardware isolation.
-11. **Debug-transparent hypervisor as a first-class security property, not a
-    hole.** Confidential computing (SEV-SNP/TDX/ARM RME) hides the guest
-    from the host. The inverse, interesting problem: give a guest's own
-    developer full, audited transparency into *this specific* hypervisor's
-    behavior on demand, without weakening isolation for anyone else. Nobody
-    builds this bottom-up the way this project incidentally already has the
-    scaffolding for (breadcrumb rings are, structurally, an audit log).
+Xen / Jailhouse / seL4 сильнее по зрелости и изоляции. Но никто из них не даёт «отлаживай упавшую гостевую ОС на плате за $30 с дивана, без serial-кабеля, по сети». Вся приоритизация ниже отсортирована под эту идентичность.
 
-## Sequencing note
+---
 
-Tier 1 items are worth doing regardless of which Tier 3 bet (if any) pans
-out — they're useful on their own and each is a prerequisite for at least one
-Tier 2/3 item. Don't start on Tier 3 before at least #2 and #3 are done;
-everything past that point assumes generic trap logging and a working guest
-clock.
+## 1. Честная оценка (краткий срез на 2026-07-22)
+
+### Сильные стороны
+- **Всё своё до регистра**: stage-2 MMU, GICv2, eMMC PIO, EMAC, USB-gadget, virtio-mmio, ns8250. Ни SDK, ни портов.
+- **Гость не патчен**: FreeBSD грузится «как есть», все баги чинились со стороны эмуляции (IIR-латч, MSR=0xB0, DATA_OVER-гонка) — доказательство качества эмуляции, а не обход.
+- **Debug-plane уже лучший в классе**: выделенный CPU1 с сетевым монитором, переживающим смерть гостя; `hv.call()` по сети; watchdog-hold; break-glass по USB; автономный `supervise.py`. Плата на 100% управляема без физдоступа — наполовину готовый software-BMC.
+- **Внеполосная хирургия диска**: `ufs2walk.py` патчит файлы гостевой ФС через HV по сети, оффсеты верифицированы компиляцией C-зеркал.
+- **Инженерная культура**: hardware-verified fallback'ы (HS-clock→400kHz), breadcrumb-протоколы, честные доки («identity map is NOT isolation»).
+- **Запас железа**: CPU2/CPU3 простаивают, GbE, 2GB RAM.
+
+### Слабые стороны (по убыванию серьёзности)
+1. **Изоляции нет.** Гость видит и может затереть память HV; GIC у гостя (IMO=0). Пока это «супервизируемая среда исполнения», слово «гипервизор» — аванс.
+2. **Стабильность не измерена.** Нет ни одного числа: сколько чистых бутов подряд, сколько часов soak под I/O.
+3. **Ноль тестов вне платы.** Каждая правка проверяется на единственной плате через флаки-линк, хотя virtqueue-парсер и stage-2 builder — чистая логика, компилируемая на хосте.
+4. **Синхронный I/O**: kick → PIO прямо в трапе, vCPU стоит на каждом запросе. Потолок — единицы MB/s.
+5. **Debug-протокол без аутентификации** — любой в LAN может peek/poke память.
+6. **Один SoC 2016 г., одна плата**, пины захардкожены. Без второй цели жизнеспособность = срок жизни платы.
+7. **Знание в session-логах, а не в design-доках репо.**
+
+---
+
+## 2. v1-гейт: критерии готовности (числа, а не ощущения)
+
+v1 = **зрелый, стабильный, изолированный**. Гейт закрывается, когда одновременно верно:
+
+- [ ] **Изоляция**: HV вырезан из stage-2, W^X на гостевых маппингах, попытка гостя писать в HV-регион → перехват, а не тихая порча.
+- [ ] **100 чистых boot-циклов подряд** без ручных вмешательств (harness-отчёт).
+- [ ] **72h soak** под непрерывной диск-нагрузкой без деградации/утечек.
+- [ ] **20 пережитых break-glass ресетов** подряд с автовосстановлением.
+- [ ] **Чистый shutdown**: `shutdown -p` в госте → PSCI SYSTEM_OFF в EL2 → ФС всегда clean (закрывает fs_clean-сагу навсегда).
+- [ ] **Хостовые юнит-тесты** на virtqueue + stage-2 builder в CI.
+- [ ] **Вторая цель** собирается и грузится (минимум QEMU-virt).
+- [ ] **Bring-up guide** воспроизводим сторонним человеком на чистой плате.
+- [ ] **Лицензия + фиксация тулчейна.**
+
+`supervise.py` уже покрывает ~90% механики soak/reset — превратить его в ночной soak-харнесс с отчётом это маленький шаг, но именно он превращает страх «хрупкости» в измеряемый SLO.
+
+---
+
+## 3. Дорожная карта фич
+
+Условные обозначения:
+- **Effort:** S / M / L / XL (относительная сложность, не дни).
+- **Есть:** что уже реализовано/спроектировано и переиспользуется.
+- **DoD:** definition of done.
+
+### Milestone A — Table stakes (без этого нет права на слово «гипервизор»)
+
+#### A1. Реальная stage-2 изоляция  ⟶ приоритет #1
+- **Effort:** L
+- **Есть:** stage-2 builder работает (identity map); нужно вычесть HV-регионы и снять RWX.
+- **Что:** вырезать образ HV + скретч + CPU1-стек из гостевого stage-2; W^X (гостевой код — RX, данные — RW-XN); реджект-фолт на доступ гостя к HV-региону вместо тихой порчи.
+- **Осознанно НЕ делаем в v1:** IMO=1 / vGIC (прошлый заход дал регресс — см. память `vgic-revert-complete`). Защитимая позиция: **статический партишенинг à la Jailhouse** — гость владеет реальным GIC, но не может дотянуться до HV. Это честная архитектура, а не недоделка.
+- **DoD:** гость пишет в HV-адрес → перехват; 100-boot прогон стабилен с включённой изоляцией.
+
+#### A2. Guest-agent + чистое выключение  ⟶ закрывает fs_clean-сагу
+- **Effort:** S–M
+- **Есть:** hvc-канал (vconsole) уже эмулируется; PSCI-трапы частично на месте.
+- **Что:** ловить PSCI `SYSTEM_OFF`/`SYSTEM_RESET` в EL2; крошечный guest-agent (или просто `shutdown -p` → PSCI) → ФС размонтируется штатно → `fs_clean` всегда 1.
+- **Почему здесь:** наш открытый `fs_clean`-баг это буквально первая user story этой фичи. Патч суперблока (`ufs_clean.py`) — костыль; правильный фикс — не порождать грязь.
+- **DoD:** `shutdown -p now` в госте → EL2 ловит SYSTEM_OFF → следующий бут без fsck-грязи, 10 циклов подряд.
+
+### Milestone B — Флагманская наблюдаемость (ДНК проекта)
+
+#### B1. Software-BMC — «SBC с настоящим BMC за $0»  ⟶ флагман
+- **Effort:** M (в основном интеграция, не research)
+- **Есть:** dbgmon + wdt + supervise + breadcrumb'ы ≈ 70% реализации.
+- **Что:** `bzdctl` CLI + веб-морда: soft/hard power, серийная консоль по сети, температура SoC, телеметрия AXP803 (на M64 есть батарейный разъём → «сервер с UPS»), прогресс загрузки по breadcrumb'ам, автосбор crash-отчётов.
+- **Почему вау:** ни Xen, ни KVM не дают этого без IPMI-железа.
+- **DoD:** полный жизненный цикл платы (power → boot-watch → console → reset → crash-dump) из одного CLI/веба без ssh на хост.
+
+#### B2. GDB-stub: гостевое ядро дебажится с хоста как локальный процесс
+- **Effort:** M
+- **Есть:** дизайн-док; peek/poke памяти по сети уже работает (`hv.call`); наименьший интеграционный зазор из всех фич.
+- **Что:** `gdb kernel.debug; target remote :…` → брейкпоинты через stage-2 unmap / HW BP из EL2, single-step, регистры/память через готовый транспорт. Гость не в курсе, kgdb в госте не нужен.
+- **DoD:** поставить bp на функцию ядра FreeBSD, поймать, посмотреть стек, продолжить — с ноутбука по сети.
+
+#### B3. Crash-forensics из EL2
+- **Effort:** M
+- **Есть:** ELF ядра в руках (символы); духовный родственник `ufs2walk`.
+- **Что:** гость запаниковал → HV сам достаёт `msgbuf`, по символам разворачивает backtrace, пишет vmcore для kgdb. «Ваше ядро упало, вот отчёт» — снаружи, без участия трупа.
+- **DoD:** искусственная паника гостя → HV кладёт читаемый crash-report + валидный vmcore без ручных действий.
+
+#### B4. Flight recorder
+- **Effort:** S
+- **Есть:** breadcrumb-механика — это его зачаток.
+- **Что:** кольцевой буфер в reserved RAM: последние N тыс. событий (трапы, инжекты, virtio-опы, байты консоли), автосброс при крэше.
+- **Естественное обобщение:** конфиг-таблица `(PA-range → logger)` вместо одного хардкод-кейса — no-recompile инструментация регистрового трафика любого драйвера (именно это сделало два UART-бага находимыми). Этот же субстрат питает record/replay и fault-injection из §6.
+- **DoD:** после любого крэша доступен таймлайн последних событий до сбоя.
+
+### Milestone C — «Им можно пользоваться»
+
+#### C1. virtio-net через EMAC-мультиплексор  ⟶ макс. скачок полезности
+- **Effort:** L
+- **Есть:** EMAC-драйвер и virtio-mmio-фреймворк (от virtio-blk).
+- **Что:** HV фильтрует по ethertype — debug-протокол себе, остальное гостю. FreeBSD выходит в сеть: ssh, `pkg install`.
+- **Почему:** превращает «грузится» в «им можно пользоваться».
+- **DoD:** из гостя `ssh` наружу и `pkg install` пакета, одновременно с живым debug-каналом.
+
+#### C2. Async I/O на CPU2
+- **Effort:** M
+- **Есть:** SMP-инфра (CPU1 уже автономен); CPU2/CPU3 простаивают.
+- **Что:** kick → мейлбокс → гость продолжает считать; CPU2 крутит PIO и инжектит completion-IRQ.
+- **Почему безопасно:** перф **без единого риска DMA-когерентности** (на эти грабли уже наступали — см. `aw-mmc-cache-coherency-hypothesis`). Идеологично: CPU1 — management-сервер, CPU2 — I/O-сервер. Микроядро в действии.
+- **DoD:** vCPU не блокируется на диск-запросе; измеренный рост throughput vs синхронного пути.
+
+### Milestone D — Множители доверия
+
+#### D1. Snapshot / restore
+- **Effort:** L
+- **Есть:** дизайн-док; GbE + 2GB RAM.
+- **Что:** заморозить, слить RAM по GbE (2GB ≈ 20–30 с сырьём; zero-skip + LZ4 быстрее), восстановить.
+- **Killer-применение:** отладка — снапшот перед багом, воспроизводи хоть 100 раз.
+- **v1-объём:** полный снапшот. Dirty-tracking через stage-2 RO-фолты — этап 2 (A64 = v8.0, HW dirty-бита нет).
+- **DoD:** freeze → dump → restore возвращает гостя в бит-в-бит то же состояние.
+
+#### D2. Linux как второй гость
+- **Effort:** L
+- **Есть:** virtio те же; mainline A64 поддержан отлично.
+- **Что:** довести до буста mainline Linux/arm64 на том же стеке.
+- **Почему:** проект перестаёт быть «FreeBSD-специфичным хаком». Множитель доверия ко всему остальному.
+- **DoD:** Linux грузится до shell на том же HV без изменений в изоляции/virtio-контрактах.
+
+---
+
+## 4. Сквозные задачи (важнее фич — с первого дня, параллельно всему)
+
+- **T1. Soak-харнесс.** `supervise.py` → ночной прогон с отчётом: N boot-циклов, часы под нагрузкой, пережитые ресеты. Это инструмент закрытия v1-гейта (§2).
+- **T2. Хостовые тесты.** virtqueue-парсер и stage-2 builder — чистая логика: юниты на хосте + прогон записанных MMIO-трейсов через vblk. Ловит регрессии без платы.
+- **T3. Вторая цель / CI.** Порт ядра HV на QEMU-virt — одновременно CI и ответ на риск одноплатности.
+- **T4. Документация как фича.** War stories bring-up'а (EHCI-шторм 145 кГц, DATA_OVER-гонка, пинмукс PC5, GICV-редирект) — материал уровня «книга о bring-up на живом железе». Для целевой аудитории притягивает людей сильнее любой фичи.
+- **T5. Релиз-гигиена.** Лицензия (BSD-2 напрашивается — экосистема гостя), фиксация тулчейна, bring-up guide для BPi-M64 *и* Pine64+ (тот же A64), HMAC на debug-протокол либо его compile-out в prod-сборке.
+
+---
+
+## 5. Рекомендуемый порядок
+
+```
+Параллельно с первого дня:  T1 soak-харнесс · T2 хостовые тесты
+                                    │
+A1 изоляция ──► A2 чистый shutdown ──► B1 BMC ──► B2 GDB-stub ──► C1 virtio-net
+                                                      │
+                          B3 forensics · B4 flight-recorder (по пути, дёшево)
+                                                      │
+                                    C2 async-I/O · D1 snapshot · D2 Linux-guest
+                                                      │
+                            T3 вторая цель/CI · T4 доки · T5 релиз-гигиена ──► v1
+```
+
+Первые четыре пункта (A1→A2→B1→B2) складываются в одну цельную историю:
+**«безопасно изолированный гость на плате, которую невозможно потерять и в которую можно заглянуть дебаггером».**
+
+---
+
+## 6. За горизонтом v1
+
+### 6.1. Прямые расширения
+- SMP-гость через PSCI `CPU_ON` (два ядра уже простаивают).
+- Live-миграция между двумя платами (snapshot + dirty-tracking → уже не фантастика).
+- Флеймграф загрузки семплированием PC из EL2.
+- Incremental snapshot через stage-2 dirty-tracking.
+
+### 6.2. Research-frontier ставки (унаследовано из прежнего ROADMAP, обновлено)
+
+Ранжировано по тому, насколько прямо строится на уже существующем коде, а не по эффектности. Ничего из этого не начинать раньше, чем сделан generic trap-logging (§B4-обобщение) — всё дальше предполагает его.
+
+1. **Record/replay всего trap-потока.** Как только трапы логируются генерически, персистить последовательность `(addr, dir, value, cycle)` в кольцо/по сети. Побайтовое воспроизведение делает перемежающийся баг детерминированным — на машине, к которой плата даже не подключена. Фундамент для #2 и #4.
+2. **Символьное исполнение над записанным трейсом.** Скормить последовательность из #1 в angr-подобное: «что если THR-read вернул бы X вместо Y — по какой ветке пойдёт гость?» — ответ офлайн, без железа. Прямой фикс главной боли bring-up'а (каждая гипотеза стоила board-цикла).
+3. **Live-патчинг ядра через stage-2 unmap.** `stage2_unmap_guest_vector()` уже доказывает технику. Обобщить до редиректа страницы *конкретной горячей функции* на HV-резидентную замену — минимальный from-scratch DTrace/eBPF для гостя, без изменений исходников FreeBSD.
+4. **Fault injection для driver-robustness.** На базе generic-логгера намеренно возвращать битые/задержанные/ошибочные ответы от эмулируемых устройств и смотреть, деградируют ли драйверы FreeBSD штатно — режимы отказа, которые реальный кремний по команде не воспроизведёт.
+5. **Agentic debugging loop.** То, что происходило в этой разработке — читать breadcrumb-кольца, формировать гипотезу, сверять с точным исходником, патчить, перешивать, повторять — делает агент, сам решающий *куда смотреть дальше*, используя generic-инструментацию (#выше) и офлайн-проверку гипотез (#2), чтобы не жечь board-циклы на тупики. Структурированный (ring-buffer, не free-text) интерфейс к состоянию гостя — то, что делает это осуществимым; у большинства bring-up проектов есть только текст serial-консоли.
+6. **Верификация периметра trap-хендлеров, а не всего HV.** Полная seL4-верификация вне scope. Но каждый хендлер (`vconsole_handle_fault`, `gtrace_handle_sysreg`, …) — уже маленькая чистая функция «syndrome in → эмулированный ARM-архитектурный эффект out», правильного размера для model checker'а против таблиц кодирования ARM ARM, по одному хендлеру за раз. Дёшево, потому что TCB мал by construction.
+7. **CHERI-линза как design lens, не порт.** У A64 нет capability-железа — не собирается здесь. Но полезно периодически спрашивать на каждый новый хендлер: «исчез бы этот трап, если бы указатели несли аппаратные bounds/permissions, а не ловились постфактум stage-2?» — помогает судить, какие трапы присущи эмуляции, а какие компенсируют отсутствие тонкой аппаратной изоляции.
+8. **Debug-transparent hypervisor как security property, а не дыра.** Confidential computing (SEV-SNP/TDX/ARM RME) прячет гостя от хоста. Обратная, интересная задача: дать разработчику гостя полную аудируемую прозрачность поведения *именно этого* гипервизора по требованию, не ослабляя изоляцию ни для кого. Breadcrumb-кольца структурно уже являются audit-логом — снизу вверх это почти никто так не строит.
