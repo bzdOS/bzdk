@@ -30,6 +30,7 @@
 #include "wdt.h"
 #include "smp.h"
 #include "vblk_emmc.h"
+#include "reboot.h"
 
 /* Shared snapshot of the guest register frame, written by CPU0 on every
  * guest-group trap and read by the SMP debug core (CPU1) so it can serve
@@ -47,6 +48,23 @@ volatile uint32_t dbg_core_active;
  * reset that fell off the USB bus entirely (confirmed 2026-07-18), so we NEVER
  * forward it; the guest thinks the reset succeeded and we keep the board live. */
 volatile uint32_t dbg_block_reset = 1;
+
+/* When 1 (default), a guest PSCI SYSTEM_OFF (0x84000008) is treated as an
+ * INTENTIONAL clean poweroff and honored with a clean warm reset back to
+ * U-Boot (reboot_clean) instead of the dbg_block_reset "fake success, stay
+ * alive" path. SYSTEM_OFF is only ever issued by `shutdown -p`/`halt -p`,
+ * which run the full rc shutdown sequence FIRST — sync + unmount, so the
+ * on-disk UFS fs_clean flag is already 1 by the time the SMC reaches us.
+ * Doing a controlled WDOG warm reset here (supervisor reloads a fresh
+ * HV+guest) is the DURABLE fix for the fs_clean re-dirtying problem: the one
+ * intentional shutdown path now leaves the filesystem clean, exactly as real
+ * hardware would on `shutdown -p`, instead of us hand-patching the superblock
+ * (ufs_clean.py) after every hard reset. Clear this over the net if a debug
+ * session wants the old catch-and-stay-alive behavior on SYSTEM_OFF too.
+ * NOTE: SYSTEM_RESET (0x84000009) is deliberately NOT auto-honored — it is
+ * ambiguous (an intentional `reboot` vs a panic auto-reboot) and stays on the
+ * dbg_block_reset stay-alive path so crash-reboots can still be inspected. */
+volatile uint32_t dbg_clean_off = 1;
 
 /* 0x50000400 — the DOCUMENTED exc window that the READERS (hud.c, dbgmon.c
  * cmd_ff DBGMON_EXC_BASE) already expect. The writer was wrongly pointing at
@@ -297,6 +315,22 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			r[0] = idx;
 			r[1u + ((idx - 1u) & 0xFu)] = (uint32_t)fnid;
 			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
+			/* SYSTEM_OFF (0x84000008): operator-initiated clean poweroff.
+			 * The rc shutdown path has already synced + unmounted (fs_clean
+			 * is 1 on disk), so honor it with a CLEAN warm reset to U-Boot —
+			 * the supervisor reloads a fresh HV+guest onto an already-clean
+			 * filesystem. This is the durable fix for the fs_clean saga (see
+			 * dbg_clean_off's comment). MUST raise wdt_debug_hold first, or the
+			 * SMP debug core (CPU1) keeps petting the HW WDOG via
+			 * wdt_debug_kick() and defeats the ~2s timer reboot_clean() arms
+			 * here on CPU0. reboot_clean() drops the USB gadget cleanly and
+			 * never returns. */
+			if (fnid == 0x84000008ull && dbg_clean_off) {
+				r[1u + ((idx - 1u) & 0xFu)] = 0x0FF0FF0Fu; /* bc: clean-off */
+				__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
+				wdt_debug_hold = 1;   /* release both pet paths so WDOG fires */
+				reboot_clean();       /* USB drop + ~2s WDOG warm reset; no return */
+			}
 			if ((fnid == 0x84000009ull || fnid == 0x84000008ull) &&
 			    dbg_block_reset) {
 				frame->x[0] = 0;          /* PSCI SUCCESS, but no real reset */
