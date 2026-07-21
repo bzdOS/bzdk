@@ -38,6 +38,12 @@ extern int el2_ss_toggle(struct el2_frame *frame);
 extern int  hwbp_set(int idx, uint64_t va, int is_write_wp);
 extern int  hwbp_clear(int idx, int is_write_wp);
 extern void hwbp_clear_all(void);
+
+/* Guest console RX injection (vconsole.c): push one host byte into the
+ * guest's virtual UART0 RX ring. Used by the `poweroff` command to type a
+ * clean-shutdown line into the guest. extern-decl only, per this file's
+ * self-contained convention (no vconsole.h include). */
+extern void vconsole_rx_push(uint8_t c);
 extern int  hwbp_list_bp(uint64_t *va, int *en);
 extern int  hwbp_list_wp(uint64_t *va, int *en);
 extern int  backtrace_walk(uint64_t pc, uint64_t fp, uint64_t lr,
@@ -631,6 +637,24 @@ static void cmd_patch(uint64_t pa, uint32_t word)
 	cputs("patched "); print_addr(pa); cputs(" = "); print_hex32(word); newline();
 }
 
+/* poweroff: type a clean-shutdown line into the guest console. The guest's
+ * rc shutdown path syncs + unmounts (UFS fs_clean -> 1 on disk) and then
+ * issues PSCI SYSTEM_OFF, which el2_trap() honors (dbg_clean_off) with a clean
+ * warm reset to U-Boot — so the supervisor reloads onto an already-clean
+ * filesystem. This is the durable, "no hand-patching the superblock" way to
+ * cycle the board. Requires a context that can run `shutdown` (a root shell /
+ * single-user prompt); a leading newline flushes any partial line first. */
+static void cmd_poweroff(void)
+{
+	static const char line[] = "\nshutdown -p now\n";
+	const char *p;
+
+	for (p = line; *p; p++)
+		vconsole_rx_push((uint8_t)*p);
+	cputs("injected 'shutdown -p now' -> guest unmounts, PSCI SYSTEM_OFF, "
+	      "HV clean warm-reset to U-Boot (fs stays clean)\r\n");
+}
+
 static void cmd_help(void)
 {
 	cputs("bzdOS live hv-debugger commands:\r\n");
@@ -655,6 +679,7 @@ static void cmd_help(void)
 	cputs("  sw <name> <val>    write sysreg LIVE (cnthctl hcr vtcr vttbr cptr sctlr1/2 ...)\r\n");
 	cputs("  call <pa> [x0..x3] call hypervisor function at PA, return x0\r\n");
 	cputs("  patch <pa> <word>  write instruction + I-cache flush (hot-patch)\r\n");
+	cputs("  poweroff | off     inject 'shutdown -p now' -> clean fs + warm reset\r\n");
 	cputs("  h | ?              this help\r\n");
 }
 
@@ -928,6 +953,10 @@ static void exec_line(char *line, struct el2_frame *frame)
 			err("usage: patch <pa> <word>"); return;
 		}
 		cmd_patch((uint64_t)a0, (uint32_t)a1);
+		return;
+	}
+	if (streq(cmd, "poweroff") || streq(cmd, "off")) {
+		cmd_poweroff();
 		return;
 	}
 	if (streq(cmd, "h") || streq(cmd, "?")) {
