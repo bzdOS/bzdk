@@ -70,34 +70,11 @@ int main(void)
 	DBG_BC(1, 1);
 	usb_gadget_disconnect();   /* clean-disconnect U-Boot gadget on takeover */
 
-	/* ── aw_mmc IDMAC DMA-coherency fix, part 1/2: EARLY cache flush ──
-	 * The guest reads eMMC via the SMHC IDMAC — a NON-coherent DMA that doesn't
-	 * snoop the A53 caches. Under this HV there are extra cacheable observers of
-	 * guest DRAM that don't exist bare-metal (EL2 + the CPU1 debug core), and
-	 * U-Boot ran with caches on and left dirty/stale lines all over DRAM. Any
-	 * stale line over a PA the guest later DMAs into intermittently clobbers the
-	 * freshly-DMA'd eMMC data -> corrupt EXT_CSD (card won't enumerate), GPT
-	 * (taste storm), userland binaries (SIGSEGV). See docs/aw-mmc-dma-coherency.
-	 * FIX part 1: clean+invalidate ALL guest DRAM to PoC ONCE, HERE — at the very
-	 * top of takeover, BEFORE emac_init()/smp_init() bring up the EMAC DMA rings
-	 * and the CPU1 core. (Doing this right before kload_enter instead WEDGES the
-	 * board: it invalidates the EMAC descriptors the already-running CPU1 debug
-	 * core is actively using -> dbgmon dies.) Part 2 = DTB /reserved-memory over
-	 * the HV regions so the guest never DMAs where EL2/CPU1 keep touching.
-	 * Range = guest DRAM 0x40000000..0x80000000, 64-byte lines (A53 CWG).
-	 * DISABLED 2026-07-20: even at the top of main(), the full-DRAM dc-civac
-	 * loop WEDGES EMAC (dbgmon dead after load, only 1d6b USB console up) — the
-	 * exact mechanism is unclear (it invalidates 0x42000000 HV image incl. the
-	 * loop's own code + U-Boot's page tables/stack mid-execution, or the ~1GB
-	 * loop trips something). Rely on part 2 (DTB /reserved-memory) ALONE first;
-	 * if boot-time U-Boot stale lines still corrupt early DMA, reintroduce a
-	 * TARGETED flush of only the guest's free-DRAM regions, never the HV image. */
-	if (0) {
-		uint64_t line;
-		for (line = 0x40000000UL; line < 0x80000000UL; line += 64u)
-			__asm__ volatile("dc civac, %0" :: "r"(line) : "memory");
-		__asm__ volatile("dsb sy\n\tisb" ::: "memory");
-	}
+	/* aw_mmc IDMAC DMA-coherency: a blanket dc-civac sweep of all guest DRAM
+	 * was tried here and reliably wedged EMAC (see docs/aw-mmc-dma-coherency.md
+	 * for the failure analysis). Superseded by el2_ncmap.c, which makes EL2
+	 * itself a non-cacheable observer of guest DRAM instead of flushing it —
+	 * see el2_ncmap_apply() below. */
 
 	/* Network debug console up first. */
 	emac_init();
