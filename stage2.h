@@ -1,0 +1,204 @@
+/* stage2.h — ARMv8-A EL2 stage-2 (IPA -> PA) translation for the bzdOS
+ * microkernel-turned-hypervisor on the Allwinner A64 (Cortex-A53, GICv2).
+ *
+ * FIRST MILESTONE: an IDENTITY stage-2 map (IPA == PA) covering the low
+ * SoC MMIO window and DRAM, so an EL1 guest (see guest.c/guest.h) sees
+ * real pass-through memory and devices once HCR_EL2.VM is turned on. This
+ * is intentionally NOT isolation — it exists so guest_enter()/guest_config()
+ * can flip on stage-2 without changing what the guest observes, and so a
+ * later milestone can replace individual block entries with something that
+ * traps/remaps, one region at a time.
+ *
+ * We do NOT touch stage-1 anywhere (neither our own EL2 stage-1, which stays
+ * exactly as U-Boot's flat mapping left it, nor a future guest EL1 stage-1).
+ * Only VTCR_EL2, VTTBR_EL2 and HCR_EL2.VM are stage-2 hypervisor state, and
+ * those are all this file writes.
+ *
+ * ------------------------------------------------------------------------
+ * Table topology (see stage2.c for the full derivation):
+ *   - 4 KiB translation granule (TG0 = 0b00).
+ *   - 40-bit IPA space (T0SZ = 24, i.e. 64 - 40).
+ *   - Starting level 1 (VTCR_EL2.SL0 = 1), with the architecturally
+ *     REQUIRED concatenation of 2 level-1 tables (2 = 2^(25 - T0SZ), the
+ *     standard stage-2 concatenation formula for start-level 1 / 4 KiB
+ *     granule — a single level-1 table only covers 512 GiB = 2^39 bytes,
+ *     and 40-bit IPA needs 2^40 = 1 TiB, hence exactly 2 tables).
+ *   - Level-1 index 1..N (IPA 0x40000000 upward, DRAM) is still a plain
+ *     1 GiB BLOCK descriptor, Normal WB cacheable — unchanged.
+ *   - Level-1 index 0 (IPA 0x00000000-0x3FFFFFFF, SoC MMIO) is NO LONGER a
+ *     single 1 GiB block. It is now a TABLE descriptor pointing at a
+ *     level-2 table (512 x 2 MiB entries) so we can trap just the UART:
+ *       - every level-2 entry is a plain 2 MiB Device-nGnRE BLOCK,
+ *         identity-mapped, EXCEPT the one entry (index 14, IPA
+ *         0x01C00000-0x01DFFFFF) that contains UART0_BASE.
+ *       - that one level-2 entry is itself a TABLE descriptor pointing at
+ *         a level-3 table (512 x 4 KiB page entries), where every page is
+ *         a plain identity Device-nGnRE PAGE descriptor EXCEPT the single
+ *         page at UART0_BASE (index 40 within that table), which is left
+ *         entirely INVALID (all zero, bits[1:0]=00).
+ *     Net effect: every MMIO byte that used to be identity-mapped still
+ *     is, at 2 MiB or 4 KiB granularity as needed — only the 4 KiB UART0
+ *     page is unmapped, so a guest access there takes a stage-2
+ *     translation fault (DFSC in ESR_EL2.ISS) that el2_trap hands to
+ *     vconsole_handle_fault() (see vconsole.c/vconsole.h).
+ *   - Only the first concatenated table is populated; the second (which
+ *     covers IPA 512 GiB..1 TiB, entirely unused) stays all-zero/invalid.
+ *     The architecture requires it to exist and be contiguous with table 0
+ *     purely because of how VTCR_EL2.T0SZ/SL0 encode the walk — it does not
+ *     need any valid entries.
+ * ------------------------------------------------------------------------
+ *
+ * Freestanding: <stdint.h> only, no libc, -mgeneral-regs-only. Breadcrumb
+ * writes use the same cache-coherent (dc civac + dsb sy) pattern as every
+ * other lane in this tree so a post-reset `bc 0x50000c00` still shows the
+ * last state even with the D-cache on.
+ */
+#ifndef BZDOS_STAGE2_H
+#define BZDOS_STAGE2_H
+
+#include <stdint.h>
+
+/* ------------------------------------------------------------------ *
+ * Identity-map region definitions. Both bases/sizes are 1 GiB block
+ * aligned (required — we only ever emit 1 GiB level-1 block descriptors
+ * in this milestone).
+ *
+ *   MMIO region:  [0x00000000, 0x00000000 + STAGE2_MMIO_SIZE)
+ *                 covers GIC (0x01c81000), UART, EMAC (0x01c30000),
+ *                 CCU (0x01c20000) and everything else in the A64's
+ *                 0x01000000..0x02000000 MMIO cluster — mapped as a
+ *                 single 1 GiB Device-nGnRE block for simplicity/safety
+ *                 (mapping "0 up to DRAM base" as device, per the brief).
+ *
+ *   DRAM region:  [STAGE2_DRAM_BASE, STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE)
+ *                 mapped as Normal, Inner-Shareable, Write-Back cacheable,
+ *                 executable (XN=0) RW.
+ *
+ * STAGE2_DRAM_SIZE is a #define specifically so the integrator can widen
+ * it later (e.g. to the board's full RAM size) by bumping one constant and
+ * relinking — stage2_init() fills however many contiguous 1 GiB blocks
+ * that implies, starting right after the MMIO entry.
+ * ------------------------------------------------------------------ */
+#define STAGE2_MMIO_BASE   0x00000000UL
+#define STAGE2_MMIO_SIZE   0x40000000UL   /* 1 GiB: covers 0..0x40000000 */
+
+#define STAGE2_DRAM_BASE   0x40000000UL
+#define STAGE2_DRAM_SIZE   0x40000000UL   /* 1 GiB by default (0x40000000..0x80000000) */
+
+/* A64 UART0 — the physical console FreeBSD's DTB points the kernel at
+ * (chosen/stdout-path = "serial0:115200n8", serial0 = /soc/serial@1c28000,
+ * "reg = <0x1c28000 0x400>" in /opt/bzdos/build/bananapi-min.dtb — this
+ * confirms, rather than contradicts, the base below). 8250/16550-compatible,
+ * one 4 KiB page holds all the registers vconsole.c needs (THR/LSR/etc, see
+ * vconsole.h).
+ *
+ * This exact page is carved out of the level-1 MMIO identity block (see the
+ * table-topology comment above and stage2.c) so guest accesses fault to EL2
+ * instead of reaching real hardware we aren't wired to (our host link is the
+ * USB gadget, not the UART pins) — vconsole.c emulates the UART from there.
+ * Every other MMIO page (GIC, EMAC, CCU, UART1, ...) stays identity-mapped
+ * exactly as before. */
+#define UART0_BASE   0x01C28000UL
+#define UART0_SIZE   0x1000UL      /* 4 KiB page carved out of stage-2 */
+
+/* ------------------------------------------------------------------ *
+ * FIRST-FAULT PROBE — catch the guest's ORIGINAL EL1 fault.
+ *
+ * The FreeBSD guest dies in a recursive-exception storm so early that the
+ * ORIGINAL first fault's ELR_EL1/ESR_EL1/FAR_EL1 are immediately masked:
+ * the guest re-enters its own EL1 vector table (VBAR_EL1) over and over,
+ * each re-entry overwriting those banked registers with a NEW fault before
+ * anything can read them. locore runs with PSTATE.D=1 so HW breakpoints /
+ * watchpoints / software single-step never fire either.
+ *
+ * The probe makes the guest's EL1 vector PAGE fault at stage-2 on the very
+ * first vector fetch: when the guest takes its first EL1 exception the
+ * hardware sets ELR_EL1/ESR_EL1/FAR_EL1/SPSR_EL1 to the ORIGINAL fault and
+ * branches to VBAR_EL1. If the stage-2 translation of that page is invalid,
+ * the fetch takes a stage-2 INSTRUCTION ABORT to EL2 (ESR_EL2 EC=0x20)
+ * BEFORE the storm overwrites the EL1 fault registers — firstfault.c then
+ * reads the still-pristine EL1 fault state = the real first fault.
+ *
+ * GUEST_VECTOR_IPA is VBAR_EL1's physical page: the FreeBSD kernel is loaded
+ * at phys 0x46000000 and its EL1 vector table (VBAR_EL1 KVA
+ * 0xffff000000927000) is phys 0x46927000. One 4 KiB page covers all 16
+ * architectural vector entries (0x927000..0x9277ff). Since this sits inside
+ * DRAM (the 1 GiB level-1 block at IPA index 1), the probe splits that block
+ * into a level-2 (2 MiB) table and, for the 2 MiB block that holds the page,
+ * a level-3 (4 KiB) table — every page identity Normal-WB executable EXCEPT
+ * GUEST_VECTOR_IPA, left invalid. Modelled exactly on the UART0 L2/L3 split.
+ * ------------------------------------------------------------------ */
+#define GUEST_VECTOR_IPA   0x46927000UL
+#define GUEST_VECTOR_SIZE  0x1000UL      /* 4 KiB page: all 16 EL1 vectors */
+
+/* PROBE TOGGLE. Neither of these is called by the normal boot path — a probe
+ * build (e.g. main_dbg.c) calls stage2_unmap_guest_vector() AFTER
+ * stage2_init()/stage2_enable() to arm the trap; firstfault_handle() calls
+ * stage2_map_guest_vector() once it has latched the original fault, so the
+ * guest can proceed into its own EL1 handler instead of looping in EL2.
+ * A build that never calls stage2_unmap_guest_vector() boots identically to
+ * before (the vector page stays part of the plain DRAM identity map). */
+void stage2_unmap_guest_vector(void);
+void stage2_map_guest_vector(void);
+
+/* IPA address used by the self-check: must land inside the DRAM region
+ * above for the check to be meaningful (0x42000000 is 32 MiB into DRAM). */
+#define STAGE2_SELFTEST_IPA 0x42000000UL
+
+/* Program VTCR_EL2 + build/fill the stage-2 identity tables + program
+ * VTTBR_EL2 (VMID 0). Does NOT touch HCR_EL2.VM — stage-2 translation is
+ * fully configured but still logically "off" until stage2_enable() runs.
+ * Safe to call more than once (idempotent: tables are rebuilt from
+ * scratch, registers rewritten). Writes breadcrumb words 0,1,2,4,5,6 (see
+ * stage2.c for the exact layout) — including the self-check of word 6.
+ */
+void stage2_init(void);
+
+/* Turn stage-2 translation on: HCR_EL2.VM = 1 via read-modify-write
+ * (every other HCR_EL2 bit, in particular RW and IMO, is preserved
+ * untouched — this must NEVER undo guest.c's RW or gic_timer.c's IMO).
+ * Followed by `tlbi vmalls12e1; dsb ish; isb` to flush any stale
+ * stage-1+stage-2 combined translations before anything relies on the
+ * new mapping. Must be called AFTER stage2_init() has programmed
+ * VTCR_EL2/VTTBR_EL2 — turning VM on before the tables/VTCR exist is
+ * undefined. Writes breadcrumb word 3 (HCR_EL2 readback).
+ */
+void stage2_enable(void);
+
+/* Turn stage-2 translation back off: HCR_EL2.VM = 0 (read-modify-write,
+ * same preservation rule as stage2_enable), then the same
+ * tlbi/dsb/isb flush. Clean fallback path — does not free or alter the
+ * tables themselves, so a subsequent stage2_enable() (without re-running
+ * stage2_init()) resumes the identical mapping.
+ */
+void stage2_disable(void);
+
+/* One-call bring-up + verification: stage2_init(); stage2_enable(); then
+ * re-reads VTCR_EL2 and HCR_EL2 to confirm the programmed bits actually
+ * stuck in hardware (not just that we wrote them), storing both back into
+ * the breadcrumb. This cannot fully prove stage-2 translation works (that
+ * needs a running EL1 guest actually touching memory through it), but it
+ * does prove: the tables were built, the self-check on our own top-level
+ * table's DRAM entry is internally consistent (IPA 0x42000000 -> PA
+ * 0x42000000), and every system register write took.
+ */
+void stage2_selftest(void);
+
+/* Combined-translation coherency proof. Performs `AT S12E1R` (stage-1 +
+ * stage-2 EL1-read translation) of `va` and stores the resulting PAR_EL1
+ * into stage2 breadcrumb words 7 (low32) + 8 (high32) at 0x50000c1c /
+ * 0x50000c20. PAR_EL1.F (bit0) == 0 means the combined walk succeeded; the
+ * output PA is in bits[47:12] and the memory attributes (should be 0xFF =
+ * Normal Inner+Outer WB for DRAM) in bits[63:56]. Must be called AFTER
+ * stage2_enable(). Uses the CURRENT EL1 stage-1 regime: if called before
+ * the guest kernel turns on its own MMU (SCTLR_EL1.M==0), stage-1 is flat
+ * so this isolates and proves the stage-2 DRAM mapping; if called from a
+ * trap while the guest MMU is on, it proves the full combined walk the
+ * guest's hardware table-walker sees. Safe/side-effect-free besides the
+ * breadcrumb write.
+ *
+ * Integrator: add `stage2_at_check(0x42000000);` (a known DRAM IPA) right
+ * after `stage2_enable();` in main_fbsd.c to record the proof each boot. */
+void stage2_at_check(uint64_t va);
+
+#endif /* BZDOS_STAGE2_H */

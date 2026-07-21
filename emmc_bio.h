@@ -1,0 +1,75 @@
+/* emmc_bio.h — Allwinner A64 SMHC2/eMMC (aw_mmc1 @ 0x01c11000) block-I/O
+ * helper for the bzdOS EL2 microkernel. Contract for emmc_bio.c.
+ *
+ * PURPOSE: draining the eMMC controller's 128-word FIFO by hand over the
+ * EMAC debug channel (one `rd`/`wr` dbgmon round-trip per 32-bit register)
+ * costs 128+ network round-trips per 512-byte block — far too slow for a
+ * `gpart recover` pass over the whole disk. These three functions live IN
+ * the hypervisor's own .text and are invoked directly on the debug core via
+ * dbgmon's `call <pa> <x0> <x1> <x2> <x3>` (see dbgmon.c cmd_call): the
+ * FIFO drain loop runs entirely on-board, and only ONE round-trip per block
+ * is needed (the host then bulk-reads/writes the DRAM scratch buffer over
+ * the same coherent debug channel).
+ *
+ * Register offsets, bit values, command flags and the bring-up/read
+ * sequence below are ported VERBATIM from a hardware-verified Python
+ * sequence run over the debug channel against THIS controller (not from a
+ * generic datasheet) — see emmc_bio.c for the register map and citations.
+ * The write path (emmc_bio_write / CMD24) mirrors the read path structurally
+ * but has NOT been hardware-verified yet (the read path has).
+ *
+ * ABI: plain C, callable via dbgmon `call` (AAPCS x0-x3, up to 4 uint64_t
+ * args, ret in x0). All internal polls are iteration-capped — a call can
+ * never hang the debug core; a timeout is reported as a nonzero/negative
+ * return instead of spinning forever.
+ */
+#ifndef BZDOS_EMMC_BIO_H
+#define BZDOS_EMMC_BIO_H
+#include <stdint.h>
+
+/* One-time (idempotent) controller bring-up: PC5 pinmux -> func3, 400 kHz
+ * init clock, controller reset, GO_IDLE/SEND_OP_COND/ALL_SEND_CID/SET_RCA/
+ * SEND_CSD/SELECT/SET_BLOCKLEN(512) card-identification sequence.
+ * Returns 0 on success (OCR "ready" bit seen from CMD1), nonzero on failure
+ * (a bounded poll timed out, or CMD1 never reported ready within the
+ * retry budget). Safe to call more than once; each call re-runs the whole
+ * sequence from scratch. Must be called (and must return 0) before
+ * emmc_bio_read()/emmc_bio_write(). */
+int emmc_bio_init(void);
+
+/* Read one 512-byte block (CMD17, single-block read) at 512-byte-sector
+ * address `lba` into DRAM at physical address `buf_pa`, written as 128
+ * little-endian 32-bit words (buf_pa need not be aligned strictly beyond
+ * natural uint32_t alignment). Returns 0 on success, negative on a bounded
+ * timeout (FIFO never delivered/DATA_OVER never seen). */
+int emmc_bio_read(uint32_t lba, uint64_t buf_pa);
+
+/* Write one 512-byte block (CMD24, single-block write) at 512-byte-sector
+ * address `lba` from DRAM at physical address `buf_pa` (128 LE 32-bit
+ * words). Returns 0 on success, negative on a bounded timeout. NOTE: unlike
+ * emmc_bio_read(), this path mirrors the read sequence structurally but has
+ * NOT been hardware-verified — treat a nonzero return (or a return of 0
+ * that doesn't survive a read-back compare) with suspicion until confirmed
+ * on real silicon. */
+int emmc_bio_write(uint32_t lba, uint64_t buf_pa);
+
+/* Best-effort reclock to HIGH-SPEED mode (CMD6 HS_TIMING + bus-width switch,
+ * then controller clock 400 kHz -> ~25 MHz, per EMMC_HS_CLK_REG). Called
+ * automatically at the END of emmc_bio_init() -- not required to be called
+ * directly, but exposed (and dbgmon `call`-able) so a HS attempt can be
+ * retried standalone without re-running the whole identification sequence.
+ *
+ * FAIL-SAFE BY CONSTRUCTION: every internal step (CMD6 timeout, clock-update
+ * handshake timeout, post-switch test read of LBA 0) is guarded; on ANY
+ * failure the controller AND card are restored to the known-good 400 kHz/
+ * 1-bit configuration and this still returns 0 -- HS is a pure speed
+ * optimization layered on top of the mandatory slow-path bring-up, never a
+ * hard dependency. The eMMC keeps working at 400 kHz either way.
+ *
+ * Records the outcome in the EBIO breadcrumb window (see emmc_bio.c,
+ * @0x50020200): word[6] (EBIO_BC_HS_STATE) = 0 never run / 1 HS active /
+ * 2 fell back after a failure; word[7] (EBIO_BC_HS_STEP) = which step
+ * failed when word[6]==2 (0 otherwise). Always returns 0. */
+int emmc_bio_set_highspeed(void);
+
+#endif /* BZDOS_EMMC_BIO_H */

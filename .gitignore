@@ -1,0 +1,6 @@
+# Build artifacts (Makefile outputs — see DBG_OBJS/etc.)
+*.o
+*.elf
+*.bin
+__pycache__/
+*.pyc
