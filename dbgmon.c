@@ -49,6 +49,10 @@ extern int  hwbp_list_wp(uint64_t *va, int *en);
 extern int  backtrace_walk(uint64_t pc, uint64_t fp, uint64_t lr,
 			   uint64_t *out, int max);
 
+/* bmc.c — software-BMC management-plane verbs. Extern decl only, per this
+ * file's self-contained discipline (no bmc.h include). */
+extern void bmc_dispatch(char **argv, int argc, struct el2_frame *frame);
+
 /* ------------------------------------------------------------------ *
  * Tiny freestanding I/O + string helpers (mirrors repl.c's style, but is
  * an independent copy -- dbgmon.c does not include or call repl.c).
@@ -157,7 +161,12 @@ static void err(const char *msg)
 /* Split line in place into up to MAX_TOKENS NUL-terminated tokens on runs
  * of spaces/tabs. Returns the token count. Bounded (no allocation, no
  * recursion) -- safe to call from interrupt context. */
-#define MAX_TOKENS 4
+/* 8 (was 4): the bare minimum for "bmc" to dispatch stayed at 4, but that
+ * only leaves room for a 2-word tail after "bmc <verb>" -- too little for
+ * `bmc con inject <text...>` (bmc.c's bmc_con_inject re-joins whatever
+ * argv it is handed). Bumped per docs/bmc-integration.md's explicit note.
+ * Every other command still just ignores the extra slots it doesn't need. */
+#define MAX_TOKENS 8
 
 static int tokenize(char *line, char *tok[MAX_TOKENS])
 {
@@ -680,6 +689,7 @@ static void cmd_help(void)
 	cputs("  call <pa> [x0..x3] call hypervisor function at PA, return x0\r\n");
 	cputs("  patch <pa> <word>  write instruction + I-cache flush (hot-patch)\r\n");
 	cputs("  poweroff | off     inject 'shutdown -p now' -> clean fs + warm reset\r\n");
+	cputs("  bmc <verb> ...     software-BMC mgmt plane (bmc help)\r\n");
 	cputs("  h | ?              this help\r\n");
 }
 
@@ -961,6 +971,11 @@ static void exec_line(char *line, struct el2_frame *frame)
 	}
 	if (streq(cmd, "h") || streq(cmd, "?")) {
 		cmd_help();
+		return;
+	}
+	if (streq(cmd, "bmc")) {
+		/* Hand tokens AFTER "bmc" to the management-plane dispatcher. */
+		bmc_dispatch(&tok[1], nt - 1, frame);
 		return;
 	}
 

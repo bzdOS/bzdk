@@ -33,6 +33,10 @@
 #include "vblk_emmc.h"
 #include "el2_ncmap.h"
 
+/* bmc.c — software-BMC management plane. Extern decl only (bmc.h pulls in
+ * exceptions.h + its own struct; main_dbg.c only needs the init entry). */
+extern void bmc_init(void);
+
 /* DIAGNOSTIC (temporary): one-shot breakpoint inside pmap_bootstrap_dmap,
  * right after "ldr x0,[x21,#320]" (VA 0xffff000000939940) — x0 there is the
  * address about to be memset(0)'d by memset_early, which faults at FAR=0x1000.
@@ -133,6 +137,7 @@ int main(void)
 	gtrace_init();
 #endif
 	dbgmon_init();
+	bmc_init();                /* lay down BMC1 breadcrumb + first health record */
 	DBG_BC(1, 3);
 
 	/* Arm the dead-man's-switch watchdog EARLY — before any of the risky
