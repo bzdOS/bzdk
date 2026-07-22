@@ -31,6 +31,8 @@
 #include "smp.h"
 #include "vblk_emmc.h"
 #include "reboot.h"
+#include "backtrace.h"
+#include "flightrec.h"
 
 /* Shared snapshot of the guest register frame, written by CPU0 on every
  * guest-group trap and read by the SMP debug core (CPU1) so it can serve
@@ -429,6 +431,25 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		exc_bc(11, (uint32_t)((hpfar & 0xFFFFFFFFF0ULL) << 4)); /* IPA low */
 		exc_bc(12, (uint32_t)(((hpfar & 0xFFFFFFFFF0ULL) << 4) >> 32));
 	}
+
+	/* B3 crash-forensics: capture a frame-pointer backtrace into the BTR1
+	 * ring (backtrace.c) for every fault recorded above — previously
+	 * backtrace_walk() only ran on-demand (dbgmon's `bt` command), so a
+	 * board that rebooted before an operator typed `bt` had no backtrace at
+	 * all. pc=ELR, fp=x29, lr=x30, same triple panic.c/dbgmon.c use;
+	 * defensive by construction (never faults on a bad fp). */
+	{
+		uint64_t bt_out[16];
+		(void)backtrace_walk(frame->elr, frame->x[29], frame->x[30],
+		                     bt_out, 16);
+	}
+
+	/* B4 flight recorder: one event per recorded fault into the FLTR ring
+	 * (flightrec.c) — a0=ESR (what kind of fault), a1=ELR (where). Small,
+	 * additive; the fuller config-table generalization (every trap type,
+	 * IRQ injects, virtio ops, console bytes) is future work — see
+	 * flightrec.h. */
+	flightrec_log(FLTR_K_FAULT, frame->esr, frame->elr);
 
 	exc_report_line(frame);
 
