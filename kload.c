@@ -516,16 +516,25 @@ kload_build_modinfo(uint64_t dtb_src_pa, uint64_t dtb_dst_pa, uint64_t scratch_p
 	     * always booting multi-user. Dropped. Instead /etc/fstab was patched
 	     * directly on the eMMC via the HV (mmcsd0pX -> vtbd0p3, fsck pass 0),
 	     * so multi-user rc no longer hangs on the interactive dirty-FS fsck.) */
-	    /* Try SD (mmcsd0) then eMMC (mmcsd1) — user says root is on eMMC, which
-	     * is mmcsd1 when an SD card is present (mmcsd0) or mmcsd0 if the SD slot
-	     * is empty; the list makes FreeBSD try each in order. GPT part 3, UFS
-	     * (bpi-image.sh layout). */
-	    "vfs.root.mountfrom=ufs:/dev/vtbd0p3;ufs:/dev/gpt/rootfs\0"  /* virtio-blk RETEST: guest
-                                               * aw_mmc eMMC is DISABLED in the DTB, so the disk
-                                               * comes ONLY from the HV's eMMC-backed virtio-blk
-                                               * (vtbd0). If GEOM tastes vtbd0 cleanly (no storm)
-                                               * and userland runs WITHOUT SIGSEGV, the aw_mmc
-                                               * cache-coherency hypothesis is CONFIRMED. */
+	    /* ROOT CAUSE FOUND (2026-07-22, read straight out of the local FreeBSD
+	     * checkout, sys/kern/vfs_mountroot.c): the ';'-joined value below was
+	     * NEVER valid syntax. vfs_mountroot_conf0() reads this kenv with
+	     * parse_token(), which splits ONLY on whitespace (parse_skipto(conf,
+	     * CC_WHITESPACE), see kern_getenv("vfs.root.mountfrom") handling) — a
+	     * ';' is not a delimiter anywhere in that path. So
+	     * "ufs:/dev/vtbd0p3;ufs:/dev/gpt/rootfs" (no space around the ';') was
+	     * read as ONE token and handed whole to parse_mount(), which parses
+	     * fstype="ufs" and dev="/dev/vtbd0p3;ufs:/dev/gpt/rootfs" (everything
+	     * up to the next whitespace) — a device name that can never exist.
+	     * That is EXACTLY the string in every "mountroot: waiting for device
+	     * /dev/vtbd0p3;ufs:/dev/gpt/rootfs..." / "failed with error 19" panic
+	     * seen all session. GPT/eMMC/virtio-blk were all independently
+	     * verified healthy (see memory rootmount-gpt-healthy-blocker-
+	     * guestside.md) — this kenv string was the actual bug the whole time.
+	     * Multiple whitespace-separated fs:dev directives ARE a valid way to
+	     * list fallbacks (vfs_mountroot_conf0 emits one line per token), but a
+	     * single clean device is simplest and sufficient here. */
+	    "vfs.root.mountfrom=ufs:/dev/vtbd0p3\0"
 	    "vfs.mountroot.timeout=20\0"              /* FINDING: even a 1200s wait does NOT auto-mount —
                                                * the GPT partitions materialize only when mountroot
                                                * GIVES UP and drops to the interactive prompt (the
@@ -540,16 +549,22 @@ kload_build_modinfo(uint64_t dtb_src_pa, uint64_t dtb_dst_pa, uint64_t scratch_p
 	                                               * device" for 5 min instead of dropping to the
 	                                               * cngrab-crashing prompt — lets us read the full
 	                                               * boot + MMC-discovery result from the ring */
-	    "kern.geom.part.check_integrity=0\0"      /* The eMMC GPT is valid (p3=freebsd-ufs "rootfs")
-	                                               * but its BACKUP header sits at LBA 4955906 (the
-	                                               * ~2.5GB image was dd'd onto an 8GB/15269888-blk
-	                                               * eMMC), so GEOM flags the secondary GPT "corrupt"
-	                                               * and refuses to expose /dev/mmcsd0p3 -> mountroot
-	                                               * error 19. check_integrity=0 makes GEOM use the
-	                                               * primary GPT anyway and create the partitions.
-	                                               * (Confirmed the layout by hand-reading the eMMC
-	                                               * GPT over the debug core: LBA1="EFI PART",
-	                                               * p3 first=278562 last=2858721 freebsd-ufs.) */
+	    "kern.geom.part.check_integrity=0\0"      /* CORRECTED (2026-07-22): the theory below (stale
+	                                               * ~2.5GB-image backup-GPT mismatch) is REFUTED —
+	                                               * re-verified live by reading LBA1 (primary) AND
+	                                               * LBA 15269887 (backup, i.e. capacity-1) directly
+	                                               * via emmc_bio: BOTH are valid "EFI PART" headers,
+	                                               * capacity matches, p3="rootfs" first=278562
+	                                               * last=2858721 freebsd-ufs. The disk was since
+	                                               * recovered to a full-disk GPT; the OLD 2.5GB-image
+	                                               * backup at LBA 4955906 is stale-but-harmless (GEOM
+	                                               * follows the primary header's own backup-LBA
+	                                               * pointer, which is correct). The REAL error-19
+	                                               * cause was the ';'-joined vfs.root.mountfrom kenv
+	                                               * above, not GPT integrity — see its comment.
+	                                               * Leaving check_integrity=0 in place regardless: it
+	                                               * is a no-op safety net against the disk's genuinely
+	                                               * unused/stale old backup header, costs nothing. */
 	    "hw.aw_mmc.debug=0\0"                     /* was 0xc (INT|CMD) — used it to PROVE the
                                                * guest aw_mmc data reads all complete err 0
                                                * (CMD17/CMD18, idst=0x2 IDMAC-complete) and
