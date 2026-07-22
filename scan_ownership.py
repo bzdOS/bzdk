@@ -88,9 +88,20 @@ def read_block(lba):
         raise IOError(f"EMAC readback failed for lba={lba}")
     return b"".join(x.to_bytes(4, "little") for x in w)
 
-def write_block(lba, data):
+def write_block(lba, data, old=None):
+    """Write `data` (512 bytes) to `lba`. If `old` is given (the exact bytes
+    read_block(lba) just returned, i.e. what's still sitting unmodified in
+    SCRATCH_PA -- nothing else touches that staging buffer in between), skip
+    re-writing any 4-byte word that's unchanged from `old`. A single
+    dbgmon 'w' command is one full EMAC round-trip (~60ms); rewriting all
+    128 words of every sector when only 1-2 actually differ (di_uid/di_mode
+    inside one dinode) made this ~8s/file -- found live via tcpdump on br0
+    while this was running, see the memory/session notes. Diffing against
+    `old` cuts a typical ownership-fix write from 128 round-trips to 1-2."""
     assert len(data) == 512
     for i in range(0, 512, 4):
+        if old is not None and old[i:i+4] == data[i:i+4]:
+            continue
         hv.write_word(SCRATCH_PA + i, int.from_bytes(data[i:i+4], "little"))
     rc = _call(WR, lba, SCRATCH_PA)
     rc = rc if rc < 0x80000000 else rc - 0x100000000
@@ -189,12 +200,13 @@ def main():
         assert intra_off + ufs2walk.DINODE_SIZE <= DEV_BSIZE
         sector_lba = abs_lba_block + sector_index
 
-        sec = bytearray(read_block(sector_lba))
+        orig = read_block(sector_lba)
+        sec = bytearray(orig)
         (cur_mode,) = struct.unpack_from("<H", sec, intra_off + DI_MODE)
         new_mode = cur_mode & ~(S_IWGRP | S_IWOTH)
         struct.pack_into("<I", sec, intra_off + DI_UID, 0)
         struct.pack_into("<H", sec, intra_off + DI_MODE, new_mode)
-        write_block(sector_lba, bytes(sec))
+        write_block(sector_lba, bytes(sec), old=orig)
         print(f"  {p}: patched -> uid=0 mode=0o{new_mode:04o}, verified")
 
     print("\nRe-scanning to confirm...")
