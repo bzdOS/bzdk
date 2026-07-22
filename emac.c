@@ -131,6 +131,21 @@ __attribute__((weak)) void netcon_rx_frame(const uint8_t *payload, uint16_t len)
     (void)payload; (void)len;   /* no netcon linked in: drop silently */
 }
 
+/* vnet_emac.c (ROADMAP C1, virtio-net-over-EMAC) provides the real
+ * implementation when linked in; same weak-fallback pattern as
+ * netcon_rx_frame above so any build without vnet_emac.c (every image today)
+ * links cleanly. Unlike netcon_rx_frame's "payload after ethertype"
+ * convention, this hook receives the FULL Ethernet frame (dst MAC first
+ * byte) — see vnet_emac.h's vnet_emac_rx_frame() doc comment. Called for
+ * any accepted frame whose ethertype is neither the console's nor
+ * netcon's — i.e. every ethertype this file's own RX dispatch does not
+ * already claim. */
+extern void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len);
+__attribute__((weak)) void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
+{
+    (void)frame; (void)len;   /* no vnet_emac linked in: drop silently */
+}
+
 /* ------------------------------------------------------------------ */
 /* Scratch DRAM layout for DMA (rings + buffers). 0x50100000 onward is    */
 /* clear of the image (0x42000000..0x42800000), of musb.c's breadcrumb    */
@@ -1031,6 +1046,15 @@ void emac_poll(void)
                  * (length - 14) and let netcon_rx_frame() figure out how much
                  * of it (including the zero-padding tail) is real. */
                 netcon_rx_frame(buf + 14, (uint16_t)(length - 14));
+                note_rx_frame();
+            } else if (et != ETHERTYPE_CONSOLE && et != ETHERTYPE_NETCON &&
+                       (to_us || bcast)) {
+                /* Not our debug protocol, not netcon: ROADMAP C1 hook —
+                 * hand the whole frame to the virtio-net-over-EMAC
+                 * multiplexer (vnet_emac.c) instead of silently dropping
+                 * it. Weak no-op above when vnet_emac.c isn't linked in, so
+                 * every existing image's behavior is unchanged. */
+                vnet_emac_rx_frame(buf, (uint16_t)length);
                 note_rx_frame();
             }
         }
