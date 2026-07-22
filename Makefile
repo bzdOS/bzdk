@@ -38,8 +38,27 @@ DBG_BIN    := microkernel-dbg.bin
 HDMI_ELF   := microkernel-hdmi.elf
 HDMI_BIN   := microkernel-hdmi.bin
 
-.PHONY: all stage0 net repl fbsd dbg hdmi clean
+.PHONY: all stage0 net repl fbsd dbg hdmi clean test
 all: $(STAGE0_BIN) $(MAIN_BIN)
+
+# --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
+# Plain x86_64 gcc, NOT $(CC)/$(CROSS) — these build and run entirely on the
+# dev host, no cross-compiler and no board. They mirror the pure ring-parsing
+# logic of vblk_emmc.c and the pure table-building logic of stage2.c (see the
+# block comments at the top of each test_*.c for exactly why they mirror
+# rather than #include the real .c files: both are full of raw ARMv8 inline
+# asm — cache maintenance, exclusive-monitor spinlocks, system-register
+# access — that plain gcc cannot assemble for x86_64). Fast enough to run on
+# every commit; does not touch vblk_emmc.c/stage2.c themselves.
+test: test_vblk_ring test_stage2_tables
+	./test_vblk_ring
+	./test_stage2_tables
+
+test_vblk_ring: test_vblk_ring.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_stage2_tables: test_stage2_tables.c
+	gcc -Wall -Wextra -O2 -o $@ $<
 
 stage0: $(STAGE0_BIN)
 
@@ -126,4 +145,5 @@ clean:
 	rm -f start.o main.o main_stage0.o main_net.o main_repl.o repl.o \
 	      musb.o emac.o wdt.o exceptions.o el2_exc.o timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
-	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN)
+	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
+	      test_vblk_ring test_stage2_tables
