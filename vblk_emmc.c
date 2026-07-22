@@ -375,10 +375,22 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 
 		if (is_read) {
 			/* Read one eMMC block straight into the guest buffer. buf_gpa is a
-			 * guest PA == EL2 PA (identity), 512-aligned here, Normal-WB, so
-			 * emmc_bio_read's 128 word stores land coherently in the guest's
-			 * buffer on this core. */
+			 * guest PA == EL2 PA (identity), 512-aligned here, Normal-WB. */
 			rc = emmc_bio_read(lba, buf_gpa);
+			/* PUBLISH TO PoC (root cause of "336 clean reads but GEOM finds no
+			 * GPT / mount error 19", found live 2026-07-22). emmc_bio_read fills
+			 * buf_gpa via CACHED EL2 stores (SCTLR_EL2.C=1) and only dsb's — it
+			 * never cleans them to PoC. FreeBSD's virtio_blk treats vtbd0 as a
+			 * NON-coherent DMA device: on completion it does a POSTREAD cache
+			 * invalidate (dc ivac) on the buffer, expecting a real device wrote
+			 * to main memory. That ivac DISCARDS our still-dirty write-back
+			 * lines, so the guest refetches STALE data from PoC — every sector
+			 * (incl. the GPT/superblock) comes back wrong even though the
+			 * transfer "succeeded" (S_OK, IRQ delivered). Clean+invalidate the
+			 * destination to PoC here so the guest's refetch sees the real
+			 * sector. Exact mirror of gmem_write()'s trailing gmem_cmo(). */
+			if (rc == 0)
+				gmem_cmo(buf_gpa, VBLK_SECTOR_BYTES);
 		} else {
 			/* Bounce guest bytes into our block, then push to eMMC. Using the
 			 * bounce (rather than emmc_bio_write(lba, buf_gpa) directly) keeps
