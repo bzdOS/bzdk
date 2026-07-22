@@ -4,3 +4,8 @@
 *.bin
 __pycache__/
 *.pyc
+test_vblk_ring
+test_stage2_tables
+
+# Agent worktrees (isolated per-task git worktrees, not part of the tree)
+.claude/
