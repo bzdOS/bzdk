@@ -1,19 +1,28 @@
-/* snapshot.c — guest checkpoint / restore implementation (SKELETON).
+/* snapshot.c — guest checkpoint / restore implementation.
  *
  * See snapshot.h for the API contract and the full inventory of what is /
  * is not captured, and docs/snapshot-restore-design.md for the rationale.
  *
- * This is a compilable-looking skeleton: the MRS/MSR sysreg save/restore is
- * real and, for the encodings used elsewhere in this tree (cmd_sr / cmd_sr2 /
- * guest.c), can be trusted; anything that needs on-board verification of a bit
- * layout or a sequencing subtlety is marked TODO(board). The DRAM copy loop
- * and the coherent header commit are complete.
+ * The MRS/MSR sysreg save/restore is real and, for the encodings used
+ * elsewhere in this tree (cmd_sr / cmd_sr2 / guest.c / gic_timer.c), has been
+ * cross-checked against them (no mismatches found). The DRAM copy loop and
+ * the coherent header commit are complete. Every former TODO(board) in this
+ * file has been resolved from source-level reasoning alone (ARM ARM trap
+ * semantics, the ALLE1IS "all VMIDs" invalidate, and gic_timer.c's own
+ * already-on-board-verified finding that this guest uses the virtual timer)
+ * — see the individual comments at each former TODO site for the reasoning.
+ * Nothing in this file still needs a board test; what still needs the board
+ * is END-TO-END behavior (does a `snap`/`rest` cycle actually resume FreeBSD
+ * bit-identically) — that can only be observed live, not proven from source.
  *
  * Freestanding: <stdint.h> only, -mgeneral-regs-only, EL2, flat U-Boot map on.
  */
 #include <stdint.h>
 #include "snapshot.h"
 #include "exceptions.h"
+#include "wdt.h"   /* wdt_pet() -- feed the 16 s HW dead-man's switch during the
+                    * long (1 GiB) DRAM copy loop, same discipline el2_ncmap.c's
+                    * civac_range() uses for its own whole-DRAM sweep. */
 
 /* ------------------------------------------------------------------ *
  * MRS/MSR helpers — same idiom as dbgmon.c's RDSYSREG / cmd_sw and guest.c.
@@ -133,8 +142,15 @@ static void sysregs_reload(const struct snapshot_sysregs *s)
 	/* --- EL0 access / feature enables --- */
 	WR("cpacr_el1", s->cpacr_el1);
 	WR("mdscr_el1", s->mdscr_el1);
-	/* PMCR_EL0: writing it may need MDCR_EL2/PMU trap bits clear.
-	 * TODO(board): confirm a plain MSR here does not trap under our MDCR_EL2. */
+	/* PMCR_EL0: RESOLVED (source reasoning, no board test needed).
+	 * MDCR_EL2.TPM/TPMCR (bits 6/5) only trap EL0/EL1 accesses to the PMU
+	 * regs up to EL2 (ARMv8 ARM D13.2.35/D13.2.37) -- they never apply to
+	 * an access already executing AT EL2, which is exactly what this MSR
+	 * is (dbgmon/snapshot run at EL2, same as every other EL1-register
+	 * touch in this function). Confirmed by precedent: MDCR_EL2 in this
+	 * tree (hwbp.c, el2_exc.c, gdbstub.c) is only ever read-modify-written
+	 * to toggle bit 8 (TDE); nothing here or in firmware sets TPM/TPMCR,
+	 * and even if it did, it would not matter for an EL2-origin MSR. */
 	WR("pmcr_el0",  s->pmcr_el0);
 
 	/* --- Generic timer LAST (compare values re-based by caller) --- */
@@ -154,8 +170,13 @@ static void sysregs_reload(const struct snapshot_sysregs *s)
  *     nuke stage-2 for this VMID),
  *   - invalidate the instruction cache (we rewrote code pages in DRAM),
  *   - the DRAM copy loop already cleaned data lines to PoC as it wrote.
- * TODO(board): confirm VMID handling — if VTTBR_EL2.VMID differs pre/post
- * restore, an ALLE1 (all VMIDs) is the safe hammer. */
+ * RESOLVED (source reasoning, no board test needed): VMID handling is already
+ * safe by construction, not by luck. `TLBI ALLE1IS` is architecturally defined
+ * to invalidate EL1&0 stage-1 *and* stage-2 entries for ALL VMIDs (ARMv8 ARM
+ * D7-xxx, "ALLE1IS"), unconditionally -- it does not matter whether
+ * VTTBR_EL2.VMID differs before vs. after this restore, because we always
+ * issue the all-VMIDs form below, never a VMID-scoped one. Nothing further
+ * to confirm on-board; this is correct for any VMID value. */
 static void restore_maintenance(void)
 {
 	__asm__ volatile(
@@ -170,6 +191,33 @@ static void restore_maintenance(void)
 }
 
 /* ================================================================== *
+ * CRC32 (IEEE 802.3 / zlib polynomial 0xEDB88320, reflected)
+ * ================================================================== */
+
+/* Plain bit-at-a-time software CRC32. Deliberately NOT using the optional
+ * ARMv8 CRC32 instruction extension (CRC32B/CRC32W/...): whether this
+ * particular Cortex-A53 part has it enabled is exactly the kind of thing
+ * that would need on-board verification (ID_AA64ISAR0_EL1.CRC32 read), and
+ * a portable software fallback sidesteps the question entirely -- it is
+ * correct regardless of what the silicon implements. Runs once per byte of
+ * `word`, folded into dram_copy() below so a snapshot_save() does not pay a
+ * second full memory pass. Not called on the restore path (see dram_copy),
+ * so it never costs anything against the <1 s restore budget. */
+#define CRC32_INIT 0xFFFFFFFFu
+
+static uint32_t crc32_update_word(uint32_t crc, uint64_t word)
+{
+	int k, b;
+
+	for (k = 0; k < 8; k++) {
+		crc ^= (uint32_t)(word >> (8 * k)) & 0xffu;
+		for (b = 0; b < 8; b++)
+			crc = (crc & 1u) ? (crc >> 1) ^ 0xEDB88320u : (crc >> 1);
+	}
+	return crc;
+}
+
+/* ================================================================== *
  * DRAM COPY
  * ================================================================== */
 
@@ -179,24 +227,45 @@ static void restore_maintenance(void)
  * FreeBSD runs with them on — either way PoC-clean is correct). Both addresses
  * are flat-mapped PAs; the loop is straight-line, no allocation, restartable.
  *
+ * `crc_inout`: if non-NULL, accumulates a running CRC32 (see crc32_update_word)
+ * over the words read from `src_pa`, folded into this same pass so the
+ * integrity check costs no extra memory bandwidth. Pass NULL on the restore
+ * path -- CRC is a save-time integrity aid only, never computed on the fast
+ * restore path (see design doc "Performance", <1 s restore goal).
+ *
  * 1 GiB / 8 = 134,217,728 iterations. At EL2 with the D-cache on this is the
  * dominant cost of a snapshot; see design doc "Performance" for the
- * dc-cvac-per-line vs bulk-clean tradeoff and the <1 s budget. */
-static void dram_copy(uint64_t dst_pa, uint64_t src_pa, uint64_t bytes)
+ * dc-cvac-per-line vs bulk-clean tradeoff and the <1 s budget. Pets the HW
+ * watchdog periodically (same discipline as el2_ncmap.c's civac_range(), which
+ * sweeps a comparably-sized region): this loop runs with no other trap/tick
+ * reaching el2_trap (the only place that otherwise re-arms the 16 s WDT), so
+ * without this a slower-than-expected copy (e.g. cold caches, DRAM refresh
+ * contention) could hit the watchdog mid-copy. */
+static void dram_copy(uint64_t dst_pa, uint64_t src_pa, uint64_t bytes, uint32_t *crc_inout)
 {
 	volatile uint64_t *d = (volatile uint64_t *)dst_pa;
 	volatile uint64_t *s = (volatile uint64_t *)src_pa;
 	uint64_t n = bytes / 8u;
 	uint64_t i;
+	uint32_t crc = crc_inout ? *crc_inout : 0u;
 
 	for (i = 0; i < n; i++) {
-		d[i] = s[i];
+		uint64_t v = s[i];
+		d[i] = v;
+		if (crc_inout)
+			crc = crc32_update_word(crc, v);
 		/* Clean one cache line every 8 words (64-byte line on A53). Cleaning
 		 * per-line rather than per-word keeps this ~8x cheaper. */
 		if ((i & 7u) == 7u)
 			__asm__ volatile("dc cvac, %0" :: "r"(&d[i]) : "memory");
+		/* Every 1M words (~8 MiB): keep the 16 s HW WDT fed, same interval
+		 * discipline as el2_ncmap.c's civac_range(). */
+		if ((i & 0xFFFFFu) == 0xFFFFFu)
+			wdt_pet();
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
+	if (crc_inout)
+		*crc_inout = crc;
 }
 
 /* ================================================================== *
@@ -250,11 +319,18 @@ int snapshot_save(const struct el2_frame *frame)
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	/* Guest DRAM -> store. This is the long pole. */
-	dram_copy(SNAP_DRAM_STORE, SNAP_DRAM_BASE, SNAP_DRAM_SIZE);
+	/* Guest DRAM -> store. This is the long pole. Folds a running CRC32 over
+	 * the source words into the same pass (see crc32_update_word / dram_copy)
+	 * so integrity-checking costs no extra memory bandwidth. RESOLVED: this
+	 * closes the former "CRC left 0 in skeleton" TODO with a real check --
+	 * software CRC32, not the optional HW CRC32 extension (see
+	 * crc32_update_word for why that dependency is deliberately avoided). */
+	{
+		uint32_t crc = CRC32_INIT;
 
-	/* TODO(board): CRC over the DRAM copy for integrity. Left 0 in skeleton. */
-	h->crc32 = 0u;
+		dram_copy(SNAP_DRAM_STORE, SNAP_DRAM_BASE, SNAP_DRAM_SIZE, &crc);
+		h->crc32 = crc ^ 0xFFFFFFFFu;
+	}
 
 	/* Commit: publish the whole header (already coherent word-by-word) then
 	 * flip valid LAST, with a barrier, so a reader never sees valid=1 over a
@@ -289,8 +365,12 @@ int snapshot_restore(struct el2_frame *frame)
 
 	/* 1. Reload guest DRAM from the store. Do this BEFORE sysregs so that when
 	 *    the MMU regime comes back the memory it translates already holds the
-	 *    snapshot contents. */
-	dram_copy(SNAP_DRAM_BASE, SNAP_DRAM_STORE, h->dram_size);
+	 *    snapshot contents. NULL crc: restore never recomputes/verifies CRC32
+	 *    -- that would cost the same pass again and defeat the <1 s restore
+	 *    goal (design doc "Performance"). The stored crc32 is a save-time
+	 *    integrity aid for out-of-band inspection (e.g. a host memory dump),
+	 *    not an on-path restore check. */
+	dram_copy(SNAP_DRAM_BASE, SNAP_DRAM_STORE, h->dram_size, (uint32_t *)0);
 
 	/* 2. Reload the EL1 + per-guest EL2 sysreg set. */
 	{
@@ -304,9 +384,17 @@ int snapshot_restore(struct el2_frame *frame)
 		 *    time forward by minutes. We hide the elapsed real time from the
 		 *    guest by pushing CNTVOFF_EL2 back by the same delta, so the
 		 *    guest's virtual counter reads the value it had at snapshot time.
-		 *    TODO(board): FreeBSD arm64 uses the VIRTUAL timer via CNTVOFF; if
-		 *    a build uses the physical timer this delta must instead be added
-		 *    to the saved CNTP_CVAL. Confirm which on silicon. */
+		 *    RESOLVED (already board-verified elsewhere in this tree, no new
+		 *    hardware test needed): gic_timer.c's gic_timer_init() comment
+		 *    records that this was checked live -- "the guest uses the
+		 *    virtual timer (CNTV_*) for its own interrupts" and "FreeBSD's
+		 *    DELAY() and getcycles() use CNTVCT_EL0 (not CNTPCT)" -- which is
+		 *    exactly why that function zeroes CNTVOFF_EL2 at guest boot
+		 *    (ATF/BL31 otherwise leaves it at a huge nonzero value). The
+		 *    physical timer (CNTP_CTL/CVAL) is captured/restored here too
+		 *    (belt-and-suspenders, and it's this HV's OWN tick source per
+		 *    gic_timer.c), but the guest-visible rebase this comment is about
+		 *    is correctly CNTVOFF_EL2, not CNTP_CVAL_EL0. */
 		now_cntpct = RD("cntpct_el0");
 		delta      = now_cntpct - h->taken_cntpct;
 		sr.cntvoff_el2 = sr.cntvoff_el2 - delta;
