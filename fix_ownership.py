@@ -29,7 +29,21 @@ DI_UID  = 4     # uint32  (di_mode@0,di_nlink@2,di_uid@4,di_gid@8 — dinode.h)
 S_IWGRP = 0o020
 S_IWOTH = 0o002
 
-TARGETS = ["/etc/login.conf", "/etc/pam.d/login"]
+
+# Full pam_*.so.6 module list, enumerated directly from the guest's /usr/lib
+# directory entries (not guessed) — the whole set was factory-packaged with
+# uid=1001 (bpi-image.sh build defect), not just the handful login/PAM
+# happens to touch first. The plain "pam_*.so" names are symlinks to these
+# .so.6 targets and aren't independently patchable (ufs2walk raises on them).
+_PAM_MODULES = [
+    "chroot", "deny", "echo", "exec", "ftpusers", "group", "guest", "krb5",
+    "ksu", "lastlog", "login_access", "nologin", "passwdqc", "permit",
+    "radius", "rhosts", "rootok", "securetty", "self", "ssh", "tacplus",
+    "unix", "xdg", "zfs_key",
+]
+TARGETS = ["/etc/login.conf", "/etc/pam.d/login", "/etc/pam.d/system"] + [
+    f"/usr/lib/pam_{m}.so.6" for m in _PAM_MODULES
+]
 
 hv = HV()
 def _rw(a, n):
@@ -90,7 +104,11 @@ def main():
 
     plan = []
     for path in TARGETS:
-        info = ufs.lookup(path)
+        try:
+            info = ufs.lookup(path)
+        except Exception as e:
+            print(f"{path}: not found ({e}) — skipping")
+            continue
         ino = info["ino"]
         fsba = ufs._ino_to_fsba(ino)
         fsbo = ufs._ino_to_fsbo(ino)
@@ -136,7 +154,10 @@ def main():
 
     print("\nRe-checking all targets...")
     for path in TARGETS:
-        info = ufs.lookup(path)
+        try:
+            info = ufs.lookup(path)
+        except Exception:
+            continue
         ino = info["ino"]
         fsba = ufs._ino_to_fsba(ino); fsbo = ufs._ino_to_fsbo(ino)
         abs_lba_block = ufs._abs_lba_for_fsblock(fsba)
