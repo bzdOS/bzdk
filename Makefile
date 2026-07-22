@@ -35,10 +35,12 @@ FBSD_ELF   := microkernel-fbsd.elf
 FBSD_BIN   := microkernel-fbsd.bin
 DBG_ELF    := microkernel-dbg.elf
 DBG_BIN    := microkernel-dbg.bin
+GDB_ELF    := microkernel-gdb.elf
+GDB_BIN    := microkernel-gdb.bin
 HDMI_ELF   := microkernel-hdmi.elf
 HDMI_BIN   := microkernel-hdmi.bin
 
-.PHONY: all stage0 net repl fbsd dbg hdmi clean test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi clean test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -123,6 +125,21 @@ $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
 $(DBG_BIN): $(DBG_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+# --- GDB-stub build: same skeleton as `dbg`, but the tick-path debugger is
+# gdbstub.o + gdbstub_hw.o instead of dbgmon.o (see main_gdb.c / gdbstub.c's
+# header comment). NEW target — does not touch/replace `dbg`. ---
+gdb: $(GDB_BIN)
+
+GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+            gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
+            emac.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o smp.o firstfault.o onebp.o vgic.o \
+            musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o
+$(GDB_ELF): $(GDB_OBJS) link.ld
+	$(CC) $(LDFLAGS) -o $@ $(GDB_OBJS)
+	$(SIZE) $@
+$(GDB_BIN): $(GDB_ELF)
 	$(OBJCOPY) -O binary $< $@
 
 fbsd: $(FBSD_BIN)
