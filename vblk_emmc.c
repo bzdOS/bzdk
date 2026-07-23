@@ -66,6 +66,12 @@
  *   [18] status-byte PA hi32    [19] used->idx AFTER push
  *   [20] VBLK_MAX_CHAIN-truncation event count (should stay 0; see
  *        vblk_request()'s `truncated` handling)
+ *
+ * ROADMAP C2 (async CPU2 offload — see the "ASYNC I/O OFFLOAD" section below):
+ *   [24] mailbox posts (CPU0 -> CPU2 handoffs accepted)
+ *   [25] mailbox completions (CPU2 finished + injected IRQ)
+ *   [26] synchronous fallbacks (mailbox busy / chain too long for the slot,
+ *        or g_vblk_async_ready==0 — always correct, just not accelerated)
  * ------------------------------------------------------------------ */
 #define VBLK_BC_BASE   0x50020000UL   /* MOVED from 0x50005000: that was INSIDE the
                                        * 64KB vconsole capture ring (0x50000f10..
@@ -85,6 +91,12 @@ static inline void vblk_bc(uint32_t idx, uint32_t v)
  * ------------------------------------------------------------------ */
 static struct vblk_dev g_blk;
 static uint32_t        g_reads, g_writes, g_irqs, g_faults, g_truncated;
+
+/* ROADMAP C2 async I/O offload readiness handshake (see vblk_emmc.h and the
+ * "ASYNC I/O OFFLOAD" section below). Zero-initialized (.bss) in EVERY build;
+ * only vblk_async_cpu2_run() (vblk_async.c, linked ONLY into DBG_OBJS) ever
+ * sets it to 1. This is the real on/off switch for the whole async path. */
+volatile uint32_t g_vblk_async_ready;
 
 /* One-sector HV-local bounce buffer. uint64_t-aligned (emmc_bio wants at least
  * uint32_t alignment of the PA it is handed). Kept in .bss (Normal-WB), so its
@@ -433,8 +445,176 @@ static inline void vblk_diag(uint16_t head, uint32_t chain_len,
 	vblk_bc(19, used_idx_after);
 }
 
-/* Handle one descriptor-chain request. */
-static void vblk_request(struct vblk_dev *d, uint16_t head)
+/* ------------------------------------------------------------------ *
+ * ASYNC I/O OFFLOAD (ROADMAP milestone C2): single-slot mailbox handed to
+ * CPU2, so the guest's QueueNotify trap (CPU0) can return immediately for
+ * the common T_IN/T_OUT case instead of blocking on the eMMC PIO.
+ *
+ * PROTOCOL: single producer (CPU0, vblk_request() below) / single consumer
+ * (CPU2, vblk_async_poll(), called from vblk_async.c's dedicated loop), one
+ * fixed slot — "only ONE request in flight" is an explicit, accepted
+ * simplification for this first cut (see vblk_async.h). A plain state flag
+ * with `dsb sy` bracketing is therefore sufficient (no ldaxr/stlxr exclusive
+ * loop needed, unlike the eMMC controller lock below, which genuinely has
+ * more than one writer): CPU0 is the only core that ever transitions
+ * EMPTY->POSTED, CPU2 is the only core that ever transitions POSTED->EMPTY,
+ * so there is no read-modify-write race on the flag itself, only an
+ * ordering requirement on the PAYLOAD around it:
+ *
+ *   CPU0 (producer): write payload fields -> dsb sy -> state = POSTED -> dsb sy.
+ *     The first dsb ensures CPU2 can never observe POSTED with a
+ *     half-written payload (no store can be reordered past it to become
+ *     visible after the flag). The second is belt-and-suspenders so the
+ *     flag write itself is not still in-flight when the trap returns and
+ *     the vCPU resumes running on the SAME core (matches this file's
+ *     existing convention of dsb-bracketing every guest-visible state
+ *     change, e.g. vq_push_used()).
+ *   CPU2 (consumer): dsb sy -> read payload -> ... -> dsb sy -> state = EMPTY
+ *     -> dsb sy. The leading dsb is the mirror-image acquire: it orders
+ *     CPU2's payload reads after CPU0's writes are guaranteed visible (both
+ *     cores are cache-coherent under SMPEN — see smp.h — so this is ordering,
+ *     not a cache-visibility flush). The trailing dsb+store ensures CPU0
+ *     never observes EMPTY (and posts a new request) before every one of
+ *     THIS request's completion side effects — status byte, used-ring push,
+ *     IRQ injection — has actually landed.
+ *
+ * FALLBACK: if the mailbox is busy, the chain has more data descriptors than
+ * the slot holds, or g_vblk_async_ready==0 (no build with vblk_async.o
+ * linked and running — e.g. the gdb build, see vblk_emmc.h), vblk_async_post()
+ * returns 0 and the caller (vblk_request()) finishes the request the OLD
+ * way, synchronously, inline. This is ALWAYS correct — the async path is a
+ * pure best-effort accelerator layered on top of the original behaviour,
+ * never a hard dependency.
+ * ------------------------------------------------------------------ */
+#define VBLK_ASYNC_MAX_DESC   (VBLK_MAX_CHAIN - 2u)   /* data descs only */
+
+#define VBLK_MBOX_EMPTY   0u
+#define VBLK_MBOX_POSTED  1u
+
+struct vblk_async_req {
+	volatile uint32_t state;
+	uint16_t head;
+	uint16_t is_read;
+	uint64_t sector;
+	uint64_t status_gpa;
+	uint32_t ndesc;
+	uint64_t data_addr[VBLK_ASYNC_MAX_DESC];
+	uint32_t data_len[VBLK_ASYNC_MAX_DESC];
+};
+
+/* .bss, zero-initialized -> state starts VBLK_MBOX_EMPTY at boot. */
+static struct vblk_async_req g_async;
+static uint32_t g_async_posts, g_async_completes, g_async_fallbacks;
+
+/* CPU0 side. Returns 1 if the mailbox accepted the request (caller MUST NOT
+ * touch the used ring / status byte / IRQ for this head — CPU2 owns
+ * completion now), 0 if the caller should fall back to the synchronous path. */
+static int vblk_async_post(uint16_t head, uint32_t is_read, uint64_t sector,
+                            uint64_t status_gpa, struct vblk_desc *chain,
+                            uint32_t first, uint32_t last_excl)
+{
+	uint32_t n = last_excl - first;
+	uint32_t i;
+
+	if (!g_vblk_async_ready)
+		return 0;                       /* no CPU2 loop draining this build */
+	if (g_async.state != VBLK_MBOX_EMPTY)
+		return 0;                       /* CPU2 still finishing the last one */
+	if (n > VBLK_ASYNC_MAX_DESC)
+		return 0;                       /* unusually long chain: fall back  */
+
+	g_async.head       = head;
+	g_async.is_read     = (uint16_t)is_read;
+	g_async.sector      = sector;
+	g_async.status_gpa  = status_gpa;
+	g_async.ndesc        = n;
+	for (i = 0; i < n; i++) {
+		g_async.data_addr[i] = chain[first + i].addr;
+		g_async.data_len[i]  = chain[first + i].len;
+	}
+
+	__asm__ volatile("dsb sy" ::: "memory");   /* payload before flag */
+	g_async.state = VBLK_MBOX_POSTED;
+	__asm__ volatile("dsb sy" ::: "memory");   /* CPU2 busy-polls; no sev needed */
+
+	g_async_posts++;
+	vblk_bc(24, g_async_posts);
+	return 1;
+}
+
+/* CPU2 side — called in a tight bounded loop from vblk_async_cpu2_run()
+ * (vblk_async.c). Does AT MOST one mailbox request's worth of work per call
+ * and returns immediately if the mailbox is empty. */
+void vblk_async_poll(void)
+{
+	uint16_t head;
+	uint32_t is_read, ndesc, i;
+	uint64_t sector, status_gpa;
+	uint8_t  status = VIRTIO_BLK_S_OK;
+	uint32_t used_len = 0, data_bytes;
+	uint32_t sfill = 0;
+	uint16_t new_idx;
+
+	if (g_async.state != VBLK_MBOX_POSTED)
+		return;
+
+	__asm__ volatile("dsb sy" ::: "memory");   /* acquire: see CPU0's payload */
+
+	head       = g_async.head;
+	is_read    = g_async.is_read;
+	sector     = g_async.sector;
+	status_gpa = g_async.status_gpa;
+	ndesc      = g_async.ndesc;
+
+	for (i = 0; i < ndesc; i++) {
+		uint64_t addr = g_async.data_addr[i];
+		uint32_t len  = g_async.data_len[i];
+		uint64_t end_sec = sector + (len / VBLK_SECTOR_BYTES);
+
+		if (end_sec > g_blk.capacity) { status = VIRTIO_BLK_S_IOERR; break; }
+		if (serve_data(is_read, addr, len, &sector, &sfill) != 0) {
+			status = VIRTIO_BLK_S_IOERR;
+			break;
+		}
+		if (is_read)
+			used_len += len;
+	}
+	if (is_read) g_reads++; else g_writes++;
+	vblk_bc(6, g_reads);
+	vblk_bc(7, g_writes);
+
+	gmem_write(status_gpa, &status, 1);
+	vblk_bc(9, status);
+	{	/* mirror vblk_request()'s bc[23] ack-byte readback diagnostic */
+		uint8_t rb = 0xEE;
+		gmem_read(status_gpa, &rb, 1);
+		vblk_bc(23, rb);
+	}
+
+	data_bytes = used_len;
+	used_len += 1;
+	new_idx = vq_push_used(&g_blk.vq[VBLK_QUEUE], head, used_len);
+	vblk_diag(head, ndesc + 2u, data_bytes, status_gpa, new_idx);
+
+	g_blk.int_status |= VBLK_INT_VRING;
+	vblk_inject_irq();
+
+	g_async_completes++;
+	vblk_bc(25, g_async_completes);
+
+	/* Release the slot only AFTER every completion side effect above (status
+	 * byte, used-ring push, IRQ) is visible, so CPU0 can never see EMPTY and
+	 * post a new request while this one's tail is still landing. */
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_async.state = VBLK_MBOX_EMPTY;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* Handle one descriptor-chain request. Returns 1 if the request was
+ * completed synchronously within this call (the caller's batch IRQ below
+ * must fire), 0 if it was handed off to CPU2's mailbox (which injects its
+ * OWN completion IRQ later, asynchronously — must NOT be double-counted). */
+static int vblk_request(struct vblk_dev *d, uint16_t head)
 {
 	struct vblk_vq *vq = &d->vq[VBLK_QUEUE];
 	struct vblk_desc chain[VBLK_MAX_CHAIN];
@@ -457,7 +637,7 @@ static void vblk_request(struct vblk_dev *d, uint16_t head)
 		 * Defensive: treat an indirect desc as a malformed request. */
 		if (flags & VRING_DESC_F_INDIRECT) {
 			vq_push_used(vq, head, 0);
-			return;
+			return 1;
 		}
 		n++;
 		if (!(flags & VRING_DESC_F_NEXT))
@@ -486,11 +666,11 @@ static void vblk_request(struct vblk_dev *d, uint16_t head)
 		g_truncated++;
 		vblk_bc(20, g_truncated);
 		vq_push_used(vq, head, 0);
-		return;
+		return 1;
 	}
 	if (n < 2) {                          /* need header + status at least */
 		vq_push_used(vq, head, 0);
-		return;
+		return 1;
 	}
 
 	/* desc[0] = 16-byte request header (read-only). */
@@ -511,6 +691,24 @@ static void vblk_request(struct vblk_dev *d, uint16_t head)
 		status = VIRTIO_BLK_S_IOERR;
 	} else if (hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) {
 		uint32_t is_read = (hdr.type == VIRTIO_BLK_T_IN);
+
+		if (vblk_async_post(head, is_read, sector, stdesc->addr,
+		                     chain, 1, n - 1)) {
+			/* Handed off to CPU2 (ROADMAP C2): it will do the PIO, write
+			 * the status byte, push the used-ring entry and inject the
+			 * completion IRQ on its own. Return immediately WITHOUT
+			 * touching any of that here — the vCPU keeps running without
+			 * waiting for the eMMC transfer. */
+			return 0;
+		}
+
+		/* Fallback: mailbox busy (a request is already in flight on CPU2),
+		 * an unusually long chain that doesn't fit the single async slot,
+		 * or no CPU2 loop draining this build at all. Finish it the OLD
+		 * way, synchronously, right here — always correct, just not
+		 * accelerated. */
+		g_async_fallbacks++;
+		vblk_bc(26, g_async_fallbacks);
 		for (uint32_t i = 1; i < n - 1; i++) {
 			struct vblk_desc *dd = &chain[i];
 			/* Bounds-check against advertised capacity. */
@@ -577,9 +775,13 @@ static void vblk_request(struct vblk_dev *d, uint16_t head)
 		new_idx = vq_push_used(vq, head, used_len);
 		vblk_diag(head, n, data_bytes, stdesc->addr, new_idx);
 	}
+	return 1;
 }
 
-/* QueueNotify handler: drain every available request, then raise one IRQ. */
+/* QueueNotify handler: drain every available request, then raise one IRQ for
+ * whatever completed SYNCHRONOUSLY within this call. A request handed off to
+ * CPU2's async mailbox (ROADMAP C2) is NOT counted here — it injects its own
+ * completion IRQ later, independently, once the PIO actually finishes. */
 static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 {
 	struct vblk_vq *vq = &d->vq[VBLK_QUEUE];
@@ -590,8 +792,8 @@ static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 		return;
 
 	while (vq_pop_avail(vq, &head)) {
-		vblk_request(d, head);
-		served = 1;
+		if (vblk_request(d, head))
+			served = 1;
 	}
 
 	if (served) {

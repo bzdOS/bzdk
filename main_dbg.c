@@ -31,6 +31,7 @@
 #include "onebp.h"
 #include "vgic.h"
 #include "vblk_emmc.h"
+#include "vblk_async.h"
 #include "el2_ncmap.h"
 
 /* bmc.c — software-BMC management plane. Extern decl only (bmc.h pulls in
@@ -269,7 +270,19 @@ int main(void)
 	 * smp_init faulted; 0x50000900 shows how far. */
 	/* SMP debug core: bring up CPU1 to run dbgmon over EMAC independently of the
 	 * guest (the real tooling fix). Bracket breadcrumbs at DBG1[1] (0x50000e04)
-	 * + SMP breadcrumbs at 0x50000900 localise any bring-up fault post-reset. */
+	 * + SMP breadcrumbs at 0x50000900 localise any bring-up fault post-reset.
+	 *
+	 * ROADMAP C2: this SAME call also brings up CPU2, which smp.c's
+	 * smp_secondary_main() now dispatches (for cpu==2) into
+	 * vblk_async_cpu2_run() (vblk_async.c) instead of parking it in WFI —
+	 * the dedicated async eMMC PIO-offload core for vblk_emmc.c's virtio-blk
+	 * device (see vblk_async.h for the full mailbox design). It sets
+	 * g_vblk_async_ready=1 once its loop is actually running, which is what
+	 * lets vblk_kick()'s QueueNotify handler start handing T_IN/T_OUT
+	 * requests to CPU2 instead of blocking CPU0 on the eMMC PIO inline.
+	 * Nothing else needs to change here — vblk_init() (above) already
+	 * brought the eMMC and the virtio-mmio device up before this point;
+	 * this just gives CPU2 something useful to do instead of idling. */
 	DBG_BC(1, 0x53591417);   /* 'SY..' about to call smp_init */
 	smp_init();
 	DBG_BC(1, 0x53590417);   /* smp_init returned cleanly */

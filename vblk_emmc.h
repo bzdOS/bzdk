@@ -294,4 +294,34 @@ int  vblk_init(void);
  * Mirrors vconsole_handle_fault()'s contract exactly. */
 int  vblk_mmio_fault(struct el2_frame *frame);
 
+/* ------------------------------------------------------------------ *
+ * ASYNC I/O OFFLOAD (ROADMAP milestone C2): CPU2 mailbox consumer.
+ *
+ * vblk_kick()/vblk_request() (CPU0, inside the guest's QueueNotify trap) try
+ * to hand every T_IN/T_OUT request to a single-slot mailbox instead of
+ * running the eMMC PIO inline; vblk_async_poll() is the CPU2-side consumer
+ * that drains it. See vblk_async.c/.h for the CPU2 bring-up loop that calls
+ * this in a tight bounded loop, and for the full mailbox-protocol / memory-
+ * ordering writeup (the mailbox producer+consumer both live HERE, in
+ * vblk_emmc.c, not in vblk_async.c — they need this file's already-static
+ * helpers: gmem_read/gmem_write, vq_push_used, vblk_inject_irq, serve_data).
+ *
+ * Call ONLY from CPU2's dedicated loop, never from CPU0/the guest trap path.
+ * Each call does AT MOST one mailbox request's worth of work (itself bounded
+ * by emmc_bio.c's iteration-capped polls) and returns immediately if the
+ * mailbox is empty — it never blocks. */
+void vblk_async_poll(void);
+
+/* Set to 1 by vblk_async_cpu2_run() (vblk_async.c) once CPU2's mailbox-
+ * draining loop is actually running; stays 0 forever in any build that
+ * doesn't link vblk_async.o (e.g. the gdb build's GDB_OBJS, which links this
+ * file + emmc_bio.o but not vblk_async.o). vblk_async_post() (vblk_emmc.c)
+ * checks this BEFORE ever marking the mailbox POSTED, so such builds fall
+ * back to the pre-C2 fully-synchronous path for every request, unchanged.
+ * This is THE on/off switch for the whole async path — do not add a second,
+ * independent one that gates only the CPU2 loop or only the producer: a
+ * request posted with nobody guaranteed to drain it hangs the guest's I/O
+ * forever (see vblk_async.h's design note). */
+extern volatile uint32_t g_vblk_async_ready;
+
 #endif /* BZDOS_VBLK_EMMC_H */
