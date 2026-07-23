@@ -35,15 +35,21 @@
  * are a different, reserved lane).
  *
  * ============================================================================
- * TRANSPORT: virtio-mmio, MODERN (spec v2 / VIRTIO 1.x), NOT legacy. Only
- * VIRTIO_F_VERSION_1 is offered — no VIRTIO_NET_F_MAC, no CSUM/offload
+ * TRANSPORT: virtio-mmio, MODERN (spec v2 / VIRTIO 1.x), NOT legacy.
+ * VIRTIO_F_VERSION_1 and VIRTIO_NET_F_MAC are offered — no CSUM/offload
  * features, no VIRTIO_NET_F_MRG_RXBUF, no VIRTIO_NET_F_STATUS. This means:
- *   - every virtio_net_hdr on the wire is the LEGACY 10-byte form (no trailing
- *     num_buffers field — that only exists under MRG_RXBUF);
- *   - the guest picks its own (random) virtio-net MAC; this does not matter
- *     because emac_send_frame() always transmits with src = EMAC's OWN MAC
- *     (see the "MAC identity" note in vnet_emac.c) — the guest's virtio MAC
- *     never appears on the wire.
+ *   - every virtio_net_hdr on the wire always carries the trailing
+ *     num_buffers field (VIRTIO 1.0 §5.1.6.1 — a MODERN device always
+ *     includes it, MRG_RXBUF negotiation doesn't change that; see
+ *     VNET_HDR_LEN's own comment below);
+ *   - the guest is ASSIGNED VNET_GUEST_MAC (== emac.c's OUR_MAC) via config
+ *     space rather than picking its own random MAC. emac_send_frame() always
+ *     transmits with src = EMAC's OWN MAC regardless (see the "MAC identity"
+ *     note in vnet_emac.c), so the guest's virtio MAC still never appears on
+ *     the wire as a TX source — but making it EQUAL to OUR_MAC means the
+ *     guest's own ARP announcements (sender-HA field) match a destination
+ *     the EMAC hardware filter already accepts, so peers' unicast replies
+ *     actually reach it. See VNET_GUEST_MAC's comment for the full story.
  * ============================================================================
  */
 #ifndef BZDOS_VNET_EMAC_H
@@ -150,11 +156,38 @@
 /* InterruptStatus bits. */
 #define VNET_INT_VRING            0x1u    /* used ring advanced (either queue) */
 
-/* Feature bit 32 = VIRTIO_F_VERSION_1 lives in feature word 1, bit 0. This is
- * the ONLY feature bit offered — no VIRTIO_NET_F_MAC/CSUM/MRG_RXBUF/STATUS/
+/* Feature bit 32 = VIRTIO_F_VERSION_1 lives in feature word 1, bit 0.
+ * VIRTIO_NET_F_MAC (bit 5) lives in feature word 0 — offered so the guest
+ * uses a HYPERVISOR-ASSIGNED MAC (VNET_GUEST_MAC below, == emac.c's OUR_MAC)
+ * instead of picking its own random one. See the config-space comment below
+ * for why this matters (2026-07-24: fixes unicast RX never reaching the
+ * guest). No other feature bit is offered — no CSUM/MRG_RXBUF/STATUS/
  * offloads, matching vblk_emmc.c's minimal-feature-set precedent. */
+#define VNET_FEATWORD_LO          0u
 #define VNET_FEATWORD_HI          1u
+#define VNET_F_MAC_BIT            (1u << 5)
 #define VNET_F_VERSION_1_BIT      0x1u
+
+/* Device-specific config space (struct virtio_net_config): just the 6-byte
+ * `mac` field at offset 0, nothing else (no VIRTIO_NET_F_STATUS/MQ/etc, so
+ * the guest never reads past offset 5). MUST equal emac.c's OUR_MAC.
+ *
+ * WHY: emac_send_frame() (see the "MAC IDENTITY NOTE" below) always sources
+ * TX frames from OUR_MAC — the guest's own virtio-net MAC never appears on
+ * the wire as an Ethernet source address regardless of what it is. Without
+ * VIRTIO_NET_F_MAC, FreeBSD's if_vtnet(4) picks a RANDOM MAC for its own
+ * interface identity; that random value is what ends up in the ARP
+ * sender-HA field the guest announces, so peers address their unicast
+ * REPLIES to a MAC our EMAC hardware never learns to recognize as "us" (its
+ * destination-address filter only knows EMAC_ADDR0 == OUR_MAC + broadcast).
+ * Found live 2026-07-23/24 chasing why ping/ARP-reply never reached the
+ * guest despite three lower-level fixes (VNET_HDR_LEN framing, the
+ * software (to_us||bcast) gate, and the EMAC_RX_FRM_FLT RXALL register) —
+ * assigning the guest OUR_MAC directly sidesteps the whole problem: the
+ * guest's ARP announces OUR_MAC, so replies are addressed to a MAC the
+ * hardware filter already passes with NO promiscuous mode needed at all. */
+#define VNET_GUEST_MAC            { 0x02, 0xbd, 0x05, 0x00, 0x00, 0x01 }
+#define VNET_GUEST_MAC_LEN        6u
 
 /* virtio-net queue convention (spec): 0 = receiveq (RX, device->driver),
  * 1 = transmitq (TX, driver->device). Unlike vblk's single request queue. */
