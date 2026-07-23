@@ -54,7 +54,8 @@
  * MAJOR it does not understand.
  * ------------------------------------------------------------------------- */
 #define BMC_PROTO_MAJOR   1u
-#define BMC_PROTO_MINOR   0u
+#define BMC_PROTO_MINOR   1u   /* +AXP803 battery telemetry (back-compat: */
+                               /* fills what was reserved[23..28], see below) */
 
 /* -------------------------------------------------------------------------
  * Structured health / status record ("BMC1"). Written by bmc_health_snapshot()
@@ -98,7 +99,18 @@ struct bmc_health {
 	uint32_t flags;          /* [20] snapshot of the dbg_* flag bitmap      */
 	uint32_t wdt_hold;       /* [21] wdt_debug_hold (1 = reset gate armed)  */
 	uint32_t ffv_count;      /* [22] FF1V vector first-fault hit count      */
-	uint32_t reserved[9];    /* [23..31] padding to a clean 32-word record  */
+	/* --- v1.1: AXP803 battery telemetry (see axp803.h for citations/
+	 * confidence). Fills what was reserved[23..28] in v1.0 — additive,
+	 * back-compatible; a v1.0 client just never reads these words. All 0
+	 * if no AXP803 was confirmed present (batt_status bit BMC_BATT_CHIP_OK
+	 * clear). */
+	uint32_t vbat_mv;        /* [23] battery voltage, mV (0 = n/a)          */
+	uint32_t ichg_ma;        /* [24] charge current, mA                     */
+	uint32_t idischg_ma;     /* [25] discharge current, mA                  */
+	uint32_t batt_ts_mv;     /* [26] TS-pin raw mV (NOT calibrated to °C)   */
+	uint32_t batt_status;    /* [27] BMC_BATT_* bitmap (axp803.h)           */
+	uint32_t axp_ok;         /* [28] 1 = AXP803 detected + REG03H verified  */
+	uint32_t reserved[3];    /* [29..31] padding to a clean 32-word record  */
 };
 
 /* Bit assignments for the `flags` word above and for `bmc flags`. Each maps to

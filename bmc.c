@@ -55,6 +55,21 @@ extern volatile uint32_t dbg_block_reset;
 /* el2_exc.c — the shared guest register snapshot (guest PC / liveness). */
 extern struct el2_frame g_last_guest_frame;
 
+/* axp803.c — AXP803 PMIC battery telemetry over the RSB bus (rsb.c). See
+ * axp803.h for the full register-map citation/confidence breakdown. Extern
+ * decl only, per this file's self-contained discipline (no axp803.h pull-in
+ * beyond the two struct/constant names we actually use). */
+struct axp803_health {
+	uint32_t vbat_mv, ichg_ma, idischg_ma, ts_mv, status, chip_ok;
+};
+extern int  axp803_init(void);
+extern void axp803_read_health(struct axp803_health *out);
+#define BMC_BATT_PRESENT   (1u << 0)
+#define BMC_BATT_CHARGING  (1u << 1)
+#define BMC_BATT_VBUS      (1u << 2)
+#define BMC_BATT_DIE_HOT   (1u << 3)
+#define BMC_BATT_CHIP_OK   (1u << 4)
+
 /* ------------------------------------------------------------------ *
  * Breadcrumb windows we READ (documented owners in parentheses). Fixed
  * addresses per the tree convention; we do not include their headers, we just
@@ -262,6 +277,20 @@ struct bmc_health *bmc_health_snapshot(struct bmc_health *out)
 	out->wdt_hold     = wdt_debug_hold;
 	out->ffv_count    = (ffv[0] == 0x46463156u) ? ffv[1] : 0u;
 
+	/* AXP803 battery telemetry (v1.1) — axp803_read_health() is bounded and
+	 * self-zeroing if the chip was never confirmed present, so this is safe
+	 * to call unconditionally every snapshot. */
+	{
+		struct axp803_health bh;
+		axp803_read_health(&bh);
+		out->vbat_mv     = bh.vbat_mv;
+		out->ichg_ma     = bh.ichg_ma;
+		out->idischg_ma  = bh.idischg_ma;
+		out->batt_ts_mv  = bh.ts_mv;
+		out->batt_status = bh.status;
+		out->axp_ok      = bh.chip_ok;
+	}
+
 	/* Latch to the BMC1 breadcrumb, word-for-word (struct order == word order). */
 	{
 		const uint32_t *w = (const uint32_t *)out;
@@ -295,7 +324,46 @@ static void bmc_print_health(void)
 	cputs("  temp_mC=");   pdec(h.temp_mc);
 	cputs(" flags=0x");    ph32(h.flags);
 	cputs(" wdt_hold=");   pdec(h.wdt_hold); nl();
+	if (h.axp_ok) {
+		cputs("  battery: vbat_mV="); pdec(h.vbat_mv);
+		cputs(" ichg_mA=");           pdec(h.ichg_ma);
+		cputs(" idischg_mA=");        pdec(h.idischg_ma);
+		cputs(" ts_mV=");             pdec(h.batt_ts_mv);
+		cputs(" ["); if (h.batt_status & BMC_BATT_PRESENT)  cputs("present ");
+		if (h.batt_status & BMC_BATT_CHARGING) cputs("charging ");
+		if (h.batt_status & BMC_BATT_VBUS)     cputs("vbus ");
+		if (h.batt_status & BMC_BATT_DIE_HOT)  cputs("DIE_HOT ");
+		cputs("]\r\n");
+	} else {
+		cputs("  battery: no AXP803 detected (RSB probe failed or absent)\r\n");
+	}
 	cputs("  (record latched @0x"); ph32((uint32_t)BMC_HEALTH_BASE); cputs(")\r\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * BATTERY domain — `bmc battery`: AXP803 telemetry alone (mirrors `bmc temp`).
+ * ------------------------------------------------------------------ */
+static void bmc_print_battery(void)
+{
+	struct axp803_health bh;
+	axp803_read_health(&bh);
+
+	if (!bh.chip_ok) {
+		cputs("no AXP803 detected (RSB probe failed or absent)\r\n");
+		return;
+	}
+	cputs("vbat_mV=");    pdec(bh.vbat_mv);
+	cputs(" ichg_mA=");   pdec(bh.ichg_ma);
+	cputs(" idischg_mA=");pdec(bh.idischg_ma);
+	cputs(" ts_mV=");     pdec(bh.ts_mv);
+	cputs(" status=0x");  ph32(bh.status);
+	cputs(" ["); if (bh.status & BMC_BATT_PRESENT)  cputs("present ");
+	if (bh.status & BMC_BATT_CHARGING) cputs("charging ");
+	if (bh.status & BMC_BATT_VBUS)     cputs("vbus ");
+	if (bh.status & BMC_BATT_DIE_HOT)  cputs("DIE_HOT ");
+	cputs("]\r\n");
+	cputs("(ts_mV is the raw TS-pin millivolts, NOT a calibrated temperature"
+	      " -- see axp803.h)\r\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -438,6 +506,7 @@ static void bmc_help(void)
 	cputs("  bmc ver                 protocol version\r\n");
 	cputs("  bmc health              structured status record (+latch @0x50006000)\r\n");
 	cputs("  bmc temp                SoC temperature (milli-C)\r\n");
+	cputs("  bmc battery             AXP803 VBAT/IBAT/charge status (RSB)\r\n");
 	cputs("  bmc flags               list debug flags + values\r\n");
 	cputs("  bmc flag <name> <0|1>   set a debug flag            [ARMED]\r\n");
 	cputs("  bmc con read [n]        dump guest console capture ring\r\n");
@@ -465,6 +534,7 @@ void bmc_dispatch(char **argv, int argc, struct el2_frame *frame)
 	}
 	if (streq(verb, "health")) { bmc_print_health(); return; }
 	if (streq(verb, "temp"))   { cputs("temp_mC="); pdec(bmc_read_temp_mc()); nl(); return; }
+	if (streq(verb, "battery")) { bmc_print_battery(); return; }
 	if (streq(verb, "flags"))  { bmc_flags_list(); return; }
 	if (streq(verb, "flag")) {
 		unsigned long v;
@@ -510,6 +580,8 @@ void bmc_init(void)
 	struct bmc_health h;
 	bmc_arm_nonce = 0u;                 /* start disarmed */
 	bmc_prev_tick_lo = rd32(BMC_GICT_BASE + 4u);
+	axp803_init();                     /* probe the AXP803 over RSB (bounded; */
+	                                    /* leaves chip_ok=0 on any failure)    */
 	bmc_health_snapshot(&h);           /* lay down BMC1 magic + first record */
 	cputs("bmc: software-BMC mgmt plane ready ('bmc help')\r\n");
 }

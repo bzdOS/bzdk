@@ -123,7 +123,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
-            netcon.o snapshot_net.o
+            netcon.o snapshot_net.o rsb.o axp803.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
@@ -214,7 +214,7 @@ clean-qemu:
 clean:
 	rm -f start.o main.o main_stage0.o main_net.o main_repl.o repl.o \
 	      musb.o emac.o wdt.o exceptions.o el2_exc.o timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o \
-	      snapshot.o snapshot_net.o \
+	      snapshot.o snapshot_net.o bmc.o rsb.o axp803.o \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
 	      test_vblk_ring test_stage2_tables
