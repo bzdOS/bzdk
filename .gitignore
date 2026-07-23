@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 test_vblk_ring
 test_stage2_tables
+test_vnet_ring
 
 # Agent worktrees (isolated per-task git worktrees, not part of the tree)
 .claude/

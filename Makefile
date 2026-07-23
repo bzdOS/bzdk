@@ -54,14 +54,18 @@ all: $(STAGE0_BIN) $(MAIN_BIN)
 # asm — cache maintenance, exclusive-monitor spinlocks, system-register
 # access — that plain gcc cannot assemble for x86_64). Fast enough to run on
 # every commit; does not touch vblk_emmc.c/stage2.c themselves.
-test: test_vblk_ring test_stage2_tables
+test: test_vblk_ring test_stage2_tables test_vnet_ring
 	./test_vblk_ring
 	./test_stage2_tables
+	./test_vnet_ring
 
 test_vblk_ring: test_vblk_ring.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_stage2_tables: test_stage2_tables.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_vnet_ring: test_vnet_ring.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 stage0: $(STAGE0_BIN)
@@ -217,4 +221,4 @@ clean:
 	      snapshot.o snapshot_net.o bmc.o rsb.o axp803.o \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
-	      test_vblk_ring test_stage2_tables
+	      test_vblk_ring test_stage2_tables test_vnet_ring
