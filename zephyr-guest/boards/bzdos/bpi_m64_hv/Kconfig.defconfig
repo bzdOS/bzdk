@@ -1,0 +1,33 @@
+# Copyright (c) 2026 bzdOS project
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_BPI_M64_HV
+
+config BUILD_OUTPUT_BIN
+	default y
+
+# --- Tickless first bring-up -------------------------------------------
+# bzdOS's EL2 hypervisor does not yet forward ANY interrupt to this guest's
+# EL1 (see bpi_m64_hv.dts's "timer" node comment, and vgic.h/vgic.c in the
+# hypervisor tree: the virtual-timer injection plumbing exists but is not
+# wired into the guest-boot path in this pass, and wiring it needs a
+# stage-2 change that is explicitly out of scope / frozen for a parallel
+# milestone). So: no architected timer, no system clock, no scheduler
+# tick. k_busy_wait() still works (crude calibrated busy-loop, see
+# BUSYWAIT_CPU_LOOPS_PER_USEC below) -- k_sleep()/timeouts do not.
+config ARM_ARCH_TIMER
+	default n
+
+config SYS_CLOCK_EXISTS
+	default n
+
+# Rough calibration only (no real measurement was done -- no board access
+# from this worktree). Cortex-A53 here runs at ~1.2 GHz; this is a
+# deliberately conservative (slow) guess so a heartbeat/delay loop errs on
+# the side of "too slow to watch" rather than "way too fast to see" if
+# wrong. Whoever brings this up on real hardware should re-time it (e.g.
+# against the UART capture ring's own timestamps) and correct this value.
+config BUSYWAIT_CPU_LOOPS_PER_USEC
+	default 400
+
+endif # BOARD_BPI_M64_HV

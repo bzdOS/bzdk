@@ -1,0 +1,15 @@
+# Copyright (c) 2026 bzdOS project
+# SPDX-License-Identifier: Apache-2.0
+#
+# NOTE on SOC_QEMU_VIRT_ARM64: this selects zephyr/soc/arm/qemu_virt_arm64,
+# an upstream Zephyr SoC layer that -- despite its name -- is generic
+# ARM64/Cortex-A/ARMv8-A glue (see its Kconfig.soc + mmu_regions.c): the only
+# thing mmu_regions.c does is flat-map whatever GIC address the *board's own
+# devicetree* declares, and its linker script is zephyr's stock generic
+# arm64 one. It carries no QEMU-specific assumptions. It is already reused
+# by the qemu_kvm_arm64 board (a real-AArch64/HW-virtualization target, not
+# software emulation) for exactly this reason. We reuse it here rather than
+# duplicating a whole new (also-generic) SoC layer for one board.
+
+config BOARD_BPI_M64_HV
+	select SOC_QEMU_VIRT_ARM64

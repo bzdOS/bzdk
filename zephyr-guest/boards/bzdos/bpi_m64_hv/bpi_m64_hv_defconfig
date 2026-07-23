@@ -1,0 +1,17 @@
+# Non-secure EL1 guest (bzdOS's guest_config() sets HCR_EL2.RW=1 for an
+# AArch64 EL1, no secure world involved).
+CONFIG_ARMV8_A_NS=y
+
+# Cache management: the guest runs with its own SCTLR_EL1 MMU (Zephyr's own
+# static MMU tables via CONFIG_ARM_MMU below), independent of the flat
+# MMU-off physical execution bzdOS's demo/FreeBSD guest.c payloads use.
+CONFIG_CACHE_MANAGEMENT=y
+CONFIG_ARM_MMU=y
+
+# UART0 (ns16550-compatible, bzdOS's vconsole.c trap-and-emulates it):
+# polling only for this first cut -- see Kconfig.defconfig for why no
+# interrupt is wired up yet.
+CONFIG_SERIAL=y
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y
+CONFIG_UART_INTERRUPT_DRIVEN=n

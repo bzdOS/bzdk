@@ -1,0 +1,157 @@
+/*
+ * Copyright (c) 2026 bzdOS project
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Zephyr board devicetree for a Zephyr/AArch64 EL1 guest running under the
+ * bzdOS EL2 hypervisor (Banana Pi M64 / Allwinner A64, Cortex-A53).
+ *
+ * MMIO addresses below are the REAL Allwinner A64 addresses bzdOS's own
+ * hypervisor source uses (gic_timer.c, vgic.c/vgic.h, vconsole.c/stage2.h),
+ * cross-checked directly against the authoritative SoC devicetree shipped
+ * with this host's U-Boot build,
+ * /opt/bzdos/build/u-boot/arch/arm/dts/sun50i-a64.dtsi (interrupt-controller@1c81000,
+ * serial@1c28000 nodes) -- NOT the addresses QEMU's "virt" machine uses
+ * (which is why this board does not derive from qemu_cortex_a53/xenvm's
+ * .dtsi, only borrows their structure).
+ *
+ * Unlike the FreeBSD guest (main_fbsd.c / kload.c), Zephyr does not parse a
+ * runtime DTB at all -- this file is compiled into the build's internal
+ * devicetree database (edtlib) and baked into the image as static C/asm
+ * (linker script regions, IRQ tables, driver instance data). No DTB blob
+ * needs to be loaded or handed to the guest at boot for Zephyr to use any
+ * of this; x0 at guest entry is a "don't care" from Zephyr's own reset code
+ * point of view.
+ */
+
+/dts-v1/;
+
+#include <mem.h>
+#include <arm64/armv8-a.dtsi>
+#include <zephyr/dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	model = "Banana Pi M64 (bzdOS EL2 hypervisor EL1 guest)";
+	compatible = "bzdos,bpi-m64-hv";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0>;
+			i-cache-line-size = <64>;
+			d-cache-line-size = <64>;
+		};
+	};
+
+	/*
+	 * ARMv8 architected timer -- status DISABLED for this first
+	 * bring-up. Zephyr's arm64 arch code always programs the VIRTUAL
+	 * timer/IRQ (CNTV, GIC PPI 11 -> INTID 27 below): see
+	 * zephyr/include/zephyr/arch/arm64/timer.h,
+	 *   #define ARM_ARCH_TIMER_IRQ  ARM_TIMER_VIRTUAL_IRQ
+	 * That is EXACTLY the vINTID bzdOS's vgic.c already knows how to
+	 * inject on each host physical tick (see vgic.c's header comment
+	 * and its VGIC_VTIMER_INTID #define, both =27/PPI 11) -- but
+	 * vgic_init() + the stage-2 GICC-IPA -> physical-GICV redirect it
+	 * depends on are not wired into any guest-boot path in this pass
+	 * (stage2.c is explicitly frozen for a parallel isolation
+	 * milestone). Getting this node to "okay" is therefore a bzdOS
+	 * integration task, not a Zephyr/board one. Flip this to "okay"
+	 * (and drop the ARM_ARCH_TIMER=n / SYS_CLOCK_EXISTS=n overrides in
+	 * Kconfig.defconfig) once that hookup lands.
+	 */
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "disabled";
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-parent = <&gic>;
+
+		/*
+		 * bzdOS's stage-2 identity-maps [0x40000000, 0x80000000)
+		 * (1 GiB, see stage2.h STAGE2_DRAM_BASE/STAGE2_DRAM_SIZE)
+		 * MINUS two small hypervisor-owned windows a guest must not
+		 * touch: hv-image @ 0x42000000 (~1 MiB) and hv-scratch @
+		 * 0x50000000 (~2 MiB, ends 0x50200000). Zephyr has no runtime
+		 * reserved-memory/DTB concept of its own here (see file
+		 * header) -- what actually keeps this guest out of both
+		 * windows is simply this static RAM description starting
+		 * well past both of them: 0x51000000 is 14 MiB above
+		 * hv-scratch's end, and the 256 MiB region here ends at
+		 * 0x61000000, comfortably inside the 1 GiB map and nowhere
+		 * near either excluded range.
+		 */
+		sram0: memory@51000000 {
+			compatible = "mmio-sram";
+			reg = <0x0 0x51000000 0x0 DT_SIZE_M(256)>;
+		};
+
+		/*
+		 * GIC-400 (GICv2 + virtualization extensions). Real A64
+		 * addresses -- see file header citation. Only GICD+GICC
+		 * described (what an EL1 guest driver ever programs); GICH
+		 * (0x01c84000) and GICV (0x01c86000) are hypervisor-side
+		 * vgic.c internals a guest devicetree has no business naming
+		 * (see vgic.h: the guest's GICC IPA -- this node's second reg
+		 * range, 0x01c82000 -- is what bzdOS's stage-2 redirects onto
+		 * the physical GICV page once/if that plumbing is enabled).
+		 */
+		gic: interrupt-controller@1c81000 {
+			compatible = "arm,gic-v2", "arm,gic";
+			reg = <0x0 0x01c81000 0x0 0x1000>,	/* GICD */
+			      <0x0 0x01c82000 0x0 0x2000>;	/* GICC (guest IPA) */
+			interrupt-controller;
+			#interrupt-cells = <4>;
+			#address-cells = <0>;
+			status = "okay";
+		};
+
+		/*
+		 * Allwinner/Synopsys 16550-compatible UART0. reg, reg-shift
+		 * and the SPI 0 IRQ line are cited from the real
+		 * sun50i-a64.dtsi serial@1c28000 node (compatible
+		 * "snps,dw-apb-uart"; Zephyr's generic "ns16550" binding
+		 * covers the same register layout -- reg-shift=2 is the
+		 * relevant bit both share). Trap-and-emulated by bzdOS's
+		 * vconsole.c (see UART0_BASE/UART0_SIZE in stage2.h).
+		 * vconsole.c never raises this IRQ today, so it is listed
+		 * here for devicetree/binding completeness only -- polling
+		 * mode is what is actually selected (see
+		 * bpi_m64_hv_defconfig: CONFIG_UART_INTERRUPT_DRIVEN=n).
+		 */
+		uart0: serial@1c28000 {
+			compatible = "ns16550";
+			reg = <0x0 0x01c28000 0x0 0x400>;
+			reg-shift = <2>;
+			clock-frequency = <24000000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+			status = "disabled";
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};
