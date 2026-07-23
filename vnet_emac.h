@@ -170,13 +170,24 @@
 #define VNET_VRING_DESC_F_INDIRECT 0x4u    /* .addr points at a desc array       */
 
 /* ------------------------------------------------------------------ *
- * virtio-net packet header (LEGACY form, VIRTIO 1.0 §5.1.6.1, no trailing
- * num_buffers — that field only exists when VIRTIO_NET_F_MRG_RXBUF is
- * negotiated, which we do not offer). Prepended to every RX buffer we hand
- * the guest, and expected (ignored beyond its length) at the front of every
- * TX buffer the guest hands us.
- * ------------------------------------------------------------------ */
-#define VNET_HDR_LEN               10u
+ * virtio-net packet header.
+ *
+ * BUG FIX (2026-07-23, found live via tcpdump on br0 during the first-ever
+ * real TX test: every frame's ethertype field showed 2 bytes of GARBAGE —
+ * the low 16 bits of the guest's OWN source MAC — with the TRUE ethertype
+ * (0x0806, ARP) sitting as the first 2 bytes of what should have been pure
+ * payload. That is exactly the signature of every downstream offset being
+ * 2 bytes too small.
+ *
+ * The original comment here had the VIRTIO_NET_F_MRG_RXBUF rule BACKWARDS.
+ * Per VIRTIO 1.0 §5.1.6.1: the trailing `num_buffers` field is omitted ONLY
+ * for a LEGACY (pre-1.0) device. For a MODERN device — which is exactly
+ * what this is, since only VIRTIO_F_VERSION_1 is offered (see this file's
+ * top-of-file comment) — `num_buffers` is ALWAYS present, regardless of
+ * whether MRG_RXBUF itself is negotiated. So the on-wire header the real
+ * FreeBSD if_vtnet(4) driver actually uses is 12 bytes, not 10 — confirmed
+ * by the exact 2-byte discrepancy observed on the wire. */
+#define VNET_HDR_LEN               12u
 struct vnet_hdr {
 	uint8_t  flags;
 	uint8_t  gso_type;
@@ -184,6 +195,7 @@ struct vnet_hdr {
 	uint16_t gso_size;
 	uint16_t csum_start;
 	uint16_t csum_offset;
+	uint16_t num_buffers;   /* always present for a VERSION_1 (modern) device */
 };
 
 /* Ethernet framing constants. */
