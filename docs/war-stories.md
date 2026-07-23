@@ -1,0 +1,462 @@
+# War stories: bring-up on real, unfamiliar silicon
+
+This is not a design document. It is a collection of bugs that were actually
+hit, live, on a Banana Pi M64 with no UART, no JTAG, and no reference
+hypervisor to copy from — plus the reasoning that got from symptom to fix.
+Every story below is reconstructed from this tree's own source comments,
+which this project treats as its primary incident record (there is no
+separate bug tracker). File:line citations point at the exact comment or
+code the claim is drawn from, so you can go verify it yourself.
+
+Two honesty notes up front, because they matter for how much to trust each
+story:
+
+- Some of these are **closed**: root-caused, fixed, and the fix is live in
+  the default build. Some are **still open** — a rigorous analysis with a
+  designed fix that hasn't been confirmed on hardware yet. Each section says
+  which kind it is.
+- Where the tree itself records a *wrong* first hypothesis, that's kept in,
+  not smoothed over — the wrong turns are usually the more useful part for a
+  reader debugging their own board.
+
+If you're doing bring-up on unfamiliar SoC silicon with a debug channel this
+thin, the shape of these bugs will probably look familiar.
+
+---
+
+## 1. The interrupt-routing odyssey: a 145 kHz storm, and a fix that was blamed on the wrong thing
+
+**Subsystem:** GICv2 virtualization (`vgic.c`, `gic_timer.c`, `stage2.c`, `main_dbg.c`). Tracked throughout as `internal task`.
+
+This is the longest-running saga in the tree, and it runs across three
+files and at least three distinct "fixes," one of which was later found to
+have fixed nothing.
+
+**Act 1 — the timer tick that never arrived.** Early on, the hypervisor
+wanted its own preemptive EL2 tick, driven off the physical CNTP timer. The
+first attempt programmed the GIC distributor and CPU interface, armed the
+comparator — and nothing happened. Rather than guess, the code adds a bounded
+diagnostic busy-wait that samples `CNTP_CTL.ISTATUS` and `GICD_ISPENDR0`
+after the deadline should have passed, and documents a decision table for
+what each combination means (`gic_timer.c:485–507`). The result: **both bits
+were set** — the timer had genuinely fired and the GIC had genuinely latched
+it pending — but the CPU never took the exception. That combination is the
+fingerprint of a *routing* problem, not a GIC problem: with `HCR_EL2.IMO`
+clear (the reset default), a physical IRQ routes to EL1, and an asynchronous
+exception targeting a lower EL than the current one is never taken — it just
+sits pending forever while the hypervisor runs at EL2. The comment is candid
+about correcting itself here: an earlier claim that IMO didn't matter
+"because nothing runs below EL2" was backwards — it matters *because*
+everything here runs at EL2 (`gic_timer.c:435–460`). Setting `HCR_EL2.IMO=1`
+fixed the tick.
+
+**Act 2 — building the virtual GIC, and an interrupt storm at 145 kHz.**
+Once physical IRQs routed to EL2, the natural next step was a real vGIC:
+forward device interrupts into the guest via GICH list registers, and
+redirect the guest's GICC MMIO window to the physical GICV page so its
+`IAR`/`EOIR` accesses land on hardware built for exactly this
+(`stage2.c:186–199`, `vgic.c:1–49`). That's the standard GICv2 KVM trick, and
+`vgic.c`'s header is explicit about the half that was actually finished: the
+CNTV virtual timer path (inject on tick, guest EOIs through GICV) worked.
+Forwarding for arbitrary *device* IRQs did not get built out to the same
+level. The consequence: with `IMO=1` now catching every physical Group-1
+IRQ at EL2, a level-triggered device interrupt — the EHCI controller at
+`0x01c1b000`, SPI 74 / INTID 106 — arrived at EL2, got EOI'd there, and was
+never forwarded to the guest and never cleared at the device. Level-triggered
++ un-cleared means it re-fires immediately. The result was an IRQ storm at
+roughly 145 kHz that starved the guest and wedged it inside `ehci_reset()`'s
+own `DELAY()` loop (`main_dbg.c:214–224`, referenced as "EHCI INTID 106
+storm").
+
+**Act 3 — a clean architectural reversal, and a misdiagnosis caught after
+the fact.** The fix was not "finish the vGIC forwarding." It was to step back
+and ask why EL2 needed to own physical device IRQs at all: this is a
+single-guest debug hypervisor, and FreeBSD's own native drivers already know
+how to service and deactivate their interrupts correctly. `main_dbg.c` flips
+`HCR_EL2.IMO`/`FMO` back to 0 — routing *every* physical IRQ straight to the
+guest's EL1 — and drops the EL2 preemptive tick entirely in favor of
+polling `dbgmon_service()` from inside the existing UART-trap path
+(`main_dbg.c:214–230`). That single policy change fixed the EHCI storm.
+
+Here's the part worth dwelling on: the GICC→GICV stage-2 redirect from Act 2
+was pulled out as part of the same cleanup, and for a while an apparent
+regression was blamed on removing it. It wasn't. The `stage2.c` comment
+documents the correction in full: under `IMO=0`, the guest must be able to
+acknowledge and EOI interrupts through the *real* physical GICC — redirecting
+that IPA to the (now-inert, since nothing drives GICH anymore) GICV left the
+guest unable to service any interrupt at all, hanging at the MMC/root-mount
+phase. Removing the redirect was the right call. But the boards that seemed
+to regress *after* an earlier attempt to remove it were actually failing for
+an unrelated reason — a `chimpd` `autostart=no` bug that kept `bootelf` from
+jumping to the loaded image at all. Once that infrastructure bug was fixed,
+the "regression" vanished on its own (`stage2.c:279–286`).
+
+**Lesson:** two independent bugs wearing the same symptom (guest doesn't
+boot after a change) will absolutely get blamed on each other if you don't
+have an independent way to tell "the change is wrong" apart from "something
+else broke." Here that independent signal was the GIC's own pending/latched
+state, sampled with bounded polling before anything auto-recovers it — worth
+building before you need it.
+
+---
+
+## 2. eMMC bring-up: the clock pin FreeBSD keeps stealing back
+
+**Subsystem:** `emmc_bio.c` (the hypervisor's own PIO eMMC driver), `smp.c`, `main_dbg.c`.
+
+**Symptom:** `CMD1 SEND_OP_COND` came back with `OCR=0` — the card
+essentially reporting "not present" — even though the eMMC was known-good
+hardware sitting right there on the bus.
+
+**Root-causing:** the A64's eMMC clock line shares a pinmux nibble (PC5,
+`PIO PC_CFG0` bit-field `[23:20]`) with a GPIO function, and it turned out
+FreeBSD's own A64 pinctrl driver was the one un-muxing it: on this board's
+DTS, FreeBSD correctly muxes every *other* MMC2 pin to function 3 but leaves
+PC5 at `gpio_in` (function 0) — so the clock pad the eMMC controller needs
+is simply dead from the controller's point of view (`smp.c:449–453`). This
+was confirmed directly rather than inferred: forcing PC5 to function 3 and
+re-issuing the identification sequence over the debug channel got `CMD0` to
+`CMD_DONE` and `CMD1` to return `OCR=0xc0ff8080` (ready) — proof the eMMC was
+present and answering the whole time; only the clock was missing
+(`main_dbg.c:278–286`).
+
+**Fix, and why it needs to run continuously, not once:** `emmc_bio_init()`
+forces the mux at bring-up (`emmc_bio.c:237–239`), but because FreeBSD's own
+pinctrl driver is the thing un-muxing it, a one-time fix loses the race the
+moment the guest kernel re-touches that register. The dedicated CPU1 debug
+core therefore re-checks and re-enforces PC5=func3 on every iteration of its
+poll loop — reading before writing so it doesn't fight the other bits
+FreeBSD legitimately owns on that same register (`smp.c:449–459`).
+
+**A second, adjacent trap in the same file:** getting the controller to
+*respond* is only half the story — getting its **new-mode timing
+registers** (`NTSR` "mode select new" and `SAMP_DL` "calibration delay") to
+actually take effect is a separate, non-obvious precondition. The first
+attempt wrote `NTSR` with the card clock already running, and it silently
+read back as `0x0` — not an error, just a write that went nowhere. The fix,
+found by working out from U-Boot's own `mmc_config_clock()` what it actually
+does (not what a generic sunxi-mmc datasheet suggests), is that both
+registers only **latch** while `CKCR.CLK_ENABLE` is off: clock off → issue a
+clock-update command → program the CCU divider, then `NTSR`, then `SAMP_DL`
+→ clock back on → clock-update again (`emmc_bio.c:63–82`, implemented at
+`emmc_bio.c:261–283`). Skip that ordering and reads still work at the
+crawling 400 kHz init clock (read timing tolerates the missing
+calibration) — but `CMD24` **writes** hang forever with `RINT` stuck at
+`CMD_DONE|TX_DATA_REQ` and `DATA_OVER` never asserting, because the card's
+write CRC/status-token phase needs the new-mode sample-clock alignment to be
+recognized at all. A bug that only manifests on the write path, while every
+read-path test keeps passing, is exactly the kind of thing that survives
+into an integration milestone before it's caught.
+
+---
+
+## 3. The race that only showed up back-to-back
+
+**Subsystem:** `emmc_bio.c`'s read path, exposed by `vblk_emmc.c` (virtio-blk).
+**Status:** closed — root-caused and fixed live, 2026-07-20.
+
+**Symptom:** once virtio-blk started driving `emmc_bio_read()` in a tight
+loop (one call per sector, back-to-back, with no delay between them — unlike
+the earlier `dbgmon`/CPU1 callers, which are naturally paced ~80 ms apart by
+an EMAC round-trip), reads started failing spuriously — not deterministically
+wrong, just intermittently timing out with `nwords=0`.
+
+**Initial shape of the read path:** drain 128 words from the FIFO, see
+`FIFO_EMPTY` together with `DATA_OVER` in `RINT`, declare the block done, and
+return (`emmc_bio.c:364–382`). That looks complete — the data is drained, the
+transfer-done bit is set — but it's the wrong stopping point.
+
+**Root-causing:** the breadcrumb window this file already keeps for read
+failures (`RINT`, `STAR`, words-drained, `GCTL`, at
+`emmc_bio.c:333–345`) caught the actual failure signature directly:
+`RINT = 0x8` — `DATA_OVER` set — **without** `CMD_DONE`, and `nwords=0`. That
+combination only makes sense if a *new* command had already been issued and
+its `RINT` cleared before the *previous* transfer's `DATA_OVER` had actually
+landed. Draining all 128 FIFO words is not the end of the transfer: the
+controller keeps running a CRC/end-of-transfer phase afterward and only sets
+`DATA_OVER` slightly *later*. A caller that returns the moment the FIFO
+empties and immediately issues the next command resets the FIFO and writes a
+new `CMDR` while the *previous* block is still retiring — so the previous
+block's late `DATA_OVER` arrives after the new command has already cleared
+`RINT`, and the new command's own drain loop sees `FIFO_EMPTY + DATA_OVER`
+immediately and bails out with zero words read. Every back-to-back read hit
+this; paced callers essentially never did, which is exactly why it surfaced
+only once virtio-blk started hammering the controller (`emmc_bio.c:384–396`).
+
+**Fix:** wait for `DATA_OVER` and card-idle *after* draining the FIFO, before
+returning — mirroring what the write path (`emmc_bio_write()`) already did
+correctly (`emmc_bio.c:397–412`).
+
+**Lesson:** "the data is all there" and "the transaction is over" are two
+different facts about a hardware FIFO, and a caller that only checks the
+first one will pass every test that isn't back-to-back — which usually means
+it passes in isolation and fails only once it's wired into the thing that
+actually stresses it.
+
+---
+
+## 4. Ghost sectors: when "the transfer succeeded" doesn't mean the data is there
+
+**Subsystem:** `vblk_emmc.c`, cache maintenance on the read completion path.
+**Status:** closed — root-caused and fixed live, 2026-07-22.
+
+**Symptom:** virtio-blk reads completed cleanly — 336 sectors in, no I/O
+error, IRQ delivered, `S_OK` — and yet GEOM couldn't find a GPT on the disk,
+and the guest panicked with mount error 19. The hypervisor's own read path
+(the exact same `emmc_bio_read()` from story 3, now working) had already been
+independently proven byte-correct.
+
+**Root-causing:** the FreeBSD `virtio_blk` driver treats its backing device
+as a normal non-coherent DMA device: on completion of a read, it performs a
+POSTREAD cache **invalidate** (`dc ivac`) on its buffer, on the reasonable
+assumption that a real hardware device just wrote fresh bytes to main memory
+behind the CPU's cache and the stale cache line needs to be dropped so the
+next load refetches from DRAM. But `emmc_bio_read()` fills that buffer with
+ordinary **cached EL2 stores** (`SCTLR_EL2.C=1`) and only issues a `dsb` —
+it never cleans those lines to the point of coherency. So the sequence is:
+EL2 writes the sector into its own dirty cache line; the guest's POSTREAD
+`dc ivac` discards that dirty line outright (invalidate, not
+clean-then-invalidate); the guest's subsequent load misses the cache and
+fetches whatever stale bytes were actually sitting in DRAM. Every sector —
+including the GPT header and superblock — could come back wrong even though
+the transfer itself reported success, because the "transfer" was never the
+problem; the *publication* of its result to a real device's coherency
+contract was (`vblk_emmc.c:380–393`).
+
+**Fix:** clean+invalidate the destination range to the point of coherency
+after every successful `emmc_bio_read()`, exactly mirroring the cache
+maintenance the write path (`gmem_write()`) already performed in the other
+direction (`vblk_emmc.c:393`, `vblk_emmc.c:117–141` for `gmem_cmo()`).
+
+**A related, still-open investigation worth knowing about:** this is not the
+only DMA-coherency bug this tree has chased. `docs/aw-mmc-dma-coherency.md`
+is a much longer, still-unconfirmed analysis of a *different* code path —
+FreeBSD's *native* `aw_mmc` driver doing IDMAC (controller-driven) DMA
+directly, rather than going through the hypervisor's PIO `emmc_bio` shim.
+Its hypothesis is structurally similar in spirit (an extra cacheable
+observer of guest DRAM — here, EL2 itself and the CPU1 debug core, both
+running cache-coherently on the same DRAM the guest treats as
+non-coherent-DMA target) but the proposed fix (`el2_ncmap.c`, making EL2's
+own stage-1 mapping of guest DRAM non-cacheable) is implemented and
+self-checking but explicitly gated off (`DBG_NCMAP_ENABLE 0`,
+`main_dbg.c:185`) pending a live hardware confirmation that hasn't happened
+yet as of this writing. Worth reading if you hit DMA corruption that looks
+similar but isn't on the virtio-blk path — but don't mistake it for a closed
+story.
+
+---
+
+## 5. The USB-OTG lane: from a silent enumeration failure to a break-glass reset
+
+**Subsystem:** `musb.c` (MUSB CDC-ACM gadget), `usbacm.c` (poll/console bridge).
+
+**Act 1 — enumeration that never finished.** The gadget descriptors were
+ported from a reference driver, and enumeration simply looped forever
+(`-71`, `ENODEV`/protocol error, from the host's point of view) without any
+obvious single cause. Live tracing over the REPL turned up **two
+independent** bugs stacked on top of each other, both in static descriptor
+tables:
+
+  - The 18-byte USB device descriptor the reference carried was actually
+    only 17 bytes — `bcdDevice` had been squeezed to a single byte while
+    `bLength` still claimed 18 — so every `GET_DESCRIPTOR(device)` handed
+    back a short packet, which the host rejected outright, looping
+    enumeration from the top. Confirmed directly: a breadcrumb word reading
+    back the descriptor length showed 17, not 18 (`musb.c:689–696`).
+  - Independently, the configuration descriptor's `wTotalLength` field said
+    67 while the descriptor set had actually grown to 75 bytes when an
+    Interface Association Descriptor (IAD) was added for the CDC-ACM
+    composite layout — the IAD was appended to the byte array without
+    updating the length field next to it. A host reads `wTotalLength` first,
+    then requests exactly that many bytes; getting 67 truncated a real
+    75-byte set by 8 bytes — precisely the final endpoint descriptor — so
+    every enumeration attempt received a config that looked internally
+    inconsistent and started over (`musb.c:708–715`).
+
+Neither bug alone would have been the whole story; both had to be found and
+fixed before enumeration completed, which is a good reminder that "the host
+keeps re-enumerating" is a symptom with more than one simultaneous cause
+available, not a single bug to stop looking after finding the first
+plausible one.
+
+**Act 2 — turning the same channel into a recovery mechanism.** Once the
+USB-ACM console worked, a real incident exposed a gap: EMAC/`dbgmon` went
+dark, the guest was hung, and CPU1 kept dutifully petting the hardware
+watchdog forever — the one combination with **no** remote recovery path at
+all. It cost a physical power-cycle (`usbacm.c:30–34`, dated 2026-07-21).
+The fix is a "break-glass" sequence: because the USB-ACM RX path is serviced
+independently by CPU1 regardless of what EMAC or the guest are doing, typing
+a specific, deliberately console-traffic-unlikely byte sequence
+(`0x00 '~' 'B' 'Z' 'R' 'S' 'T' 0x00`) into `/dev/ttyACM0` sets a flag that
+stops both watchdog-pet paths, letting the real hardware watchdog fire within
+~16 seconds and reboot to U-Boot, where a persistent `chimpd` reloads the
+image automatically (`usbacm.c:36–57`). The interesting design point isn't
+the mechanism itself — it's recognizing that the *last independently-alive
+channel* is exactly the one that needs a way to force a reset, and building
+that in before the next incident rather than after.
+
+---
+
+## 6. The register write that hangs a whole CPU core, silently, forever
+
+**Subsystem:** `start.S` (`_start_secondary`), `smp.c`/`smp.h`.
+
+**Symptom:** bringing up secondary cores via PSCI `CPU_ON` (the standard way
+to start additional cores on this platform) simply never completed for
+CPU1 — no crash, no fault, just a core that never reported itself online.
+
+**Root-causing:** the per-core progress breadcrumbs this path writes at each
+stage (`STAGE 0x00` through `STAGE 0x04`, `start.S:98–182`) are written
+MMU-off, straight to DRAM, specifically so they survive a hang and are
+readable via `md` after a reset. They showed the secondary core reaching
+`STAGE 0x00` — "just entered `_start_secondary`" — and never reaching
+`STAGE 0x01`, confirmed live on 2026-07-18. The very first substantive thing
+the old code did after that breadcrumb was set `CPUECTLR_EL1.SMPEN=1` — a
+real requirement on this core family, since the A53's D-cache does not join
+the inner-shareable coherency domain until that bit is set, and a secondary
+that enabled its MMU/cache without it would silently corrupt every shared
+structure it touched. The step is architecturally necessary; the problem is
+*how* it was being done. `CPUECTLR_EL1` (`S3_1_C15_C2_1`) is
+implementation-defined, and on this SoC, accessing it from EL2 **traps to
+EL3**, where ARM Trusted Firmware has no handler installed for it — the trap
+has nowhere to go, and the core simply stops there, forever, with no
+exception visible from EL2's side at all (`start.S:128–135`).
+
+**Fix:** don't write it. ATF/BL31 already sets `CPUECTLR_EL1.SMPEN` as part
+of its own per-core power-on sequence before handing control to the
+hypervisor at all — which is also, on reflection, why the *primary* core
+(which boots via U-Boot's `go`, not PSCI) never needed to touch this
+register either and was cache-coherent from its very first instruction. The
+fix is simply to remove the write and mark the stage as already passed
+(`start.S:128–135`).
+
+**Lesson:** on a platform with a firmware layer between you and the
+hardware, a register access that is architecturally correct can still be
+fatal if the *privilege level* it traps to doesn't expect it — and the only
+visible symptom from your own level is "this core just... stopped," with no
+exception frame to read, which is exactly the situation a stage that's
+recorded *before* attempting the risky operation (not after) is built to
+distinguish from every other kind of hang.
+
+---
+
+## 7. Catching a guest's first breath before it erases the evidence
+
+**Subsystem:** `firstfault.c`, `stage2.c`/`stage2.h` (`stage2_unmap_guest_vector()`).
+
+This one isn't a bug in the hypervisor — it's a debugging *technique*, built
+because the two obvious tools both failed against this specific guest
+failure mode, and it's a good illustration of what "no JTAG" actually forces
+you into.
+
+**The problem it solves:** the FreeBSD guest, early in its boot, was dying in
+a recursive-exception storm fast enough that the original fault's own
+records — `ELR_EL1`/`ESR_EL1`/`FAR_EL1` — were gone before anything could
+read them: each re-entry into the guest's own EL1 vector table overwrites
+those banked registers with a new fault, and by the time the hypervisor's
+generic trap handler gets a look, it's looking at the *Nth* fault, not the
+first one. Worse, FreeBSD's `locore` runs this early stretch with
+`PSTATE.D=1` — the debug-exception mask bit set — which means hardware
+breakpoints, watchpoints, and software single-stepping are all masked and
+simply cannot fire here, closing off the normal answer to "which instruction
+faulted first" (`stage2.h:104–120`).
+
+**The technique:** rather than trying to observe the guest's EL1 state from
+outside it, make the guest's very first vector *fetch* itself visible to
+EL2. `stage2_unmap_guest_vector()` leaves the guest's EL1 vector table page
+(the physical page backing its `VBAR_EL1`, resolved once from the known
+kernel load address) deliberately **invalid** at stage-2
+(`stage2.c:319–342`, `stage2.h:122–132`). The guest's hardware fault
+mechanism doesn't care that PSTATE.D is set — it still sets
+`ELR_EL1`/`ESR_EL1`/`FAR_EL1`/`SPSR_EL1` to describe the *original* fault and
+branches to `VBAR_EL1`, exactly per the architecture. But because that page
+is unmapped at stage-2, the vector *fetch itself* takes a stage-2
+instruction abort straight to EL2 — before the guest's own vector code ever
+executes and before the storm can overwrite anything.
+`firstfault_handle()` catches that specific abort, confirms the faulting IPA
+is the vector page (via `HPFAR_EL2`), and reads the guest's still-pristine
+EL1 fault state directly with `mrs` — an EL2 read of EL1-banked registers
+takes no trap at all — plus all 31 GPRs from the saved trap frame
+(`firstfault.c:68–95`). It records all of that into a breadcrumb, then
+re-maps the vector page and returns control to the guest, which proceeds
+into its own (storm-continuing) handler having lost nothing — the original
+fault is already safely captured.
+
+**Why this is worth knowing even outside this project:** it's a general
+answer to "how do I catch the very first exception of something that
+immediately masks or destroys the evidence of its own first exception,"
+using only a stage-2 translation fault as the tripwire — no hardware debug
+facilities required, which matters a great deal when those facilities are
+exactly the ones the guest has masked.
+
+---
+
+## 8. Two ways to get the FreeBSD boot contract wrong
+
+**Subsystem:** `kload.c`/`kload.h` — this hypervisor loads the FreeBSD kernel
+directly, emulating just enough of the loader's ELF-note/modinfo protocol
+for the kernel to think a normal loader handed it off.
+
+**Bug 1 — an off-by-one in a tag enum, caught by tracing, not by inspection.**
+The machine-independent `MODINFOMD_*` tag numbers the loader protocol uses
+(`sys/sys/linker.h`) were originally transcribed as `ENVP=7 / HOWTO=8 /
+KERNEND=9`. The real header defines them as `ENVP=6 / HOWTO=7 / KERNEND=8`.
+Because FreeBSD's metadata-fetch matches records purely by
+`MODINFO_METADATA | tag`, this off-by-one didn't produce a missing field or
+an obvious parse failure — it made the kernel's boot-parameter code read the
+hypervisor's *ENVP* record while thinking it was reading *HOWTO*, and its
+*HOWTO* record while thinking it was reading *KERNEND*. Every record was
+present, well-formed, and simply aliased to the wrong meaning one slot down.
+The symptom this produced — a traced register holding what looked like the
+kernel's `lastaddr` value where the `HOWTO` boot flags should have been —
+was real and reproducible, but compatible with several different theories
+(a compiler quirk, a calling-convention mismatch) before the tags themselves
+were checked line-for-line against the exact FreeBSD source commit the
+on-board binary was actually built from (`releng/15.1`, commit `9263fb9`)
+and the off-by-one fell out directly (`kload.h:164–176`).
+
+**Bug 2 — a device string that was never valid syntax, hiding behind a much
+scarier-looking failure.** For a long stretch, the guest panicked at
+mountroot with `error 19` trying to mount
+`/dev/vtbd0p3;ufs:/dev/gpt/rootfs` — a device name that obviously can't
+exist — and the investigation reasonably suspected the disk itself: a stale
+GPT backup header from an earlier, smaller disk image, a GEOM taste race, a
+virtio-blk transport bug. All of those were individually and carefully ruled
+out on real hardware (independently reading both the primary and backup GPT
+headers via `emmc_bio` and confirming both matched the current full-disk
+image, cross-referenced against the completed cache-coherency fix from story
+4). The actual bug was much smaller and had been sitting in plain sight the
+whole time: the kernel environment string this hypervisor injects had set
+`vfs.root.mountfrom=ufs:/dev/vtbd0p3;ufs:/dev/gpt/rootfs`, intending a
+primary device with a fallback. But FreeBSD's kenv parser
+(`sys/kern/vfs_mountroot.c`, `parse_token()`) splits **only on whitespace** —
+a semicolon is not a delimiter anywhere in that path — so the entire string
+was read as one token and handed whole to `parse_mount()`, which took
+everything up to the next whitespace as a single (non-existent) device name.
+That is exactly the string the panic was printing, the whole time
+(`kload.c:519–537`). The fix was simply to stop using `;` as a separator —
+multiple whitespace-**separated** `fstype:device` tokens are the actual
+FreeBSD-supported way to list fallbacks, but a single clean device sufficed
+here.
+
+**Lesson shared by both:** when the "protocol" you're implementing is
+someone else's undocumented internal contract (a linker-note tag enum, a
+kenv parser's tokenization rule), the only trustworthy source is the exact
+matching source tree the on-board binary was built from — not a
+recollection of "how loaders usually work," and not the first plausible
+theory that fits the symptom. Both bugs here produced confusing,
+theory-compatible symptoms right up until someone read the real parser.
+
+---
+
+## Further reading in this tree
+
+- `docs/aw-mmc-dma-coherency.md` — the long-form, still-open DMA coherency
+  investigation referenced in story 4.
+- `docs/el2-nc-guest-dram.md` — the design for the non-cacheable EL2 remap
+  proposed (but not yet enabled) as its fix.
+- `docs/virtio-blk-design.md` / `docs/virtio-blk-integration.md` — the
+  virtio-blk device stories 3 and 4 happened inside.
+- `DEBUG_RULES.md` — the operating rules this project distilled from
+  exactly these kinds of incidents (R2, in particular, is the rule story 8
+  is a direct illustration of).
