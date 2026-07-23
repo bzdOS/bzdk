@@ -62,6 +62,7 @@
 #include <stdint.h>
 #include "exceptions.h"
 #include "gdbstub.h"
+#include "gdbstub_hw.h"
 
 /* Byte transport — provided by main_dbg.c (wired to emac). gdb_getc() MUST
  * pump the EMAC RX ring (e.g. { emac_poll(); return emac_getc(); }) so bytes
@@ -693,29 +694,35 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 		return GDB_RUN_STEP;
 
 	case 'Z': {                                /* insert breakpoint */
-		if (pkt[1] == '0') {               /* Z0,addr,kind (software) */
-			uint64_t addr;
-			p = pkt + 2;
-			if (*p == ',') p++;
-			addr = parse_num(&p);
-			if (bp_insert(addr)) gdb_send_ok();
-			else                 gdb_send("E01");
-		} else {
-			gdb_send_empty();          /* hw bp/watchpoints unsupported */
+		int type = pkt[1] - '0';
+		p = pkt + 2;
+		if (*p == ',') p++;
+		{
+			uint64_t addr = parse_num(&p);
+			int kind = 0;
+			if (*p == ',') { p++; kind = (int)parse_num(&p); }
+			if (type == 0) {            /* Z0,addr,kind (software) */
+				if (bp_insert(addr)) gdb_send_ok();
+				else                 gdb_send("E01");
+			} else {                    /* HW bp / watchpoints */
+				int r = gdbstub_hw_insert(type, addr, kind, g);
+				if      (r == 1)  gdb_send_ok();
+				else if (r == -1) gdb_send("E01"); /* refused: CPSR.D=1 */
+				else              gdb_send_empty(); /* full -> GDB uses SW bp */
+			}
 		}
 		return GDB_RUN_NONE;
 	}
 
 	case 'z': {                                /* remove breakpoint */
-		if (pkt[1] == '0') {
-			uint64_t addr;
-			p = pkt + 2;
-			if (*p == ',') p++;
-			addr = parse_num(&p);
-			bp_remove(addr);
+		int type = pkt[1] - '0';
+		p = pkt + 2;
+		if (*p == ',') p++;
+		{
+			uint64_t addr = parse_num(&p);
+			if (type == 0) bp_remove(addr);
+			else           gdbstub_hw_remove(type, addr);
 			gdb_send_ok();
-		} else {
-			gdb_send_empty();
 		}
 		return GDB_RUN_NONE;
 	}
@@ -739,7 +746,7 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 
 	case 'q':                                  /* general query */
 		if (str_n_eq(pkt, "qSupported", 10)) {
-			gdb_send("PacketSize=1024;qXfer:features:read+");
+			gdb_send("PacketSize=1024;qXfer:features:read+;swbreak+;hwbreak+");
 		} else if (str_n_eq(pkt, "qXfer:features:read:target.xml:", 31)) {
 			xfer_reply(target_xml, (int)(sizeof(target_xml) - 1), pkt + 31);
 		} else if (str_n_eq(pkt, "qAttached", 9)) {
@@ -798,8 +805,13 @@ static int command_loop_ex(struct el2_frame *g, int first_open)
 	int first = first_open;
 
 	for (;;) {
-		int n = first ? gdb_recv_body() : gdb_recv();
+		extern void wdt_debug_kick(void);   /* CPU1-owned HW WDOG */
+		int n;
 		int act;
+
+		wdt_debug_kick();                   /* keep the board alive while
+						      * gdb dwells at a breakpoint  */
+		n = first ? gdb_recv_body() : gdb_recv();
 		first = 0;
 		if (n < 0)
 			continue;              /* bad checksum — GDB will resend */
@@ -835,8 +847,20 @@ void gdbstub_init(void)
 
 void gdbstub_on_debug_event(struct el2_frame *guest, int signal)
 {
+	char reason[48];
+
 	disarm_step(guest);                    /* we have stopped; clear stepping */
-	send_stop(signal);
+	if (signal == 5 && gdbstub_hw_stop_reason(guest, reason)) {
+		char s[64];
+		int n = 0;
+		s[n++] = 'T'; s[n++] = nyb((unsigned)signal >> 4); s[n++] = nyb((unsigned)signal);
+		{ const char *r = reason; while (*r) s[n++] = *r++; }
+		s[n++]='t';s[n++]='h';s[n++]='r';s[n++]='e';s[n++]='a';s[n++]='d';
+		s[n++]=':';s[n++]='0';s[n++]='1';s[n++]=';'; s[n]='\0';
+		gdb_send(s);
+	} else {
+		send_stop(signal);
+	}
 	command_loop(guest);                   /* arms `guest` before returning */
 }
 
