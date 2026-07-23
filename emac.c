@@ -162,6 +162,13 @@ static const uint8_t OUR_MAC[6] = { 0x02, 0xbd, 0x05, 0x00, 0x00, 0x01 };
  * "RX demux hook" below). Kept as a plain broadcast dst byte to reuse the
  * exact same TX descriptor path as the console (see tx_frame_raw()). */
 #define ETHERTYPE_NETCON  0x88B6u
+/* Bulk snapshot-stream channel (snapshot_net.h, ROADMAP D1) — a THIRD,
+ * independent channel from the console and netcon. Fire-and-forget bulk
+ * DATA frames only (no ACK on this channel; reliability is a small
+ * netcon-carried manifest/missing-list handshake — see snapshot_net.h).
+ * Demuxed away from both the console ring and netcon_rx_frame() exactly
+ * like netcon's own EtherType is demuxed away from the console below. */
+#define ETHERTYPE_SNAPNET 0x88B8u
 static const uint8_t BCAST_MAC[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
 /* netcon.c provides the real implementation when linked in; the weak no-op
@@ -171,6 +178,16 @@ extern void netcon_rx_frame(const uint8_t *payload, uint16_t len);
 __attribute__((weak)) void netcon_rx_frame(const uint8_t *payload, uint16_t len)
 {
     (void)payload; (void)len;   /* no netcon linked in: drop silently */
+}
+
+/* snapshot_net.c provides the real implementation when linked in; same
+ * weak-fallback pattern as netcon_rx_frame above so any build without
+ * snapshot_net.c links cleanly. Same "payload after the 14-byte Ethernet
+ * header" convention as netcon_rx_frame. */
+extern void snapshot_net_rx_frame(const uint8_t *payload, uint16_t len);
+__attribute__((weak)) void snapshot_net_rx_frame(const uint8_t *payload, uint16_t len)
+{
+    (void)payload; (void)len;   /* no snapshot_net linked in: drop silently */
 }
 
 /* vnet_emac.c (ROADMAP C1, virtio-net-over-EMAC) provides the real
@@ -1186,8 +1203,17 @@ void emac_poll(void)
                  * of it (including the zero-padding tail) is real. */
                 netcon_rx_frame(buf + 14, (uint16_t)(length - 14));
                 note_rx_frame();
+            } else if (et == ETHERTYPE_SNAPNET && (to_us || bcast)) {
+                /* Bulk snapshot-stream channel: same "strip the 14-byte
+                 * Ethernet header, hand the rest to the module's own parser"
+                 * convention as netcon above. NEVER falls through to the
+                 * vnet_emac muxer below (that hook is for the ROADMAP C1
+                 * virtio-net device and expects IP-ish traffic, not our raw
+                 * framing). */
+                snapshot_net_rx_frame(buf + 14, (uint16_t)(length - 14));
+                note_rx_frame();
             } else if (et != ETHERTYPE_CONSOLE && et != ETHERTYPE_NETCON &&
-                       (to_us || bcast)) {
+                       et != ETHERTYPE_SNAPNET && (to_us || bcast)) {
                 /* Not our debug protocol, not netcon: ROADMAP C1 hook —
                  * hand the whole frame to the virtio-net-over-EMAC
                  * multiplexer (vnet_emac.c) instead of silently dropping
