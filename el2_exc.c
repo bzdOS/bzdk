@@ -34,6 +34,7 @@
 #include "reboot.h"
 #include "backtrace.h"
 #include "flightrec.h"
+#include "coredump.h"
 
 /* Shared snapshot of the guest register frame, written by CPU0 on every
  * guest-group trap and read by the SMP debug core (CPU1) so it can serve
@@ -78,6 +79,14 @@ volatile uint32_t dbg_clean_off = 1;
 #define EXC_MAGIC   0x45584331u   /* "EXC1" */
 
 static uint32_t exc_count;
+
+/* B3 crash-forensics flood guard (see the call site below for the full
+ * rationale): hard cap on how many coredump_send() streams (each up to
+ * COREDUMP_MAX_TOTAL bytes) we're willing to emit in a single boot, as a
+ * backstop behind the same-fault latch. Picked comfortably above "one" (so a
+ * genuine handful of distinct faults during a debugging session all get a
+ * coredump) but nowhere near "unbounded". */
+#define CORE_DUMPS_PER_BOOT 4u
 
 static inline void exc_bc(int i, uint32_t v)
 {
@@ -474,6 +483,57 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		uint64_t bt_out[16];
 		(void)backtrace_walk(frame->elr, frame->x[29], frame->x[30],
 		                     bt_out, 16);
+	}
+
+	/* B3 crash-forensics: stream a bounded ELF coredump to the host
+	 * (coredump_send(), coredump.c/.h) for a GENUINE guest panic, but not
+	 * for every iteration of a re-fault storm. coredump_send() was left
+	 * uncalled when it was first written (see commit 2624ae5's message)
+	 * precisely because guest synchronous faults never advance ELR (the
+	 * ELR-advance rule is right below, at the bottom of this function) —
+	 * a guest wedged re-executing the same unmapped instruction re-traps
+	 * at the IDENTICAL (esr,elr) every single time until the WDT reboots
+	 * us, and firing coredump_send() unconditionally here would turn one
+	 * bug into a flood of redundant up-to-384-KiB transfers.
+	 *
+	 * Two bounded guards, belt-and-braces:
+	 *   (a) same-fault latch (cd_last_esr/cd_last_elr): skip if this
+	 *       fault's (esr,elr) is identical to the last one we already
+	 *       streamed a coredump for. An identical repeat of the exact
+	 *       same trap IS the re-fault-storm signature described above,
+	 *       not a new panic — so it costs nothing beyond the guest's own
+	 *       original bug, already an infinite loop by construction.
+	 *   (b) hard per-boot cap (CORE_DUMPS_PER_BOOT, above): defense in
+	 *       depth in case a pathological guest loop varies esr/elr
+	 *       slightly between iterations (e.g. a differing FAR on each
+	 *       pass) and would otherwise slip past guard (a) — mirrors
+	 *       coredump.c's own "everything here is bounded" design
+	 *       (COREDUMP_MAX_TOTAL, per-region caps, bounded TX retries) and
+	 *       flightrec.c's fixed-size-ring philosophy for the sibling
+	 *       post-mortem instrument.
+	 * Both guards are plain function-local statics (.bss): a WDT warm
+	 * reboot clears them, so a genuinely NEW panic in a later boot is
+	 * never held back by a previous boot's cap or latch — the intent is
+	 * "once per genuine panic", not "once ever".
+	 *
+	 * Guest faults only: (kind>>2)==2u is the lower-EL (guest) group,
+	 * exactly the same test g_last_guest_frame's snapshot above uses. Our
+	 * own EL2-level sync self-faults (e.g. the deliberate brk self-test)
+	 * advance ELR and return at the bottom of this function instead of
+	 * looping, so they were never the flood risk and aren't "guest
+	 * panics" this milestone is about. */
+	if ((kind >> 2) == 2u) {
+		static uint32_t cd_dumps_sent;
+		static uint64_t cd_last_esr = ~0ULL;
+		static uint64_t cd_last_elr = ~0ULL;
+
+		if (cd_dumps_sent < CORE_DUMPS_PER_BOOT &&
+		    (frame->esr != cd_last_esr || frame->elr != cd_last_elr)) {
+			cd_last_esr = frame->esr;
+			cd_last_elr = frame->elr;
+			cd_dumps_sent++;
+			coredump_send(frame, (uint64_t *)0, 0);
+		}
 	}
 
 	/* B4 flight recorder: one event per recorded fault into the FLTR ring
