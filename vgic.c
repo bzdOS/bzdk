@@ -50,6 +50,7 @@
 #include <stdint.h>
 #include "vgic.h"
 #include "guest.h"   /* guest_config(), guest_enter() for the self-test */
+#include "flightrec.h"  /* B4: flightrec_log(FLTR_K_IRQ, ...) on every injected LR */
 
 /* ================================================================
  *  GICH — hypervisor control interface register block (0x01c84000).
@@ -252,6 +253,10 @@ void vgic_inject(uint32_t vintid, int priority)
 			vg_bc(5, vg_inject_ok);
 			vg_bc(7, lr);
 			vg_bc(8, elrsr);
+			/* B4 flight recorder: one event per IRQ actually landed in a
+			 * List Register — a0=vintid, a1=the LR word written (priority +
+			 * state folded in, cheaper than a second arg). */
+			flightrec_log(FLTR_K_IRQ, vintid, lr);
 			return;
 		}
 	}
@@ -550,6 +555,8 @@ void vgic_inject_hw(uint32_t vintid, uint32_t pintid, int priority)
 			vg_bc(5, vg_inject_ok);
 			vg_bc(7, lr);
 			vg_bc(8, elrsr);
+			/* B4 flight recorder: a0=vintid(==pintid for HW mode), a1=LR word. */
+			flightrec_log(FLTR_K_IRQ, vintid, lr);
 			return;
 		}
 	}

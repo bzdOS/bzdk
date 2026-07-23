@@ -111,6 +111,7 @@
 #include <stdint.h>
 #include "vnet_emac.h"
 #include "emac.h"           /* emac_send_frame() */
+#include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO, ...) on QueueNotify */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -666,6 +667,10 @@ int vnet_mmio_fault(struct el2_frame *frame)
 	if (wnr) {
 		uint64_t val = (srt == SRT_XZR) ? 0 : frame->x[srt];
 		vnet_reg_write(&g_net, off, (uint32_t)val);
+		/* B4 flight recorder: log only the kick (QueueNotify), not every
+		 * register write — a0=off, a1=val (queue index notified). */
+		if (off == VNET_R_QUEUE_NOTIFY)
+			flightrec_log(FLTR_K_VIRTIO, off, val);
 	} else {
 		uint32_t val = vnet_reg_read(&g_net, off);
 		if (srt != SRT_XZR)
