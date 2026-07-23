@@ -404,6 +404,31 @@ void smp_heartbeat(uint32_t cpu, int current_task)
 }
 
 /* ------------------------------------------------------------------ *
+ * CPU2 async eMMC I/O offload hook (ROADMAP C2 — see vblk_async.h for the
+ * full design). WEAK default: a plain WFI park, byte-for-byte the old
+ * "unused secondary" behaviour this replaces. vblk_async.c (linked ONLY
+ * into the dbg build's DBG_OBJS) provides a STRONG override that actually
+ * runs the mailbox-draining loop; every other Makefile target
+ * (stage0/net/repl/fbsd/gdb) does not link vblk_async.o and keeps this weak
+ * park unchanged — the dispatch in smp_secondary_main() below therefore
+ * never changes behaviour for those targets. (Several of those targets
+ * already fail to link today for unrelated pre-existing reasons — missing
+ * musb.o/dbgmon.o/etc. this file's OTHER calls also depend on — so this is
+ * not a new fragility, just consistent with how the rest of smp.c already
+ * has build-specific dependencies.)
+ *
+ * NOTE: linking vblk_async.o alone does not make the mailbox producer side
+ * (vblk_emmc.c's vblk_async_post()) active — that additionally requires
+ * g_vblk_async_ready, which THIS function sets, on the same "who's actually
+ * running" logic. See vblk_async.h / vblk_emmc.h for why there must not be
+ * an independent toggle for one half without the other. */
+__attribute__((weak)) void vblk_async_cpu2_run(void)
+{
+	for (;;)
+		__asm__ volatile("wfi" ::: "memory");
+}
+
+/* ------------------------------------------------------------------ *
  * Secondary C entry — MMU already ON and coherent (set up in start.S).
  * ------------------------------------------------------------------ */
 void smp_secondary_main(uint64_t cpuid)
@@ -493,9 +518,22 @@ void smp_secondary_main(uint64_t cpuid)
 		}
 	}
 
-	/* Other secondaries (2,3): unused for now — park in WFI, out of the way.
-	 * (The per-core preemptive-tick/sched path is intentionally NOT started;
-	 * it's untested and only adds risk to the guest bring-up.) */
+	/* ---- CPU2 = ROADMAP C2 async eMMC I/O offload core -------------------
+	 * See vblk_async.h for the full design. Weak/strong linkage (above):
+	 * a plain WFI park unless vblk_async.o is linked in (dbg build only),
+	 * in which case this call runs the mailbox-draining loop and never
+	 * returns. */
+	if (cpu == 2) {
+		vblk_async_cpu2_run();
+		/* NOTREACHED — both the weak and strong definitions loop forever —
+		 * but fall through to the shared park below defensively in case
+		 * that invariant is ever broken by a future change. */
+	}
+
+	/* CPU3 (and CPU2 defensively, see above): unused for now — park in WFI,
+	 * out of the way. (The per-core preemptive-tick/sched path is
+	 * intentionally NOT started; it's untested and only adds risk to the
+	 * guest bring-up.) */
 	for (;;)
 		__asm__ volatile("wfi" ::: "memory");
 }

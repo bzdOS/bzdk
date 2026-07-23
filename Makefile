@@ -122,7 +122,7 @@ dbg: $(DBG_BIN)
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o smp.o firstfault.o onebp.o vgic.o \
-            musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o el2_ncmap.o snapshot.o flightrec.o coredump.o
+            musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o el2_ncmap.o snapshot.o flightrec.o coredump.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
