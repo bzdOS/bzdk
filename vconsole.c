@@ -14,6 +14,7 @@
 #include "stage2.h"     /* UART0_BASE, UART0_SIZE */
 #include "exceptions.h" /* struct el2_frame */
 #include "wdt.h"        /* wdt_note_progress() — feed the dead-man's switch */
+#include "flightrec.h"  /* B4: flightrec_log(FLTR_K_CONSOLE, ...) per byte */
 
 /* ------------------------------------------------------------------ *
  * A64 UART0 (8250/16550-compatible) register byte offsets from
@@ -93,6 +94,12 @@ vconsole_rx_push(uint8_t c)
 	__asm__ volatile("dsb sy" ::: "memory");
 	VC_RX_HEAD = n;
 	__asm__ volatile("dsb sy" ::: "memory");
+
+	/* B4 flight recorder: a captured console byte, direction RX (host ->
+	 * guest, i.e. an operator keystroke injected over the USB-ACM bridge).
+	 * Low volume (human typing speed) so this never competes with fault/IRQ
+	 * events for ring space. a1=1 marks the direction for the host decoder. */
+	flightrec_log(FLTR_K_CONSOLE, c, 1);
 }
 
 /* ------------------------------------------------------------------ *
@@ -300,6 +307,19 @@ vconsole_capture_byte(uint8_t c)
 	uint32_t off = total % VCONSOLE_BUF_SIZE;
 	vc_store_byte(off, c);
 	vc_store32(1, total + 1);
+
+	/* B4 flight recorder: a captured console byte, direction TX (guest ->
+	 * host, i.e. the guest's own printf/tty output). a1=0 marks the
+	 * direction. NOTE deliberate tradeoff: during a verbose boot this is by
+	 * far the highest-frequency flightrec_log() caller and can dominate the
+	 * 2048-slot ring, but that's the intended behavior, not overflow: the
+	 * 64 KiB VCONSOLE_RING_BASE capture ring above already retains the full
+	 * text separately, so flightrec's unique value here is INTERLEAVING the
+	 * last console bytes with faults/IRQs/virtio ops in one time-ordered
+	 * ring -- if the last ~2048 events before a crash are all console
+	 * bytes, that itself is the finding (crashed mid-boot-spew, not
+	 * mid-virtio-op). */
+	flightrec_log(FLTR_K_CONSOLE, c, 0);
 
 	/* Tee the same byte to the USB-ACM bridge's TX ring (see above) so the
 	 * CPU1 debug core can push it out the gadget's bulk-IN endpoint. This

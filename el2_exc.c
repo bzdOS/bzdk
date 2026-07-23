@@ -328,6 +328,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			r[0] = idx;
 			r[1u + ((idx - 1u) & 0xFu)] = (uint32_t)fnid;
 			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
+			/* B4 flight recorder: every guest PSCI SMC, interleaved with
+			 * the fault/IRQ/virtio/console timeline — a0=fnid, a1=ELR (the
+			 * guest PC that issued the SMC). The bespoke ring above
+			 * (0x50000200) already keeps a PSCI-only history; this call
+			 * additionally places the event on the shared generic
+			 * timeline so a post-mortem can see e.g. "PSCI SYSTEM_RESET
+			 * right before/after this fault", not PSCI in isolation. */
+			flightrec_log(FLTR_K_TRAP, fnid, frame->elr);
 			/* SYSTEM_OFF (0x84000008): operator-initiated clean poweroff.
 			 * The rc shutdown path has already synced + unmounted (fs_clean
 			 * is 1 on disk), so honor it with a CLEAN warm reset to U-Boot —

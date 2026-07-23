@@ -31,6 +31,7 @@
 #include "vblk_emmc.h"
 #include "emmc_bio.h"       /* emmc_bio_init / emmc_bio_read / emmc_bio_write */
 #include "wdt.h"            /* wdt_note_progress / wdt_pet — keep the HW WDOG fed */
+#include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO/FLTR_K_IRQ, ...) */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -335,6 +336,12 @@ static void vblk_inject_irq(void)
 
 	g_irqs++;
 	vblk_bc(10, g_irqs);
+
+	/* B4 flight recorder: one event per virtio-blk completion IRQ raised —
+	 * covers both callers (vblk_kick's synchronous path and
+	 * vblk_async_poll's CPU2 completion path). a0=intid, a1=running count
+	 * (cheap way to see gaps/storms in the timeline without a 2nd lookup). */
+	flightrec_log(FLTR_K_IRQ, intid, g_irqs);
 }
 
 /* ------------------------------------------------------------------ *
@@ -795,6 +802,13 @@ static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 		if (vblk_request(d, head))
 			served = 1;
 	}
+
+	/* B4 flight recorder: one event per QueueNotify (the guest's virtio-blk
+	 * "kick") — a0=qidx, a1=served (1 if anything completed synchronously
+	 * within this call, 0 if every request went to CPU2's async mailbox or
+	 * the queue was empty). This is the dispatch entry, not the per-byte PIO
+	 * loop (serve_data()), so cost is one log call per kick, not per sector. */
+	flightrec_log(FLTR_K_VIRTIO, qidx, (uint64_t)served);
 
 	if (served) {
 		d->int_status |= VBLK_INT_VRING;
