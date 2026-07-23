@@ -40,7 +40,7 @@ GDB_BIN    := microkernel-gdb.bin
 HDMI_ELF   := microkernel-hdmi.elf
 HDMI_BIN   := microkernel-hdmi.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi clean test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi qemu clean clean-qemu test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -151,6 +151,39 @@ $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(SIZE) $@
 $(FBSD_BIN): $(FBSD_ELF)
 	$(OBJCOPY) -O binary $< $@
+
+# --- QEMU `virt`-machine CI target (ROADMAP.md T3) ----------------------
+# A second, portable target that needs no physical board: proves the CORE
+# hypervisor logic (stage-2 identity mapping, guest EL1 entry, GICv2
+# timer/IRQ handling, a serial console) under `qemu-system-aarch64 -M virt`.
+# See docs/qemu-ci.md for the full invocation + what a passing/failing run
+# looks like.
+#
+# NEW, SEPARATE object list/target/linker script — does NOT reuse or alter
+# link.ld, DBG_OBJS/GDB_OBJS/REPL_OBJS/FBSD_OBJS, or any of their targets.
+# Reuses stage2.c/.h, guest.c/.h, exceptions.S/.h and timer.c/.h from the
+# real-board build completely UNCHANGED (see main_qemu.c's banner for why
+# that's possible); only the board-specific bits (entry/stack setup, GIC
+# base addresses, the UART, and a minimal EL2 trap dispatch + EL1 payload
+# in place of the full board debugger) are QEMU-specific NEW files.
+#
+# NOTE: this target intentionally does NOT use $(CFLAGS)/$(LDFLAGS)/link.ld
+# above (different link address/layout — see link_qemu.ld) but DOES reuse
+# the same freestanding compiler flags, just with its own linker script.
+QEMU_ELF  := microkernel-qemu.elf
+QEMU_OBJS := start_qemu.o main_qemu.o exceptions.o guest.o stage2.o timer.o \
+             gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o libmin.o
+LDFLAGS_QEMU := -nostdlib -static -no-pie -Wl,--build-id=none -T link_qemu.ld
+
+qemu: $(QEMU_ELF)
+
+$(QEMU_ELF): $(QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(QEMU_OBJS)
+	$(SIZE) $@
+
+clean-qemu:
+	rm -f start_qemu.o main_qemu.o gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o \
+	      $(QEMU_ELF)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
