@@ -39,8 +39,10 @@ GDB_ELF    := microkernel-gdb.elf
 GDB_BIN    := microkernel-gdb.bin
 HDMI_ELF   := microkernel-hdmi.elf
 HDMI_BIN   := microkernel-hdmi.bin
+ZEPHYR_ELF := microkernel-zephyr.elf
+ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi qemu clean clean-qemu test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr qemu clean clean-qemu test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -150,6 +152,23 @@ $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(FBSD_OBJS)
 	$(SIZE) $@
 $(FBSD_BIN): $(FBSD_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+# --- Zephyr guest-boot build: same skeleton as `fbsd` (see main_zephyr.c's
+# header comment for exactly what differs and why). NEW target — does not
+# touch/replace `fbsd`. The Zephyr RTOS image itself (zephyr.elf, built out
+# of tree from zephyr-guest/) is NOT part of this object list and is not
+# linked into this binary — it is a separate artifact this firmware loads
+# and jumps into at runtime, exactly like main_fbsd.c does for the FreeBSD
+# kernel ELF. ---
+zephyr: $(ZEPHYR_BIN)
+
+ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o firstfault.o onebp.o
+$(ZEPHYR_ELF): $(ZEPHYR_OBJS) link.ld
+	$(CC) $(LDFLAGS) -o $@ $(ZEPHYR_OBJS)
+	$(SIZE) $@
+$(ZEPHYR_BIN): $(ZEPHYR_ELF)
 	$(OBJCOPY) -O binary $< $@
 
 # --- QEMU `virt`-machine CI target (ROADMAP.md T3) ----------------------
