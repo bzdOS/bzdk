@@ -32,6 +32,7 @@
 #include "vgic.h"
 #include "vblk_emmc.h"
 #include "vblk_async.h"
+#include "vnet_emac.h"   /* ROADMAP C1: virtio-net multiplexed onto this EMAC */
 #include "el2_ncmap.h"
 
 /* bmc.c — software-BMC management plane. Extern decl only (bmc.h pulls in
@@ -112,6 +113,20 @@ int main(void)
 	 * emmc_bio_init() leaves the controller in a state the guest's aw_mmc
 	 * can't re-enumerate from (no mmcsd0). */
 	vblk_init();
+
+	/* virtio-net multiplexed onto this same EMAC (ROADMAP C1 — see
+	 * vnet_emac.h). Registers the modern virtio-mmio device at 0x0A001000,
+	 * inside vblk's already-trapped 2 MiB stage-2 block (no stage2.c change
+	 * needed). Must run before stage2_init()/stage2_enable() below, same as
+	 * vblk_init() above. Always "succeeds" (rides on emac_init(), already up
+	 * a few lines above) — see vnet_init()'s own doc comment. TX (guest ->
+	 * wire) drops ethertype 0x88B5 (our own debug protocol) so the guest can
+	 * never spoof the HV's control channel; RX (wire -> guest) is fed by
+	 * emac.c's RX demux via vnet_emac_rx_frame() (weak no-op there when this
+	 * object isn't linked in). Cross-core TX safety vs the CPU1 debug core's
+	 * own EMAC console traffic is provided by emac.c's EMAC_TX_LOCK_PA
+	 * (see the "TX CROSS-CORE MUTUAL EXCLUSION" block in emac.c). */
+	vnet_init();
 
 	/* USB-OTG CDC-ACM interactive console bridge (usbacm.c): brings up the
 	 * MUSB gadget (musb_init()) so the CPU1 debug core's usbacm_poll()
