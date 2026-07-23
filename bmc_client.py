@@ -11,6 +11,7 @@ for free. Every subcommand sends a `bmc <verb> ...` line and renders the reply.
     ./bmc_client.py health                 # structured status record
     ./bmc_client.py health --raw           # parse the BMC1 breadcrumb directly
     ./bmc_client.py temp
+    ./bmc_client.py battery                # AXP803 VBAT/IBAT/charge status (RSB)
     ./bmc_client.py flags                  # list debug flags
     ./bmc_client.py flag usbacm 0          # (auto-arms) set a debug flag
     ./bmc_client.py console                # dump the guest console capture ring
@@ -36,17 +37,25 @@ BMC_HEALTH_MAGIC = 0x424D4331  # "BMC1"
 
 # struct bmc_health field order (must match bmc.h). Names only; each is one
 # 32-bit word except the lo/hi pairs which we recombine below.
+# v1.1 appends AXP803 battery telemetry (vbat_mv..axp_ok) — these fill what
+# was reserved padding in v1.0, so a v1.0-only board just reads zeros here.
 HEALTH_WORDS = [
     "magic", "version", "uptime_lo", "uptime_hi", "tick_lo", "tick_hi",
     "tick_delta", "exc_count", "last_exc_kind", "last_exc_esr",
     "guest_pc_lo", "guest_pc_hi", "online_map",
     "hb_cpu0", "hb_cpu1", "hb_cpu2", "hb_cpu3",
     "cons_bytes", "cons_faults", "temp_mc", "flags", "wdt_hold", "ffv_count",
+    "vbat_mv", "ichg_ma", "idischg_ma", "batt_ts_mv", "batt_status", "axp_ok",
 ]
 
 FLAG_BITS = [
     ("usbacm", 0), ("core_enable", 1), ("cpu1_wdog", 2),
     ("isolate_noemac", 3), ("no_guest", 4), ("block_reset", 5),
+]
+
+# BMC_BATT_* bits (axp803.h) — decoded from health["batt_status"].
+BATT_STATUS_BITS = [
+    ("present", 0), ("charging", 1), ("vbus", 2), ("die_hot", 3), ("chip_ok", 4),
 ]
 
 
@@ -83,10 +92,15 @@ class BMC(HV):
         d["ticks"] = (d["tick_hi"] << 32) | d["tick_lo"]
         d["guest_pc"] = (d["guest_pc_hi"] << 32) | d["guest_pc_lo"]
         d["flag_names"] = [n for (n, b) in FLAG_BITS if d["flags"] & (1 << b)]
+        d["batt_status_names"] = [n for (n, b) in BATT_STATUS_BITS
+                                   if d["batt_status"] & (1 << b)]
         return d
 
     def temp(self):
         return self.bmc("temp", 2)
+
+    def battery(self):
+        return self.bmc("battery", 2)
 
     def flags(self):
         return self.bmc("flags", 2)
@@ -136,6 +150,12 @@ def print_health(d):
     print(f"  temperature {'n/a' if t == 0 else f'{t/1000:.1f} C'}")
     print(f"  flags       0x{d['flags']:x}  {d['flag_names']}")
     print(f"  wdt_hold    {d['wdt_hold']}")
+    if d.get("axp_ok"):
+        print(f"  battery     vbat={d['vbat_mv']}mV  ichg={d['ichg_ma']}mA  "
+              f"idischg={d['idischg_ma']}mA  ts={d['batt_ts_mv']}mV(raw, not calibrated)  "
+              f"{d['batt_status_names']}")
+    else:
+        print("  battery     no AXP803 detected (RSB probe failed or absent)")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -148,6 +168,7 @@ def main(argv):
     h.add_argument("--raw", action="store_true",
                    help="decode the BMC1 breadcrumb directly (memory read)")
     sub.add_parser("temp", help="SoC temperature")
+    sub.add_parser("battery", help="AXP803 battery telemetry (VBAT/IBAT/status)")
     sub.add_parser("flags", help="list debug flags")
     f = sub.add_parser("flag", help="set a debug flag (auto-arms)")
     f.add_argument("name"); f.add_argument("value", type=int)
@@ -173,6 +194,8 @@ def main(argv):
                 print(bmc.health_text())
         elif args.cmd == "temp":
             print(bmc.temp())
+        elif args.cmd == "battery":
+            print(bmc.battery())
         elif args.cmd == "flags":
             print(bmc.flags())
         elif args.cmd == "flag":
