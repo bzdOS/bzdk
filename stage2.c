@@ -351,12 +351,100 @@ static uint64_t stage2_l3_vec[STAGE2_L3_ENTRIES]
  * DRAM block. */
 static void stage2_tlb_flush(void);
 
+/* ------------------------------------------------------------------ *
+ * A1 — guest/HV DRAM partitioning (ROADMAP milestone A1: "static
+ * partitioning à la Jailhouse" — no IMO=1/vGIC, just carve the HV's own
+ * memory out of the guest's identity map so a guest write there takes a
+ * stage-2 fault instead of silently corrupting the hypervisor).
+ *
+ * The two excluded windows below are NOT invented here — they mirror the
+ * `reserved-memory` node this exact DTB (bananapi-min.dtb) already declares
+ * (`hv-image@42000000` / `hv-scratch@50000000`, both `no-map`), which is
+ * what already keeps a WELL-BEHAVED guest's own allocator off these ranges.
+ * This code is what turns that convention into a hard boundary: a guest
+ * that ignores/doesn't know about the DTB reservation (or is compromised)
+ * gets a stage-2 translation fault instead of write access.
+ *
+ *   hv-image    0x42000000, 1 MiB reserved in the DTB, current actual image
+ *               (.text+.data+.bss) is ~265 KiB (see `make dbg`'s own `size`
+ *               output) — rounding UP to one whole 2 MiB L2 block (index 16
+ *               within stage2_l2_dram[]) costs nothing and avoids an L3
+ *               sub-split for a non-2MiB-aligned size; still >3x the DTB's
+ *               own declared margin over the real image.
+ *   hv-scratch  0x50000000, exactly 2 MiB in the DTB (index 128) — the
+ *               breadcrumb/scratch DRAM windows used throughout the tree
+ *               (STG2 0x50000c00, BMC 0x50000f00+, VBK 0x50020000, EBIO
+ *               0x50020200, SD 0x50020500, flightrec "FLTR" 0x50012000, …)
+ *               all sit inside this single 2 MiB window, which is why the
+ *               DTB sized it exactly one L2 block.
+ *
+ * Both windows are read/written ONLY by EL2 code (the hypervisor's own
+ * functions, plus CPU1's dedicated debug core, which per smp.c's design
+ * never enters EL1/the guest) — stage-2 translation applies ONLY to
+ * EL1/EL0 (the guest), never to EL2, so excluding these windows from the
+ * guest's stage-2 map cannot break the hypervisor's own access to them.
+ *
+ * SHARES stage2_l2_dram[] WITH stage2_unmap_guest_vector() below (both are
+ * splits of the SAME 1 GiB DRAM block, IPA 0x40000000-0x7FFFFFFF). This
+ * function (called from stage2_init(), i.e. BEFORE the vector-page probe
+ * arms) builds the canonical, fully-populated table; stage2_unmap_guest_
+ * vector() then only overwrites its OWN single entry (index VEC_L2_IDX=52,
+ * disjoint from HVIMG_L2_IDX=16 and HVSCR_L2_IDX=128) rather than rebuilding
+ * from scratch — see that function's own comment for why. */
+#define HVIMG_BASE      0x42000000UL   /* DTB reserved-memory hv-image@... */
+#define HVSCR_BASE      0x50000000UL   /* DTB reserved-memory hv-scratch@..*/
+
+#define HVIMG_L2_IDX  ((unsigned)((HVIMG_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
+#define HVSCR_L2_IDX  ((unsigned)((HVSCR_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
+
+/* Build the level-2 DRAM table for the 1 GiB block starting at `block_base`
+ * into stage2_l2_dram[]: identity Normal-WB executable 2 MiB blocks
+ * everywhere, EXCEPT the hv-image/hv-scratch entries, left INVALID
+ * (all-zero). Only called for the DRAM block that actually contains those
+ * windows (see stage2_dram_block_needs_split()) — a block with neither
+ * stays the simple flat 1 GiB descriptor, unchanged from before this
+ * milestone. Returns stage2_l2_dram[]'s PA for the caller to install. */
+static uint64_t
+stage2_build_dram_table(uint64_t block_base)
+{
+	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
+		if (block_base == STAGE2_DRAM_BASE &&
+		    (i == HVIMG_L2_IDX || i == HVSCR_L2_IDX)) {
+			stage2_l2_dram[i] = 0;   /* INVALID: HV image or HV scratch */
+			continue;
+		}
+		uint64_t pa = block_base + (uint64_t)i * STAGE2_L2_BLOCK_SIZE;
+		stage2_l2_dram[i] = stage2_l2_block_desc(pa,
+			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+	}
+	return (uint64_t)(uintptr_t)&stage2_l2_dram[0];
+}
+
+/* Does the 1 GiB block at `block_base` contain either excluded window?
+ * Both windows are known to fit inside a single 1 GiB block each (their L2
+ * indices above are computed relative to STAGE2_DRAM_BASE specifically),
+ * so this is only ever true for the block starting at STAGE2_DRAM_BASE
+ * itself today; written as a real range check (not a hardcoded block
+ * index) so it stays correct if STAGE2_DRAM_SIZE grows to cover more
+ * blocks later. */
+static int
+stage2_dram_block_needs_split(uint64_t block_base)
+{
+	uint64_t block_end = block_base + STAGE2_BLOCK_SIZE;
+	if (HVIMG_BASE >= block_base && HVIMG_BASE < block_end)
+		return 1;
+	if (HVSCR_BASE >= block_base && HVSCR_BASE < block_end)
+		return 1;
+	return 0;
+}
+
 void
 stage2_unmap_guest_vector(void)
 {
 	/* Base of the 2 MiB block that holds the vector page (its level-3
-	 * table's coverage), and base of the whole 1 GiB block (the level-2
-	 * table's coverage). */
+	 * table's coverage), and base of the whole 1 GiB block (only used to
+	 * compute l2_block_base below — the level-2 table itself is NOT
+	 * rebuilt here, see the comment above stage2_build_dram_table()). */
 	uint64_t l1_block_base = (uint64_t)VEC_L1_IDX << STAGE2_BLOCK_SHIFT;
 	uint64_t l2_block_base = l1_block_base +
 		((uint64_t)VEC_L2_IDX << STAGE2_L2_BLOCK_SHIFT);
@@ -373,25 +461,23 @@ stage2_unmap_guest_vector(void)
 			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
 	}
 
-	/* Level-2: identity Normal-WB executable 2 MiB blocks across the 1 GiB
-	 * block, EXCEPT the block holding the vector page (a TABLE down to the
-	 * level-3 table above). */
-	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
-		if (i == VEC_L2_IDX) {
-			uint64_t l3_pa = (uint64_t)(uintptr_t)&stage2_l3_vec[0];
-			stage2_l2_dram[i] = stage2_table_desc(l3_pa);
-			continue;
-		}
-		uint64_t pa = l1_block_base + (uint64_t)i * STAGE2_L2_BLOCK_SIZE;
-		stage2_l2_dram[i] = stage2_l2_block_desc(pa,
-			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
-	}
+	/* A1 NOTE: stage2_l2_dram[] was already fully built by stage2_init()
+	 * (via stage2_build_dram_table(), called because this 1 GiB block
+	 * contains hv-image/hv-scratch) BEFORE this function ever runs — see
+	 * its own comment above. Replacing all 512 entries here, as an
+	 * earlier version of this function did, would silently re-identity-map
+	 * (and thus un-protect) the HVIMG_L2_IDX/HVSCR_L2_IDX exclusions. Only
+	 * this ONE entry (VEC_L2_IDX=52, disjoint from both) is touched. */
+	stage2_l2_dram[VEC_L2_IDX] =
+		stage2_table_desc((uint64_t)(uintptr_t)&stage2_l3_vec[0]);
 
-	/* Replace the 1 GiB DRAM block descriptor with a TABLE down to the
-	 * level-2 table, then flush the combined stage-1+2 TLB so the walker
-	 * picks up the new topology before the guest runs. */
-	stage2_l1[0][VEC_L1_IDX] =
-		stage2_table_desc((uint64_t)(uintptr_t)&stage2_l2_dram[0]);
+	/* stage2_l1[0][VEC_L1_IDX] already points at stage2_l2_dram[] — that
+	 * install happened in stage2_init() (either as a table descriptor, if
+	 * this block needed the A1 split, or — see stage2_dram_block_needs_
+	 * split() — this function is only ever armed on the block that DOES
+	 * need it, since GUEST_VECTOR_IPA and HVIMG_BASE/HVSCR_BASE all sit in
+	 * the same 1 GiB span today). Just flush the combined stage-1+2 TLB so
+	 * the walker picks up the level-3 split before the guest runs. */
 	stage2_tlb_flush();
 }
 
@@ -584,14 +670,25 @@ stage2_init(void)
 	/* Index 1..N: DRAM as contiguous 1 GiB Normal WB blocks, XN=0
 	 * (guest code lives here and must be executable). N is derived
 	 * from STAGE2_DRAM_SIZE so bumping that one #define is enough to
-	 * map more RAM later. */
+	 * map more RAM later.
+	 *
+	 * A1: a block that overlaps the hv-image or hv-scratch DTB-reserved
+	 * windows gets a TABLE descriptor down to a level-2 table (built by
+	 * stage2_build_dram_table(), with those two windows left INVALID)
+	 * instead of a single flat BLOCK — every other block is unaffected,
+	 * identical to before this milestone. */
 	{
 		unsigned nblocks = (unsigned)(STAGE2_DRAM_SIZE / STAGE2_BLOCK_SIZE);
 		unsigned base_idx = (unsigned)(STAGE2_DRAM_BASE >> STAGE2_BLOCK_SHIFT);
 		for (unsigned b = 0; b < nblocks; b++) {
 			uint64_t pa = STAGE2_DRAM_BASE + (uint64_t)b * STAGE2_BLOCK_SIZE;
-			stage2_l1[0][base_idx + b] = stage2_block_desc(pa,
-				S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+			if (stage2_dram_block_needs_split(pa)) {
+				uint64_t l2_pa = stage2_build_dram_table(pa);
+				stage2_l1[0][base_idx + b] = stage2_table_desc(l2_pa);
+			} else {
+				stage2_l1[0][base_idx + b] = stage2_block_desc(pa,
+					S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+			}
 			ndesc++;
 		}
 	}
@@ -623,17 +720,41 @@ stage2_init(void)
 	/* Self-check: walk our own top-level table in software for
 	 * STAGE2_SELFTEST_IPA and confirm it decodes back to the same PA
 	 * (i.e. the identity property actually holds for the descriptor we
-	 * built, independent of whether the MMU hardware agrees). */
+	 * built, independent of whether the MMU hardware agrees).
+	 *
+	 * A1 UPDATE: the level-1 DRAM entry can now be EITHER a plain 1 GiB
+	 * BLOCK (bits[1:0]=0b01) or, for a block containing an excluded window
+	 * (see stage2_dram_block_needs_split()), a TABLE (bits[1:0]=0b11) down
+	 * to stage2_l2_dram[]. Both descriptor-type bits must be checked
+	 * (desc & 0x3, not the old single-bit S2_DESC_VALID_BLOCK mask, which
+	 * only tested bit0 — true for both a block AND a table descriptor, so
+	 * it would have silently mis-resolved a table's address as if it were
+	 * a 1 GiB-aligned block base). The table case walks one more level
+	 * into stage2_l2_dram[] to find the actual leaf. STAGE2_SELFTEST_IPA
+	 * is chosen (see stage2.h) to land on a plain L2 block entry in that
+	 * table, never one of the excluded/further-split indices. */
 	{
 		unsigned idx = (unsigned)(STAGE2_SELFTEST_IPA >> STAGE2_BLOCK_SHIFT);
 		uint64_t desc = stage2_l1[0][idx];
 		uint32_t pass = 0;
-		if ((desc & S2_DESC_VALID_BLOCK) == S2_DESC_VALID_BLOCK) {
+		uint64_t desc_type = desc & 0x3ull;
+		if (desc_type == S2_DESC_VALID_BLOCK) {
 			uint64_t block_pa = desc & STAGE2_BLOCK_ADDR_MASK;
 			uint64_t offset = STAGE2_SELFTEST_IPA & (STAGE2_BLOCK_SIZE - 1u);
-			uint64_t resolved_pa = block_pa | offset;
-			if (resolved_pa == STAGE2_SELFTEST_IPA)
+			if ((block_pa | offset) == STAGE2_SELFTEST_IPA)
 				pass = 1;
+		} else if (desc_type == S2_DESC_VALID_TABLE) {
+			uint64_t l2_table_pa = desc & STAGE2_TABLE_ADDR_MASK;
+			const uint64_t *l2 = (const uint64_t *)(uintptr_t)l2_table_pa;
+			unsigned l2_idx = (unsigned)((STAGE2_SELFTEST_IPA >> STAGE2_L2_BLOCK_SHIFT)
+				% STAGE2_L2_ENTRIES);
+			uint64_t l2_desc = l2[l2_idx];
+			if ((l2_desc & 0x3ull) == S2_DESC_VALID_BLOCK) {
+				uint64_t block_pa = l2_desc & STAGE2_L2_ADDR_MASK;
+				uint64_t offset = STAGE2_SELFTEST_IPA & (STAGE2_L2_BLOCK_SIZE - 1u);
+				if ((block_pa | offset) == STAGE2_SELFTEST_IPA)
+					pass = 1;
+			}
 		}
 		stg2_bc(STG2_SELFCHECK_IDX, pass);
 	}

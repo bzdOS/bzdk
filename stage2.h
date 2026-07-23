@@ -142,8 +142,14 @@ void stage2_unmap_guest_vector(void);
 void stage2_map_guest_vector(void);
 
 /* IPA address used by the self-check: must land inside the DRAM region
- * above for the check to be meaningful (0x42000000 is 32 MiB into DRAM). */
-#define STAGE2_SELFTEST_IPA 0x42000000UL
+ * above, AND (since A1's HVIMG_L2_IDX/HVSCR_L2_IDX exclusions and the
+ * first-fault VEC_L2_IDX split all live in the same 1 GiB DRAM block, see
+ * stage2.c) on a PLAIN, un-excluded, un-split 2 MiB entry within it — not
+ * 0x42000000 (that IS the hv-image exclusion's base address, now
+ * deliberately unmapped). 0x60000000 is 512 MiB into the 1 GiB DRAM span,
+ * clear of hv-image (0x42000000-0x421fffff), the guest vector-page split
+ * (0x46800000-0x469fffff) and hv-scratch (0x50000000-0x501fffff). */
+#define STAGE2_SELFTEST_IPA 0x60000000UL
 
 /* Program VTCR_EL2 + build/fill the stage-2 identity tables + program
  * VTTBR_EL2 (VMID 0). Does NOT touch HCR_EL2.VM — stage-2 translation is
