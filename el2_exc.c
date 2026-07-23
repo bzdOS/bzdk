@@ -453,8 +453,23 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	}
 
 	/* Synchronous / SError: record the fault for post-mortem. HPFAR_EL2 holds
-	 * the faulting guest IPA (bits[39:4]<<4) on a stage-2 fault — the key datum
-	 * for "where did the FreeBSD guest touch unmapped memory". */
+	 * the faulting guest IPA on a stage-2 fault — the key datum for "where
+	 * did the FreeBSD guest touch unmapped memory".
+	 *
+	 * BUG FIX (2026-07-23, found live while investigating the first-ever
+	 * userland-transition fault storm past vtbd0p3): HPFAR_EL2 bits[39:4]
+	 * hold FIPA[47:12] (the faulting IPA's page-frame-number, i.e. the
+	 * field sits at bit position 4 of the register but represents address
+	 * bit position 12) — reconstructing the real address needs a NET left
+	 * shift of 8 from the register value with its low 4 reserved bits
+	 * masked off (equivalently: extract the field with >>4, then place it
+	 * at bits[47:12] with <<12, netting <<8 against the masked raw value).
+	 * This matches the standard KVM/Linux idiom `(hpfar & mask) << 8`. The
+	 * previous `<< 4` here computed an IPA exactly 16x (one hex digit) too
+	 * small, silently mis-locating every stage-2-fault diagnostic this
+	 * breadcrumb ever reported. Confirmed by manually walking the guest's
+	 * own stage-1 tables (TTBR1_EL1) for a live repro and finding the true
+	 * faulting page's PA matched the OLD field's value << 4 exactly. */
 	{
 		uint64_t hpfar;
 		__asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
@@ -469,8 +484,32 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		exc_bc(8, (uint32_t)frame->x[0]);
 		exc_bc(9, (uint32_t)frame->x[1]);
 		exc_bc(10, (uint32_t)frame->x[30]);
-		exc_bc(11, (uint32_t)((hpfar & 0xFFFFFFFFF0ULL) << 4)); /* IPA low */
-		exc_bc(12, (uint32_t)(((hpfar & 0xFFFFFFFFF0ULL) << 4) >> 32));
+		exc_bc(11, (uint32_t)((hpfar & 0xFFFFFFFFF0ULL) << 8)); /* IPA low */
+		exc_bc(12, (uint32_t)(((hpfar & 0xFFFFFFFFF0ULL) << 8) >> 32));
+
+		/* AD-HOC diagnostic capture (2026-07-23, first-ever userland-
+		 * transition fault storm investigation): the guest's own EL1 MMU
+		 * config at fault time. These are CPU0's OWN banked EL1 registers
+		 * (this code runs ON the faulting core, CPU0, in response to ITS
+		 * OWN trap -- unlike dbgmon's `sr` command, which is serviced by
+		 * CPU1 and would read CPU1's own, irrelevant, always-zero EL1 bank).
+		 * A trap to EL2 does NOT touch the guest's EL1-banked registers, so
+		 * these are genuinely the guest's live page-table-walk config at
+		 * the moment of this specific fault. Words 13-18, comfortably
+		 * inside the free 0x50000400-0x500 window (next breadcrumb, jitter/
+		 * TIMR, starts at 0x50000500). */
+		{
+			uint64_t ttbr0, ttbr1, tcr;
+			__asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+			__asm__ volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+			__asm__ volatile("mrs %0, tcr_el1"   : "=r"(tcr));
+			exc_bc(13, (uint32_t)ttbr0);
+			exc_bc(14, (uint32_t)(ttbr0 >> 32));
+			exc_bc(15, (uint32_t)ttbr1);
+			exc_bc(16, (uint32_t)(ttbr1 >> 32));
+			exc_bc(17, (uint32_t)tcr);
+			exc_bc(18, (uint32_t)(tcr >> 32));
+		}
 	}
 
 	/* B3 crash-forensics: capture a frame-pointer backtrace into the BTR1
