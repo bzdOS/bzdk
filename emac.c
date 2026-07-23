@@ -1213,12 +1213,32 @@ void emac_poll(void)
                 snapshot_net_rx_frame(buf + 14, (uint16_t)(length - 14));
                 note_rx_frame();
             } else if (et != ETHERTYPE_CONSOLE && et != ETHERTYPE_NETCON &&
-                       et != ETHERTYPE_SNAPNET && (to_us || bcast)) {
+                       et != ETHERTYPE_SNAPNET) {
                 /* Not our debug protocol, not netcon: ROADMAP C1 hook —
                  * hand the whole frame to the virtio-net-over-EMAC
                  * multiplexer (vnet_emac.c) instead of silently dropping
                  * it. Weak no-op above when vnet_emac.c isn't linked in, so
-                 * every existing image's behavior is unchanged. */
+                 * every existing image's behavior is unchanged.
+                 *
+                 * DELIBERATELY no (to_us || bcast) gate here (2026-07-23,
+                 * found live via tcpdump while chasing why ping never got
+                 * an ARP reply back to the guest): emac_send_frame()'s TX
+                 * path always sources frames from OUR_MAC (see its own
+                 * "MAC IDENTITY NOTE"), but the guest's virtio-net driver's
+                 * OWN protocol payloads (e.g. an ARP request's sender-HA
+                 * field) correctly carry the guest's REAL virtio MAC. Peers
+                 * that learn that MAC from the payload (not from the
+                 * Ethernet source, which is a separate mechanism) address
+                 * their unicast REPLIES to it directly -- a destination our
+                 * hardware never learns to recognize as "us". Since this
+                 * link is a dedicated point-to-point board<->host cable
+                 * (not a busy shared segment), accepting every non-debug-
+                 * protocol frame regardless of destination MAC is safe and
+                 * correct here -- vnet_emac.c's own ethertype/queue checks
+                 * are still the real gate on what it does with a frame.
+                 * This also matches what a future in-guest packet sniffer
+                 * (promiscuous-style capture) needs: frames not addressed
+                 * to the guest's own MAC must still reach it to be seen. */
                 vnet_emac_rx_frame(buf, (uint16_t)length);
                 note_rx_frame();
             }
