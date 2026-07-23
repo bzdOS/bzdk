@@ -117,6 +117,19 @@
 #define  EMAC_RX_CTL1_RX_DMA_EN    (1u << 30)
 #define  EMAC_RX_CTL1_RX_DMA_START (1u << 31)
 #define EMAC_RX_DMA_DESC     0x34
+/* Receive Frame Filter (offset+bit confirmed against Linux mainline
+ * drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c, NOT in U-Boot's
+ * minimal sun8i_emac.c driver, which never touches this register at all
+ * -- explaining why the hardware's default (address-filtered, RXALL=0)
+ * behavior was never noticed before ROADMAP C1: every prior use of this
+ * EMAC (debug protocol, netcon, snapshot-net) only ever needed frames
+ * addressed to OUR_MAC, which the default filter already passes). RXALL
+ * (bit0) disables destination-address filtering entirely -- needed so a
+ * unicast reply addressed to the GUEST's own (not OUR_MAC) virtio MAC
+ * reaches the RX descriptor ring at all; see emac_init()'s own comment at
+ * the RX_FRM_FLT write site for the live-hardware story (2026-07-23/24). */
+#define EMAC_RX_FRM_FLT      0x38
+#define  EMAC_FRM_FLT_RXALL      (1u << 0)
 #define EMAC_MII_CMD         0x48
 #define EMAC_MII_DATA        0x4c
 #define EMAC_ADDR0_HIGH      0x50
@@ -944,6 +957,26 @@ int emac_init(void)
     setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
                           EMAC_RX_CTL1_RX_RUNT_FRM);
     setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
+    /* Disable the hardware unicast destination-address filter (RXALL) --
+     * found live 2026-07-23/24 while chasing why an ARP REPLY (unicast,
+     * addressed to the GUEST's own virtio MAC) never reached vnet_emac.c
+     * despite ARP REQUESTS (broadcast) working fine and despite the
+     * software-side (to_us||bcast) gate already being removed from
+     * emac.c's RX demux for the vnet path. Direct experiment on real
+     * hardware (send a raw unicast test frame to a non-OUR_MAC
+     * destination, watch vnet's rx_ethertype breadcrumb) proved the
+     * default hardware filter (RXALL=0, i.e. only frames matching
+     * EMAC_ADDR0/OUR_MAC or broadcast reach the RX ring at all) was
+     * silently dropping it BEFORE any of our software ever saw it -- no
+     * prior use of this EMAC (debug protocol, netcon, snapshot-net) ever
+     * needed a different destination than OUR_MAC, so this was never hit
+     * before. Written here (config-before-enable, at init time) rather
+     * than as a live runtime toggle -- toggling EMAC_RX_CTL0's RX_EN bit
+     * on a RUNNING board to test this disables ALL reception including
+     * the debug protocol itself, self-inflicting an "EMAC dark" episode
+     * (recovered via the USB-ACM break-glass, see project memory) before
+     * this fix was written correctly here. */
+    wr(EMAC_RX_FRM_FLT, EMAC_FRM_FLT_RXALL);
     setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
     setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
     __asm__ volatile("dsb sy" ::: "memory");
