@@ -30,6 +30,7 @@
 #include "wdt.h"
 #include "smp.h"
 #include "vblk_emmc.h"
+#include "vnet_emac.h"   /* vnet_mmio_fault() -- ROADMAP C1 virtio-net-over-EMAC */
 #include "reboot.h"
 #include "backtrace.h"
 #include "flightrec.h"
@@ -105,6 +106,16 @@ __attribute__((weak)) void gic_timer_irq(struct el2_frame *f)
 __attribute__((weak)) void dbgmon_service(struct el2_frame *f)
 {
 	(void)f;
+}
+
+/* virtio-net-over-EMAC MMIO device (vnet_emac.c, ROADMAP C1). Weak fallback
+ * (same pattern as gic_timer_irq/dbgmon_service above) so the `gdb`/`fbsd`
+ * builds -- which don't link vnet_emac.o -- still link; the call then always
+ * reports "not my window" and every existing image's behavior is unchanged. */
+__attribute__((weak)) int vnet_mmio_fault(struct el2_frame *frame)
+{
+	(void)frame;
+	return 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -405,6 +416,19 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		 * arbitrary. A QueueNotify write here drains the ring straight to the
 		 * real eMMC and injects INTID 82. See docs/virtio-blk-design.md. */
 		if (vblk_mmio_fault(frame)) {
+			if (!dbg_core_active)
+				dbgmon_service(frame);
+			return;
+		}
+		/* Finally, the virtio-net-over-EMAC multiplexer at 0x0A001000
+		 * (ROADMAP C1 — see vnet_emac.h). Same "handled -> return without
+		 * recording" contract; vnet_mmio_fault() returns 0 for any abort
+		 * outside its own 0x200-byte window (disjoint from vconsole's UART0
+		 * page and vblk's 0x0A000000 window), so calling it unconditionally
+		 * here is safe. A QueueNotify(1) write here drains the transmitq
+		 * straight to the real EMAC (muxed with the debug-protocol traffic —
+		 * see vnet_emac.c's TX ethertype filter) and injects VNET_INTID. */
+		if (vnet_mmio_fault(frame)) {
 			if (!dbg_core_active)
 				dbgmon_service(frame);
 			return;

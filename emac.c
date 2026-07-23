@@ -17,6 +17,48 @@
  * (dc civac) before handing memory to the EMAC, invalidate (dc ivac) before
  * reading what the EMAC wrote, each bracketed by a dsb. Generalized from
  * musb.c's bc_write "dc civac + dsb sy" pattern.
+ *
+ * ============================================================================
+ * TX CROSS-CORE MUTUAL EXCLUSION (added for ROADMAP C1 / vnet_emac.c).
+ * ============================================================================
+ * As of vnet_emac.c (virtio-net multiplexed onto this EMAC), tx_frame_raw()
+ * gets a SECOND caller on a SECOND core:
+ *   - CPU1 (the dedicated debug core, see smp.c's "CPU1 = dedicated EMAC/
+ *     dbgmon DEBUG CORE" block): the console/repl/status-line TX path
+ *     (emac_putc/emac_puts/emac_flush -> tx_frame() -> tx_frame_raw()),
+ *     driven from dbgmon_service() inside CPU1's free-running poll loop.
+ *   - CPU0 (the guest's core): vnet_emac.c's TX-kick path
+ *     (vnet_kick() -> emac_send_frame() -> tx_frame_raw()), driven
+ *     synchronously inside the guest's QueueNotify trap.
+ * Both share g_tx_slot, the TX descriptor ring (tx_desc()), and the
+ * EMAC_TX_CTL1 DMA-kick register with NO prior locking (this driver was
+ * written and hardware-verified for single-core (CPU1) use only). Two cores
+ * racing tx_frame_raw() concurrently can hand out the SAME g_tx_slot to both
+ * (one frame silently clobbers the other's descriptor mid-fill) or kick TX
+ * DMA while a descriptor is only half-written.
+ *
+ * Note RX (emac_poll()'s ring, g_rx_slot, rx_push()) does NOT need the same
+ * treatment: emac_poll() is only ever invoked from ONE core at a time by
+ * construction — dbg_core_active gates it (CPU1 exclusively when the debug
+ * core is enabled; CPU0 inline inside its own trap, serially, when it is
+ * not) — see el2_exc.c's `if (!dbg_core_active) dbgmon_service(frame)` call
+ * sites and smp.c's secondary-core loop. There is never a second core also
+ * calling emac_poll() concurrently, so g_rx_slot/rx_ring are single-owner at
+ * all times and vnet_emac_rx_frame()'s queue-0 (RX) virtio ring likewise
+ * stays single-owner (only ever reached via emac_poll()).
+ *
+ * Fix: a single test-and-set spinlock in a fixed DRAM word (EMAC_TX_LOCK_PA,
+ * below), acquired around the WHOLE of tx_frame_raw() — mirrors
+ * vblk_emmc.c's vblk_emmc_trylock()/vblk_emmc_unlock() precedent exactly
+ * (ldaxr/stlxr exclusive test-and-set; no LSE on the A53). Bounded acquire
+ * (never an unbounded spin): CPU0 must never hang the guest trap past the
+ * HW watchdog waiting for CPU1's console output to finish, and CPU1 must
+ * never stall its RX/dbgmon service loop waiting for a guest-driven TX
+ * burst. A failed acquire is treated exactly like the pre-existing "TX
+ * descriptor still busy" case a few lines below: the frame is dropped,
+ * counted, and the caller's existing 0-return contract (retry later) is
+ * unchanged — no new failure mode is introduced, just a new REASON for the
+ * same, already-handled outcome.
  */
 #include <stdint.h>
 #include "emac.h"
@@ -244,9 +286,16 @@ static inline void udelay_spin(uint32_t n)
  *                     nonzero means EMAC never saw an RX frame and CPU1 is
  *                     retrying the PHY/rings bring-up
  *  [19] first_rx     latches to 1 the FIRST time a frame is ever accepted
+ *  [32] tx_lock_contended  sticky 1 if the cross-core TX lock (added for
+ *                     vnet_emac.c, EMAC_TX_LOCK_PA) was ever seen already
+ *                     held by tx_frame_raw()'s bounded acquire — expected
+ *                     occasionally under real CPU0(vnet)/CPU1(console) TX
+ *                     contention, NOT expected to ever hit the bounded
+ *                     acquire's give-up case (see the "TX CROSS-CORE MUTUAL
+ *                     EXCLUSION" block comment at the top of this file)
  * [5] link_speed is kept LIVE (rewritten on every debounced link check in
  * emac_poll()), not just set once at init.
- * Read after a run with  md.l 0x50000100 24                                */
+ * Read after a run with  md.l 0x50000100 24 ; md.l 0x50000180 1               */
 /* ------------------------------------------------------------------ */
 #define BC_BASE  0x50000100UL
 #define BC_MAGIC 0xE3AC0DE1u
@@ -271,6 +320,78 @@ static inline void bc(int i, uint32_t v)
     volatile uint32_t *p = (volatile uint32_t *)(BC_BASE + (uint32_t)i * 4u);
     *p = v;
     __asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+/* ------------------------------------------------------------------ */
+/* TX cross-core lock — see the "TX CROSS-CORE MUTUAL EXCLUSION" block at   */
+/* the top of this file. Fixed DRAM word (cross-core coherent under         */
+/* SMPEN), zeroed in emac_init() so a stale "1" can never survive a warm     */
+/* WDT reset into a deadlock — same discipline as VBLK_EMMC_LOCK_PA.        */
+/* Lives inside EMAC's own breadcrumb window (0x50000100..0x500001ff), well */
+/* clear of the highest breadcrumb index actually used (19 -> 0x1a4c) and   */
+/* of every other lane's documented window.                                 */
+/* ------------------------------------------------------------------ */
+#define EMAC_TX_LOCK_PA        0x50000180UL
+#define EMAC_TX_LOCK_CONTEND_BC 32   /* bc() index: contended-acquire count  */
+
+static inline volatile uint32_t *emac_tx_lock_word(void)
+{
+    return (volatile uint32_t *)EMAC_TX_LOCK_PA;
+}
+
+/* Non-blocking test-and-set. Returns 1 if acquired (caller MUST call
+ * emac_tx_unlock()), 0 if already held. ARMv8.0 A53 has no LSE atomics, so
+ * this is the same ldaxr/stlxr exclusive loop as vblk_emmc_trylock() and
+ * smp.c's g_online set. */
+static int emac_tx_trylock(void)
+{
+    volatile uint32_t *p = emac_tx_lock_word();
+    uint32_t prev, status, one = 1u;
+    __asm__ volatile(
+        "	ldaxr	%w0, [%3]\n"
+        "	cbnz	%w0, 1f\n"          /* already held -> fail */
+        "	stlxr	%w1, %w2, [%3]\n"   /* try to store 1 */
+        "	b	2f\n"
+        "1:	mov	%w1, #1\n"          /* prev!=0: report failure */
+        "2:\n"
+        : "=&r"(prev), "=&r"(status)
+        : "r"(one), "r"(p)
+        : "memory");
+    if (prev == 0u && status == 0u) {
+        __asm__ volatile("dsb sy" ::: "memory");
+        return 1;
+    }
+    return 0;
+}
+
+static void emac_tx_unlock(void)
+{
+    volatile uint32_t *p = emac_tx_lock_word();
+    __asm__ volatile("dsb sy" ::: "memory");
+    *p = 0u;
+    __asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
+/* Bounded acquire: a few hundred spins is generous (a single tx_frame_raw()
+ * call, even including its own bounded descriptor-busy wait, is a bounded,
+ * short critical section — nothing in it blocks on link state or an
+ * external event). Never risk hanging CPU0's guest trap or CPU1's RX/dbgmon
+ * loop waiting on the other side's console/vnet TX burst; a failed acquire
+ * just means "drop this frame, exactly like a busy TX descriptor" (see the
+ * call site below). */
+#define EMAC_TX_LOCK_SPINS  20000u
+static int emac_tx_lock_acquire_bounded(void)
+{
+    uint32_t contended = 0;
+    for (uint32_t i = 0; i < EMAC_TX_LOCK_SPINS; i++) {
+        if (emac_tx_trylock())
+            return 1;
+        contended = 1;
+        __asm__ volatile("yield" ::: "memory");
+    }
+    if (contended)
+        bc(EMAC_TX_LOCK_CONTEND_BC, 1u);   /* sticky "we saw contention" flag */
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -697,6 +818,15 @@ int emac_init(void)
     g_first_rx_latched = 0;
     tx_line_len = 0; rx_head = rx_tail = 0;
 
+    /* Zero the TX cross-core lock so a stale "1" left over from a prior warm
+     * WDT reset can never deadlock a fresh boot — same discipline as
+     * VBLK_EMMC_LOCK_PA in vblk_init(). Plain store (not the bc() cache-
+     * maintenance helper) is fine here: the lock's own trylock/unlock
+     * already bracket every access with dsb, and this runs before either
+     * core could possibly contend for it. */
+    *(volatile uint32_t *)EMAC_TX_LOCK_PA = 0u;
+    bc(EMAC_TX_LOCK_CONTEND_BC, 0u);
+
     /* 1. CCU: ungate EMAC bus clock + deassert EMAC bus reset. */
     reg = (volatile uint32_t *)(CCU_BASE + CCU_BUS_GATE0);
     *reg |= CCU_EMAC_BIT;
@@ -877,9 +1007,10 @@ int emac_link_watchdog(void)
 /* ------------------------------------------------------------------ */
 /* TX — build and send one raw Ethernet frame (shared by the console line  */
 /* flusher and emac_send_frame()). Returns 1 if the frame was queued to    */
-/* TX DMA, 0 if it was dropped (link down, or TX ring stayed busy past the */
-/* bounded wait) — the caller (netcon, in the send-frame case) decides     */
-/* whether/how to retry; this function itself never blocks unboundedly.   */
+/* TX DMA, 0 if it was dropped (link down, TX ring stayed busy past the    */
+/* bounded wait, or the cross-core TX lock could not be acquired) — the    */
+/* caller (netcon, vnet_emac.c, in the send-frame case) decides whether/   */
+/* how to retry; this function itself never blocks unboundedly.           */
 /* ------------------------------------------------------------------ */
 static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
                          const uint8_t *payload, int plen)
@@ -888,11 +1019,17 @@ static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
     uint8_t *buf;
     int total, i, to;
 
+    if (!emac_tx_lock_acquire_bounded()) {
+        bc(15, ++g_tx_drops);
+        return 0;
+    }
+
     if (!g_link_up) {
         /* No point queuing onto a dead link — count the drop instead of
          * silently swallowing it, so the host lane can see loss happening
          * instead of just a gap in the log. */
         bc(15, ++g_tx_drops);
+        emac_tx_unlock();
         return 0;
     }
 
@@ -919,6 +1056,7 @@ static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
         bc(15, ++g_tx_drops);
         if (++g_tx_slot >= N_TX_DESC)
             g_tx_slot = 0;
+        emac_tx_unlock();
         return 0;
     }
 
@@ -949,6 +1087,7 @@ static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
     if (++g_tx_slot >= N_TX_DESC)
         g_tx_slot = 0;
     bc(6, ++g_tx_count);
+    emac_tx_unlock();
     return 1;
 }
 
