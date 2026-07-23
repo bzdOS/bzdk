@@ -49,10 +49,24 @@
  * brief explicitly calls for reusing its EXACT existing signature) — see
  * the report for the consequences and why it is not necessarily fatal for
  * the C1 DoD (ssh/pkg over a single-segment link where the peer floods
- * broadcast anyway). Inbound replies addressed to OUR_MAC (which is what
- * the far end learned as our source) are correctly delivered to vnet's RX
- * hook by the SAME to_us/broadcast filter emac_poll() already applies to
- * the console/netcon paths — no widening of that filter was needed.
+ * broadcast anyway).
+ *
+ * CORRECTION (2026-07-23/24, found live via tcpdump chasing why ping never
+ * got an ARP reply back): the paragraph above assumed a peer's unicast
+ * reply would be addressed to whatever the guest's frame carried as its
+ * Ethernet SOURCE — which is always OUR_MAC, true — but that is NOT how ARP
+ * actually works. A peer learns the sender's hardware address from the ARP
+ * PAYLOAD's own sender-HA field (a separate, independently-substitutable
+ * value the guest's if_vtnet fills in with its OWN virtio MAC, not
+ * emac_send_frame()'s OUR_MAC), and addresses its REPLY to THAT learned
+ * address directly. Before this fix, that was the guest's random
+ * virtio-net MAC — a destination the EMAC hardware's default filter never
+ * recognized as "us", so unicast replies were silently dropped before
+ * emac_poll()'s software filter (widened separately, see its own comment)
+ * ever saw them. Fixed by offering VIRTIO_NET_F_MAC and assigning the guest
+ * VNET_GUEST_MAC == OUR_MAC (see vnet_emac.h) instead of a random one: the
+ * guest's ARP sender-HA now IS OUR_MAC, so peers address replies to a MAC
+ * the hardware filter already passes — no promiscuous-mode dependency.
  *
  * ============================================================================
  * CROSS-CORE CONCURRENCY — READ THIS BEFORE THIS EVER TOUCHES HARDWARE.
@@ -504,11 +518,14 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 	case VNET_R_DEVICE_ID:     return VNET_DEVICE_ID;         /* 1: virtio-net */
 	case VNET_R_VENDOR_ID:     return VNET_MMIO_VENDOR;
 	case VNET_R_DEVICE_FEATURES:
-		/* Modern: only VIRTIO_F_VERSION_1 (word 1, bit 0). Word 0 = 0 — no
+		/* Word 1, bit 0 = VIRTIO_F_VERSION_1. Word 0, bit 5 = VIRTIO_NET_F_MAC
+		 * (see vnet_emac.h's VNET_GUEST_MAC comment for why) — no other
 		 * MAC/CSUM/offload/MRG_RXBUF/STATUS bits offered, matching
 		 * vblk_emmc.c's minimal-feature-set precedent. */
 		if (d->dev_feat_sel == VNET_FEATWORD_HI)
 			return VNET_F_VERSION_1_BIT;
+		if (d->dev_feat_sel == VNET_FEATWORD_LO)
+			return VNET_F_MAC_BIT;
 		return 0u;
 	case VNET_R_QUEUE_NUM_MAX: return VNET_QUEUE_MAX;
 	case VNET_R_QUEUE_READY:
@@ -519,11 +536,35 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 	case VNET_R_STATUS:        return d->status;
 	case VNET_R_CONFIG_GENERATION: return d->config_gen;
 	default:
-		/* virtio-net config space: we advertise no VIRTIO_NET_F_MAC/STATUS,
-		 * so a spec-following driver never reads config at all; return 0 for
-		 * every offset regardless (harmless if a driver peeks anyway). */
+		/* Config space (VNET_R_CONFIG..+6, the `mac` field) is handled by
+		 * vnet_config_read() directly in vnet_mmio_fault() — it needs the
+		 * access width (SAS) to return a correctly narrow, zero-extended
+		 * value, which this word-only function's callers don't carry. Any
+		 * other offset: 0 (harmless if a driver peeks anyway). */
 		return 0u;
 	}
+}
+
+/* Config-space byte-granular read for VNET_GUEST_MAC (see vnet_emac.h).
+ * `byte_off` is relative to VNET_R_CONFIG; `sas` is the ESR_EL2.ISS access
+ * size (0=byte,1=halfword,2/3=word). FreeBSD's if_vtnet reads a uint8_t[6]
+ * config field with individual byte-width accesses, so — unlike every other
+ * register here, which is always word-width per the virtio-mmio spec — this
+ * one must return a correctly narrow, zero-extended value or corrupt
+ * whatever the guest packs into the unread high bits of its destination
+ * register. */
+static uint32_t vnet_config_read(uint32_t byte_off, uint32_t sas)
+{
+	static const uint8_t mac[VNET_GUEST_MAC_LEN] = VNET_GUEST_MAC;
+	uint32_t nbytes = (sas == 0u) ? 1u : (sas == 1u) ? 2u : 4u;
+	uint32_t v = 0;
+
+	for (uint32_t i = 0; i < nbytes; i++) {
+		uint32_t idx = byte_off + i;
+		uint8_t b = (idx < VNET_GUEST_MAC_LEN) ? mac[idx] : 0u;
+		v |= (uint32_t)b << (8u * i);
+	}
+	return v;
 }
 
 static void vnet_reg_write(struct vnet_dev *d, uint32_t off, uint32_t val)
@@ -660,7 +701,9 @@ int vnet_mmio_fault(struct el2_frame *frame)
 	uint32_t wnr = esr & ESR_WNR_BIT;
 	uint32_t srt = (esr >> ESR_SRT_SHIFT) & ESR_SRT_MASK;
 	uint32_t sas = (esr >> ESR_SAS_SHIFT) & ESR_SAS_MASK;
-	(void)sas;   /* all virtio-mmio registers are 32-bit word accesses */
+	/* Every STANDARD virtio-mmio register is a 32-bit word access — sas is
+	 * only actually consulted below for the config-space (VNET_GUEST_MAC)
+	 * read path, which FreeBSD accesses byte-at-a-time. */
 
 	uint32_t off = (uint32_t)(addr - g_net.base);
 
@@ -672,7 +715,9 @@ int vnet_mmio_fault(struct el2_frame *frame)
 		if (off == VNET_R_QUEUE_NOTIFY)
 			flightrec_log(FLTR_K_VIRTIO, off, val);
 	} else {
-		uint32_t val = vnet_reg_read(&g_net, off);
+		uint32_t val = (off >= VNET_R_CONFIG && off < VNET_R_CONFIG + VNET_GUEST_MAC_LEN)
+		             ? vnet_config_read(off - VNET_R_CONFIG, sas)
+		             : vnet_reg_read(&g_net, off);
 		if (srt != SRT_XZR)
 			frame->x[srt] = (uint64_t)val;
 	}
