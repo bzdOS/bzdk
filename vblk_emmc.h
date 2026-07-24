@@ -225,6 +225,46 @@ int  vblk_emmc_trylock(void);
 void vblk_emmc_unlock(void);
 
 /* ------------------------------------------------------------------ *
+ * USED-RING / COMPLETION-PUBLISH MUTUAL EXCLUSION.
+ *
+ * ROOT CAUSE (found live 2026-07-24 chasing why `fsck -y /dev/vtbd0p3`
+ * reproducibly corrupted the guest — manifesting as the console rapidly
+ * re-printing stale early-boot text, megabytes of it in seconds): the
+ * ROADMAP-C2 async I/O offload (vblk_async.c, CPU2) completes a request by
+ * calling vq_push_used() + setting int_status + vblk_inject_irq() — and
+ * vblk_request()'s SYNCHRONOUS fallback path (CPU0) does the exact same
+ * three things for its own completions, with NO exclusion between them.
+ * vq_push_used() is a classic unlocked read-modify-write (read used->idx,
+ * write the ring slot, write idx+1) on a virtqueue struct BOTH cores can
+ * complete into. Under light I/O (mount, ls) the two completions never
+ * actually overlap in real time, so the race never fired — but fsck's
+ * sustained back-to-back request pattern was the first workload to ever
+ * actually exercise the C2 async path under enough concurrent load to hit
+ * it: CPU0 and CPU2 completing two DIFFERENT requests at genuinely the same
+ * moment lose one ring entry (both write the SAME slot, idx only advances
+ * by 1 for what should have been 2 completions), permanently desyncing the
+ * guest's view of the used ring from reality — exactly the kind of
+ * corruption that can make a completed read appear to hand back a stale/
+ * wrong buffer's content instead of the real disk data.
+ *
+ * Same test-and-set-in-fixed-DRAM-word pattern as VBLK_EMMC_LOCK_PA above,
+ * zeroed in vblk_init() for the same warm-reset-safety reason. Deliberately
+ * a SEPARATE word/lock: this protects the virtqueue completion-publish step
+ * (a CPU0-vs-CPU2 race), which is an entirely different critical section
+ * than the eMMC controller register access the other lock guards. */
+#define VBLK_USED_LOCK_PA   0x50020200UL   /* clear of the vconsole ring, the
+                                            * eMMC lock (0x50020100), and every
+                                            * vblk_bc() breadcrumb slot. */
+
+/* Try to acquire the used-ring publish lock: 1 on success (caller now owns
+ * the virtqueue completion step and MUST call vblk_used_unlock()), 0 if
+ * already held (the other core is mid-publish; caller should spin briefly
+ * and retry — the critical section is a handful of word writes, never a
+ * real hardware wait). */
+int  vblk_used_trylock(void);
+void vblk_used_unlock(void);
+
+/* ------------------------------------------------------------------ *
  * Split-virtqueue in-guest layout (VIRTIO 1.x, little-endian). We read these
  * out of guest DRAM (identity-mapped, IPA==PA) into host-endian structs.
  * ------------------------------------------------------------------ */

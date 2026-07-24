@@ -212,6 +212,63 @@ void vblk_emmc_unlock(void)
 	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
 }
 
+/* ------------------------------------------------------------------ *
+ * Used-ring publish lock (CPU0 sync completion vs CPU2 async completion) —
+ * see VBLK_USED_LOCK_PA's comment in vblk_emmc.h for the bug this closes.
+ * Same ldaxr/stlxr test-and-set as the eMMC lock above, duplicated (not
+ * shared) because it protects a completely different critical section.
+ * ------------------------------------------------------------------ */
+static inline volatile uint32_t *used_lock_word(void)
+{
+	return (volatile uint32_t *)VBLK_USED_LOCK_PA;
+}
+
+int vblk_used_trylock(void)
+{
+	volatile uint32_t *p = used_lock_word();
+	uint32_t prev, status, one = 1u;
+	__asm__ volatile(
+		"	ldaxr	%w0, [%3]\n"
+		"	cbnz	%w0, 1f\n"
+		"	stlxr	%w1, %w2, [%3]\n"
+		"	b	2f\n"
+		"1:	mov	%w1, #1\n"
+		"2:\n"
+		: "=&r"(prev), "=&r"(status)
+		: "r"(one), "r"(p)
+		: "memory");
+	if (prev == 0u && status == 0u) {
+		__asm__ volatile("dsb sy" ::: "memory");
+		return 1;
+	}
+	return 0;
+}
+
+void vblk_used_unlock(void)
+{
+	volatile uint32_t *p = used_lock_word();
+	__asm__ volatile("dsb sy" ::: "memory");
+	*p = 0u;
+	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
+/* Bounded spin: the critical section is a handful of word writes (no real
+ * hardware wait involved, unlike the eMMC controller lock), so a small spin
+ * count is plenty — this is only ever contended for a few instructions'
+ * worth of time against the OTHER core's own publish step. */
+static void vblk_used_lock_acquire(void)
+{
+	for (uint32_t i = 0; i < 100000u; i++) {
+		if (vblk_used_trylock())
+			return;
+		__asm__ volatile("yield" ::: "memory");
+	}
+	/* Never expected to be reached (critical section is tiny), but never
+	 * silently corrupt the ring either: force-clear and take it rather than
+	 * deadlock forever, exactly like a stale eMMC lock would be handled. */
+	*used_lock_word() = 0u;
+}
+
 /* Acquire the eMMC lock from CPU0's trap path, BOUNDED so a CPU1 holder can
  * never stall the guest's core past the ~16 s HW watchdog. On each spin we
  * feed the watchdog (note-progress + pet) so a legitimately long wait stays
@@ -600,11 +657,17 @@ void vblk_async_poll(void)
 
 	data_bytes = used_len;
 	used_len += 1;
+	/* Locked: vblk_request()/vblk_kick() (CPU0) can be publishing a
+	 * DIFFERENT completion into this same used ring concurrently — see
+	 * VBLK_USED_LOCK_PA's comment in vblk_emmc.h (this is the race that
+	 * caused it). */
+	vblk_used_lock_acquire();
 	new_idx = vq_push_used(&g_blk.vq[VBLK_QUEUE], head, used_len);
 	vblk_diag(head, ndesc + 2u, data_bytes, status_gpa, new_idx);
 
 	g_blk.int_status |= VBLK_INT_VRING;
 	vblk_inject_irq();
+	vblk_used_unlock();
 
 	g_async_completes++;
 	vblk_bc(25, g_async_completes);
@@ -779,7 +842,12 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		uint16_t new_idx;
 
 		used_len += 1;
+		/* Locked: vblk_async_poll() (CPU2) can be publishing a DIFFERENT
+		 * completion into this same used ring concurrently — see
+		 * VBLK_USED_LOCK_PA's comment in vblk_emmc.h. */
+		vblk_used_lock_acquire();
 		new_idx = vq_push_used(vq, head, used_len);
+		vblk_used_unlock();
 		vblk_diag(head, n, data_bytes, stdesc->addr, new_idx);
 	}
 	return 1;
@@ -811,8 +879,12 @@ static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 	flightrec_log(FLTR_K_VIRTIO, qidx, (uint64_t)served);
 
 	if (served) {
+		/* Locked against vblk_async_poll()'s (CPU2) own int_status update +
+		 * IRQ injection for the same reason vq_push_used() above is. */
+		vblk_used_lock_acquire();
 		d->int_status |= VBLK_INT_VRING;
 		vblk_inject_irq();
+		vblk_used_unlock();
 	}
 }
 
@@ -1007,6 +1079,9 @@ int vblk_init(void)
 	 * RX/TX-tee stale-counter class of bug. Zero it BEFORE emmc_bio_init()
 	 * (which itself touches the controller) and before the guest/CPU1 exist. */
 	*(volatile uint32_t *)VBLK_EMMC_LOCK_PA = 0u;
+	/* Same warm-reset-safety reason: the used-ring publish lock (see
+	 * VBLK_USED_LOCK_PA's comment in vblk_emmc.h). */
+	*(volatile uint32_t *)VBLK_USED_LOCK_PA = 0u;
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	/* Bring the eMMC up. emmc_bio_init() is idempotent and returns 0 on the
