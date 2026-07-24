@@ -50,4 +50,12 @@ SECTIONS
         *(.eh_frame)
         *(.ARM.attributes)
     }
+
+    /* The stage-2 "A1" boundary protects exactly ONE 2 MiB L2 block at
+     * 0x42000000 (stage2.c HVIMG_L2_IDX) — anything the image places above
+     * 0x42200000 stays identity-mapped RW to the guest, silently eroding the
+     * boundary. RAM is 8 MiB but only the first 2 MiB is protected, so fail
+     * the build if text+rodata+data+bss ever outgrows the protected window. */
+    ASSERT(__bss_end - 0x42000000 <= 0x200000,
+           "HV image exceeds the 2 MiB stage-2 protected window at 0x42000000 -- extend HVIMG protection in stage2.c or shrink the image")
 }

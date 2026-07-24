@@ -1,14 +1,11 @@
 # Makefile — bzdOS microkernel (AArch64, Allwinner A64 / BPI-M64).
 #
-# Two products (see PROJECT.md):
-#   microkernel-stage0.bin = start.o + main_stage0.o        (load/exec/return self-test, no USB)
-#   microkernel.bin        = start.o + main.o + musb.o      (real Stage-1 firmware)
-#
-# musb.o is built from musb.c, which is owned by a different agent/lane and
-# is NOT provided by this Makefile's lane. Until musb.c exists, `make` /
-# `make all` / `make microkernel.bin` will fail at the final link with
-# "musb.o: No such file" (or musb.c missing) — that is EXPECTED. `make stage0`
-# does not depend on musb.c at all and must always build cleanly on its own.
+# Products (see README.md — `dbg` is the current milestone build):
+#   microkernel-dbg.bin  = the live-debug EL2 hypervisor (main_dbg.c) — what
+#                          reliable_load.py flashes to the board; `make dbg`.
+#   microkernel-qemu.elf = portable QEMU-virt CI target; `make qemu`.
+# The stage0/net/repl/fbsd/hdmi/zephyr targets build earlier, narrower
+# milestones from the same tree and are kept for reference/bisection.
 
 CROSS   ?= aarch64-linux-gnu-
 CC      := $(CROSS)gcc
@@ -209,16 +206,27 @@ clean-qemu:
 	rm -f start_qemu.o main_qemu.o gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o \
 	      $(QEMU_ELF)
 
+# Header dependency tracking: -MMD -MP emits a .d per object listing the
+# headers it includes, so editing e.g. vblk_emmc.h rebuilds vblk_emmc.o. This
+# binary is flashed to live hardware — a stale object silently wrong against
+# its header is the most dangerous build failure mode, so track deps.
 %.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 %.o: %.S
-	$(CC) $(ASFLAGS) -c -o $@ $<
+	$(CC) $(ASFLAGS) -MMD -MP -c -o $@ $<
 
-clean:
-	rm -f start.o main.o main_stage0.o main_net.o main_repl.o repl.o \
-	      musb.o emac.o wdt.o exceptions.o el2_exc.o timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o \
-	      snapshot.o snapshot_net.o bmc.o rsb.o axp803.o \
+-include $(wildcard *.d)
+
+# Remove every build artifact this Makefile can produce (all targets), the
+# per-object .d dependency files, and the hosted test binaries. A blanket
+# *.o/*.d avoids the old hand-maintained list silently going stale as files
+# are added (dbgmon.o, emmc_bio.o, vblk_*.o, … were all missing before).
+clean: clean-qemu
+	rm -f *.o *.d \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
+	      $(FBSD_ELF) $(FBSD_BIN) $(DBG_ELF) $(DBG_BIN) \
+	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
+	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
 	      test_vblk_ring test_stage2_tables test_vnet_ring
