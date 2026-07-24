@@ -395,8 +395,18 @@ int sd_bio_write(uint32_t lba, uint64_t buf_pa)
 		if (i2 >= 30000000u)
 			return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
 	}
-	for (i = 0; i < SD_POLL_CAP; i++)
-		if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
-			break;
+	/* Mirror of emmc_bio_write()'s CARD_BUSY fix: the post-write flash
+	 * program time is a genuinely longer latency than the read-side polls,
+	 * so use the same generous cap as the DATA_OVER wait above, and return a
+	 * real timeout error instead of unconditionally claiming success (which
+	 * would let the next command hit a still-programming card). */
+	{
+		uint32_t i2;
+		for (i2 = 0; i2 < 30000000u; i2++)
+			if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
+				break;
+		if (i2 >= 30000000u)
+			return -2;   /* card never signaled program-done */
+	}
 	return 0;
 }

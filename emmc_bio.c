@@ -463,13 +463,40 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
 	}
 
-	/* Card may be busy programming (DAT0 low) — wait STAR CARD_BUSY(bit9) clear. */
+	/* Card may be busy programming (DAT0 low) — wait STAR CARD_BUSY(bit9)
+	 * clear.
+	 *
+	 * BUG FIXED HERE (found live 2026-07-24 chasing why `fsck -y
+	 * /dev/vtbd0p3` — the FIRST real write workload this path has EVER
+	 * seen; every prior test this project ran was read-only — corrupted
+	 * the guest): this used EMMC_POLL_CAP (400000 register-read iterations,
+	 * fine for the DATA-phase polls above and for emmc_bio_read()'s OWN
+	 * post-transfer busy-wait, since reads don't have a comparable
+	 * latency) for the POST-WRITE flash PROGRAM time — which is a
+	 * genuinely different, typically much longer latency than anything a
+	 * read incurs, especially at the 400 kHz init clock this controller
+	 * has only ever run at (see emmc_bio_set_highspeed()'s own comment: HS
+	 * mode has never been exercised). Worse, the old code didn't even
+	 * check whether the wait actually succeeded — it fell out of the loop
+	 * and returned 0 (success) UNCONDITIONALLY, whether CARD_BUSY had
+	 * cleared or not. If the card was still internally busy programming
+	 * when this returned, the caller's NEXT command (another sector's
+	 * write, or a completely unrelated read) hit the controller/card
+	 * while it was still mid-program — exactly the same class of bug
+	 * emmc_bio_read()'s own "ROOT-CAUSE FIX" comment above describes for
+	 * back-to-back reads, just on the write side, where it's far more
+	 * likely to actually manifest. Now: a generous cap matching the
+	 * DATA_OVER wait above (real card program time can exceed the raw
+	 * transfer time), and a genuine timeout error instead of a silent lie. */
 	{
-		unsigned i2;
-		for (i2 = 0; i2 < EMMC_POLL_CAP; i2++)
+		uint32_t i2;
+		for (i2 = 0; i2 < 30000000u; i2++)
 			if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
 				break;
+		if (i2 >= 30000000u)
+			return -2;   /* card never signaled program-done: do NOT claim success */
 	}
+	__asm__ volatile("dsb sy" ::: "memory");
 	return 0;
 }
 
