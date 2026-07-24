@@ -4,12 +4,46 @@
  *     long entry(int argc, char **argv)
  * at EL2, MMU already ON, running on U-Boot's own stack. Contract (see
  * PROJECT.md "ABI / calling convention (КРИТИЧНО)"):
- *   - Do NOT touch the MMU, caches, or U-Boot's stack pointer — we run on
- *     whatever SP U-Boot handed us and must leave it exactly as we found it.
+ *   - Do NOT touch the MMU or caches; do NOT leave any lasting change to
+ *     U-Boot's own memory — `ret` must land back in U-Boot exactly as if we
+ *     had never run (this is what lets iteration happen without a physical
+ *     power-cycle: loady a new binary, `go` it again).
  *   - Save/restore the callee-saved registers (x19-x30, i.e. x19..x28 plus
  *     fp/lr) so returning via `ret` lands cleanly back in U-Boot's prompt.
  *   - Zero our own .bss (__bss_start..__bss_end, provided by link.ld).
  *   - Call main() and propagate its return value in x0.
+ *
+ * H2(a) STACK HARDENING (2026-07-24): U-Boot's inherited SP lives in high
+ * DRAM that stage-2 (once the guest is running) identity-maps RW to the
+ * guest -- no carve-out protects it (stage2.c only excludes HVIMG_BASE/
+ * HVSCR_BASE, and U-Boot's stack is neither). A buggy/malicious guest write
+ * there would corrupt our live call stack and every exception frame
+ * el2_common (exceptions.S) pushes on it -- el2_common never switches SP, it
+ * just uses whatever SP_EL2 is already live (all 16 vectors are "current
+ * EL2, SPx" or "lower EL", both of which bank to SP_EL2, the ONE stack
+ * register in play from _start to `ret`).
+ *
+ * Fix: immediately after saving U-Boot's callee-saved regs (i.e. as early as
+ * possible, before any C code -- including el2_install() and the .bss zero
+ * loop -- runs), CPU0 switches SP to smp_stacks[0]: a plain 16 KiB .bss array
+ * that already exists (smp.c, shared with the secondaries' per-core stacks)
+ * and, being part of THIS image's .bss, already sits inside the one 2 MiB
+ * window stage2.c's HVIMG_L2_IDX excludes from the guest's stage-2 map -- no
+ * new carve-out, no DTB change, no link.ld change needed (link.ld's existing
+ * "image must fit in 2 MiB" ASSERT already guards this the same way it
+ * guards every other static allocation in the tree). Row 0 of smp_stacks[]
+ * was always unused by the secondaries (_start_secondary only ever indexes
+ * rows 1..SMP_MAX_CPUS-1 -- see smp.h) -- this finally gives CPU0 the "own
+ * stack" smp.h's comment already claimed it had.
+ *
+ * U-Boot's ORIGINAL sp (captured right after the push, i.e. the value the
+ * epilogue below must pop from) is stashed in el2_boot_sp_saved -- plain
+ * DRAM, not a register, so it survives the `bl main` call untouched -- and
+ * restored right before the epilogue's ldp sequence. Nothing between the two
+ * switches ever touches U-Boot's stack memory again, so the external
+ * contract (U-Boot sees identical SP/state on return) is unchanged; only the
+ * stack bzdOS itself runs on while resident is now HV-owned and stage-2
+ * protected.
  *
  * This section is named .text.start and is force-placed first by link.ld's
  * KEEP(*(.text.start)), so _start ends up exactly at the link base 0x42000000.
@@ -39,6 +73,28 @@ _start:
 	stp	x27, x28, [sp, #80]
 	mov	x29, sp
 
+	/* H2(a): stash U-Boot's SP (as it stands right now, post-push -- this is
+	 * exactly the value the epilogue's ldp sequence must pop from) into
+	 * el2_boot_sp_saved, THEN switch to our own protected stack. Must happen
+	 * before the .bss zero loop below: smp_stacks[] (which the new stack
+	 * lives inside) is itself part of .bss, and nothing is pushed onto the
+	 * new stack between the switch and that loop, so zeroing it in the same
+	 * pass as every other .bss byte is safe (there is nothing live there to
+	 * clobber yet). x9-x11 are ordinary caller-saved scratch regs here --
+	 * the values U-Boot handed us in them (if any) were never part of the
+	 * AAPCS callee-saved set we promised to preserve. */
+	mov	x9, sp
+	adrp	x10, el2_boot_sp_saved
+	add	x10, x10, :lo12:el2_boot_sp_saved
+	str	x9, [x10]
+
+	adrp	x11, smp_stacks
+	add	x11, x11, :lo12:smp_stacks
+	add	x11, x11, #SMP_STACK_SIZE	/* top of smp_stacks[0] (row 0 --
+						 * see smp.h: unused by any
+						 * secondary, reserved for CPU0) */
+	mov	sp, x11
+
 	/* Zero .bss: for (p = __bss_start; p < __bss_end; p += 8) *p = 0; */
 	adrp	x9, __bss_start
 	add	x9, x9, :lo12:__bss_start
@@ -53,6 +109,18 @@ _start:
 	/* argc/argv (x0/x1) from U-Boot are not used by main(); ignored. */
 	bl	main
 	mov	x9, x0		/* stash main()'s return value */
+
+	/* H2(a): if main() ever returns (main_stage0.c, main.c's 'q' command,
+	 * ...), switch back to U-Boot's ORIGINAL sp (saved above) before
+	 * touching its stack again -- the ldp sequence below pops from
+	 * whatever sp is live at the time it runs, and el2_boot_sp_saved is
+	 * plain DRAM so `bl main` (and everything it called, transitively)
+	 * could never have disturbed it. From this point on we are back on
+	 * U-Boot's stack exactly as we found it, same as before this change. */
+	adrp	x10, el2_boot_sp_saved
+	add	x10, x10, :lo12:el2_boot_sp_saved
+	ldr	x10, [x10]
+	mov	sp, x10
 
 	/* Restore callee-saved regs, then return x9 -> x0 to U-Boot. */
 	ldp	x27, x28, [sp, #80]
@@ -180,3 +248,22 @@ _start_secondary:
 1:	wfi
 	b	1b
 	.size _start_secondary, . - _start_secondary
+
+/* H2(a) stack-hardening scratch word: U-Boot's original SP (captured in
+ * _start right after the callee-saved-regs push), so it can be restored
+ * before `ret` even though CPU0 spends the resident phase on smp_stacks[0]
+ * instead. One CPU (CPU0, before SMP bring-up) ever writes or reads this --
+ * no locking needed.
+ *
+ * MUST be in .data, NOT .bss: _start writes this word BEFORE the .bss zero
+ * loop runs (the SP capture is right after the register push, the switch and
+ * capture precede the zero loop). If it lived in .bss, that very loop would
+ * zero the just-saved SP back to 0, and any build whose main() returns
+ * (main_stage0.c, main.c's 'q') would `ret` to U-Boot with SP=0 and crash.
+ * .data is loaded from the image and never touched by the .bss zero loop, so
+ * the captured value survives. It still sits inside the 2 MiB HVIMG stage-2
+ * window (dead weight to a guest — an address, not a code pointer). */
+	.section .data
+	.balign 8
+el2_boot_sp_saved:
+	.quad 0

@@ -254,7 +254,17 @@ stage2_l2_block_desc(uint64_t pa, unsigned memattr, unsigned sh, unsigned xn)
 
 /* Build the level-2 MMIO table (+ its nested level-3 UART table), leaving
  * exactly the UART0_BASE page invalid. Returns the level-2 table's PA, to
- * be installed as level-1[0][0] by the caller (stage2_init()). */
+ * be installed as level-1[0][0] by the caller (stage2_init()).
+ *
+ * H2(b) CAVEAT: every entry this function marks INVALID gates only CPU
+ * (stage-2) accesses. Several other MMIO blocks left identity-mapped below
+ * are DMA-capable engines (EHCI/OHCI, the MMC/eMMC controllers, the crypto
+ * engine, the system DMA controller) with no SMMU in front of them on this
+ * SoC — a guest-programmed DMA descriptor reaches DRAM (including hv-image/
+ * hv-scratch below) without ever going through this table. See
+ * docs/dma-bypass-stage2.md for the full inventory of what's genuinely
+ * needed by the guest, what's fixable here (one draft patch, not yet
+ * applied), and what's an inherent hardware limitation. */
 static uint64_t
 stage2_build_mmio_tables(void)
 {
@@ -383,6 +393,16 @@ static void stage2_tlb_flush(void);
  * never enters EL1/the guest) — stage-2 translation applies ONLY to
  * EL1/EL0 (the guest), never to EL2, so excluding these windows from the
  * guest's stage-2 map cannot break the hypervisor's own access to them.
+ *
+ * H2(a) (2026-07-24): CPU0's own EL2 runtime stack (smp_stacks[0], see
+ * smp.h) rides inside the hv-image window above for free — it's a plain
+ * .bss array linked into this same image, so HVIMG_L2_IDX already covers it.
+ * Before this fix CPU0 ran on U-Boot's inherited SP instead, which lives
+ * OUTSIDE both windows below (in plain identity-mapped guest DRAM) and thus
+ * had no stage-2 protection at all — see start.S's header comment for the
+ * full writeup. No change was needed here: the existing HVIMG carve-out
+ * already had room (link.ld's 2 MiB ASSERT is the safety net that would
+ * have caught it if not).
  *
  * SHARES stage2_l2_dram[] WITH stage2_unmap_guest_vector() below (both are
  * splits of the SAME 1 GiB DRAM block, IPA 0x40000000-0x7FFFFFFF). This

@@ -86,8 +86,17 @@
  * Non-static so the assembler entry can reference the symbol. */
 extern uint64_t smp_boot_config[SMP_CFG_N];
 
-/* Per-core EL2/idle/exception stacks (secondaries only; CPU0 keeps its own).
- * stack_top(cpu) = &smp_stacks[cpu][SMP_STACK_SIZE]. */
+/* Per-core EL2/idle/exception stacks. _start_secondary (start.S) only ever
+ * indexes rows 1..SMP_MAX_CPUS-1 (stack_top(cpu) = &smp_stacks[cpu]
+ * [SMP_STACK_SIZE], cpu = 1..3) -- row 0 is CPU0's OWN stack: _start (start.S,
+ * H2(a) stack hardening, 2026-07-24) switches to smp_stacks[0]'s top for the
+ * entire resident phase, immediately after saving U-Boot's inherited SP and
+ * before any C code (including el2_install()) runs, and switches back only
+ * right before the final `ret` to U-Boot. This is what closes the
+ * "unprotected EL2 stack" gap: smp_stacks[] is a plain .bss array inside the
+ * image, already covered by stage2.c's HVIMG_L2_IDX exclusion, whereas
+ * U-Boot's inherited stack lives in plain identity-mapped guest DRAM with no
+ * carve-out. See start.S's header comment for the full rationale. */
 extern uint8_t smp_stacks[SMP_MAX_CPUS][SMP_STACK_SIZE];
 
 /* Assembly secondary entry point (start.S); passed to PSCI CPU_ON as the
