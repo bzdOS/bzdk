@@ -8,4 +8,6 @@ __pycache__/
 test_vblk_ring
 test_stage2_tables
 test_vnet_ring
+test_kload_modinfo
+test_vconsole_uart
 
