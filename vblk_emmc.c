@@ -263,10 +263,25 @@ static void vblk_used_lock_acquire(void)
 			return;
 		__asm__ volatile("yield" ::: "memory");
 	}
-	/* Never expected to be reached (critical section is tiny), but never
-	 * silently corrupt the ring either: force-clear and take it rather than
-	 * deadlock forever, exactly like a stale eMMC lock would be handled. */
+	/* Never expected to be reached: the critical section is a handful of word
+	 * writes (no hardware wait), so a 100k-yield standoff means the word is
+	 * almost certainly stale garbage, not a live holder. Break it — but by
+	 * RE-ACQUIRING, not merely clearing. The old code did `*word = 0; return`,
+	 * which left the caller running UNLOCKED: a concurrent vblk_used_trylock()
+	 * then succeeded immediately, reopening the exact CPU0-vs-CPU2 race this
+	 * lock exists to close. Force-clear the stale word, then take it. */
 	*used_lock_word() = 0u;
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (uint32_t i = 0; i < 100000u; i++) {
+		if (vblk_used_trylock())
+			return;
+		__asm__ volatile("yield" ::: "memory");
+	}
+	/* Still contended after a forced clear (truly pathological) — proceed with
+	 * the word held-set so at least the OTHER core's trylock fails, rather than
+	 * both cores running free into the ring. */
+	*used_lock_word() = 1u;
+	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 /* Acquire the eMMC lock from CPU0's trap path, BOUNDED so a CPU1 holder can
@@ -706,7 +721,9 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		 * OFF (we don't set the feature bit) so the driver never sends one.
 		 * Defensive: treat an indirect desc as a malformed request. */
 		if (flags & VRING_DESC_F_INDIRECT) {
+			vblk_used_lock_acquire();   /* CPU2 may publish concurrently */
 			vq_push_used(vq, head, 0);
+			vblk_used_unlock();
 			return 1;
 		}
 		n++;
@@ -735,11 +752,15 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		 * real, silent-corruption-capable bug worth closing regardless. */
 		g_truncated++;
 		vblk_bc(20, g_truncated);
+		vblk_used_lock_acquire();           /* CPU2 may publish concurrently */
 		vq_push_used(vq, head, 0);
+		vblk_used_unlock();
 		return 1;
 	}
 	if (n < 2) {                          /* need header + status at least */
+		vblk_used_lock_acquire();           /* CPU2 may publish concurrently */
 		vq_push_used(vq, head, 0);
+		vblk_used_unlock();
 		return 1;
 	}
 
