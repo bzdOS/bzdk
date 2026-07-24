@@ -617,16 +617,20 @@ static void vnet_reg_write(struct vnet_dev *d, uint32_t off, uint32_t val)
 	case VNET_R_QUEUE_READY:
 		if (d->queue_sel < VNET_NUM_QUEUES) {
 			struct vnet_vq *vq = &d->vq[d->queue_sel];
-			vq->ready = val & 1u;
-			if (vq->ready) {
+			if (val & 1u) {
 				vq->last_avail = 0;      /* fresh negotiation */
-				/* Publish the whole vq struct (desc/avail/used/num, all
-				 * written just above/before this) to CPU1 BEFORE it can
-				 * observe ready==1 — see the cross-core comment block:
-				 * narrows, does not eliminate, the negotiation-window
-				 * race for queue 0 (RX), which CPU1 starts polling the
-				 * moment it sees ready==1. */
+				/* Barrier BEFORE the ready store, not after: publish the
+				 * whole vq struct (desc/avail/used/num, all written just
+				 * above/before this) so CPU1 cannot observe ready==1 while
+				 * the ring pointers are still stale. Setting ready first and
+				 * fencing after (the old order) left exactly that window open
+				 * for queue 0 (RX), which CPU1 starts polling the moment it
+				 * sees ready==1. */
 				__asm__ volatile("dsb sy" ::: "memory");
+				vq->ready = 1u;
+				__asm__ volatile("dsb sy" ::: "memory");
+			} else {
+				vq->ready = 0u;
 			}
 		}
 		break;

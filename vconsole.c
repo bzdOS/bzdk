@@ -65,6 +65,11 @@ static inline uint8_t vc_rx_getc(void)
 	uint8_t c;
 	if (t == VC_RX_HEAD)
 		return 0xffu;                    /* empty */
+	/* Order the HEAD gate-load before the data load: the producer (usbacm.c
+	 * on CPU1) writes the byte, THEN bumps HEAD, so a data load reordered
+	 * ahead of the HEAD check could return a byte the producer hasn't stored
+	 * yet. dmb ishld pins the ordering (ring.c uses LDAR for the same reason). */
+	__asm__ volatile("dmb ishld" ::: "memory");
 	c = *(volatile uint8_t *)(VC_RX_BUF + (t & VC_RX_MASK));
 	VC_RX_TAIL = t + 1u;
 	__asm__ volatile("dsb sy" ::: "memory");
@@ -154,6 +159,10 @@ vconsole_tx_tee_getc(uint8_t *out)
 	if (t == VC_TXTEE_HEAD)
 		return 0;                         /* empty */
 
+	/* Order the HEAD gate-load before the data load (see vc_rx_getc): the
+	 * producer stores the byte then bumps HEAD, so the data load must not be
+	 * reordered ahead of the HEAD check that gated it. */
+	__asm__ volatile("dmb ishld" ::: "memory");
 	*out = *(volatile uint8_t *)(VC_TXTEE_BUF + (t & VC_TXTEE_MASK));
 	__asm__ volatile("dsb sy" ::: "memory");
 	VC_TXTEE_TAIL = t + 1u;

@@ -623,12 +623,16 @@ write_hcr_el2(uint64_t v)
 static void
 stage2_tlb_flush(void)
 {
-	/* vmalls12e1: invalidate stage-1 AND stage-2 combined TLB entries
-	 * for all VMIDs at EL1 — the correct, broad flush any time VTCR/
-	 * VTTBR or HCR.VM just changed. dsb ish + isb: make sure the
-	 * invalidation is globally observed and no stale translation is
-	 * used by an instruction fetched after this point. */
-	__asm__ volatile("tlbi vmalls12e1\n\tdsb ish\n\tisb" ::: "memory");
+	/* Leading dsb ish: the stage-2 tables are built with PLAIN cacheable
+	 * stores into .bss (stage2_l*[...] = desc), NOT through a clean+barrier
+	 * helper, so this barrier is what guarantees every descriptor store is
+	 * complete in the inner-shareable domain BEFORE the invalidate — else the
+	 * tlbi (and the walker after it) may race a not-yet-visible table store.
+	 * vmalls12e1: invalidate stage-1 AND stage-2 combined TLB entries for all
+	 * VMIDs at EL1 — the correct broad flush any time VTCR/VTTBR or HCR.VM just
+	 * changed. Trailing dsb ish + isb: make the invalidation globally observed
+	 * and stop any instruction fetched after this from using a stale walk. */
+	__asm__ volatile("dsb ish\n\ttlbi vmalls12e1\n\tdsb ish\n\tisb" ::: "memory");
 }
 
 /* ------------------------------------------------------------------ *
