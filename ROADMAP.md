@@ -2,7 +2,7 @@
 
 **Дата:** 2026-07-22
 **Статус базы:** FreeBSD arm64 грузится как EL1-гость под самописным EL2-гипервизором на Banana Pi M64 (Allwinner A64, 4× Cortex-A53), доведён до `login:` prompt. Отладка целиком по сети (EMAC) + USB-OTG, физического UART на плате нет.
-**Связанные доки:** [`SESSION-STATUS-2026-07-22.md`](SESSION-STATUS-2026-07-22.md) (текущий срез), [`README.md`](README.md), `hv-feature-designs` (дизайн-доки: virtio-blk ✅ / snapshot / GDB-stub / software-BMC).
+**Связанные доки:** [`docs/sessions/SESSION-STATUS-2026-07-22.md`](docs/sessions/SESSION-STATUS-2026-07-22.md) (текущий срез), [`README.md`](README.md), `hv-feature-designs` (дизайн-доки: virtio-blk ✅ / snapshot / GDB-stub / software-BMC).
 
 > **История файла:** прежний `ROADMAP.md` был forward-looking доком «для чего нужен trap-and-emulate субстрат». Его исследовательские ставки перенесены в §6, обновлённые под текущее состояние (virtio-blk уже доведён, RAM-disk virtio-стек удалён). Этот файл — конкретный путь к v1.
 
