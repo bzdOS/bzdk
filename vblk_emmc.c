@@ -360,6 +360,14 @@ static int vq_pop_avail(struct vblk_vq *vq, uint16_t *head)
  * vblk_diag() -- see the breadcrumb block comment). */
 static uint16_t vq_push_used(struct vblk_vq *vq, uint16_t head, uint32_t used_len)
 {
+	/* Guard against a concurrent driver reset (VBLK_R_STATUS=0 on CPU0 clears
+	 * num/used) landing between an async request's dispatch and CPU2's
+	 * completion: with num==0 the modulo below is a div-by-zero (AArch64 UDIV
+	 * yields 0, no trap) and used==0 would send the ring write to PA 0x2/0x4 —
+	 * silent low-memory corruption. After a reset the guest has torn this ring
+	 * down anyway, so dropping the stale completion is correct, not just safe. */
+	if (vq->num == 0u || vq->used == 0u)
+		return 0;
 	uint16_t used_idx = gmem_ld16(vq->used + 2u);
 	uint16_t slot = (uint16_t)(used_idx % vq->num);
 	uint64_t e = vq->used + 4u + (uint64_t)slot * 8u;   /* &ring[slot] */
@@ -1005,17 +1013,28 @@ static void vblk_reg_write(struct vblk_dev *d, uint32_t off, uint32_t val)
 		vblk_kick(d, val);
 		break;
 	case VBLK_R_INTERRUPT_ACK:
+		/* This RMW races CPU2's `int_status |= VBLK_INT_VRING` (done under the
+		 * used lock): interleaved, it can clear a pending bit CPU2 just set, so
+		 * the guest ISR reads InterruptStatus==0 and skips the vq scan while a
+		 * completion sits unseen in the used ring. Take the same lock. */
+		vblk_used_lock_acquire();
 		d->int_status &= ~val;           /* driver acked these bits */
+		vblk_used_unlock();
 		vblk_bc(22, ++g_isr_acks);
 		break;
 	case VBLK_R_STATUS:
 		d->status = val;
 		vblk_bc(1, val);
 		if (val == 0u) {
-			/* Driver reset: clear queue state (device stays registered). */
+			/* Driver reset: clear queue state (device stays registered). Under
+			 * the used lock so a concurrent CPU2 completion can't be mid
+			 * vq_push_used() while num/used are torn down; with vq_push_used()'s
+			 * own num/used==0 guard this closes the reset-vs-async race. */
+			vblk_used_lock_acquire();
 			vq->ready = 0; vq->num = 0; vq->last_avail = 0;
 			vq->desc = vq->avail = vq->used = 0;
 			d->int_status = 0;
+			vblk_used_unlock();
 		}
 		break;
 	default:
