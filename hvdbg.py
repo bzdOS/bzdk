@@ -19,11 +19,12 @@ Usage:
     hv.reenter_guest()               # restart guest without board reset
 """
 import os, sys, socket, struct, time, re, subprocess
+import bzd_board as B
 
-IFACE     = "br0"
-ETYPE     = 0x88B5
-BOARD_MAC = bytes.fromhex("02bd05000001")
-BCAST     = b"\xff" * 6
+IFACE     = B.IFACE
+ETYPE     = B.ETYPE
+BOARD_MAC = B.BOARD_MAC
+BCAST     = B.BCAST
 CSI       = re.compile(rb'\x1b\[[0-9;?]*[a-zA-Z]')
 
 class HV:
@@ -200,7 +201,7 @@ class HV:
                 pass
             return
         # ---- fallback: MMIO with retried reads (never skip the disconnect) ----
-        MUSB = 0x01c19000
+        MUSB = B.MUSB_BASE
         def _read1(pa):
             for _ in range(20):
                 w = self.read_words(pa, 1)
@@ -215,13 +216,13 @@ class HV:
         poww = _read1(MUSB + 0x40)
         if poww is not None:
             self.write_word(MUSB + 0x40, poww & ~0x40)      # clear SOFTCONN (bit6)
-        for pa, val in [(0x01c20cb4, 1), (0x01c20cb8, 0x21), (0x01c20cb0, 0x14af)]:
+        for pa, val in B.WDOG_ARM_SEQUENCE:
             self.write_word(pa, val)
 
     # ── breadcrumb shortcuts ───────────────────────────────────────────
     def gict(self):
         """Read the GICT timer breadcrumb. Returns dict."""
-        w = self.read_words(0x50000800, 8)
+        w = self.read_words(B.GICT_BC_DRAM_PA, 8)
         if len(w) < 8: return {}
         return dict(
             magic=w[0], ticks_lo=w[1], ticks_hi=w[2],
@@ -229,7 +230,7 @@ class HV:
 
     def vconsole(self):
         """Read vconsole capture ring header. Returns dict."""
-        w = self.read_words(0x50000f00, 4)
+        w = self.read_words(B.VCONSOLE_HDR_PA, 4)
         if len(w) < 4: return {}
         return dict(magic=w[0], total_bytes=w[1], fault_count=w[2])
 
@@ -239,7 +240,7 @@ class HV:
         n = hdr.get('total_bytes', 0)
         if n == 0: return b""
         if length: n = min(n, length)
-        return self.dump(0x50000f10, min(n, 0x1000))
+        return self.dump(B.VCONSOLE_RING_PA, min(n, B.VCONSOLE_RING_SZ))
 
     # ── flight recorder (flightrec.c/.h, ROADMAP B4) ────────────────────
     # Generic (kind, a0, a1) event ring at 0x50012000, magic "FLTR". See
@@ -248,7 +249,7 @@ class HV:
     # a raw memory blob. No existing reader touched this ring before B4
     # (grepped "FLTR"/"flightrec" across every *.py in the tree: only the
     # source files themselves matched).
-    FLTR_BASE       = 0x50012000
+    FLTR_BASE       = B.FLTR_BASE
     FLTR_MAGIC      = 0x464C5452       # "FLTR"
     FLTR_HDR_WORDS  = 8
     FLTR_SLOT_WORDS = 5                # kind, a0 lo/hi, a1 lo/hi

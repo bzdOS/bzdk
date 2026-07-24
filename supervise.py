@@ -19,21 +19,23 @@ Recovery paths, in order of gentleness — none need a human:
   * EMAC dead       -> USB-ACM break-glass (this file)
 """
 import os, sys, time, subprocess
+import bzd_board as B
 
-USB_NODE = "/sys/bus/usb/devices/1-4"
-ACM = "/dev/ttyACM0"
+USB_NODE = B.USB_NODE
+ACM = B.GUEST_ACM_TTY
 # Break-glass magic (must match usbacm.c bg_seq): 0x00 '~' B Z R S T 0x00
 BG_SEQ = bytes([0x00, 0x7e, 0x42, 0x5a, 0x52, 0x53, 0x54, 0x00])
 WEDGE_GRACE_S = 60          # EMAC dead this long -> reset
 POLL_S = 5
 
 def vidpid():
-    try:
-        with open(f"{USB_NODE}/idVendor") as f: v = f.read().strip()
-        with open(f"{USB_NODE}/idProduct") as f: p = f.read().strip()
-        return f"{v}:{p}"
-    except OSError:
-        return None
+    # Delegates to bzd_board's shared reader. NOTE (discrepancy found while
+    # centralizing): the original implementation here caught only OSError
+    # around both sysfs reads; the shared helper catches more broadly per
+    # field (matching reliable_load.py's original _rd()), so a
+    # never-observed-live non-OSError read failure now returns None instead
+    # of propagating. See bzd_board.usb_vidpid_str()'s docstring.
+    return B.usb_vidpid_str(USB_NODE)
 
 def emac_alive():
     """Liveness: does the HV answer a breadcrumb read? Tries a few times so a
@@ -43,7 +45,7 @@ def emac_alive():
         from hvdbg import HV
         hv = HV()
         for _ in range(3):
-            if hv.read_words(0x50000f00, 2):
+            if hv.read_words(B.VCONSOLE_HDR_PA, 2):
                 return True
         return False
     except Exception:
@@ -106,9 +108,9 @@ def main():
     # for WEDGED/GONE, which are the states actually prone to flappy reads.
     while True:
         vp = vidpid()
-        if vp == "1f3a:efe8":
+        if vp == B.UBOOT_VIDPID:
             raw = "UBOOT"
-        elif vp == "1d6b:0010":
+        elif vp == B.HVCON_VIDPID:
             raw = "HV_OK" if emac_alive() else "WEDGED"
         elif vp is None:
             raw = "GONE"
