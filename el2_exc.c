@@ -41,6 +41,29 @@
  * gr/sr over EMAC even while CPU0 is wedged inside the guest. Caches are
  * coherent across cores (SMPEN set in start.S) so a plain global suffices. */
 struct el2_frame g_last_guest_frame;
+/* seqlock for g_last_guest_frame (review H8): CPU0 (sole writer) bumps this
+ * odd before the struct copy and even after; CPU1 readers (dbgmon gr/sr via
+ * smp.c, bmc telemetry) copy through el2_snapshot_guest_frame(), which retries
+ * across a stable EVEN interval rather than reading a half-written frame.
+ * Coherency across cores is guaranteed (SMPEN); this adds the missing
+ * atomicity. */
+volatile uint32_t g_last_guest_frame_seq;
+
+void el2_snapshot_guest_frame(struct el2_frame *out)
+{
+	uint32_t s1, s2;
+	unsigned tries = 0;
+	do {
+		s1 = g_last_guest_frame_seq;
+		__asm__ volatile("dsb ish" ::: "memory");
+		*out = g_last_guest_frame;
+		__asm__ volatile("dsb ish" ::: "memory");
+		s2 = g_last_guest_frame_seq;
+		/* Bounded: writes are per-guest-trap, never a continuous stream, so
+		 * a stable even interval is reached almost immediately; the cap only
+		 * guarantees a CPU1 reader can never spin forever. */
+	} while (((s1 & 1u) || s1 != s2) && ++tries < 1000u);
+}
 /* Set to 1 by the debug core (smp_secondary_main, CPU1) once it owns the
  * EMAC/dbgmon channel. While set, CPU0 does NOT call dbgmon_service itself —
  * only the debug core talks to EMAC, so the two never race the port. */
@@ -443,8 +466,16 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 
 	/* Snapshot the guest frame for the SMP debug core (CPU1) — only when that
 	 * core is actually up (dbg_core_active). Inert/zero-overhead otherwise. */
-	if (dbg_core_active && (kind >> 2) == 2u)
+	if (dbg_core_active && (kind >> 2) == 2u) {
+		/* seqlock publish (review H8): odd seq marks the copy in progress so
+		 * a concurrent CPU1 reader retries instead of seeing a torn frame. */
+		g_last_guest_frame_seq++;                        /* -> odd */
+		__asm__ volatile("dsb ish" ::: "memory");
 		g_last_guest_frame = *frame;
+		__asm__ volatile("dsb ish" ::: "memory");
+		g_last_guest_frame_seq++;                        /* -> even */
+		__asm__ volatile("dsb ish" ::: "memory");
+	}
 
 	/* Recovery for cmd_call(): if a dbgmon-invoked function faults with an
 	 * EL2 sync exception, don't let it kill the hypervisor. Restore the

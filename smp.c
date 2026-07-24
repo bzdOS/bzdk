@@ -24,6 +24,7 @@
 
 /* The shared guest-frame snapshot + debug-core flag live in el2_exc.c. */
 extern struct el2_frame g_last_guest_frame;
+extern void el2_snapshot_guest_frame(struct el2_frame *out);  /* seqlock read (H8) */
 extern volatile uint32_t dbg_core_active;
 
 /* ISOLATION TEST flag. Default 0 = the debug core runs EMAC/dbgmon normally
@@ -489,7 +490,9 @@ void smp_secondary_main(uint64_t cpuid)
 			 * stays resident forever (word5 huge, no reset), the wedge is in
 			 * dbgmon_service; restore it once confirmed. */
 			if (!dbg_isolate_no_emac) {
-				dbgmon_service(&g_last_guest_frame);
+				struct el2_frame snap;
+				el2_snapshot_guest_frame(&snap);   /* consistent copy (H8) */
+				dbgmon_service(&snap);
 				/* Self-heal for "EMAC never saw a frame": bounded +
 				 * rate-limited internally, ~one branch per iteration on
 				 * the healthy path. Escalation to a WDOG self-reboot is
