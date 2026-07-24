@@ -252,9 +252,21 @@ void vblk_emmc_unlock(void);
  * a SEPARATE word/lock: this protects the virtqueue completion-publish step
  * (a CPU0-vs-CPU2 race), which is an entirely different critical section
  * than the eMMC controller register access the other lock guards. */
-#define VBLK_USED_LOCK_PA   0x50020200UL   /* clear of the vconsole ring, the
-                                            * eMMC lock (0x50020100), and every
-                                            * vblk_bc() breadcrumb slot. */
+#define VBLK_USED_LOCK_PA   0x50020700UL   /* MOVED from 0x50020200: that word
+                                            * ALIASED emmc_bio.c's EBIO_BC_BASE
+                                            * (also 0x50020200), whose word[0] is
+                                            * the eMMC read-failure counter — so
+                                            * the first I/O error stamped a
+                                            * nonzero value into this lock word,
+                                            * wedging it permanently "held" and
+                                            * reopening the very CPU0-vs-CPU2 race
+                                            * it closes, precisely when errors
+                                            * start. The 0x50020000 block is
+                                            * dense: vblk BC+lock 0x000..0x17f,
+                                            * EBIO 0x200..0x21f, HS testbuf
+                                            * 0x300..0x4ff, SD BC 0x500..0x527,
+                                            * async BC 0x600..0x60b. 0x50020700 is
+                                            * the first clear word above all. */
 
 /* Try to acquire the used-ring publish lock: 1 on success (caller now owns
  * the virtqueue completion step and MUST call vblk_used_unlock()), 0 if
