@@ -45,16 +45,21 @@ all: $(STAGE0_BIN) $(MAIN_BIN)
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
 # Plain x86_64 gcc, NOT $(CC)/$(CROSS) — these build and run entirely on the
 # dev host, no cross-compiler and no board. They mirror the pure ring-parsing
-# logic of vblk_emmc.c and the pure table-building logic of stage2.c (see the
-# block comments at the top of each test_*.c for exactly why they mirror
-# rather than #include the real .c files: both are full of raw ARMv8 inline
-# asm — cache maintenance, exclusive-monitor spinlocks, system-register
-# access — that plain gcc cannot assemble for x86_64). Fast enough to run on
-# every commit; does not touch vblk_emmc.c/stage2.c themselves.
-test: test_vblk_ring test_stage2_tables test_vnet_ring
+# logic of vblk_emmc.c/vnet_emac.c, the pure table-building logic of
+# stage2.c, the pure ELF/modinfo-tag logic of kload.c, and the pure
+# register-decode/IIR-LSR-USR emulation logic of vconsole.c (see the block
+# comments at the top of each test_*.c for exactly why they mirror rather
+# than #include the real .c files: all are full of raw ARMv8 inline asm —
+# cache maintenance, exclusive-monitor spinlocks, system-register access —
+# that plain gcc cannot assemble for x86_64). Fast enough to run on every
+# commit; does not touch vblk_emmc.c/stage2.c/vnet_emac.c/kload.c/vconsole.c
+# themselves.
+test: test_vblk_ring test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart
 	./test_vblk_ring
 	./test_stage2_tables
 	./test_vnet_ring
+	./test_kload_modinfo
+	./test_vconsole_uart
 
 test_vblk_ring: test_vblk_ring.c
 	gcc -Wall -Wextra -O2 -o $@ $<
@@ -63,6 +68,12 @@ test_stage2_tables: test_stage2_tables.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vnet_ring: test_vnet_ring.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_kload_modinfo: test_kload_modinfo.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_vconsole_uart: test_vconsole_uart.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 stage0: $(STAGE0_BIN)
@@ -229,4 +240,4 @@ clean: clean-qemu
 	      $(FBSD_ELF) $(FBSD_BIN) $(DBG_ELF) $(DBG_BIN) \
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
-	      test_vblk_ring test_stage2_tables test_vnet_ring
+	      test_vblk_ring test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart
