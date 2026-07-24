@@ -11,39 +11,66 @@
  *   can never see.
  * DOES NOT TOUCH: GICV (0x01c86000). The guest reaches GICV through the
  *   stage-2 mapping of its GICC IPA (0x01c82000 -> 0x01c86000, wired in
- *   stage2.c's stage2_build_mmio_tables() as of internal task); we never program
- *   GICV from here — that would fight the guest. GICD (0x01c81000) is passed
- *   through / identity-mapped to the guest (vgic_gicd_* below are the
- *   ready-but-inert trap-emulate hooks for when a later milestone unmaps it),
- *   BUT (v2, internal task) vgic_init() DOES make one real distributor write of
- *   its own: enabling/grouping/prioritizing INTID 27 (CNTV's own PPI) via
- *   GICD_ISENABLER0/IGROUPR0/IPRIORITYR, exactly like gic_timer.c already
- *   does for INTID 30. Without that, CNTV's hardware compare condition would
- *   never reach GICC_IAR at all — this is not the same thing as the guest's
- *   own GICD MMIO reads/writes (still identity/passed-through unmodified).
- * MOSTLY DOES NOT TOUCH the physical GICC path (GICC_IAR/EOIR) — gic_timer.c
- *   owns the physical CNTP tick end to end, and v1 does NOT enable any
- *   maintenance IRQ, precisely so INTID 25 never appears on gic_timer_irq()'s
- *   physical IAR. (v2, internal task): gic_timer_irq() now ALSO recognizes
- *   physical INTID 27 - the guest's real CNTV firing, routed to EL2 solely
- *   because HCR_EL2.IMO=1 catches every non-secure Group-1 physical IRQ,
- *   this one included - and calls vgic_inject() on it instead of discarding
- *   it as an unexpected PPI. See gic_timer.c for that side.
+ *   stage2.c's stage2_build_mmio_tables()); we never program GICV from here —
+ *   that would fight the guest. GICD (0x01c81000) is passed through /
+ *   identity-mapped to the guest — a DELIBERATE choice, not an oversight:
+ *   vgic_gicd_* below are ready-but-INERT trap-emulate hooks for a later
+ *   milestone, and they must stay inert here, because vgic_gicd_write()
+ *   today only mutates a private SRAM shadow completely disconnected from
+ *   the real hardware. Trapping GICD now (with that stub) would let the
+ *   guest's own GICD driver "successfully" write ISENABLER/IPRIORITYR/
+ *   IGROUPR into the shadow while the REAL distributor — the one
+ *   HCR_EL2.IMO=1 depends on to ever hand EL2 a device's physical IRQ in the
+ *   first place — never sees those writes, silently breaking every device
+ *   interrupt the guest tries to enable. GICD stays pass-through until a
+ *   real read-modify-shadow-then-write-through GICD emulation replaces the
+ *   current stub. The ONE exception vgic_init() makes to "GICD is the
+ *   guest's business" is enabling the maintenance PPI (INTID 25) at the
+ *   real distributor — that interrupt is never guest-visible or
+ *   guest-programmed, so it doesn't conflict with pass-through GICD at all.
+ * DRIVES the physical GICC path only indirectly: gic_timer_irq() (gic_timer.c)
+ *   is the one place that reads GICC_IAR/writes GICC_EOIR/DIR — this file
+ *   never touches GICC directly. What THIS file adds on top is: (a) the List
+ *   Registers that turn "gic_timer_irq() got some physical INTID" into "the
+ *   guest sees that INTID as a virtual IRQ, HW-tied so the guest's own
+ *   virtual EOI deactivates the real physical source", and (b) the
+ *   LR-exhaustion pending queue + maintenance-IRQ-driven drain below, so a
+ *   burst bigger than 4 List Registers is queued, never silently dropped.
  *
  * ================================================================
  *  Delivery chain (why a virtual IRQ actually reaches the guest)
  * ================================================================
- *   1. gic_timer.c set HCR_EL2.IMO=1. On this part IMO=1 does two things:
- *      routes physical IRQ to EL2 (the host tick), AND enables the virtual CPU
- *      interface to signal a *virtual* IRQ to EL1.
- *   2. vgic_init() sets GICH_HCR.En=1 (virtual interface on) and CNTVOFF_EL2=0.
- *   3. On each physical CNTP tick, el2_trap()->vgic_inject(27,0) writes a
- *      GICH_LR with state=pending, Group 1, priority 0.
- *   4. GICV sees a pending Group-1 vIRQ above the virtual PMR/running-priority
- *      and asserts the virtual IRQ line. The guest at EL1 (PSTATE.I clear)
- *      takes it through its own VBAR_EL1, reads the virtual IAR (its "GICC"
- *      IPA, redirected to GICV), gets INTID 27, EOIs. The EOI drops the LR to
- *      invalid (GICH_ELRSR bit sets), freeing it for the next inject.
+ *   1. main_dbg.c sets HCR_EL2.IMO=1 (+FMO=1): every physical IRQ/FIQ is now
+ *      routed to and taken at EL2, whether it's the guest's own device (an
+ *      SPI), its virtual timer's underlying PPI (CNTV, INTID 27), or
+ *      anything else — nothing reaches EL1 as a real physical IRQ anymore.
+ *   2. vgic_init() sets GICH_HCR.En=1 (virtual interface on), presets VMCR
+ *      (Group 1 enabled, virtual PMR wide open), CNTVOFF_EL2=0, and enables
+ *      the maintenance PPI (INTID 25) at the real distributor (UIE itself
+ *      stays clear until there's an actual backlog — see VGIC_MAINT_INTID).
+ *   3. gic_timer_irq() (gic_timer.c) reads the real GICC_IAR for EVERY
+ *      physical IRQ EL2 now takes, EOIs it (priority-drop only — see below),
+ *      and calls vgic_inject_hw(intid, intid, prio) — this file's job, from
+ *      here down.
+ *   4. vgic_inject_hw() finds a free List Register (GICH_ELRSR0) and writes
+ *      it HW=1 (tied to the physical INTID), Group 1, pending. If no LR is
+ *      free, it queues the request instead of dropping it (see the
+ *      LR-exhaustion pending queue below) and enables GICH_HCR.UIE so the
+ *      underflow maintenance IRQ drives the eventual drain.
+ *   5. GICV sees a pending Group-1 vIRQ above the virtual PMR/running-priority
+ *      and asserts the virtual IRQ line. The guest at EL1 takes it through
+ *      its own VBAR_EL1 (redirected "GICC" IPA -> GICV via stage-2), reads
+ *      the virtual IAR, services the device, and writes the virtual EOIR.
+ *   6. Because the LR was HW=1, that guest EOI does TWO things atomically in
+ *      hardware: it invalidates the LR (freeing it for reuse) AND
+ *      deactivates the tied PHYSICAL interrupt — exactly the "the guest's
+ *      own driver clears the level source" step that was missing in the two
+ *      prior (reverted) attempts, which is why a level-triggered IRQ
+ *      (EHCI/INTID 106) stormed at ~145 kHz: EL2 EOI'd *and* DIR'd it itself
+ *      without ever letting the guest's driver see/clear it, so the level
+ *      source re-asserted forever. gic_timer_irq() here EOIs (priority-drop)
+ *      but deliberately NEVER DIRs an HW-mode-injected interrupt — DIR is
+ *      hardware's job now, triggered by the guest's virtual EOI.
  * Freestanding, no libc: <stdint.h> only. Cache-coherent breadcrumb stores
  * (dc civac + dsb sy), same convention as every other lane in this tree.
  */
@@ -113,18 +140,23 @@
 #define GIC_SPURIOUS_MIN  1020u
 
 /* ================================================================
- *  GICD (distributor) — the ONE additional distributor write vgic_init()
- *  makes, despite this file's "does not touch GICD" header comment (that
- *  comment is about the shadow/trap-emulate path further down, which stays
- *  inert). Without this, CNTV's own physical PPI (INTID 27) is simply never
- *  enabled at the distributor - GICD_ISENABLER0 resets with it clear - so
- *  the hardware timer condition (CNTVCT >= guest's CNTV_CVAL_EL0) would
- *  never even reach GICC_IAR, real or virtual, no matter what GICH/vgic_init
- *  below does. This mirrors exactly what gic_timer.c already does for
- *  INTID 30 (CNTP): same NON-SECURE Group-1 view this board was proven to
- *  run in (see gic_timer.c's TIMER_INTID comment), same offsets. GICC_PMR/
- *  GICC_CTLR are CPU-interface-wide (not per-INTID) and gic_timer_init()
- *  already opened them, so nothing more is needed there for INTID 27 too.
+ *  GICD (distributor) — the ONLY distributor writes vgic_init() makes,
+ *  despite this file's "GICD is pass-through/guest's business" header
+ *  comment (that comment is about the guest-visible device-interrupt
+ *  configuration and the inert shadow/trap-emulate path further down,
+ *  neither of which this touches). vgic_init() enables/groups/prioritizes
+ *  the MAINTENANCE PPI (INTID 25) here — same NON-SECURE Group-1 offsets
+ *  gic_timer.c uses for INTID 30 (CNTP) — because that interrupt is never
+ *  guest-visible or guest-programmed (it exists purely to tell EL2 "an LR
+ *  just freed up", driven by GICH_HCR.UIE, which THIS file toggles), so
+ *  enabling it here doesn't touch anything the guest's own GICD driver
+ *  owns. CNTV's own physical PPI (INTID 27) is DELIBERATELY NOT enabled
+ *  here (see the comment above this block, just below vgic_init()'s body)
+ *  — that one IS guest-owned state and enabling it before the guest
+ *  programs CNTV_CVAL_EL0 would storm. GICC_PMR/GICC_CTLR are
+ *  CPU-interface-wide (not per-INTID); main_dbg.c's gic_timer_cpuif_init()
+ *  call already opens those before vgic_init() runs, so nothing more is
+ *  needed here for INTID 25 either.
  * ================================================================ */
 #define VGIC_GICD(reg)        (*(volatile uint32_t *)(VGIC_GICD_BASE + (reg)))
 #define VGIC_GICD_IGROUPR0    0x080u
@@ -160,6 +192,17 @@ static inline void write_cntvoff_el2(uint64_t v)
  *   [14] gicd_isenabler0  real GICD_ISENABLER0 readback (bit27 must be 1 -
  *                      proves CNTV's PPI is actually enabled at the
  *                      distributor, not just the virtual CPU interface)
+ *   --- v2 (interrupt-virtualization milestone) additions -------------
+ *   [15] pendq_count   current depth of the LR-exhaustion pending queue
+ *   [16] pendq_hwm     high-water mark ever reached by pendq_count
+ *   [17] pendq_overflow  injections actually LOST (the pending queue itself
+ *                      was full — distinct from inject_drop above, which
+ *                      pre-v2 meant "no free LR, dropped"; that case now
+ *                      queues instead of dropping)
+ *   [18] uie_state     last GICH_HCR readback (bit1 = UIE, toggled live as
+ *                      the pending queue fills/drains)
+ *   [19] maint_intid_en  GICD_ISENABLER0 readback (bit25 must be 1 — the
+ *                      maintenance PPI is enabled at the real distributor)
  * ================================================================ */
 /* 0x50001c00, matching the window documented just above (and smp.h / hv_addrmap.h).
  * Was 0x00018000 — guest-writable SRAM, next to start.S's boot breadcrumbs; a
@@ -182,6 +225,107 @@ static uint32_t vg_inject_count;
 static uint32_t vg_inject_ok;
 static uint32_t vg_inject_drop;
 static uint32_t vg_maint_count;
+static uint32_t vg_active;           /* 1 once vgic_init() has completed */
+
+/* ================================================================
+ *  LR-exhaustion pending-injection queue (v2, interrupt-virtualization
+ *  milestone). A GIC-400 has only vg_nr_lr (4) List Registers; under real
+ *  load (a burst of device SPIs, the guest's own CNTV tick, etc.) all 4 can
+ *  be occupied at once. Before v2, vgic_inject_hw() simply DROPPED the
+ *  interrupt in that case (fine for an idempotent periodic tick, WRONG for
+ *  arbitrary device interrupts — an edge-triggered completion IRQ dropped on
+ *  the floor never comes back). This fixed-size ring makes that loss
+ *  bounded-but-vanishingly-rare instead of routine: vgic_inject_hw() queues
+ *  here instead of dropping, and vgic_maintenance() (driven by the
+ *  GICH_HCR.UIE underflow maintenance IRQ, INTID 25 — see vgic.h) drains the
+ *  queue into List Registers as they free up. Only if THIS ring is also
+ *  full (VGIC_PENDQ_SIZE simultaneously-backlogged interrupts on top of 4
+ *  already-occupied LRs) is an injection ever actually lost — see
+ *  vg_pendq_overflow. No allocation, fixed array, bounded loops only. */
+#define VGIC_PENDQ_SIZE 32u
+
+struct vgic_pend {
+	uint32_t vintid;
+	uint32_t pintid;
+	int      priority;
+};
+
+static struct vgic_pend vg_pendq[VGIC_PENDQ_SIZE];
+static uint32_t vg_pendq_head;       /* next slot to push into */
+static uint32_t vg_pendq_tail;       /* next slot to pop from   */
+static uint32_t vg_pendq_count;
+static uint32_t vg_pendq_hwm;        /* high-water mark, diagnostic only */
+static uint32_t vg_pendq_overflow;   /* queue itself was full: TRUE loss  */
+
+/* Push one (vintid,pintid,priority) onto the pending queue. Returns 1 if
+ * queued, 0 if the queue itself was full (counted in vg_pendq_overflow —
+ * the only case where an interrupt is actually lost in v2). Enables
+ * GICH_HCR.UIE the moment the queue transitions from empty to non-empty, so
+ * the underflow maintenance IRQ starts firing to drive draining — see the
+ * file-header rationale for why UIE is never left on unconditionally. */
+static int vgic_pendq_push(uint32_t vintid, uint32_t pintid, int priority)
+{
+	if (vg_pendq_count >= VGIC_PENDQ_SIZE) {
+		vg_pendq_overflow++;
+		vg_bc(17, vg_pendq_overflow);
+		return 0;
+	}
+
+	if (vg_pendq_count == 0)
+		GICH(GICH_HCR) |= GICH_HCR_UIE;   /* start driving drains */
+
+	vg_pendq[vg_pendq_head].vintid   = vintid;
+	vg_pendq[vg_pendq_head].pintid   = pintid;
+	vg_pendq[vg_pendq_head].priority = priority;
+	vg_pendq_head = (vg_pendq_head + 1u) % VGIC_PENDQ_SIZE;
+	vg_pendq_count++;
+	if (vg_pendq_count > vg_pendq_hwm)
+		vg_pendq_hwm = vg_pendq_count;
+
+	vg_bc(15, vg_pendq_count);
+	vg_bc(16, vg_pendq_hwm);
+	return 1;
+}
+
+/* Pop the oldest queued entry. Returns 0 if the queue is empty. */
+static int vgic_pendq_pop(uint32_t *vintid, uint32_t *pintid, int *priority)
+{
+	if (vg_pendq_count == 0)
+		return 0;
+
+	*vintid   = vg_pendq[vg_pendq_tail].vintid;
+	*pintid   = vg_pendq[vg_pendq_tail].pintid;
+	*priority = vg_pendq[vg_pendq_tail].priority;
+	vg_pendq_tail = (vg_pendq_tail + 1u) % VGIC_PENDQ_SIZE;
+	vg_pendq_count--;
+	vg_bc(15, vg_pendq_count);
+	return 1;
+}
+
+/* Write one List Register in HW mode (tied to physical INTID `pintid`) —
+ * the single LR-programming step shared by vgic_inject_hw()'s fast path and
+ * vgic_maintenance()'s drain path, so the field layout is defined exactly
+ * once. Caller has already confirmed LR `n` is free (GICH_ELRSR0 bit set). */
+static void vgic_lr_write_hw(uint32_t n, uint32_t vintid, uint32_t pintid,
+                              int priority)
+{
+	uint32_t prio5 = ((uint32_t)priority >> 3) & 0x1fu;
+	uint32_t lr = (vintid & GICH_LR_VID_MASK) |
+	              ((pintid & 0x3ffu) << 10) |
+	              GICH_LR_GRP1 |
+	              GICH_LR_HW |
+	              GICH_LR_STATE_PENDING |
+	              (prio5 << GICH_LR_PRIO_SHIFT);
+
+	GICH(GICH_LR(n)) = lr;
+
+	vg_inject_ok++;
+	vg_bc(4, vg_inject_count);
+	vg_bc(5, vg_inject_ok);
+	vg_bc(7, lr);
+	/* B4 flight recorder: a0=vintid(==pintid for HW mode), a1=LR word. */
+	flightrec_log(FLTR_K_IRQ, vintid, lr);
+}
 
 /* ================================================================
  *  Public API
@@ -225,12 +369,32 @@ void vgic_init(void)
 	 * VGIC_GICD(VGIC_GICD_ISENABLER0) |= (1u << VGIC_VTIMER_INTID);
 	 */
 
+	/* The maintenance PPI (INTID 25), by contrast, IS safe to enable at the
+	 * real distributor unconditionally right here: unlike CNTV's hardware
+	 * comparator, whether this line ever actually asserts is gated entirely
+	 * by GICH_HCR.UIE, which WE control (left clear here, toggled on/off
+	 * dynamically only while the pending-injection queue is non-empty — see
+	 * vgic_inject_hw()/vgic_maintenance()). Enabling it at the distributor
+	 * now with UIE clear is inert; it only matters once UIE is set. */
+	VGIC_GICD(VGIC_GICD_IGROUPR0)   |= (1u << VGIC_MAINT_INTID);
+	VGIC_GICD_IPRIORITYR_BYTE(VGIC_MAINT_INTID) = 0x00u;
+	VGIC_GICD(VGIC_GICD_ISENABLER0) |= (1u << VGIC_MAINT_INTID);
+
 	vg_bc(1, vtr);
 	vg_bc(2, vg_nr_lr);
 	vg_bc(3, GICH(GICH_HCR));
 	vg_bc(12, 1u);
 	vg_bc(13, GICH(GICH_VMCR));
 	vg_bc(14, VGIC_GICD(VGIC_GICD_ISENABLER0)); /* readback: bit27 must be 1 */
+	vg_bc(18, GICH(GICH_HCR));                  /* UIE (bit1) expected 0 here */
+	vg_bc(19, VGIC_GICD(VGIC_GICD_ISENABLER0)); /* readback: bit25 must be 1 */
+
+	vg_active = 1;
+}
+
+uint32_t vgic_active(void)
+{
+	return vg_active;
 }
 
 void vgic_inject(uint32_t vintid, int priority)
@@ -276,22 +440,52 @@ void vgic_inject(uint32_t vintid, int priority)
 
 void vgic_maintenance(void)
 {
-	uint32_t misr, eisr, n;
+	uint32_t misr, eisr, elrsr, n;
 
 	vg_maint_count++;
 	misr = GICH(GICH_MISR);
 	eisr = GICH(GICH_EISR0);
 
-	/* EISR bit n == 1: the guest EOIed LR n (an EOI-maintenance LR). Clear
-	 * it so the slot is reusable. (In v1 no maintenance IRQ is enabled, so
-	 * this path is exercised only if a v2 revision turns it on.) */
+	/* EISR bit n == 1: the guest EOIed LR n via the EOI-maintenance path.
+	 * Clear it so the slot is reusable. Our HW-mode LRs (GICH_LR_HW set,
+	 * GICH_LR_EOI clear) don't request this — deactivation on guest EOI is
+	 * done by hardware directly, no maintenance IRQ needed for THAT — so
+	 * this loop is normally a no-op in v2 too; kept for completeness/safety
+	 * against any future LR that does set the EOI-maintenance bit. */
 	for (n = 0; n < vg_nr_lr; n++)
 		if (eisr & (1u << n))
 			GICH(GICH_LR(n)) = 0u;
 
+	/* Drain the LR-exhaustion pending queue (vgic_inject_hw()) into
+	 * whichever LRs GICH_ELRSR0 shows free RIGHT NOW — this is what the
+	 * underflow condition (MISR.U, the reason UIE fired this INTID 25 in
+	 * the first place) is telling us: at least one LR just freed up. Bounded
+	 * to vg_nr_lr iterations regardless of queue depth — never loops on the
+	 * queue itself, only on the fixed LR count. */
+	elrsr = GICH(GICH_ELRSR0);
+	for (n = 0; n < vg_nr_lr && vg_pendq_count > 0; n++) {
+		uint32_t vintid, pintid;
+		int priority;
+
+		if (!(elrsr & (1u << n)))
+			continue;
+		if (!vgic_pendq_pop(&vintid, &pintid, &priority))
+			break;
+		vgic_lr_write_hw(n, vintid, pintid, priority);
+	}
+
+	/* Once the queue is empty again, stop asking for underflow maintenance —
+	 * see the file-header rationale (UIE left on unconditionally would make
+	 * INTID 25 itself storm at idle, since <2-valid-LRs is the normal idle
+	 * state of a 4-LR GIC-400). */
+	if (vg_pendq_count == 0)
+		GICH(GICH_HCR) &= ~GICH_HCR_UIE;
+
 	vg_bc(9, vg_maint_count);
 	vg_bc(10, misr);
 	vg_bc(11, eisr);
+	vg_bc(15, vg_pendq_count);
+	vg_bc(18, GICH(GICH_HCR));
 }
 
 /* ================================================================
@@ -538,36 +732,36 @@ void vgic_selftest_start(void)
 
 void vgic_inject_hw(uint32_t vintid, uint32_t pintid, int priority)
 {
-	uint32_t elrsr, n, prio5, lr;
+	uint32_t elrsr, n;
 
 	vg_inject_count++;
 
-	elrsr = GICH(GICH_ELRSR0);
-
-	for (n = 0; n < vg_nr_lr; n++) {
-		if (elrsr & (1u << n)) {
-			prio5 = ((uint32_t)priority >> 3) & 0x1fu;
-			lr = (vintid & GICH_LR_VID_MASK) |
-			     ((pintid & 0x3ffu) << 10) |
-			     GICH_LR_GRP1 |
-			     GICH_LR_HW |
-			     GICH_LR_STATE_PENDING |
-			     (prio5 << GICH_LR_PRIO_SHIFT);
-			GICH(GICH_LR(n)) = lr;
-
-			vg_inject_ok++;
-			vg_bc(4, vg_inject_count);
-			vg_bc(5, vg_inject_ok);
-			vg_bc(7, lr);
-			vg_bc(8, elrsr);
-			/* B4 flight recorder: a0=vintid(==pintid for HW mode), a1=LR word. */
-			flightrec_log(FLTR_K_IRQ, vintid, lr);
-			return;
+	/* Fast path only when the pending queue is already empty: if it isn't,
+	 * something is draining (or about to be, via the maintenance IRQ) and
+	 * injecting straight into a free LR here would deliver THIS interrupt
+	 * ahead of ones already queued — not incorrect (the guest doesn't
+	 * require strict inter-device ordering) but needlessly surprising to
+	 * reason about, so we keep FIFO order across the queue+LR combination
+	 * by always queuing behind an existing backlog. */
+	if (vg_pendq_count == 0) {
+		elrsr = GICH(GICH_ELRSR0);
+		for (n = 0; n < vg_nr_lr; n++) {
+			if (elrsr & (1u << n)) {
+				vgic_lr_write_hw(n, vintid, pintid, priority);
+				vg_bc(8, elrsr);
+				return;
+			}
 		}
 	}
 
-	vg_inject_drop++;
+	/* No free LR right now (or the queue is already draining) — queue it.
+	 * vgic_maintenance() (driven by the GICH_HCR.UIE underflow maintenance
+	 * IRQ this push enables) drains it the moment an LR frees up. Only the
+	 * queue itself being full actually loses the interrupt (vg_pendq_overflow,
+	 * counted separately from vg_inject_drop's legacy meaning below). */
+	if (!vgic_pendq_push(vintid, pintid, priority))
+		vg_inject_drop++;   /* true loss: even the pending queue was full */
+
 	vg_bc(4, vg_inject_count);
 	vg_bc(6, vg_inject_drop);
-	vg_bc(8, elrsr);
 }
