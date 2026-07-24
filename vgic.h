@@ -30,12 +30,17 @@
  * (this file) drives GICH (0x01c84000): it never touches GICV, and the guest
  * never touches GICH — they meet only through the List Registers.
  *
- * STATUS (2026-07-16): this whole vGIC path is OFF. stage2.c REMOVED the
- * GICC->GICV redirect (see its FIX-1 comment) because under IMO=0 the guest
- * must ack/EOI via the REAL GICC, and the redirect made it unable to service
- * any interrupt. So the descriptions below that say "stage-2 redirects GICC to
- * GICV" describe the INTENDED IMO=1 design, not the current build — re-adding
- * that remap is a precondition for ever running this code again.
+ * STATUS (2026-07-24): RE-ENABLED for the interrupt-virtualization milestone.
+ * main_dbg.c now sets HCR_EL2.IMO=1/FMO=1 (every physical IRQ/FIQ routed to
+ * and taken at EL2) and stage2.c's stage2_build_mmio_tables() re-adds the
+ * GICC->GICV redirect (paired with IMO=1, as it must be — see the two prior
+ * reverts documented in gic_timer.c's INTID 106/27 comments: IMO=1 alone,
+ * without either the redirect or COMPLETE HW-mode LR forwarding, is exactly
+ * what produced the 145 kHz EHCI storm). gic_timer_irq() (gic_timer.c) now
+ * forwards EVERY non-spurious physical INTID to the guest via
+ * vgic_inject_hw() once vgic_active() is true — see that file for the full
+ * per-INTID dispatch and the LR-exhaustion pending-queue this file adds
+ * (vgic_maintenance() below).
  *
  * Freestanding, no libc: <stdint.h> only. Depends on exceptions.h for
  * struct el2_frame (the GICD trap-emulate + maintenance handlers take the
@@ -61,9 +66,21 @@
 #define VGIC_VTIMER_INTID   27u
 
 /* The GIC-400 maintenance interrupt (the GIC node's own PPI 9 -> INTID 25).
- * NOT routed/enabled in v1 (see vgic.c): v1 reclaims List Registers by polling
- * GICH_ELRSR at inject time, so no maintenance IRQ is generated and there is
- * no risk of it colliding with gic_timer_irq()'s physical GICC_IAR handling. */
+ * v2 (interrupt-virtualization milestone): ENABLED. vgic_init() enables it at
+ * the real distributor (IGROUPR0/ISENABLER0/IPRIORITYR, same treatment as any
+ * other PPI) but GICH_HCR.UIE (the bit that actually asserts this line on LR
+ * underflow) is left CLEAR at init and toggled on/off dynamically by the
+ * pending-injection queue (vgic_inject_hw()/vgic_maintenance() in vgic.c) —
+ * only while there is a backlog waiting for a free List Register. Enabling
+ * UIE unconditionally would make INTID 25 itself storm: the underflow
+ * condition ("fewer than 2 valid LRs") is the NORMAL idle state of a GIC-400
+ * with only 4 LRs, so it would fire continuously whenever the guest isn't
+ * actively holding >=2 interrupts pending — the same class of bug this whole
+ * milestone exists to fix, just self-inflicted instead of device-inflicted.
+ * gic_timer_irq() routes INTID 25 to vgic_maintenance() and — unlike every
+ * other (HW-mode, guest-EOI-deactivated) forwarded INTID — fully EOIs *and*
+ * DIRs it itself, because this one is never placed in a List Register: it is
+ * serviced entirely by EL2, so nothing else will ever deactivate it. */
 #define VGIC_MAINT_INTID    25u
 
 /* ---- Core vGIC API ---- */
@@ -84,12 +101,21 @@ void vgic_init(void);
  * el2_trap()'s IRQ arm on each host tick with (VGIC_VTIMER_INTID, 0). */
 void vgic_inject(uint32_t vintid, int priority);
 
-/* Service the maintenance interrupt: read GICH_MISR/GICH_EISR and clear any
- * List Register the guest has EOIed (EISR bit set). Provided for completeness
- * / the v2 path; in v1 it is unused (no maintenance IRQ is enabled). If a
- * future revision enables GICH_HCR.UIE/EOI maintenance and routes INTID 25,
- * call this from el2_trap when the acknowledged physical INTID == 25. */
+/* Service the maintenance interrupt (v2: WIRED — call from gic_timer_irq()
+ * when the acknowledged physical INTID == VGIC_MAINT_INTID (25), after fully
+ * EOI+DIR'ing it yourself — see VGIC_MAINT_INTID's comment above for why).
+ * Clears any List Register the guest EOIed via the EOI-maintenance path
+ * (GICH_EISR — unused by our pure HW-mode LRs today, kept for completeness),
+ * then drains the pending-injection queue (see vgic_inject_hw()) into
+ * whichever List Registers GICH_ELRSR now shows free, bounded to at most
+ * vg_nr_lr iterations. Clears GICH_HCR.UIE once the queue is empty again. */
 void vgic_maintenance(void);
+
+/* True once vgic_init() has completed. Lets gic_timer_irq() (gic_timer.c)
+ * decide, per-build, whether to run the full vGIC forwarding path (main_dbg,
+ * where vgic_init() is called) or the legacy/no-vgic behavior (REPL/GDB
+ * builds, which link the same gic_timer.c but never call vgic_init()). */
+uint32_t vgic_active(void);
 
 /* ---- Distributor (GICD) trap-and-emulate helpers (v1: INERT) ----
  * In v1 the GICD page (0x01c81000) is left identity-mapped (passed through),
@@ -120,5 +146,21 @@ void vgic_selftest_start(void)      __attribute__((noreturn));
 #endif /* BZDOS_VGIC_H */
 
 /* Inject a hardware-backed interrupt (HW=1). When the guest writes virtual
- * EOIR, the GIC automatically deactivates the physical interrupt 'pintid'. */
+ * EOIR, the GIC automatically deactivates the physical interrupt 'pintid' —
+ * the caller (gic_timer_irq()) must therefore EOI (priority-drop) but NEVER
+ * DIR the physical interrupt itself; DIR'ing it here would deactivate it
+ * before the guest ever services it, and re-arm nothing (that combination —
+ * EOI+DIR a level-triggered source the guest never got to clear — is exactly
+ * the documented 145 kHz EHCI/INTID-106 storm from the prior two reverts).
+ *
+ * LR-exhaustion handling (v2, interrupt-virtualization milestone): a GIC-400
+ * has only 4 List Registers. If none is free when this is called, the
+ * request is NOT dropped — it is pushed onto a small fixed-size pending-
+ * injection ring (bounded, no allocation) and drained by vgic_maintenance()
+ * as LRs free up (signalled by the GICH_HCR.UIE underflow maintenance IRQ,
+ * INTID 25, dynamically enabled only while the ring is non-empty). Only if
+ * that ring ITSELF is full (a sustained, extreme burst far beyond 4 LRs +
+ * the ring depth) is an injection ever actually lost — counted separately
+ * from the ordinary "LR busy, queued" case so a real overrun is
+ * distinguishable from normal backlog in the breadcrumb window. */
 void vgic_inject_hw(uint32_t vintid, uint32_t pintid, int priority);
