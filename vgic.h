@@ -30,6 +30,13 @@
  * (this file) drives GICH (0x01c84000): it never touches GICV, and the guest
  * never touches GICH — they meet only through the List Registers.
  *
+ * STATUS (2026-07-16): this whole vGIC path is OFF. stage2.c REMOVED the
+ * GICC->GICV redirect (see its FIX-1 comment) because under IMO=0 the guest
+ * must ack/EOI via the REAL GICC, and the redirect made it unable to service
+ * any interrupt. So the descriptions below that say "stage-2 redirects GICC to
+ * GICV" describe the INTENDED IMO=1 design, not the current build — re-adding
+ * that remap is a precondition for ever running this code again.
+ *
  * Freestanding, no libc: <stdint.h> only. Depends on exceptions.h for
  * struct el2_frame (the GICD trap-emulate + maintenance handlers take the
  * trapped frame, matching el2_trap's call sites).
