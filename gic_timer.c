@@ -585,17 +585,33 @@ gic_timer_irq(struct el2_frame *frame)
 	}
 
 	if (intid != TIMER_INTID) {
-		/* PMU (INTID 106) storm mitigation: drop it completely.
-		 * Guest PMU driver is causing a storm because it never clears it. */
+		/* INTID 106 (EHCI SPI 74, usb@1c1b000, level-high) storm mitigation:
+		 * EOI+DIR and drop — do NOT inject to the guest. This is a documented
+		 * WORKAROUND, not a fix: the level source stays asserted because
+		 * nothing clears it at the device, so injecting would re-fire forever
+		 * (the confirmed 145 kHz storm — see the EHCI-INTID-106 investigation).
+		 * NOT silent: every drop is counted in irq_counter[106], and the
+		 * storm-diagnostics breadcrumb (IRQ_COUNTER_BC_BASE below) surfaces
+		 * the dominant storming INTID, so the drop rate is measurable over
+		 * EMAC. The real fix is proper interrupt virtualization (vGIC/IMO=1
+		 * with the device source actually serviced) — a separate milestone
+		 * that was attempted and reverted once; see vgic.h's STATUS note. */
 		if (intid == 106) {
 			GICC_EOIR = iar;
 			GICC_DIR = iar;
 			return;
 		}
 
-		/* CNTV (INTID 27) storm mitigation: drop it for now (internal task).
-		 * Virtual timer firing too frequently, blocking guest progress.
-		 * TODO: investigate why CNTV is storming despite CNTVOFF_EL2=0. */
+		/* INTID 27 (CNTV, guest virtual timer PPI) storm mitigation (hubd
+		 * #142): EOI+DIR and drop. Same WORKAROUND caveat as 106 — dropping
+		 * the guest's own virtual-timer tick means it never arrives via this
+		 * path (the guest uses CNTP instead in the current build). Counted in
+		 * irq_counter[27] and surfaced via the storm breadcrumb, so this is a
+		 * measured steady-state workaround, not a silent one. Root cause (why
+		 * CNTV storms despite CNTVOFF_EL2=0) and the real fix (inject CNTV via
+		 * the vGIC List Registers) belong to the interrupt-virtualization
+		 * milestone; the prior vGIC injection attempt regressed and was
+		 * reverted (see vgic.h STATUS / the vgic-revert history). */
 		if (intid == 27) {
 			GICC_EOIR = iar;
 			GICC_DIR = iar;

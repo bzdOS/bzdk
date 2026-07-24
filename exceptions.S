@@ -9,8 +9,13 @@
  *
  * We run under U-Boot (MMU on, EL2, U-Boot's stack). el2_install() saves
  * U-Boot's VBAR_EL2 and points it at our table; el2_uninstall() restores it,
- * so a clean return to the U-Boot prompt is preserved. A dedicated exception
- * stack is used so a fault while SP is bad still lands somewhere valid.
+ * so a clean return to the U-Boot prompt is preserved. NOTE: there is NO
+ * separate dedicated exception stack — el2_common banks to the live SP_EL2
+ * (after H2(a) that is CPU0's protected smp_stacks[0] for the resident phase,
+ * see start.S). A fault taken while SP_EL2 is itself corrupt would push onto a
+ * bad stack; tolerated only because exception entry masks DAIF, so IRQ/FIQ/
+ * SError cannot nest — only a synchronous fault inside a handler (a hypervisor
+ * bug, already fatal) can.
  *
  * Frame layout (offsets, bytes) — must match struct el2_frame in exceptions.h:
  *   0x000..0x0f8  x0..x30            (31 * 8 = 248)
@@ -27,7 +32,12 @@
 
 /* One architectural vector slot (0x80 bytes). Stash x0 in TPIDR_EL2 (a
  * scratch sysreg we never otherwise use) so we can load the kind index
- * without clobbering the guest's x0, then jump to the common path. */
+ * without clobbering the guest's x0, then jump to the common path. CAVEAT:
+ * a synchronous fault taken INSIDE a handler, before el2_common stores x0 to
+ * the frame, would overwrite this TPIDR_EL2 stash — acceptable only because
+ * such nesting is a hypervisor bug (async exceptions can't nest: DAIF is
+ * masked on entry), and no free GPR exists at vector entry to avoid the
+ * scratch-sysreg round-trip. */
 	.macro	VEC kind
 	.balign	0x80
 	msr	tpidr_el2, x0
