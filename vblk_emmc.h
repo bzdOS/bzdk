@@ -51,6 +51,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"     /* struct el2_frame */
+#include "hv_addrmap.h"     /* HVMAP_* fixed-DRAM address map (single source) */
 
 /* ------------------------------------------------------------------ *
  * MMIO window.
@@ -208,13 +209,12 @@
  * coherent AND inspectable/resettable over EMAC; vblk_init() zeroes it so a
  * stale "locked" value can never survive a warm WDT reset into a deadlock.
  * ------------------------------------------------------------------ */
-#define VBLK_EMMC_LOCK_PA   0x50020100UL   /* MOVED from 0x50005100 — that was INSIDE the
-                                            * 64KB vconsole ring (0x50000f10..0x50010f10),
-                                            * so console output clobbered the lock word ->
-                                            * it read "locked" (garbage) -> every guest read
-                                            * failed emmc_lock_acquire_bounded -> S_IOERR ->
-                                            * no vtbd0pN partitions. THE root virtio-blk bug.
-                                            * 0x50020100 is above the ring, clear. */
+/* eMMC controller lock (CPU0 sync path vs CPU1 debug-core). Address is owned by
+ * hv_addrmap.h now; it was originally 0x50005100 INSIDE the 64 KiB vconsole
+ * ring, where console output clobbered it -> it read "locked" -> every guest
+ * read failed emmc_lock_acquire_bounded -> S_IOERR -> no vtbd0pN partitions
+ * (THE root virtio-blk bug). */
+#define VBLK_EMMC_LOCK_PA   HVMAP_EMMC_LOCK
 
 /* Try to acquire the eMMC-controller lock: returns 1 on success (caller now
  * owns the controller and MUST call vblk_emmc_unlock()), 0 if already held.
@@ -252,21 +252,10 @@ void vblk_emmc_unlock(void);
  * a SEPARATE word/lock: this protects the virtqueue completion-publish step
  * (a CPU0-vs-CPU2 race), which is an entirely different critical section
  * than the eMMC controller register access the other lock guards. */
-#define VBLK_USED_LOCK_PA   0x50020700UL   /* MOVED from 0x50020200: that word
-                                            * ALIASED emmc_bio.c's EBIO_BC_BASE
-                                            * (also 0x50020200), whose word[0] is
-                                            * the eMMC read-failure counter — so
-                                            * the first I/O error stamped a
-                                            * nonzero value into this lock word,
-                                            * wedging it permanently "held" and
-                                            * reopening the very CPU0-vs-CPU2 race
-                                            * it closes, precisely when errors
-                                            * start. The 0x50020000 block is
-                                            * dense: vblk BC+lock 0x000..0x17f,
-                                            * EBIO 0x200..0x21f, HS testbuf
-                                            * 0x300..0x4ff, SD BC 0x500..0x527,
-                                            * async BC 0x600..0x60b. 0x50020700 is
-                                            * the first clear word above all. */
+/* Address owned by hv_addrmap.h, which also compile-time-proves it does not
+ * alias the EBIO diagnostics window it was mistakenly placed on in d24dcbc
+ * (0x50020200, whose word[0] — the read-failure counter — wedged it "held"). */
+#define VBLK_USED_LOCK_PA   HVMAP_USED_LOCK
 
 /* Try to acquire the used-ring publish lock: 1 on success (caller now owns
  * the virtqueue completion step and MUST call vblk_used_unlock()), 0 if
