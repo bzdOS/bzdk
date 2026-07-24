@@ -22,10 +22,13 @@ State machine per cycle:
 Usage: python3 reliable_load.py [--expect-vbk] [--cycles N]
 Exit 0 on verified load, 1 on exhaustion.
 """
-import os, sys, time, argparse
+import os, sys, time, argparse, termios, tty
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chimpd as C
 from hvdbg import HV
+
+GUEST_TTY = "/dev/ttyACM0"
+ROOT_MOUNTFROM = "ufs:/dev/vtbd0p3"
 
 UBOOT_VID, UBOOT_PID = "1f3a", "efe8"     # U-Boot download gadget
 HVCON_VID, HVCON_PID = "1d6b", "0010"     # HV's bzdOS USB Console
@@ -188,7 +191,86 @@ def verify(expect_vbk):
     return True
 
 
-def reliable_load(expect_vbk=False, max_cycles=5):
+def auto_mount_root(timeout=45):
+    """Automate the mountroot> workaround over the guest's USB-ACM console
+    (usbacm.c bridges /dev/ttyACM0 <-> the guest UART RX/TX rings).
+
+    ROOT CAUSE (found live 2026-07-24): FreeBSD's vfs_mountroot automatic
+    path (kload.c's vfs.root.mountfrom=ufs:/dev/vtbd0p3 kenv) does NOT
+    reliably auto-mount even given a huge timeout -- empirically, GEOM's
+    one-shot partition taste of vtbd0 sometimes loses a boot-time race and
+    NEVER retries on its own (g_part_taste() runs exactly once per provider
+    attach; see sys/geom/part/g_part.c). But typing ANYTHING at the
+    interactive "mountroot>" prompt that results -- even just "?" -- makes
+    the mount succeed right after. This points at a guest scheduler/GEOM
+    event-queue-draining quirk under this HV (worth a deeper future
+    investigation), NOT a disk/transport bug (see project memory
+    rootmount-gpt-healthy-blocker-guestside.md). Until that's root-caused,
+    this function automates the exact manual workaround an operator has
+    been typing by hand all session, so no human has to do it anymore.
+
+    Returns True if "mountroot>" was seen and the mount command was sent
+    (best-effort — does not guarantee multi-user boot succeeds afterward;
+    a separately dirty/unclean filesystem can still drop to single-user,
+    which is an orthogonal issue -- run fsck once to clear that)."""
+    fd = None
+    t_open = time.time()
+    while time.time() - t_open < 10:
+        try:
+            fd = os.open(GUEST_TTY, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            break
+        except OSError:
+            time.sleep(0.2)
+    if fd is None:
+        C.slog(f"  [automount] {GUEST_TTY} never appeared")
+        return False
+    try:
+        try:
+            tty.setraw(fd)
+        except termios.error:
+            pass
+        buf = b""
+        t0 = time.time()
+        sent = False
+        while time.time() - t0 < timeout:
+            try:
+                d = os.read(fd, 4096)
+                if d:
+                    buf += d
+            except BlockingIOError:
+                time.sleep(0.05)
+            except OSError:
+                time.sleep(0.05)
+            if not sent and b"mountroot>" in buf:
+                C.slog("  [automount] mountroot> seen, injecting "
+                       f"{ROOT_MOUNTFROM}")
+                payload = (ROOT_MOUNTFROM + "\r").encode("ascii")
+                for byte in payload:
+                    for _ in range(40):
+                        try:
+                            os.write(fd, bytes([byte])); break
+                        except BlockingIOError:
+                            time.sleep(0.02)
+                    time.sleep(0.003)
+                sent = True
+                buf = b""     # only look at what comes AFTER our own input
+                t0 = time.time()   # give it a fresh window to confirm
+                continue
+            if sent and (b"Trying to mount root from" in buf or
+                         b"start_init" in buf or b"root@" in buf):
+                C.slog("  [automount] root mount confirmed")
+                return True
+        if sent:
+            C.slog("  [automount] sent mount command but no confirmation "
+                   "seen within timeout (may still have worked)")
+            return True
+        C.slog("  [automount] mountroot> never seen within timeout")
+        return False
+    finally:
+        os.close(fd)
+
+
+def reliable_load(expect_vbk=False, max_cycles=5, boot_to_shell=False):
     for cyc in range(1, max_cycles + 1):
         C.slog(f"━━━ reliable cycle #{cyc}/{max_cycles} ━━━")
         if not ensure_uboot():
@@ -206,6 +288,8 @@ def reliable_load(expect_vbk=False, max_cycles=5):
             continue
         if verify(expect_vbk):
             C.slog(f"🎉 [reliable] LOADED & VERIFIED on cycle #{cyc}")
+            if boot_to_shell:
+                auto_mount_root()
             return True
         C.slog("  [reliable] load unverified — retrying cycle")
     C.slog(f"⛔ [reliable] exhausted {max_cycles} cycles")
@@ -217,5 +301,9 @@ if __name__ == "__main__":
     ap.add_argument("--expect-vbk", action="store_true",
                     help="require the VBK1 breadcrumb (virtio-blk build)")
     ap.add_argument("--cycles", type=int, default=5)
+    ap.add_argument("--boot-to-shell", action="store_true",
+                    help="after verify, auto-answer the guest's mountroot> "
+                         "prompt over /dev/ttyACM0 so it reaches a real "
+                         "shell with no manual console typing")
     a = ap.parse_args()
-    sys.exit(0 if reliable_load(a.expect_vbk, a.cycles) else 1)
+    sys.exit(0 if reliable_load(a.expect_vbk, a.cycles, a.boot_to_shell) else 1)
