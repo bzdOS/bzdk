@@ -261,6 +261,171 @@ int el2_ss_toggle(struct el2_frame *frame)
 	return el2_ss_on;
 }
 
+/* ------------------------------------------------------------------ *
+ * H3 — guest PSCI SMC filter (privilege-escalation hole closed).
+ *
+ * el2_trap() traps every guest SMC (HCR_EL2.TSC=1, EC==0x17) below. Until
+ * this filter existed, every PSCI function EL2 didn't specifically
+ * recognize (SYSTEM_OFF/SYSTEM_RESET) was forwarded straight through to
+ * secure EL3 (BL31) with x1..x3 verbatim from the guest. EL2 is the highest
+ * non-secure exception level on this SoC, so whatever EL BL31 warm-boots a
+ * target core into on a PSCI "bring a core up" call is entirely up to
+ * BL31/PSCI semantics, not something EL2 can police AFTER the fact — the
+ * only safe point to stop a guest from parlaying a PSCI call into code
+ * running above its own EL1 is HERE, before the `smc` instruction ever
+ * executes.
+ *
+ * The concrete hole (finding H3): PSCI_CPU_ON (DEN0022 §5.5) takes a
+ * guest-supplied target MPIDR (x1) and a guest-supplied entry_point_address
+ * (x2 — "the address at which the core must commence execution"; the caller
+ * does not get to say what EL that is, it's whatever EL PSCI_CPU_ON's own
+ * warm-boot path uses on this platform, which is EL2 for every core this HV
+ * itself CPU_ON's at boot — see smp.c). A FreeBSD/arm64 guest issuing
+ * CPU_ON for an OFF core with x2 pointed at guest-controlled memory would
+ * have that address executed AT EL2 — full hypervisor privilege from a
+ * ring-1 guest. Today the hole is closed only BY ACCIDENT: smp_init()
+ * already PSCI-CPU_ON's affinities 1..3 for its own use (CPU1 = EMAC/dbgmon
+ * debug core, CPU2 = async eMMC I/O, CPU3 parked — see smp.c), so a guest
+ * CPU_ON for any of them returns ALREADY_ON(-4) today — but nothing
+ * enforced that on purpose, and there was no CPU_OFF interception, so a
+ * guest (or a future multi-vCPU build) that first got one of those cores
+ * OFF would immediately reopen the CPU_ON window. This filter makes the
+ * policy explicit and no longer contingent on smp_init()'s boot-time
+ * ordering being exactly what it is today.
+ *
+ * NOTE: the guest this HV runs today is single-vCPU as far as EL2 is
+ * concerned — guest_enter() (guest.c/guest.h) is called exactly once, from
+ * CPU0's own boot path (main_dbg.c et al.); smp_secondary_main() (smp.c)
+ * never calls guest_enter() for CPU1..3, they run the HV's own debug-core /
+ * async-I/O / idle loops forever. So the guest has never needed, and
+ * structurally cannot use, a real PSCI CPU_ON to bring up a second vCPU —
+ * refusing it here changes nothing about current working guest behavior.
+ *
+ * Policy (whitelist; everything not explicitly listed is refused):
+ *   PSCI_VERSION, PSCI_FEATURES, AFFINITY_INFO{,_64}, MIGRATE{,_64},
+ *   MIGRATE_INFO_TYPE, MIGRATE_INFO_UP_CPU{,_64}
+ *     -> pure informational queries per DEN0022: none of them takes an
+ *        entry-point/address parameter and none of them changes any core's
+ *        power state, so forwarding x1..x3 to the real EL3 PSCI verbatim
+ *        carries no privilege-escalation risk. Let BL31 answer exactly as
+ *        it would without this HV in the picture.
+ *   CPU_ON{,_64}
+ *     -> NEVER forwarded. Cores 1..3 are permanently HV-owned (smp.c); core
+ *        0 is the only guest vCPU and is already running. Answer
+ *        ALREADY_ON(-4) for any of the 4 physical cores that actually exist
+ *        on this SoC (matches true hardware state — not a lie) and
+ *        INVALID_PARAMS(-2) for any other target, without ever reaching
+ *        EL3 or even reading the guest's entry_point_address (x2).
+ *   CPU_OFF, CPU_SUSPEND{,_64}
+ *     -> NEVER forwarded. Neither takes a "target core" parameter in
+ *        DEN0022 — both operate on the CALLING core, and the calling core
+ *        for every guest SMC this HV ever traps IS core 0, simultaneously
+ *        running this very hypervisor. CPU_OFF succeeding would power core
+ *        0 off from under EL2 itself (self-inflicted total wedge);
+ *        CPU_SUSPEND to a power-down state hands BL31 a guest-supplied
+ *        wake-up entry_point_address for this SAME core's own warm-boot
+ *        re-entry — structurally the same "guest picks the next PC at an
+ *        elevated EL" hazard as CPU_ON, just against the running core
+ *        instead of an idle one. Refuse both with DENIED(-3): no core is
+ *        ever actually powered down or suspended, which also forecloses a
+ *        future multi-vCPU build where an HV-owned core (1..3) could be
+ *        talked into CPU_OFF'ing itself and reopening the CPU_ON window.
+ *   SYSTEM_OFF, SYSTEM_RESET
+ *     -> handled by the caller BEFORE this filter runs, unchanged
+ *        (dbg_clean_off / dbg_block_reset) — control never reaches here for
+ *        either fnid.
+ *   anything else (unrecognized function ID)
+ *     -> NOT_SUPPORTED(-1), the spec-correct answer for an unimplemented
+ *        PSCI function, instead of blindly hosting an unknown, possibly
+ *        address-bearing SMC out to EL3.
+ *
+ * Returns 1 and sets *ret to the PSCI return code when the call is decided
+ * HERE (emulated or denied) — the caller must NOT execute the real `smc`
+ * for it. Returns 0 when fnid is on the forward whitelist and safe to pass
+ * to EL3 verbatim — the caller still owns doing that round-trip itself so
+ * the existing x0..x3 smc-and-restore code doesn't have to move.
+ */
+#define PSCI_FN_VERSION            0x84000000ull
+#define PSCI_FN_CPU_SUSPEND_32     0x84000001ull
+#define PSCI_FN_CPU_SUSPEND_64     0xC4000001ull
+#define PSCI_FN_CPU_OFF            0x84000002ull /* no _64 form: takes no address arg */
+#define PSCI_FN_CPU_ON_32          0x84000003ull
+#define PSCI_FN_CPU_ON_64          0xC4000003ull
+#define PSCI_FN_AFFINITY_INFO_32   0x84000004ull
+#define PSCI_FN_AFFINITY_INFO_64   0xC4000004ull
+#define PSCI_FN_MIGRATE_32         0x84000005ull
+#define PSCI_FN_MIGRATE_64         0xC4000005ull
+#define PSCI_FN_MIGRATE_INFO_TYPE  0x84000006ull
+#define PSCI_FN_MIGRATE_INFO_UP_32 0x84000007ull
+#define PSCI_FN_MIGRATE_INFO_UP_64 0xC4000007ull
+/* 0x84000008 (SYSTEM_OFF) / 0x84000009 (SYSTEM_RESET) intentionally NOT
+ * listed here — el2_trap() special-cases both BEFORE calling this filter,
+ * so control never reaches the switch below for either fnid. */
+#define PSCI_FN_PSCI_FEATURES      0x8400000Aull
+
+/* PSCI return codes, DEN0022 Table 5.1 (the subset this filter emits). */
+#define PSCI_RET_SUCCESS         0
+#define PSCI_RET_NOT_SUPPORTED   (-1)
+#define PSCI_RET_INVALID_PARAMS  (-2)
+#define PSCI_RET_DENIED          (-3)
+#define PSCI_RET_ALREADY_ON      (-4)
+
+static int psci_guest_filter(uint64_t fnid, uint64_t x1, int64_t *ret)
+{
+	switch (fnid) {
+	/* ---- informational / query-only: no address arg, no state change */
+	case PSCI_FN_VERSION:
+	case PSCI_FN_PSCI_FEATURES:
+	case PSCI_FN_AFFINITY_INFO_32:
+	case PSCI_FN_AFFINITY_INFO_64:
+	case PSCI_FN_MIGRATE_32:
+	case PSCI_FN_MIGRATE_64:
+	case PSCI_FN_MIGRATE_INFO_TYPE:
+	case PSCI_FN_MIGRATE_INFO_UP_32:
+	case PSCI_FN_MIGRATE_INFO_UP_64:
+		return 0; /* on the forward whitelist; caller does the real smc */
+
+	/* ---- CPU_ON: never let the guest pick EL2's next PC on an off core */
+	case PSCI_FN_CPU_ON_32:
+	case PSCI_FN_CPU_ON_64: {
+		uint64_t aff0   = x1 & 0xffull;
+		uint64_t aff_hi = x1 & ~0xffull;
+
+		/* Single-cluster quad-core A64: every real target's MPIDR has
+		 * aff1==aff2==aff3==0 and aff0 in 0..3 (see smp.c's own
+		 * psci_cpu_on(), which passes the bare core index as the
+		 * whole target_mpidr). A nonzero aff_hi names a core that
+		 * doesn't exist on this SoC. */
+		if (aff_hi != 0 || aff0 > 3u) {
+			*ret = PSCI_RET_INVALID_PARAMS;
+			return 1;
+		}
+		/* Cores 0..3 are ALL already up (0 = this guest's own vCPU,
+		 * running this very call right now; 1..3 = HV-owned, brought
+		 * up by smp_init() at boot) — ALREADY_ON is the spec-correct
+		 * AND truthful answer for every one of them. This never
+		 * reaches EL3, so the guest's entry_point_address (x2) is
+		 * never even read, let alone executed. */
+		*ret = PSCI_RET_ALREADY_ON;
+		return 1;
+	}
+
+	/* ---- CPU_OFF / CPU_SUSPEND: never let the (guest-running) calling
+	 * core actually power down or suspend — see the block comment above
+	 * this function for the full rationale. */
+	case PSCI_FN_CPU_OFF:
+	case PSCI_FN_CPU_SUSPEND_32:
+	case PSCI_FN_CPU_SUSPEND_64:
+		*ret = PSCI_RET_DENIED;
+		return 1;
+
+	/* ---- not on the whitelist: refuse rather than forward blind ----- */
+	default:
+		*ret = PSCI_RET_NOT_SUPPORTED;
+		return 1;
+	}
+}
+
 void el2_trap(struct el2_frame *frame, unsigned long kind)
 {
 	unsigned t = (unsigned)(kind & 3u);
@@ -327,9 +492,13 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		 * post-reset `md` shows the guest's PSCI call sequence. Intercept
 		 * SYSTEM_RESET(0x84000009)/SYSTEM_OFF(0x84000008): DON'T actually reset —
 		 * report success and resume, so the board stays alive and we can see
-		 * whether the guest was the one resetting it. Forward everything else
-		 * (CPU_ON/AFFINITY_INFO/etc.) to the real EL3 PSCI so guest SMP still
-		 * behaves normally. */
+		 * whether the guest was the one resetting it. Everything else goes
+		 * through psci_guest_filter() (H3 mitigation, see its block comment
+		 * above): a small whitelist of informational calls is forwarded to
+		 * the real EL3 PSCI verbatim, CPU_ON/CPU_OFF/CPU_SUSPEND are decided
+		 * HERE and never reach EL3 (guest code must never pick EL2's next PC
+		 * via a warm-boot entry address), and anything unrecognized gets
+		 * PSCI NOT_SUPPORTED. */
 		if (ec == 0x17u) {
 			uint64_t fnid = frame->x[0];
 			volatile uint32_t *r = (volatile uint32_t *)0x50000200UL;
@@ -366,6 +535,21 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 				frame->x[0] = 0;          /* PSCI SUCCESS, but no real reset */
 				frame->elr += 4u;
 				return;
+			}
+			/* H3 mitigation: run every other guest PSCI call through the
+			 * whitelist filter BEFORE it gets anywhere near the real `smc`
+			 * below. A return of 1 means the filter already decided the
+			 * outcome (emulated success or a denial) — resume the guest
+			 * with that result and skip EL3 entirely. See
+			 * psci_guest_filter()'s block comment for the full policy. */
+			{
+				int64_t psci_ret;
+
+				if (psci_guest_filter(fnid, frame->x[1], &psci_ret)) {
+					frame->x[0] = (uint64_t)psci_ret;
+					frame->elr += 4u;
+					return;
+				}
 			}
 			{
 				register uint64_t x0 __asm__("x0") = frame->x[0];
