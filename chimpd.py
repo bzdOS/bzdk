@@ -42,6 +42,7 @@ USAGE:
   chimpd.py --hang-samples 6    # reset after 6 frozen samples (default 4)
 """
 import os, sys, time, re, socket, struct, select, subprocess, argparse, signal
+import bzd_board as B
 
 # ── load loady_over_acm as a library (USB serial + TFTP preflight) ──────────
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,25 +56,30 @@ DTB       = "/opt/bzdos/tftpboot/bananapi-min.dtb"
 KADDR     = 0x44000000
 DTBADDR   = 0x4a000000
 STAGE     = 0x48000000
-BOARD_IP  = "192.168.88.7"
-SRV_IP    = "192.168.88.2"
+BOARD_IP  = B.BOARD_IP
+SRV_IP    = B.SRV_IP
 
-IFACE     = "br0"
-ETYPE     = 0x88B5
-BOARD_MAC = bytes.fromhex("02bd05000001")
-BCAST     = b"\xff" * 6
+IFACE     = B.IFACE
+ETYPE     = B.ETYPE
+BOARD_MAC = B.BOARD_MAC
+BCAST     = B.BCAST
 
 # breadcrumb addresses (host physical, see dbgmon.c / el2_exc.c / gic_timer.c)
-BC_VCON   = 0x50000f00   # vconsole: [0]magic [1]?? → actually total_bytes at +4
-BC_EXC    = 0x00018100   # exception record
-BC_GICT   = 0x00018200   # gic_timer (tick + IAR/EOI diagnostic)
-VCON_RING = 0x50000f10   # vconsole ring data start
-VCON_RING_SZ = 0x1000    # ring is 4 KiB
+# NOTE (discrepancy found while centralizing, preserved as-is — see
+# bzd_board.py's header comment): this module's own docstring above claims
+# the GICT breadcrumb is at 0x50000800 (the DRAM hv-scratch address hvdbg.py
+# reads), but the constant actually POLLED here has always been the
+# low-SRAM address 0x00018200. Not silently reconciled — flagged, not fixed.
+BC_VCON   = B.VCONSOLE_HDR_PA   # vconsole: [0]magic [1]?? → actually total_bytes at +4
+BC_EXC    = B.BC_EXC_SRAM_PA    # exception record
+BC_GICT   = B.GICT_BC_SRAM_PA   # gic_timer (tick + IAR/EOI diagnostic)
+VCON_RING = B.VCONSOLE_RING_PA  # vconsole ring data start
+VCON_RING_SZ = B.VCONSOLE_RING_SZ  # ring is 4 KiB
 
 # WDT reset (A64 watchdog, see reboot.c)
-WDOG_CFG  = 0x01c20cb4
-WDOG_MODE = 0x01c20cb8
-WDOG_CTRL = 0x01c20cb0
+WDOG_CFG  = B.WDOG_CFG_PA
+WDOG_MODE = B.WDOG_MODE_PA
+WDOG_CTRL = B.WDOG_CTRL_PA
 
 # console markers for verdict
 MARK_BOOT   = b"Copyright (c) 1992"
@@ -189,7 +195,7 @@ class NetCon:
             self.cmd(f"call 0x{addr:x}", 0.5)   # atomic clean reset; won't return
             slog(f"  clean reset via reboot_clean @0x{addr:x}")
             return
-        for pa, val in [(WDOG_CFG, 1), (WDOG_MODE, 0x21), (WDOG_CTRL, 0x14af)]:
+        for pa, val in B.WDOG_ARM_SEQUENCE:
             self.cmd(f"w 0x{pa:x} {val:x}", 0.3)
         slog("  WDT reset commanded (bare WDOG — reboot_clean addr not found)")
 
@@ -438,7 +444,7 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
                     slog(f"  [monitor] backtrace:\n{bt}")
                     
                     # read VGIC breadcrumbs from SRAM C
-                    vgbc = nc.cmd("r 0x00018000 16", 2)
+                    vgbc = nc.cmd(f"r 0x{B.VGIC_BC_SRAM_PA:x} 16", 2)
                     slog(f"  [monitor] VGIC BC:\n{vgbc}")
                     
                     if boot_ok:

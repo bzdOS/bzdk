@@ -30,8 +30,10 @@ here (no import of supervisor.py) so this script also works stand-alone,
 off the dev-stand box, for manual iteration.
 """
 import os, sys, time, select, re, stat as _st, argparse, subprocess
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bzd_board as B
 
-TTY = "/dev/ttyCHIMP"   # stable udev symlink → board's ttyACMn (survives renumbering)
+TTY = B.CHIMP_TTY   # stable udev symlink → board's ttyACMn (survives renumbering)
 _CSI = re.compile(rb'\x1b\[[0-9;?]*[a-zA-Z]')
 ALIVE_MARK = b"BZDOS-MK-ALIVE"
 SB_BIN = "/usr/bin/sb"
@@ -76,7 +78,7 @@ def release_port_lock():
         _port_lock_fd = None
 
 
-def tftp_preflight(host="192.168.88.2", port=69, tftp_root="/opt/bzdos/tftpboot", autostart=True):
+def tftp_preflight(host=B.SRV_IP, port=69, tftp_root="/opt/bzdos/tftpboot", autostart=True):
     """Verify (or start) a TFTP server on the host BEFORE U-Boot's `tftpboot`
     is attempted. Rationale (2026-07-14 incident): a tftpboot against a dead
     server makes U-Boot retry internally for an unpredictable duration; if a
@@ -100,7 +102,7 @@ def tftp_preflight(host="192.168.88.2", port=69, tftp_root="/opt/bzdos/tftpboot"
         return False
     log = open("/tmp/dnsmasq-tftp.log", "a")
     subprocess.Popen(
-        ["dnsmasq", "--port=0", "--interface=br0", "--bind-interfaces",
+        ["dnsmasq", "--port=0", f"--interface={B.IFACE}", "--bind-interfaces",
          "--enable-tftp", f"--tftp-root={tftp_root}",
          "--no-daemon", "--log-facility=-"],
         stdout=log, stderr=subprocess.STDOUT,

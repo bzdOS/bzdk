@@ -99,6 +99,7 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import bzd_board as B
 import supervise as SUP  # vidpid(), emac_alive(), break_glass(), BG_SEQ, ACM, WEDGE_GRACE_S
 
 try:
@@ -395,7 +396,7 @@ def dwell(n, args, report):
         last_poll = now()
 
         vp = SUP.vidpid()
-        if vp == "1d6b:0010":
+        if vp == B.HVCON_VIDPID:
             if SUP.emac_alive():
                 wedge_since = None
                 sample_health(n, report)

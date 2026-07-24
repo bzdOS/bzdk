@@ -26,24 +26,18 @@ import os, sys, time, argparse, termios, tty
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chimpd as C
 from hvdbg import HV
+import bzd_board as B
 
-GUEST_TTY = "/dev/ttyACM0"
-ROOT_MOUNTFROM = "ufs:/dev/vtbd0p3"
+GUEST_TTY = B.GUEST_ACM_TTY
+ROOT_MOUNTFROM = B.ROOT_MOUNTFROM
 
-UBOOT_VID, UBOOT_PID = "1f3a", "efe8"     # U-Boot download gadget
-HVCON_VID, HVCON_PID = "1d6b", "0010"     # HV's bzdOS USB Console
-USB_NODE = "/sys/bus/usb/devices/1-4"     # board's OTG port on this host
-
-
-def _rd(path):
-    try:
-        return open(path).read().strip()
-    except Exception:
-        return None
+UBOOT_VID, UBOOT_PID = B.UBOOT_VID, B.UBOOT_PID     # U-Boot download gadget
+HVCON_VID, HVCON_PID = B.HVCON_VID, B.HVCON_PID     # HV's bzdOS USB Console
+USB_NODE = B.USB_NODE                               # board's OTG port on this host
 
 
 def usb_vidpid():
-    return _rd(f"{USB_NODE}/idVendor"), _rd(f"{USB_NODE}/idProduct")
+    return B.usb_vidpid(USB_NODE)
 
 
 def hv_alive(timeout=4.0):
@@ -56,7 +50,7 @@ def hv_alive(timeout=4.0):
         hv = HV()
         t0 = time.time()
         while time.time() - t0 < timeout:
-            w = hv.read_words(0x50000f00, 4)   # any 4 words from the HV's DRAM
+            w = hv.read_words(B.VCONSOLE_HDR_PA, 4)   # any 4 words from the HV's DRAM
             if w and len(w) >= 4:
                 return True
             time.sleep(0.3)
@@ -76,7 +70,7 @@ def reboot_clean_via_emac():
     All fixed MMIO / a small BSS range -> works regardless of which build ran."""
     try:
         hv = HV()
-        MUSB = 0x01c19000
+        MUSB = B.MUSB_BASE
         def r1(a):
             for _ in range(15):
                 w = hv.read_words(a, 1)
@@ -125,7 +119,7 @@ def reboot_clean_via_emac():
             for a in range(0x4201d000, 0x42030000, 0x40):   # coarse safety sweep
                 hv.write_word(a, 1)
         time.sleep(0.4)
-        for pa, val in [(0x01c20cb4, 1), (0x01c20cb8, 0x21), (0x01c20cb0, 0x14af)]:
+        for pa, val in B.WDOG_ARM_SEQUENCE:
             hv.write_word(pa, val)                                    # arm WDOG
         return True
     except Exception as e:
@@ -177,11 +171,11 @@ def verify(expect_vbk):
         return False
     if expect_vbk:
         try:
-            w = HV().read_words(0x50020000, 1)
+            w = HV().read_words(B.VBLK_BC_PA, 1)
             magic = w[0] if w else 0
             # "VBK1" little-endian = 0x56424b31
-            if magic != 0x56424b31:
-                C.slog(f"  [reliable] ⛔ verify: VBK breadcrumb=0x{magic:08x} (want 0x56424b31)")
+            if magic != B.VBLK_MAGIC:
+                C.slog(f"  [reliable] ⛔ verify: VBK breadcrumb=0x{magic:08x} (want 0x{B.VBLK_MAGIC:08x})")
                 return False
             C.slog("  [reliable] ✅ VBK1 breadcrumb present (virtio-blk build ran)")
         except Exception as e:
