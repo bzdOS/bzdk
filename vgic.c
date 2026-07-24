@@ -161,7 +161,12 @@ static inline void write_cntvoff_el2(uint64_t v)
  *                      proves CNTV's PPI is actually enabled at the
  *                      distributor, not just the virtual CPU interface)
  * ================================================================ */
-#define VGIC_BC_BASE   0x00018000UL
+/* 0x50001c00, matching the window documented just above (and smp.h / hv_addrmap.h).
+ * Was 0x00018000 — guest-writable SRAM, next to start.S's boot breadcrumbs; a
+ * latent footgun since vgic is currently off the boot path (IMO=0, vgic
+ * reverted), so this never fired, but it would have clobbered/been-clobbered
+ * the instant vgic is revisited. */
+#define VGIC_BC_BASE   0x50001c00UL
 #define VGIC_BC_MAGIC  0x56474943u   /* "VGIC" */
 
 static inline void vg_bc(int i, uint32_t v)

@@ -24,8 +24,8 @@
  *   0x50000f00..0x50010f0f  vconsole 64 KiB capture ring (UART header @0xf00)
  *   0x50011000..0x50011fff  netcon / snapshot_net staging
  *   0x50012000..            flightrec "FLTR" ring
- *   0x50001c00              vgic (per smp.h; NB vgic.c currently mis-points
- *                           its breadcrumb at 0x00018000 — see review H4)
+ *   0x50001c00              vgic breadcrumb window ("VGIC")
+ *   0x50001d00              vgic self-test guest ("VGST")
  *   0x50006000              software-BMC block
  *   0x50020000..0x50020fff  virtio-blk / eMMC / SD I/O storage — MAPPED BELOW
  *
