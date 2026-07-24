@@ -109,8 +109,18 @@ def reboot_clean_via_emac():
         if hold is not None:
             for a in range(hold - 0x80, hold + 0x84, 4):
                 hv.write_word(a, 1)
-        for a in range(0x4201d000, 0x42030000, 0x40):   # coarse safety sweep
-            hv.write_word(a, 1)
+        else:
+            # Fallback ONLY: nm failed to resolve wdt_debug_hold (unknown/
+            # unreadable ELF). Root-caused 2026-07-24 (see project memory
+            # reboot-clean-usb-pullup-drop-slows-cpu1.md): dropping the MUSB
+            # pullup above degrades CPU1's EMAC response latency to a steady
+            # ~1.05-1.07s/write afterward, turning this 1216-write sweep into
+            # ~20 minutes for what the tight sweep above already accomplishes
+            # in under a second whenever `hold` resolves (which it reliably
+            # does in the normal reload-what-we-just-built workflow). Keeping
+            # this here only for the genuinely-unknown-build case.
+            for a in range(0x4201d000, 0x42030000, 0x40):   # coarse safety sweep
+                hv.write_word(a, 1)
         time.sleep(0.4)
         for pa, val in [(0x01c20cb4, 1), (0x01c20cb8, 0x21), (0x01c20cb0, 0x14af)]:
             hv.write_word(pa, val)                                    # arm WDOG
