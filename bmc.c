@@ -54,6 +54,7 @@ extern volatile uint32_t dbg_block_reset;
 
 /* el2_exc.c — the shared guest register snapshot (guest PC / liveness). */
 extern struct el2_frame g_last_guest_frame;
+extern void el2_snapshot_guest_frame(struct el2_frame *out);  /* seqlock read (H8) */
 
 /* axp803.c — AXP803 PMIC battery telemetry over the RSB bus (rsb.c). See
  * axp803.h for the full register-map citation/confidence breakdown. Extern
@@ -263,8 +264,12 @@ struct bmc_health *bmc_health_snapshot(struct bmc_health *out)
 	out->exc_count    = exc[1];
 	out->last_exc_kind= exc[2];
 	out->last_exc_esr = exc[3];
-	out->guest_pc_lo  = (uint32_t)g_last_guest_frame.elr;
-	out->guest_pc_hi  = (uint32_t)(g_last_guest_frame.elr >> 32);
+	{
+		struct el2_frame snap;
+		el2_snapshot_guest_frame(&snap);       /* consistent copy (H8) */
+		out->guest_pc_lo  = (uint32_t)snap.elr;
+		out->guest_pc_hi  = (uint32_t)(snap.elr >> 32);
+	}
 	out->online_map   = smp[1];
 	out->hb_cpu0      = smp[6];
 	out->hb_cpu1      = smp[7];
