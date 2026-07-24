@@ -18,7 +18,7 @@
  *   [1] loop iteration counter (free-running, wraps — liveness only)
  *   [2] last CNTPCT snapshot (liveness, same idea as smp.c's CPU1 word 7)
  */
-#define VBLK_ASYNC_BC_BASE   0x50020600UL
+#define VBLK_ASYNC_BC_BASE   HVMAP_ASYNC_BC   /* see hv_addrmap.h */
 #define VBLK_ASYNC_BC_MAGIC  0x56424131u   /* "VBA1" */
 
 static inline void async_bc(uint32_t idx, uint32_t v)

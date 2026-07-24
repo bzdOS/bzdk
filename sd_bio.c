@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "sd_bio.h"
+#include "hv_addrmap.h"     /* HVMAP_SD_BC */
 
 /* ------------------------------------------------------------------ */
 /* Physical bases (SD-specific)                                        */
@@ -106,7 +107,7 @@
 
 /* SD breadcrumb window: distinct from vblk (0x50020000-17f), EBIO
  * (0x50020200-21f) and emmc HS testbuf (0x50020300-4ff). */
-#define SDBC_BASE 0x50020500UL
+#define SDBC_BASE HVMAP_SD_BC   /* see hv_addrmap.h */
 
 /* ------------------------------------------------------------------ */
 /* Raw MMIO helpers                                                    */

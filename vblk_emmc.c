@@ -74,10 +74,9 @@
  *   [26] synchronous fallbacks (mailbox busy / chain too long for the slot,
  *        or g_vblk_async_ready==0 — always correct, just not accelerated)
  * ------------------------------------------------------------------ */
-#define VBLK_BC_BASE   0x50020000UL   /* MOVED from 0x50005000: that was INSIDE the
-                                       * 64KB vconsole capture ring (0x50000f10..
-                                       * 0x50010f10), so console output clobbered these
-                                       * words. 0x50020000 is above the ring, clear. */
+/* Address owned by hv_addrmap.h (via vblk_emmc.h). Was 0x50005000, INSIDE the
+ * 64 KiB vconsole ring, where console output clobbered these words. */
+#define VBLK_BC_BASE   HVMAP_VBLK_BC
 #define VBLK_BC_MAGIC  0x56424B31u   /* "VBK1" */
 
 static inline void vblk_bc(uint32_t idx, uint32_t v)

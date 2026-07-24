@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "emmc_bio.h"
+#include "hv_addrmap.h"     /* HVMAP_EBIO_BC / HVMAP_EMMC_HS_TESTBUF */
 
 /* ------------------------------------------------------------------ */
 /* Physical bases                                                      */
@@ -336,7 +337,7 @@ int emmc_bio_init(void)
  * [5] GCTL at fail. nwords discriminates: 0 + no CMD_DONE in RISR = command
  * never completed; 0 + CMD_DONE = card took the command but sent no data;
  * 1..127 = stall mid-drain (timing/FIFO). */
-#define EBIO_BC_BASE 0x50020200UL
+#define EBIO_BC_BASE HVMAP_EBIO_BC   /* see hv_addrmap.h */
 static inline void ebio_bc(int i, uint32_t v)
 {
 	volatile uint32_t *p = (volatile uint32_t *)(EBIO_BC_BASE + (uint32_t)i * 4u);
@@ -593,7 +594,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
  * VBLK breadcrumb/lock (0x50020000-0x5002017f) and this file's own EBIO
  * breadcrumbs (0x50020200-0x5002021f, words 0-7) — placed well clear of
  * both (0x50020300, 512 B), so it can never collide with either. */
-#define EMMC_HS_TESTBUF_PA  0x50020300UL
+#define EMMC_HS_TESTBUF_PA  HVMAP_EMMC_HS_TESTBUF   /* see hv_addrmap.h */
 
 /* Breadcrumb word indices in the EBIO window (@EBIO_BC_BASE, see above):
  * word[6] = HS state (0=never run,1=HS active,2=fell back after failure);
