@@ -58,22 +58,6 @@
  */
 void gic_timer_init(uint32_t period_us);
 
-/* Just the CPU-interface-wide + distributor-group-enable half of
- * gic_timer_init() above (GICD_CTLR=0x3, GICC_PMR=0xff, GICC_CTLR=0x3|
- * EOImode) — NOT per-INTID (no CNTP arm, no INTID-30-specific GICD writes,
- * no HCR_EL2.IMO write, no diagnostic probe). For a build that wants EL2 to
- * see IRQs at the CPU-interface level (e.g. to run vgic_init() and forward
- * physical IRQs to a guest via List Registers) WITHOUT also running this
- * module's own periodic CNTP debug tick — main_dbg.c's interrupt-
- * virtualization policy is exactly that case: dbgmon already gets served via
- * vconsole traps, and wdt_pet() now fires on every EL2 exception (which
- * happens on every guest device IRQ too), so the CNTP tick is redundant
- * there. gic_timer_init() itself calls this internally, so calling BOTH
- * (this then gic_timer_init()) would simply re-do these three writes
- * harmlessly — but a caller that wants the tick-free path should call only
- * this one. Idempotent, safe to call once before IRQs are unmasked. */
-void gic_timer_cpuif_init(void);
-
 /* Call this from el2_trap()'s IRQ case (kind & 3 == EL2_KIND_IRQ). Reads
  * GICC_IAR (acknowledges), confirms the INTID is ours, samples the jitter
  * meter, re-arms the next interval, writes GICC_EOIR, and increments the

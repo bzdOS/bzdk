@@ -348,35 +348,6 @@ gict_bc(int i, uint32_t v)
 }
 
 /* ------------------------------------------------------------------ *
- * CPU-interface-wide + distributor group-enable setup — the half of the old
- * monolithic gic_timer_init() that is NOT specific to INTID 30/CNTP. See
- * gic_timer.h for the full rationale (factored out for main_dbg.c's
- * interrupt-virtualization policy, which wants this but not the CNTP tick).
- * ------------------------------------------------------------------ */
-void
-gic_timer_cpuif_init(void)
-{
-	/* Enable groups at the distributor. In the non-secure view (which the
-	 * v2 test proved we are in) bit 0 is EnableGrp1 - exactly what every
-	 * Group 1 interrupt (device SPIs, CNTP, CNTV, the vgic maintenance PPI)
-	 * needs to reach the CPU interface at all. Writing 0x3 also covers a
-	 * combined/secure view (bit1 = EnableGrp1); the extra bit is RAZ/WI in
-	 * the NS view. */
-	GICD_CTLR = 0x3u;
-
-	/* PMR wide open so any priority we or the vgic assign always clears the
-	 * mask (note: the NS view exposes only the top nibble, so 0xff reads
-	 * back as 0xf0 - still well above any priority 0x00-0x80 we ever use).
-	 * Enable Group 1 forwarding (bit0 in NS view) + EOImode=1 (bit9) for
-	 * hardware virtualization: EOIR only drops priority, DIR deactivates —
-	 * required so an HW-mode List Register's guest-EOI-triggers-physical-
-	 * deactivate magic works (see vgic.c), and so gic_timer_irq() can EOI a
-	 * device IRQ without deactivating it out from under an in-flight LR. */
-	GICC_PMR = 0xffu;
-	GICC_CTLR = 0x3u | (1u << 9);
-}
-
-/* ------------------------------------------------------------------ *
  * Init: GIC (distributor + CPU interface, one PPI only) + CNTHP.
  * ------------------------------------------------------------------ */
 void
@@ -432,13 +403,23 @@ gic_timer_init(uint32_t period_us)
 	GICD_IPRIORITYR_BYTE(TIMER_INTID) = (uint8_t)TIMER_PRIORITY;
 	GICD_ISENABLER(GICD_WORD(TIMER_INTID)) = (1u << GICD_BIT(TIMER_INTID));
 
-	/* --- GIC distributor group-enable + CPU interface ---------------- *
-	 * Factored into gic_timer_cpuif_init() (see gic_timer.h) so a caller
-	 * that wants EL2 to see IRQs WITHOUT this module's own CNTP tick (e.g.
-	 * main_dbg.c's interrupt-virtualization policy) can get just this half.
-	 * Calling it here keeps this function's own behavior identical to
-	 * before the split. */
-	gic_timer_cpuif_init();
+	/* Enable groups at the distributor. In the non-secure view (which the
+	 * v2 test proved we are in) bit 0 is EnableGrp1 - exactly what we need
+	 * for the Group 1 CNTP interrupt. Writing 0x3 also covers a combined/
+	 * secure view (bit1 = EnableGrp1); the extra bit is RAZ/WI in the NS
+	 * view. The v2 readback already showed this reading back 0x1 (NS
+	 * EnableGrp1 set), i.e. Group 1 delivery is on. */
+	GICD_CTLR = 0x3u;
+
+	/* --- GIC CPU interface ------------------------------------------ *
+	 * PMR wide open so our priority always clears the mask (note: the NS
+	 * view exposes only the top nibble, so 0xff reads back as 0xf0 - still
+	 * well above priority 0x80). Enable Group 1 forwarding (bit0 in NS
+	 * view). v2 readback showed GICC_CTLR = 0x1, i.e. already enabled.
+	 * v4: Enable EOImode=1 (bit 9) for hardware virtualization so EOIR
+	 * only drops priority and DIR deactivates. */
+	GICC_PMR = 0xffu;
+	GICC_CTLR = 0x3u | (1u << 9);
 
 	/* --- Arm the CNTP (non-secure physical) comparator for the first    */
 	/* interval. Absolute deadline (CVAL) not relative reload (TVAL) so    */
@@ -600,46 +581,6 @@ gic_timer_irq(struct el2_frame *frame)
 	if (intid >= GIC_SPURIOUS_MIN) {
 		/* 1020-1023: spurious, nothing pending for this CPU interface.
 		 * No EOI for a spurious read (GICv2 spec). */
-		return;
-	}
-
-	/* --- Interrupt-virtualization milestone: full vGIC forwarding ------ *
-	 * Only taken once vgic_init() has actually run (main_dbg.c's policy —
-	 * see vgic_active()'s doc comment). REPL/GDB builds link this same file
-	 * but never call vgic_init(), so vgic_active() is permanently false
-	 * there and they fall through to the legacy per-INTID handling below,
-	 * completely unaffected by this branch.
-	 *
-	 * EVERY non-spurious INTID reaching here — including 27 (CNTV), 30
-	 * (CNTP), 106 (EHCI) — is forwarded to the guest via vgic_inject_hw(),
-	 * with ONE exception: the vgic maintenance PPI (25) itself, which is
-	 * never guest-visible and is serviced entirely by EL2. See vgic.h's
-	 * VGIC_MAINT_INTID comment for why that one gets a full EOI+DIR here
-	 * while everything else gets EOI-only (priority-drop). Nothing is
-	 * silently dropped: vgic_inject_hw() queues on LR exhaustion instead of
-	 * discarding (see vgic.c's pending-injection queue). */
-	if (vgic_active()) {
-		if (intid == VGIC_MAINT_INTID) {
-			/* Never placed in a List Register — nothing else will ever
-			 * deactivate it, so fully EOI+DIR it ourselves (exactly like
-			 * this module's own TIMER_INTID tick below, for the same
-			 * reason: entirely EL2-serviced, not guest-facing). */
-			GICC_EOIR = iar;
-			GICC_DIR = iar;
-			vgic_maintenance();
-			return;
-		}
-
-		/* Priority-drop ONLY — do NOT DIR. The physical interrupt is about
-		 * to be tied (HW=1) to a guest List Register; the guest's own
-		 * virtual EOI is what deactivates the physical source, in
-		 * hardware, the instant its driver actually services it. DIR'ing
-		 * it here ourselves — deactivating a level-triggered source the
-		 * guest never got to clear — is exactly the documented failure
-		 * mode of the two prior (reverted) vGIC attempts (the 145 kHz
-		 * EHCI/INTID-106 storm). */
-		GICC_EOIR = iar;
-		vgic_inject_hw(intid, intid, 0);
 		return;
 	}
 

@@ -227,76 +227,39 @@ int main(void)
 	 * and DELAY() doesn't hang. */
 	__asm__ volatile("msr cntvoff_el2, xzr\n\tisb" ::: "memory");
 
-	/* IRQ POLICY (interrupt-virtualization milestone, supersedes the
-	 * internal task IMO=0 workaround): EL2 now owns EVERY physical IRQ/FIQ
-	 * (HCR_EL2.IMO=1, FMO=1) and forwards each one to the guest through the
-	 * vGIC (GICH List Registers, HW mode — vgic.c) instead of routing them
-	 * straight to EL1.
+	/* IRQ POLICY (fix internal task, EHCI INTID 106 storm): this is a THIN, single-
+	 * guest debug hypervisor — EL2 has no reason to own physical interrupts.
+	 * Route every physical IRQ straight to the guest's EL1 (HCR_EL2.IMO=0,
+	 * FMO=0) so FreeBSD's native drivers service AND deactivate their level-
+	 * triggered device IRQs (e.g. EHCI@0x01c1b000 = SPI 74 = INTID 106).
 	 *
-	 * WHY THIS SUPERSEDES, NOT JUST REVERTS, the old policy: the old
-	 * IMO=0/FMO=0 policy was itself a documented WORKAROUND for a real bug —
-	 * an earlier attempt set IMO=1 to run a preemptive EL2 debug tick and
-	 * expected vgic_init() to forward device IRQs into GICH_LR, but that
-	 * forwarding was never completed (LRs left empty), so a level-triggered
-	 * IRQ taken to EL2 was EOI'd-but-never-cleared and re-fired at ~145 kHz
-	 * (EHCI/INTID 106), starving the guest. Reverting to IMO=0 fixed the
-	 * storm by letting FreeBSD's own drivers service+deactivate their
-	 * interrupts directly — but at the cost of EL2 never seeing (and never
-	 * being able to virtualize/inject/multiplex) a single guest interrupt.
-	 * The fix here is not "flip IMO back and hope" — it's COMPLETING the
-	 * forwarding that was missing before: gic_timer_irq() (gic_timer.c) now
-	 * calls vgic_inject_hw() for every physical INTID, tying it (HW=1) to a
-	 * guest List Register, so the guest's own virtual EOI is what
-	 * deactivates the physical source in hardware — the guest's driver
-	 * genuinely services and clears the level condition, same as under
-	 * IMO=0, just routed through EL2 instead of bypassing it. Nothing is
-	 * silently dropped: vgic_inject_hw()/vgic_maintenance() queue on List-
-	 * Register exhaustion instead of discarding (see vgic.c).
+	 * Previously gic_timer_init() set IMO=1 to run a preemptive EL2 debug tick,
+	 * and vgic_init() was supposed to forward device IRQs into GICH_LR — but the
+	 * forwarding was never completed, so a level-triggered IRQ taken to EL2 was
+	 * EOI'd-but-never-cleared and re-fired at ~145 kHz, starving the guest and
+	 * wedging it in ehci_reset()'s DELAY(). See memory ehci-intid106-storm.
 	 *
-	 * ORDERING (must hold, or this regresses exactly like the two prior
-	 * reverts): stage2_init() above already re-added the GICC(0x1c82000)->
-	 * GICV(0x1c86000) redirect (stage2.c's stage2_build_mmio_tables()) —
-	 * REQUIRED in lockstep with IMO=1, because under IMO=1 the real GICC is
-	 * EL2's alone; the guest must ack/EOI through GICV instead. vgic_init()
-	 * runs BEFORE the HCR_EL2 write below, and EL2 IRQ/FIQ stays MASKED
-	 * until AFTER both vgic_init() and this HCR_EL2 write have completed —
-	 * so EL2 never takes a physical IRQ before it has somewhere (a List
-	 * Register) and a policy (HW-mode injection) ready to put it.
+	 * dbgmon stays live WITHOUT an EL2 tick: el2_exc.c polls dbgmon_service()
+	 * inside vconsole_handle_fault (guest UART0 access), as in the 21:21 build.
 	 *
-	 * dbgmon still does NOT need an EL2 periodic tick: el2_exc.c polls
-	 * dbgmon_service() inside vconsole_handle_fault (guest UART0 access),
-	 * and wdt_pet() now fires on every EL2 exception — which happens on
-	 * every guest device IRQ too, so the watchdog stays fed at least as
-	 * well as before. gic_timer_cpuif_init() below only opens the shared
-	 * CPU-interface-wide registers (GICD_CTLR/GICC_PMR/GICC_CTLR) vgic
-	 * needs; it deliberately does NOT arm this module's own CNTP debug tick
-	 * (gic_timer_init()'s other half) — not needed here, and INTID 30 would
-	 * otherwise just be one more physical IRQ this policy forwards to the
-	 * guest like any other (harmless, but pointless when nothing enables it
-	 * at the distributor in this build). */
-	gic_timer_cpuif_init();
-	vgic_init();
+	 * NB: no vgic_init(), no gic_timer_init(), and IRQ stays MASKED at EL2
+	 * (no daifclr) — belt-and-suspenders so EL2 never intercepts a guest IRQ. */
 	{
 		uint64_t hcr;
 		__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr));
-		hcr |= (1ull << 4) | (1ull << 3);   /* set IMO(4)=1 and FMO(3)=1 */
-		/* TSC (trap guest SMC) UNCHANGED from the prior policy — see the
-		 * original 2026-07-19 rationale: FreeBSD reboots via PSCI
-		 * SYSTEM_RESET (SMC); trapping it lets el2_exc.c log the fnid
-		 * (0x50000200) and, with dbg_block_reset=1, BLOCK the reset (return
-		 * PSCI SUCCESS without resetting) so the guest keeps running /
-		 * spins, the console survives, and we can see what triggered the
-		 * reboot. Non-reset SMCs are still forwarded to real EL3 (x0-x3
-		 * preserved via psci_guest_filter()'s whitelist) so PSCI still
-		 * behaves. */
+		hcr &= ~((1ull << 4) | (1ull << 5));   /* clear IMO(4) and FMO(5) */
+		/* TSC (trap guest SMC) RE-ENABLED 2026-07-19: the guest DOES reboot from
+		 * userland (root mounts, rc runs, then a full SoC reset wipes the vconsole
+		 * ring — can't see the cause). FreeBSD reboots via PSCI SYSTEM_RESET (SMC);
+		 * trap it so el2_exc.c logs the fnid (0x50000200) and, with dbg_block_reset=1,
+		 * BLOCKS the reset (returns PSCI SUCCESS w/o resetting) — the guest keeps
+		 * running / spins, the console survives, and we finally SEE what triggered the
+		 * reboot. The old cpufreq-breakage concern is moot: DVFS is stripped from the
+		 * DTB now, boot already passes cpufreq, and non-reset SMCs are forwarded to
+		 * real EL3 (x0-x3 preserved) so PSCI still behaves. */
 		hcr |= (1ull << 19);
 		__asm__ volatile("msr hcr_el2, %0\n\tisb" :: "r"(hcr) : "memory");
 	}
-	/* Unmask EL2 IRQ + FIQ now that vgic_init() and stage2's GICC->GICV
-	 * redirect are BOTH in place (see the ordering note above) — from this
-	 * instruction on, EL2 takes every physical interrupt and
-	 * gic_timer_irq() forwards it via the vGIC. */
-	__asm__ volatile("msr daifclr, #3" ::: "memory");
 	DBG_BC(1, 6);
 
 	/* NOTE: HW breakpoints/watchpoints/single-step CANNOT catch the guest's
