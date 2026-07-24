@@ -1,7 +1,7 @@
 # SESSION RULES — Chimp / BPI-M64 hypervisor debugging
 
 **Читай ПЕРВЫМ в каждой сессии, до любых действий с платой.** Это не история и не
-статус (для этого `SESSION-HANDOFF.md` / `PROGRESS.md`) — это ПРАВИЛА РАБОТЫ.
+статус (для этого `docs/sessions/SESSION-HANDOFF.md` / `PROGRESS.md`) — это ПРАВИЛА РАБОТЫ.
 Плата: Banana Pi M64 (Allwinner A64, 4× Cortex-A53). HV на EL2, FreeBSD arm64 — гость на EL1.
 
 ---
@@ -57,5 +57,5 @@
 - dbgmon команды: `gr sr sr2 r rb d gva w wb t ff ffv ss pt bp wp bt sw call patch`.
 
 ---
-_История и текущий блокер — в `SESSION-HANDOFF.md` и `PROGRESS.md`. Эти правила меняем
+_История и текущий блокер — в `docs/sessions/SESSION-HANDOFF.md` и `PROGRESS.md`. Эти правила меняем
 только когда меняется сама модель работы с железом._
