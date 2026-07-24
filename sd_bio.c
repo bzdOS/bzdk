@@ -123,6 +123,36 @@ static inline void wr32(uint64_t pa, uint32_t v)
 static inline uint32_t rreg(uint32_t off) { return rd32(SD_BASE + off); }
 static inline void wreg(uint32_t off, uint32_t v) { wr32(SD_BASE + off, v); }
 
+/* D4 fix, mirrored VERBATIM from emmc_bio.c (same controller IP, same
+ * iteration-cap-is-not-a-time-cap issue in the two post-write polls below —
+ * see that file's block comment above its EMMC_WRITE_DATA_TIMEOUT_MS for the
+ * full rationale). CNTPCT_EL0 is safe to read with no locking from any core/
+ * context (dbgmon `call` on CPU1 is this file's only caller today). */
+static inline uint64_t rd_cntpct(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t rd_cntfrq(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t ms_to_ticks(uint32_t ms)
+{
+	uint64_t f = rd_cntfrq();
+	if (f == 0)
+		f = 24000000ull;   /* A64 arch timer default, matches wdt.c's fallback */
+	return (f * (uint64_t)ms) / 1000ull;
+}
+
+#define SD_WRITE_DATA_TIMEOUT_MS   1000u
+#define SD_WRITE_BUSY_TIMEOUT_MS   4000u
+
 static void sdbc(int i, uint32_t v)
 {
 	volatile uint32_t *p = (volatile uint32_t *)(SDBC_BASE + (uint32_t)i * 4u);
@@ -385,29 +415,34 @@ int sd_bio_write(uint32_t lba, uint64_t buf_pa)
 		return -1;
 
 	{
-		uint32_t i2, ri;
-		for (i2 = 0; i2 < 30000000u; i2++) {
+		uint64_t start = rd_cntpct();
+		uint64_t cap = ms_to_ticks(SD_WRITE_DATA_TIMEOUT_MS);
+		uint32_t ri;
+		for (;;) {
 			ri = rreg(REG_RINT);
 			if (ri & RINT_DATA_OVER)
 				break;
 			if (ri & 0x0180u)   /* DATA_CRC / DATA_TIMEOUT */
 				return (int)(0x40000000u | (ri & 0x3fffu));
+			if (rd_cntpct() - start > cap)
+				return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
 		}
-		if (i2 >= 30000000u)
-			return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
 	}
 	/* Mirror of emmc_bio_write()'s CARD_BUSY fix: the post-write flash
 	 * program time is a genuinely longer latency than the read-side polls,
-	 * so use the same generous cap as the DATA_OVER wait above, and return a
-	 * real timeout error instead of unconditionally claiming success (which
-	 * would let the next command hit a still-programming card). */
+	 * so use the same generous TIME cap (D4 fix) as the DATA_OVER wait
+	 * above, and return a real timeout error instead of unconditionally
+	 * claiming success (which would let the next command hit a still-
+	 * programming card). */
 	{
-		uint32_t i2;
-		for (i2 = 0; i2 < 30000000u; i2++)
+		uint64_t start = rd_cntpct();
+		uint64_t cap = ms_to_ticks(SD_WRITE_BUSY_TIMEOUT_MS);
+		for (;;) {
 			if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
 				break;
-		if (i2 >= 30000000u)
-			return -2;   /* card never signaled program-done */
+			if (rd_cntpct() - start > cap)
+				return -2;   /* card never signaled program-done */
+		}
 	}
 	return 0;
 }

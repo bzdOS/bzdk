@@ -73,6 +73,16 @@
  *   [25] mailbox completions (CPU2 finished + injected IRQ)
  *   [26] synchronous fallbacks (mailbox busy / chain too long for the slot,
  *        or g_vblk_async_ready==0 — always correct, just not accelerated)
+ *
+ * D2/D5 diagnostics (code-review fixes; see each spot's own comment):
+ *   [27] gmem_read/gmem_write/serve_data rejects of an out-of-DRAM-range
+ *        guest PA (D2 — should stay 0 against a real, well-behaved guest)
+ *   [28] QueueNum writes refused for not being a power of two (D5(b) — should
+ *        stay 0; FreeBSD always negotiates a power-of-two size)
+ *   [29] descriptor W/R flag mismatches observed, NOT enforced (D5(d),
+ *        diagnostic only — see vblk_request()'s comment)
+ *   [30] QueueNotify seen before DRIVER_OK, NOT enforced (D5(e), diagnostic
+ *        only — see vblk_kick()'s comment)
  * ------------------------------------------------------------------ */
 /* Address owned by hv_addrmap.h (via vblk_emmc.h). Was 0x50005000, INSIDE the
  * 64 KiB vconsole ring, where console output clobbered these words. */
@@ -92,6 +102,14 @@ static inline void vblk_bc(uint32_t idx, uint32_t v)
 static struct vblk_dev g_blk;
 static uint32_t        g_reads, g_writes, g_irqs, g_faults, g_truncated;
 
+/* D5 diagnostics (see each fix's own comment for how/why they're used).
+ * Declared here (not local to their fix) so both vblk_request()/vblk_kick()
+ * (which fire them) and vblk_reg_read()/vblk_reg_write() (which fire the
+ * QueueNum one) can see them regardless of definition order in this file. */
+static uint32_t g_bad_queue_num;      /* (b) non-power-of-two QueueNum write, refused */
+static uint32_t g_bad_desc_flags;     /* (d) descriptor W/R flag mismatch, NOT enforced */
+static uint32_t g_kick_not_ready;     /* (e) kick seen before DRIVER_OK, NOT enforced */
+
 /* ROADMAP C2 async I/O offload readiness handshake (see vblk_emmc.h and the
  * "ASYNC I/O OFFLOAD" section below). Zero-initialized (.bss) in EVERY build;
  * only vblk_async_cpu2_run() (vblk_async.c, linked ONLY into DBG_OBJS) ever
@@ -104,6 +122,55 @@ volatile uint32_t g_vblk_async_ready;
 static uint64_t g_bounce_q[VBLK_SECTOR_BYTES / 8];   /* 512 bytes */
 #define BOUNCE_PA  ((uint64_t)(uintptr_t)&g_bounce_q[0])
 static inline uint8_t *bounce(void) { return (uint8_t *)(uintptr_t)&g_bounce_q[0]; }
+
+/* ------------------------------------------------------------------ *
+ * D2 fix: guest-PA range check.
+ *
+ * Every descriptor/register field below (desc.addr, avail/used ring PAs,
+ * the status-byte PA, a data buffer's PA) is a value the GUEST wrote into
+ * shared memory or an MMIO register — EL2 has no stage-2 protection here
+ * (identity map, and even where stage-2 traps a window, EL2 itself reads
+ * these as plain PAs, bypassing stage-2 entirely). A corrupt/wild/malicious
+ * value could point at HV .text/.data or a real MMIO peripheral instead of
+ * guest DRAM. Reject (never dereference) any PA/length that falls CLEARLY
+ * outside guest DRAM before touching it.
+ *
+ * Bounds: guest DRAM is stage-2-identity-mapped over
+ * [STAGE2_DRAM_BASE, STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE) — see stage2.h
+ * (0x40000000 / 0x40000000, i.e. [0x40000000, 0x80000000), 1 GiB, as of this
+ * writing). Duplicated here as plain constants (not #include "stage2.h") per
+ * this file's self-containment convention — the same one that already
+ * duplicates gmem_cmo/gmem_read/gmem_write against vnet_emac.c rather than
+ * sharing a common header. MUST stay in lockstep with stage2.h's
+ * STAGE2_DRAM_BASE/STAGE2_DRAM_SIZE if either ever changes.
+ *
+ * IMPORTANT — what this does NOT do: it does NOT protect the hv-image
+ * (0x42000000+) or hv-scratch/breadcrumb (0x50000000+) windows carved out of
+ * this SAME DRAM range (see stage2.c's HVIMG_L2_IDX/HVSCR_L2_IDX exclusions).
+ * A guest descriptor pointing AT one of those (still nominally "in DRAM")
+ * passes this check and would still corrupt HV state. Closing that gap needs
+ * real stage-2/DMA isolation for the guest (ROADMAP milestone A1) — out of
+ * scope for this fix, which only catches PAs that are clearly, unambiguously
+ * outside ALL of guest DRAM (e.g. a wild pointer at 0x0 or 0x1_00000000).
+ * ------------------------------------------------------------------ */
+#define GUEST_DRAM_BASE   0x40000000ULL
+#define GUEST_DRAM_SIZE   0x40000000ULL
+#define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
+
+static uint32_t g_gmem_oob;    /* count of rejected out-of-range accesses */
+
+static inline int gpa_in_range(uint64_t gpa, uint32_t len)
+{
+	if (len == 0u)
+		return 1;                              /* nothing to touch */
+	if ((uint64_t)len > GUEST_DRAM_SIZE)
+		return 0;                              /* pathological length */
+	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
+		return 0;
+	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
+		return 0;                              /* [gpa,gpa+len) runs past DRAM top */
+	return 1;
+}
 
 /* ------------------------------------------------------------------ *
  * Guest-memory helpers. IPA==PA identity map => a guest PA is an EL2 pointer.
@@ -137,6 +204,17 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 
 static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 {
+	if (!gpa_in_range(gpa, len)) {
+		/* D2: never dereference outside guest DRAM. Leave dst untouched —
+		 * every caller already treats gmem_read's output as
+		 * guest/attacker-controlled ring/descriptor data, so a short-circuit
+		 * here (uninitialized dst, same as if the caller hadn't zeroed it)
+		 * is strictly safer than reading real HV memory or MMIO, and never
+		 * less correct for any access actually inside DRAM. */
+		g_gmem_oob++;
+		vblk_bc(27, g_gmem_oob);
+		return;
+	}
 	const volatile uint8_t *s = (const volatile uint8_t *)(uintptr_t)gpa;
 	uint8_t *d = (uint8_t *)dst;
 	gmem_cmo(gpa, len);                  /* refetch from PoC, never stale */
@@ -146,6 +224,11 @@ static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 
 static void gmem_write(uint64_t gpa, const void *src, uint32_t len)
 {
+	if (!gpa_in_range(gpa, len)) {
+		g_gmem_oob++;
+		vblk_bc(27, g_gmem_oob);
+		return;                          /* D2: drop the write, see gmem_read() */
+	}
 	volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)gpa;
 	const uint8_t *s = (const uint8_t *)src;
 	for (uint32_t i = 0; i < len; i++)
@@ -283,24 +366,66 @@ static void vblk_used_lock_acquire(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* Acquire the eMMC lock from CPU0's trap path, BOUNDED so a CPU1 holder can
- * never stall the guest's core past the ~16 s HW watchdog. On each spin we
- * feed the watchdog (note-progress + pet) so a legitimately long wait stays
- * resident, and cap the number of spins so a wedged holder yields a clean
- * S_IOERR (return 0) instead of hanging CPU0 forever. */
-#define VBLK_EMMC_LOCK_SPINS  2000000u
+/* D4 fix: CNTPCT_EL0-based time helpers (mirrors emmc_bio.c's/wdt.c's own
+ * pattern) so the eMMC-lock acquire budget below can be expressed in real
+ * elapsed time rather than a raw spin count, whose wall-clock cost per
+ * iteration is not actually fixed (a "yield" instruction's latency is not
+ * architecturally bounded). */
+static inline uint64_t read_cntpct(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t read_cntfrq(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t vblk_ms_to_ticks(uint32_t ms)
+{
+	uint64_t f = read_cntfrq();
+	if (f == 0)
+		f = 24000000ull;   /* A64 arch timer default, matches wdt.c's fallback */
+	return (f * (uint64_t)ms) / 1000ull;
+}
+
+/* Acquire the eMMC lock from CPU0's trap path, BOUNDED so a CPU1/CPU2 holder
+ * can never stall the guest's core past the ~16 s HW watchdog. On each spin
+ * we feed the watchdog (note-progress + pet) so a legitimately long wait
+ * stays resident, and cap the WAIT in real elapsed time (D4 fix — was a raw
+ * 2,000,000-iteration spin count, which at a few instructions per iteration
+ * can amount to only single-digit milliseconds of real wall time: far
+ * shorter than a legitimate emmc_bio_write() holder can now take under its
+ * own new time caps (up to ~1 s DATA_OVER + ~4 s CARD_BUSY + sub-1s FIFO
+ * push, see emmc_bio.c's EMMC_WRITE_DATA_TIMEOUT_MS/EMMC_WRITE_BUSY_TIMEOUT_MS
+ * — worst case a little under 6 s). The old budget could therefore give up
+ * on a perfectly healthy in-progress write and hand the guest a spurious
+ * S_IOERR. VBLK_EMMC_LOCK_TIMEOUT_MS is chosen to comfortably exceed that
+ * worst case while staying well inside the 16 s HW WDOG window and the
+ * 180 s software progress window (wdt.c). A wedged holder still yields a
+ * clean S_IOERR (return 0) instead of hanging CPU0 forever. */
+#define VBLK_EMMC_LOCK_TIMEOUT_MS  6000u
 static int emmc_lock_acquire_bounded(void)
 {
-	for (uint32_t i = 0; i < VBLK_EMMC_LOCK_SPINS; i++) {
+	uint64_t start = read_cntpct();
+	uint64_t cap = vblk_ms_to_ticks(VBLK_EMMC_LOCK_TIMEOUT_MS);
+	uint32_t i = 0;
+
+	for (;;) {
 		if (vblk_emmc_trylock())
 			return 1;
-		if ((i & 0xFFFFu) == 0u) {       /* periodically keep the HW WDOG fed */
+		if ((i++ & 0xFFFFu) == 0u) {       /* periodically keep the HW WDOG fed */
 			wdt_note_progress();
 			wdt_pet();
 		}
+		if (read_cntpct() - start > cap)
+			return 0;                       /* contended too long — give up */
 		__asm__ volatile("yield" ::: "memory");
 	}
-	return 0;                            /* contended too long — give up */
 }
 
 /* Per-sector watchdog feed inside a long multi-sector transfer. el2_trap pets
@@ -464,6 +589,22 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		uint64_t buf_gpa = gpa + (uint64_t)s * VBLK_SECTOR_BYTES;
 		uint32_t lba = (uint32_t)(*sector + s);
 		int rc;
+
+		/* D2 fix: emmc_bio_read()/emmc_bio_write() take buf_gpa as a raw PA
+		 * and dereference it directly (a real DMA-like buffer handoff, NOT
+		 * routed through gmem_read()/gmem_write() the way every other guest-
+		 * memory touch in this file is) — so THIS is the one place that
+		 * needs its own explicit range check; a corrupt/wild data-descriptor
+		 * PA here would otherwise let the guest make emmc_bio_read() scribble
+		 * over HV .text/.data or a real MMIO peripheral. Checked before
+		 * acquiring the eMMC lock so a rejected request doesn't even briefly
+		 * hold the controller. See gpa_in_range()'s block comment for the
+		 * exact bounds and what this does/doesn't protect. */
+		if (!gpa_in_range(buf_gpa, VBLK_SECTOR_BYTES)) {
+			g_gmem_oob++;
+			vblk_bc(27, g_gmem_oob);
+			return -300;                 /* guest PA outside DRAM -> S_IOERR */
+		}
 
 		/* Serialize this single controller transaction against CPU1 (design
 		 * §8.1). Bounded acquire: if the debug core holds the eMMC too long we
@@ -702,6 +843,63 @@ void vblk_async_poll(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* ------------------------------------------------------------------ *
+ * D1 fix: bounded drain of the CPU2 async mailbox.
+ *
+ * Two CPU0 call sites need this, both BEFORE they act on it:
+ *   - VBLK_R_STATUS=0 (driver reset) / VBLK_R_QUEUE_READY=0, right before
+ *     vblk_reg_write() tears down vq->num/desc/avail/used (or clears ready).
+ *     vq_push_used()'s num==0||used==0 guard is the last-resort backstop for
+ *     a completion that lands DURING/AFTER teardown despite this drain (e.g.
+ *     if CPU2 is truly wedged and the bound below is hit); this drain makes
+ *     that backstop the RARE case instead of the ONLY thing standing between
+ *     a reset and a half-torn-down-ring write, by actually waiting for any
+ *     request already accepted by CPU2 to finish landing first.
+ *   - VIRTIO_BLK_T_FLUSH (D3 fix): FLUSH used to complete unconditionally,
+ *     synchronously, the instant it was seen — but an async T_OUT write can
+ *     be genuinely in flight on CPU2 at that moment (the whole point of the
+ *     ROADMAP C2 offload is that the vCPU keeps running while CPU2 does the
+ *     PIO), so "nothing is buffered" is no longer true. Waiting here for the
+ *     mailbox to empty before completing FLUSH means: by the time the guest
+ *     sees the FLUSH's S_OK, every write CPU0 has ever handed to CPU2 has
+ *     actually reached the eMMC (emmc_bio_write() itself is synchronous
+ *     CMD24 — no further buffering below CPU2 either).
+ *
+ * Bounded via CNTPCT (same helpers as emmc_lock_acquire_bounded()) rather
+ * than by re-checking vblk_emmc_trylock(): this isn't waiting on the eMMC
+ * controller lock itself, it's waiting on CPU2's whole request lifecycle
+ * (lock acquire + PIO + status/used-ring/IRQ publish), which can legitimately
+ * take as long as emmc_bio_write()'s own new time caps allow (worst case a
+ * little under 6 s — see emmc_bio.c). The same budget as the eMMC lock
+ * acquire is used for consistency. On a timeout we give up and return
+ * anyway (never hang the guest's trap): the caller's own guard (vq_push_used
+ * for the reset case; emmc_bio_write() being synchronous for the FLUSH case)
+ * keeps this SAFE even in that pathological case, just not perfectly
+ * synchronized. */
+static void vblk_async_drain_bounded(void)
+{
+	uint64_t start, cap;
+	uint32_t i = 0;
+
+	if (!g_vblk_async_ready)
+		return;                       /* no CPU2 loop -> mailbox can't be POSTED */
+	if (g_async.state == VBLK_MBOX_EMPTY)
+		return;                       /* fast path: nothing in flight */
+
+	start = read_cntpct();
+	cap = vblk_ms_to_ticks(VBLK_EMMC_LOCK_TIMEOUT_MS);
+	while (g_async.state != VBLK_MBOX_EMPTY) {
+		if ((i++ & 0xFFFFu) == 0u) {
+			wdt_note_progress();
+			wdt_pet();
+		}
+		if (read_cntpct() - start > cap)
+			break;                    /* give up — see the block comment above */
+		__asm__ volatile("yield" ::: "memory");
+	}
+	__asm__ volatile("dsb sy" ::: "memory");   /* acquire: see CPU2's writeback */
+}
+
 /* Handle one descriptor-chain request. Returns 1 if the request was
  * completed synchronously within this call (the caller's batch IRQ below
  * must fire), 0 if it was handed off to CPU2's mailbox (which injects its
@@ -778,6 +976,17 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 	/* desc[n-1] = 1-byte status (write-only). */
 	struct vblk_desc *stdesc = &chain[n - 1];
 
+	/* D5(d), DIAGNOSTIC ONLY (deliberately NOT enforced — see the task's own
+	 * caution about (d)/(e): with no hardware access in this task to confirm
+	 * FreeBSD's virtio_blk always sets these exactly per spec on every code
+	 * path, rejecting on a mismatch risks turning a working guest into a
+	 * hard-erroring one. Count violations instead of acting on them; a live
+	 * session can check bc[29] and decide whether promoting this to a real
+	 * reject is warranted). Expected: desc[0] (header) READ-ONLY, desc[n-1]
+	 * (status) device-WRITABLE. */
+	if ((chain[0].flags & VRING_DESC_F_WRITE) || !(stdesc->flags & VRING_DESC_F_WRITE))
+		vblk_bc(29, ++g_bad_desc_flags);
+
 	uint8_t  status   = VIRTIO_BLK_S_OK;
 	uint32_t used_len = 0;               /* bytes device WROTE (T_IN data)   */
 	uint64_t sector   = hdr.sector;
@@ -809,6 +1018,12 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		vblk_bc(26, g_async_fallbacks);
 		for (uint32_t i = 1; i < n - 1; i++) {
 			struct vblk_desc *dd = &chain[i];
+			/* D5(d) diagnostic (see the comment above chain[0]/stdesc's own
+			 * check — same "count, don't enforce" rationale): a T_IN data
+			 * descriptor should be device-writable, a T_OUT one should not. */
+			uint32_t want_write = is_read ? VRING_DESC_F_WRITE : 0u;
+			if ((dd->flags & VRING_DESC_F_WRITE) != want_write)
+				vblk_bc(29, ++g_bad_desc_flags);
 			/* Bounds-check against advertised capacity. */
 			uint64_t end_sec = sector + (dd->len / VBLK_SECTOR_BYTES);
 			if (end_sec > d->capacity) {
@@ -826,9 +1041,17 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		vblk_bc(6, g_reads);
 		vblk_bc(7, g_writes);
 	} else if (hdr.type == VIRTIO_BLK_T_FLUSH) {
-		/* emmc_bio writes are synchronous single-block CMD24s that wait for
-		 * DATA_OVER + card-not-busy before returning, so nothing is buffered
-		 * in the HV — FLUSH is a no-op success. */
+		/* D3 fix: emmc_bio_write() itself is synchronous (a CMD24 that waits
+		 * for DATA_OVER + card-not-busy before returning) and nothing is
+		 * buffered BELOW that — but the ROADMAP C2 async offload means a
+		 * T_OUT write CPU0 already handed off can still be genuinely IN
+		 * FLIGHT on CPU2 at the moment this FLUSH is seen (that is the
+		 * entire point of the offload: CPU0 returns before the PIO is done).
+		 * The old comment claiming "nothing is buffered" predates that
+		 * milestone and is stale. Drain the mailbox first (bounded — see
+		 * vblk_async_drain_bounded()) so FLUSH cannot report success while a
+		 * write is still in flight underneath it. */
+		vblk_async_drain_bounded();
 	} else if (hdr.type == VIRTIO_BLK_T_GET_ID) {
 		/* Answer with a fixed 20-byte identifier instead of S_UNSUPP, so
 		 * FreeBSD's vtblk_ident() stops logging "vtblk_poll_request: IO
@@ -894,6 +1117,17 @@ static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 	if (qidx != VBLK_QUEUE)
 		return;
 
+	/* D5(e), DIAGNOSTIC ONLY (same caution as (d) above — not enforced: a
+	 * spec-compliant driver always reaches DRIVER_OK, which itself implies
+	 * FEATURES_OK already passed, before its first QueueNotify, but this
+	 * task has no hardware access to confirm that holds on every FreeBSD
+	 * code path, and a wrong hard-reject here would break disk I/O outright.
+	 * Count instead of gating; see vnet_emac_rx_frame()'s existing DRIVER_OK
+	 * check for the one place in this tree that DOES hard-gate on it today,
+	 * left unchanged. */
+	if (!(d->status & VBLK_S_DRIVER_OK))
+		vblk_bc(30, ++g_kick_not_ready);
+
 	while (vq_pop_avail(vq, &head)) {
 		if (vblk_request(d, head))
 			served = 1;
@@ -943,7 +1177,11 @@ static uint32_t vblk_reg_read(struct vblk_dev *d, uint32_t off)
 		if (d->dev_feat_sel == VBLK_FEATWORD_HI)
 			return VBLK_F_VERSION_1_BIT;
 		return 0u;
-	case VBLK_R_QUEUE_NUM_MAX: return VBLK_QUEUE_MAX;
+	case VBLK_R_QUEUE_NUM_MAX:
+		/* D5(a): only queue 0 exists for virtio-blk; a nonexistent queue_sel
+		 * must read back 0 (spec: QueueNumMax==0 tells the driver the queue
+		 * is not available), not the same 256 every real queue advertises. */
+		return (d->queue_sel == VBLK_QUEUE) ? VBLK_QUEUE_MAX : 0u;
 	case VBLK_R_QUEUE_READY:   return vq->ready;
 	case VBLK_R_INTERRUPT_STATUS:
 		vblk_bc(21, ++g_isr_status_reads);
@@ -951,14 +1189,35 @@ static uint32_t vblk_reg_read(struct vblk_dev *d, uint32_t off)
 	case VBLK_R_STATUS:        return d->status;
 	case VBLK_R_CONFIG_GENERATION: return d->config_gen;
 	default:
-		/* virtio-blk config space: capacity is a le64 at CONFIG+0. FreeBSD
-		 * reads it as two 32-bit halves. Everything else in config reads 0. */
-		if (off == VBLK_R_CONFIG + 0u)
-			return (uint32_t)(d->capacity & 0xFFFFFFFFu);
-		if (off == VBLK_R_CONFIG + 4u)
-			return (uint32_t)(d->capacity >> 32);
+		/* Config space is handled by vblk_config_read() directly in
+		 * vblk_mmio_fault() (D5(c) — needs the access width). Any other
+		 * offset: 0. */
 		return 0u;
 	}
+}
+
+/* D5(c): virtio-blk config-space read, SAS-aware — exact template copy of
+ * vnet_config_read() (vnet_emac.c), per the task brief. Only the 8-byte
+ * `capacity` field (le64 at config+0) is ever nonzero; every other config
+ * offset already reads 0 regardless of width, so narrowing only matters here.
+ * FreeBSD's vtblk_read_config() happens to always read capacity as two full
+ * 32-bit halves today (sas==2 both times — see the comment this replaces),
+ * so this is a defensive correctness fix, not a behavior change for the
+ * current guest: for sas==2 it returns byte-for-byte what the old two-line
+ * special case did. */
+#define VBLK_CONFIG_CAP_LEN  8u   /* le64 `capacity` field, config+0..+7 */
+
+static uint32_t vblk_config_read(struct vblk_dev *d, uint32_t byte_off, uint32_t sas)
+{
+	uint32_t nbytes = (sas == 0u) ? 1u : (sas == 1u) ? 2u : 4u;
+	uint32_t v = 0;
+
+	for (uint32_t i = 0; i < nbytes; i++) {
+		uint32_t idx = byte_off + i;
+		uint8_t b = (idx < 8u) ? (uint8_t)(d->capacity >> (8u * idx)) : 0u;
+		v |= (uint32_t)b << (8u * i);
+	}
+	return v;
 }
 
 /* Apply a guest WRITE of `val` to register `off`. */
@@ -976,13 +1235,29 @@ static void vblk_reg_write(struct vblk_dev *d, uint32_t off, uint32_t val)
 	case VBLK_R_QUEUE_SEL:
 		d->queue_sel = val;             /* only queue 0 exists */
 		break;
-	case VBLK_R_QUEUE_NUM:
+	case VBLK_R_QUEUE_NUM: {
 		if (d->queue_sel == VBLK_QUEUE) {
-			/* Must be a power of two <= QueueNumMax; trust the driver but clamp. */
-			vq->num = (val > VBLK_QUEUE_MAX) ? VBLK_QUEUE_MAX : val;
+			uint32_t v = (val > VBLK_QUEUE_MAX) ? VBLK_QUEUE_MAX : val;
+			/* D5(b): QueueNum must be a power of two (or 0, queue disabled)
+			 * per the VIRTIO 1.x spec. FreeBSD's virtio_blk always negotiates
+			 * a power-of-two size (its segment-count-derived queue depths are
+			 * themselves powers of two), so this never fires for the real
+			 * guest — it exists purely to refuse an obviously non-compliant/
+			 * corrupt value rather than feed it, unquestioned, into
+			 * vq_pop_avail()/vq_push_used()'s `% vq->num` indexing. Leaves
+			 * vq->num UNCHANGED on a bad write (does not silently substitute
+			 * some OTHER size the guest never asked for — that would desync
+			 * our modulo indexing from the guest's own ring layout, a worse
+			 * bug than just refusing the write). */
+			if (v != 0u && (v & (v - 1u)) != 0u) {
+				vblk_bc(28, ++g_bad_queue_num);
+				break;
+			}
+			vq->num = v;
 			vblk_bc(2, vq->num);
 		}
 		break;
+	}
 	case VBLK_R_QUEUE_DESC_LOW:
 		if (d->queue_sel == VBLK_QUEUE) { vq->desc = (vq->desc & ~0xFFFFFFFFULL) | val; vblk_bc(3, val); }
 		break;
@@ -1003,6 +1278,16 @@ static void vblk_reg_write(struct vblk_dev *d, uint32_t off, uint32_t val)
 		break;
 	case VBLK_R_QUEUE_READY:
 		if (d->queue_sel == VBLK_QUEUE) {
+			if ((val & 1u) == 0u) {
+				/* D1 fix: a QueueReady=0 write is typically followed by the
+				 * driver reprogramming QueueDesc/QueueDriver/QueueDevice for a
+				 * fresh negotiation (still pointing vq->desc/avail/used at the
+				 * OLD, about-to-be-superseded addresses right now). Drain any
+				 * CPU2 completion already accepted for THIS queue before we
+				 * return from this trap, so it cannot land after the driver
+				 * has moved on and started reusing/freeing that memory. */
+				vblk_async_drain_bounded();
+			}
 			vq->ready = val & 1u;
 			if (vq->ready)
 				vq->last_avail = 0;      /* fresh negotiation */
@@ -1026,6 +1311,15 @@ static void vblk_reg_write(struct vblk_dev *d, uint32_t off, uint32_t val)
 		d->status = val;
 		vblk_bc(1, val);
 		if (val == 0u) {
+			/* D1 fix: drain any in-flight CPU2 async completion BEFORE tearing
+			 * down vq->num/desc/avail/used below (bounded — see
+			 * vblk_async_drain_bounded()). vq_push_used()'s own num==0||
+			 * used==0 guard (kept below, unchanged) remains as the backstop
+			 * for the case this drain times out on a truly wedged CPU2, but
+			 * the drain makes that the rare/defensive path instead of the
+			 * only thing preventing a completion from landing mid-teardown. */
+			vblk_async_drain_bounded();
+
 			/* Driver reset: clear queue state (device stays registered). Under
 			 * the used lock so a concurrent CPU2 completion can't be mid
 			 * vq_push_used() while num/used are torn down; with vq_push_used()'s
@@ -1081,7 +1375,10 @@ int vblk_mmio_fault(struct el2_frame *frame)
 	uint32_t wnr = esr & ESR_WNR_BIT;
 	uint32_t srt = (esr >> ESR_SRT_SHIFT) & ESR_SRT_MASK;
 	uint32_t sas = (esr >> ESR_SAS_SHIFT) & ESR_SAS_MASK;   /* 2 == 32-bit */
-	(void)sas;   /* all virtio-mmio registers are 32-bit word accesses */
+	/* sas is only actually consulted below for the config-space (capacity)
+	 * read path (D5(c)) — every other virtio-mmio register here is a
+	 * standard 32-bit word access, exactly like vnet_emac.c's identical
+	 * comment on its own vnet_mmio_fault(). */
 
 	uint32_t off = (uint32_t)(addr - g_blk.base);
 
@@ -1089,7 +1386,9 @@ int vblk_mmio_fault(struct el2_frame *frame)
 		uint64_t val = (srt == SRT_XZR) ? 0 : frame->x[srt];
 		vblk_reg_write(&g_blk, off, (uint32_t)val);
 	} else {
-		uint32_t val = vblk_reg_read(&g_blk, off);
+		uint32_t val = (off >= VBLK_R_CONFIG && off < VBLK_R_CONFIG + VBLK_CONFIG_CAP_LEN)
+		             ? vblk_config_read(&g_blk, off - VBLK_R_CONFIG, sas)
+		             : vblk_reg_read(&g_blk, off);
 		if (srt != SRT_XZR)
 			frame->x[srt] = (uint64_t)val;
 	}
