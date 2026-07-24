@@ -153,6 +153,14 @@
  *   [11] last tx ethertype  [12] last rx ethertype
  *   [13] tx chain-truncation events (VNET_MAX_CHAIN exceeded)
  *   [14] rx scatter-truncation events (guest RX buffer too small)
+ *
+ * D2/D5 diagnostics (code-review fixes; see each spot's own comment):
+ *   [15] gmem_read/gmem_write rejects of an out-of-DRAM-range guest PA (D2 —
+ *        should stay 0 against a real, well-behaved guest)
+ *   [16] QueueNum writes refused for not being a power of two (D5(b))
+ *   [17] descriptor W/R flag mismatches observed, NOT enforced (D5(d))
+ *   [18] TX QueueNotify seen before DRIVER_OK, NOT enforced (D5(e); RX side
+ *        already hard-gates on DRIVER_OK in vnet_emac_rx_frame(), unchanged)
  * ------------------------------------------------------------------ */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
@@ -169,7 +177,12 @@ static inline void vnet_bc(uint32_t idx, uint32_t v)
  * ------------------------------------------------------------------ */
 static struct vnet_dev g_net;
 static uint32_t g_rx_queued, g_rx_dropped, g_tx_sent, g_tx_blocked,
-                g_tx_dropped, g_irqs, g_faults, g_tx_truncated, g_rx_truncated;
+                g_tx_dropped, g_irqs, g_faults, g_tx_truncated, g_rx_truncated,
+                g_gmem_oob;
+/* D5 diagnostics (see vblk_emmc.c's identical fields/rationale). */
+static uint32_t g_bad_queue_num;      /* (b) non-power-of-two QueueNum, refused */
+static uint32_t g_bad_desc_flags;     /* (d) descriptor W/R flag mismatch, NOT enforced */
+static uint32_t g_kick_not_ready;     /* (e) TX kick before DRIVER_OK, NOT enforced */
 
 /* HV-local staging buffer for one frame at a time. Only ever touched from
  * ONE core per call (vnet_kick on CPU0, vnet_emac_rx_frame on CPU1), but
@@ -191,6 +204,32 @@ static uint8_t g_rx_stage[VNET_STAGE_BUF_SIZE];
  * this is the exact coherency lesson the task brief calls out as
  * hardware-found and mandatory to reuse.
  * ------------------------------------------------------------------ */
+/* D2 fix: guest-PA range check — see vblk_emmc.c's gpa_in_range() block
+ * comment for the full rationale (identical reasoning applies here: desc.addr/
+ * avail/used-ring PAs are guest-supplied, EL2 dereferences them directly with
+ * no stage-2 protection). Duplicated (not shared) per this file's
+ * self-containment convention, same as gmem_cmo/gmem_read/gmem_write
+ * themselves. MUST stay in lockstep with stage2.h's STAGE2_DRAM_BASE/
+ * STAGE2_DRAM_SIZE (currently 0x40000000 / 0x40000000). Does NOT protect the
+ * in-DRAM hv-image/hv-scratch windows (see vblk_emmc.c's comment) — that
+ * needs real stage-2/DMA isolation (milestone A1), out of scope here. */
+#define GUEST_DRAM_BASE   0x40000000ULL
+#define GUEST_DRAM_SIZE   0x40000000ULL
+#define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
+
+static inline int gpa_in_range(uint64_t gpa, uint32_t len)
+{
+	if (len == 0u)
+		return 1;
+	if ((uint64_t)len > GUEST_DRAM_SIZE)
+		return 0;
+	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
+		return 0;
+	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
+		return 0;
+	return 1;
+}
+
 static void gmem_cmo(uint64_t gpa, uint32_t len)
 {
 	uint64_t p   = gpa & ~63ULL;
@@ -202,6 +241,10 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 
 static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 {
+	if (!gpa_in_range(gpa, len)) {
+		vnet_bc(15, ++g_gmem_oob);      /* D2: corrupt/wild guest PA — drop */
+		return;
+	}
 	const volatile uint8_t *s = (const volatile uint8_t *)(uintptr_t)gpa;
 	uint8_t *d = (uint8_t *)dst;
 	gmem_cmo(gpa, len);                  /* refetch from PoC, never stale */
@@ -211,6 +254,10 @@ static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 
 static void gmem_write(uint64_t gpa, const void *src, uint32_t len)
 {
+	if (!gpa_in_range(gpa, len)) {
+		vnet_bc(15, ++g_gmem_oob);      /* D2: corrupt/wild guest PA — drop */
+		return;
+	}
 	volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)gpa;
 	const uint8_t *s = (const uint8_t *)src;
 	for (uint32_t i = 0; i < len; i++)
@@ -385,6 +432,17 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 		return;
 	}
 
+	/* D5(d), DIAGNOSTIC ONLY (same "count, don't enforce" caution as
+	 * vblk_emmc.c's identical fix): every transmitq descriptor is guest-
+	 * supplied, device-READ data (the device writes nothing back except the
+	 * zero-length completion) — none should carry VNET_VRING_DESC_F_WRITE.
+	 * Not enforced: no hardware access in this task to confirm if_vtnet never
+	 * does otherwise on some code path, and a wrong hard-reject here would
+	 * break the guest's already-working TX path outright. */
+	for (uint32_t i = 0; i < n; i++)
+		if (chain[i].flags & VNET_VRING_DESC_F_WRITE)
+			vnet_bc(17, ++g_bad_desc_flags);
+
 	uint32_t total = vnet_gather(chain, n, g_tx_stage, VNET_STAGE_BUF_SIZE);
 
 	/* Need at least the legacy header + a minimal Ethernet header to have an
@@ -434,6 +492,15 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 		struct vnet_vq *vq = &d->vq[VNET_QUEUE_TX];
 		uint16_t head;
 		int served = 0;
+
+		/* D5(e), DIAGNOSTIC ONLY (see vblk_kick()'s identical rationale in
+		 * vblk_emmc.c — not enforced, no hardware access in this task to
+		 * confirm it never fires for a working driver). vnet_emac_rx_frame()
+		 * already hard-gates on DRIVER_OK for the RX direction (existing,
+		 * unchanged, proven-safe code, predating this fix) — this counts the
+		 * TX-side equivalent instead of also hard-gating it. */
+		if (!(d->status & VNET_S_DRIVER_OK))
+			vnet_bc(18, ++g_kick_not_ready);
 
 		while (vq_pop_avail(vq, &head)) {
 			vnet_tx_one(d, head);
@@ -493,6 +560,13 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 		return;
 	}
 
+	/* D5(d), DIAGNOSTIC ONLY (see vnet_tx_one()'s identical-rationale check):
+	 * every receiveq descriptor should be device-WRITABLE (the device fills
+	 * it with the received frame). Not enforced, same caution as above. */
+	for (uint32_t i = 0; i < n; i++)
+		if (!(chain[i].flags & VNET_VRING_DESC_F_WRITE))
+			vnet_bc(17, ++g_bad_desc_flags);
+
 	uint32_t written = vnet_scatter(chain, n, g_rx_stage,
 	                                 VNET_HDR_LEN + (uint32_t)len);
 	vq_push_used(vq, head, written);
@@ -523,7 +597,11 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 		if (d->dev_feat_sel == VNET_FEATWORD_LO)
 			return VNET_F_MAC_BIT;
 		return 0u;
-	case VNET_R_QUEUE_NUM_MAX: return VNET_QUEUE_MAX;
+	case VNET_R_QUEUE_NUM_MAX:
+		/* D5(a): a nonexistent queue_sel must read back 0 (spec: QueueNumMax
+		 * ==0 tells the driver the queue is not available), not the same 256
+		 * every real queue (RX=0, TX=1) advertises. */
+		return (d->queue_sel < VNET_NUM_QUEUES) ? VNET_QUEUE_MAX : 0u;
 	case VNET_R_QUEUE_READY:
 		if (d->queue_sel < VNET_NUM_QUEUES)
 			return d->vq[d->queue_sel].ready;
@@ -578,7 +656,17 @@ static void vnet_reg_write(struct vnet_dev *d, uint32_t off, uint32_t val)
 	case VNET_R_QUEUE_NUM:
 		if (d->queue_sel < VNET_NUM_QUEUES) {
 			struct vnet_vq *vq = &d->vq[d->queue_sel];
-			vq->num = (val > VNET_QUEUE_MAX) ? VNET_QUEUE_MAX : val;
+			uint32_t v = (val > VNET_QUEUE_MAX) ? VNET_QUEUE_MAX : val;
+			/* D5(b): must be a power of two (or 0) — see vblk_emmc.c's
+			 * identical fix/rationale. FreeBSD's if_vtnet always negotiates a
+			 * power-of-two size, so this never fires for the real guest;
+			 * refuses (leaves vq->num UNCHANGED) rather than silently
+			 * substituting a different size than the guest configured. */
+			if (v != 0u && (v & (v - 1u)) != 0u) {
+				vnet_bc(16, ++g_bad_queue_num);
+				break;
+			}
+			vq->num = v;
 		}
 		break;
 	case VNET_R_QUEUE_DESC_LOW:

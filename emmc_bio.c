@@ -153,6 +153,59 @@ static inline void wr32(uint64_t pa, uint32_t v)
 static inline uint32_t rreg(uint32_t off) { return rd32(EMMC_BASE + off); }
 static inline void wreg(uint32_t off, uint32_t v) { wr32(EMMC_BASE + off, v); }
 
+/* ------------------------------------------------------------------ */
+/* D4 fix: TIME-based (CNTPCT_EL0) bounds for the two long post-write polls */
+/* below, replacing raw iteration caps. Same rationale as wdt.c's own       */
+/* CNTPCT-based software window: an iteration count assumes a fixed        */
+/* per-iteration wall-clock cost that real hardware does not guarantee (an */
+/* AHB bus stall, a slower clock, or just being on a different core with a */
+/* different memory-system path could silently blow the intended bound     */
+/* out to many times longer than assumed) — see the task's D4 finding.     */
+/* CNTPCT_EL0 is a free-running physical counter, safe to read from any     */
+/* core with no locking (each core has its own read-only view of the same  */
+/* system counter). Mirrored verbatim into sd_bio.c (same controller IP).  */
+/* ------------------------------------------------------------------ */
+static inline uint64_t rd_cntpct(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t rd_cntfrq(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+	return v;
+}
+
+/* ms -> counter ticks, with the same 24 MHz fallback wdt.c uses if CNTFRQ_EL0
+ * ever reads 0 (should not happen on real hardware, but a 0 divisor would
+ * make every wait return instantly, which is the WRONG failure direction for
+ * a timeout bound — better to assume the architected A64 default). */
+static inline uint64_t ms_to_ticks(uint32_t ms)
+{
+	uint64_t f = rd_cntfrq();
+	if (f == 0)
+		f = 24000000ull;   /* A64 arch timer default, matches wdt.c's fallback */
+	return (f * (uint64_t)ms) / 1000ull;
+}
+
+/* Generous caps, NOT tight ones: the goal is to bound worst-case wall time
+ * (so a single call can never approach the ~16 s HW WDOG window — see wdt.c),
+ * not to police "normal" latency. Both are far above the expected duration:
+ *   - DATA_OVER wait: pushing 512 B out at the 400 kHz init clock is
+ *     ~10 ms (see the original comment this replaces); 1000 ms is ~100x that.
+ *   - CARD_BUSY (flash program) wait: typically well under 1 s even on slow
+ *     eMMC; 4000 ms leaves generous headroom without the two waits, summed,
+ *     coming anywhere close to 16 s even with ZERO watchdog feeding in
+ *     between (see vblk_emmc.h's D4 discussion of why no wdt_pet() call was
+ *     added here — this file runs on CPU0, CPU1 *and* CPU2, and the per-
+ *     sector feed already happens one layer up, in vblk_emmc.c's
+ *     serve_data(), after this call returns). */
+#define EMMC_WRITE_DATA_TIMEOUT_MS   1000u
+#define EMMC_WRITE_BUSY_TIMEOUT_MS   4000u
+
 /* poll(mask, want): spin reading RINT until (RINT & mask) == want, capped at
  * EMMC_POLL_CAP iterations. Returns 0 on success, -1 on timeout. mask==0 is
  * trivially satisfied immediately (matches the source sequence's use of
@@ -447,21 +500,24 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	if (nwords < 128)
 		return -1; /* FIFO never drained enough to accept all words */
 
-	/* Wait for the controller to report the data phase complete. BIG cap:
-	 * the init clock is 400 kHz, so pushing 512 B out to the card takes ~10 ms,
+	/* Wait for the controller to report the data phase complete. TIME-capped
+	 * (D4 fix — see the block comment above EMMC_WRITE_DATA_TIMEOUT_MS): the
+	 * init clock is 400 kHz, so pushing 512 B out to the card takes ~10 ms,
 	 * far longer than EMMC_POLL_CAP (~0.4 ms) — a normal poll_rint would time
 	 * out before DATA_OVER. Also bail on any data error bit. */
 	{
-		uint32_t i2, ri;
-		for (i2 = 0; i2 < 30000000u; i2++) {
+		uint64_t start = rd_cntpct();
+		uint64_t cap = ms_to_ticks(EMMC_WRITE_DATA_TIMEOUT_MS);
+		uint32_t ri;
+		for (;;) {
 			ri = rreg(REG_RINT);
 			if (ri & RINT_DATA_OVER)
 				break;
 			if (ri & 0x0180u)   /* DATA_CRC(bit7)/DATA_TIMEOUT(bit8) */
 				return (int)(0x40000000u | (ri & 0x3fffu));
+			if (rd_cntpct() - start > cap)
+				return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
 		}
-		if (i2 >= 30000000u)
-			return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
 	}
 
 	/* Card may be busy programming (DAT0 low) — wait STAR CARD_BUSY(bit9)
@@ -486,16 +542,20 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	 * while it was still mid-program — exactly the same class of bug
 	 * emmc_bio_read()'s own "ROOT-CAUSE FIX" comment above describes for
 	 * back-to-back reads, just on the write side, where it's far more
-	 * likely to actually manifest. Now: a generous cap matching the
-	 * DATA_OVER wait above (real card program time can exceed the raw
-	 * transfer time), and a genuine timeout error instead of a silent lie. */
+	 * likely to actually manifest. Now: a generous TIME cap (D4 fix — see
+	 * EMMC_WRITE_BUSY_TIMEOUT_MS above) instead of an iteration count whose
+	 * real-world duration is not actually bounded (real card program time
+	 * can exceed the raw transfer time), and a genuine timeout error instead
+	 * of a silent lie. */
 	{
-		uint32_t i2;
-		for (i2 = 0; i2 < 30000000u; i2++)
+		uint64_t start = rd_cntpct();
+		uint64_t cap = ms_to_ticks(EMMC_WRITE_BUSY_TIMEOUT_MS);
+		for (;;) {
 			if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
 				break;
-		if (i2 >= 30000000u)
-			return -2;   /* card never signaled program-done: do NOT claim success */
+			if (rd_cntpct() - start > cap)
+				return -2;   /* card never signaled program-done: do NOT claim success */
+		}
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	return 0;
