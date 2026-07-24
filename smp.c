@@ -26,10 +26,11 @@
 extern struct el2_frame g_last_guest_frame;
 extern volatile uint32_t dbg_core_active;
 
-/* ISOLATION TEST flag (default 1 = skip EMAC/dbgmon on the debug core). Lets us
- * tell apart "CPU1 wedges in dbgmon_service" from "the guest resets the board":
- * with EMAC skipped, if the board STAYS resident the wedge was dbgmon_service;
- * if it still resets ~20-70s the reset is guest-initiated. Toggle over the net. */
+/* ISOLATION TEST flag. Default 0 = the debug core runs EMAC/dbgmon normally
+ * (the production path). Set to 1 (over the net) to skip EMAC/dbgmon on CPU1
+ * and tell apart "CPU1 wedges in dbgmon_service" from "the guest resets the
+ * board": with EMAC skipped, if the board STAYS resident the wedge was
+ * dbgmon_service; if it still resets ~20-70s the reset is guest-initiated. */
 volatile uint32_t dbg_isolate_no_emac = 0;
 
 /* DIAGNOSTIC: when 1, CPU0 does NOT enter the guest (main_dbg.c) — only the
