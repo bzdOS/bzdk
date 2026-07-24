@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "stage2.h"
 #include "vblk_emmc.h"   /* VBLK_MMIO_BASE — trapped virtio-mmio window */
+#include "vgic.h"        /* VGIC_GICV_BASE — GICC->GICV redirect target */
 
 /* ------------------------------------------------------------------ *
  * Breadcrumb window: 0x50000c00 ("STG2"). Distinct from every other window
@@ -286,14 +287,32 @@ stage2_build_mmio_tables(void)
 
 		uint64_t pa = l2_block_base + (uint64_t)j * STAGE2_L3_PAGE_SIZE;
 
-		/* FIX-1 (2026-07-16): GICC->GICV redirect REMOVED. Under IMO=0 the guest
-		 * must ack/EOI via the REAL GICC (0x1c82000); redirecting to the inert
-		 * GICV made it unable to service any interrupt -> hang at the MMC/root
-		 * interrupt-driven phase. j==130 now falls through to the identity
-		 * default (0x1c00000 + 130*0x1000 = 0x1c82000 = real GICC). The earlier
-		 * "regression" from removing it was a MISDIAGNOSIS — those NO_EMAC were
-		 * caused by a chimpd autostart=no bug (bootelf didn't jump), now fixed.
-		 * See memory gicv-redirect-working. */
+		/* GICC->GICV redirect (RE-ADDED for the interrupt-virtualization
+		 * milestone; see the block comment above this function for the
+		 * index derivation — j==130/131 are VGIC_GICC_BASE's two 4 KiB
+		 * pages). Under HCR_EL2.IMO=1 (main_dbg.c) the REAL GICC
+		 * (0x1c82000) is EL2's alone — gic_timer_irq() is the only reader
+		 * of its GICC_IAR/EOIR/DIR. If the guest's own "GICC" IPA accesses
+		 * hit that same real hardware, it would race/corrupt EL2's own
+		 * IAR/EOIR sequencing. Redirecting the guest's GICC IPA to the
+		 * VIRTUAL CPU interface (GICV, 0x1c86000) instead — the standard
+		 * KVM/GICv2-virtualization trick — lets the guest ack/EOI through
+		 * GICV, which vgic.c's GICH List Registers actually control, while
+		 * EL2 keeps the real GICC to itself. CORRECT ONLY paired with
+		 * IMO=1 + COMPLETE HW-mode LR forwarding (gic_timer.c) — see
+		 * vgic.h's STATUS note for why an earlier attempt at exactly this
+		 * redirect, alone, without complete forwarding, was reverted
+		 * (FIX-1, 2026-07-16): under the old IMO=0 policy the guest still
+		 * needed the REAL GICC to service interrupts directly, so
+		 * redirecting it to GICV left it unable to ack anything. */
+		if (j == 130u || j == 131u) {
+			uint64_t gicv_pa = VGIC_GICV_BASE +
+				(uint64_t)(j - 130u) * STAGE2_L3_PAGE_SIZE;
+
+			stage2_l3_uart[j] = stage2_page_desc(gicv_pa,
+				S2_MEMATTR_DEVICE_nGnRE, S2_SH_OUTER, /*xn=*/1);
+			continue;
+		}
 
 		stage2_l3_uart[j] = stage2_page_desc(pa,
 			S2_MEMATTR_DEVICE_nGnRE, S2_SH_OUTER, /*xn=*/1);
