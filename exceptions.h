@@ -18,13 +18,13 @@ enum {
 
 /* Must match the byte offsets stored by el2_common in exceptions.S. */
 struct el2_frame {
-	uint64_t x[31];      /* 0x000: x0..x30                       */
-	uint64_t kind;       /* 0x100: EL2_KIND_* + group<<2         */
-	uint64_t elr;        /* 0x108: ELR_EL2  (faulting/return PC) */
-	uint64_t spsr;       /* 0x110: SPSR_EL2                      */
-	uint64_t esr;        /* 0x118: ESR_EL2  (syndrome)          */
-	uint64_t far;        /* 0x120: FAR_EL2  (fault address)     */
-	uint64_t sp_at_entry;/* 0x128                               */
+	uint64_t x[31];      /* 0x000: x0..x30 (ends at 0x0f8)      */
+	uint64_t kind;       /* 0x0f8: EL2_KIND_* + group<<2        */
+	uint64_t elr;        /* 0x100: ELR_EL2  (faulting/return PC) */
+	uint64_t spsr;       /* 0x108: SPSR_EL2                      */
+	uint64_t esr;        /* 0x110: ESR_EL2  (syndrome)          */
+	uint64_t far;        /* 0x118: FAR_EL2  (fault address)     */
+	uint64_t sp_at_entry;/* 0x120                               */
 };
 
 /* Install / restore our EL2 vector table (implemented in exceptions.S).

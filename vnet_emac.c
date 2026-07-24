@@ -90,21 +90,17 @@
  * g_tx_slot/tx_desc()/g_link_up and the whole TX descriptor ring in emac.c —
  * would be touched from TWO cores concurrently: CPU1 via the console's own
  * tx_frame()/emac_flush() (and RX ring maintenance) AND CPU0 via vnet_kick's
- * emac_send_frame() call. emac.c has NO locking around any of this (it was
- * designed and hardware-verified for single-core (CPU1) use only). This is
- * the EXACT SAME CLASS of bug vblk_emmc.c's design doc calls out as its
- * "TOP RISK" for the eMMC controller (see vblk_emmc.h §8.1) — except here it
- * is NOT mitigated. A lock analogous to vblk_emmc_trylock()/unlock() would
- * need to be taken around EVERY emac.c entry point that touches the TX/RX
- * rings or their static state (tx_frame_raw, emac_poll's RX drain,
- * link_recheck), i.e. inside emac.c and dbgmon.c/console_poll()'s call
- * sites — both out of this task's edit budget (dbgmon.c is explicitly
- * reserved; emac.c's existing call sites are deliberately left untouched
- * beyond the one described RX-dispatch hook). THIS IS THE #1 RISK TO CLOSE
- * BEFORE ANY HARDWARE TEST — see the report for options (a real cross-core
- * lock touching emac.c/dbgmon.c, or moving vnet's TX to its OWN core per
- * roadmap C2's "CPU2 as I/O server" direction, sidestepping the CPU0/CPU1
- * collision entirely).
+ * emac_send_frame() call.
+ *
+ * RESOLVED (this was the original "#1 RISK" banner — kept for context): emac.c
+ * now takes a cross-core test-and-set spinlock (EMAC_TX_LOCK_PA, mirroring
+ * vblk_emmc_trylock()/unlock()) around the WHOLE of tx_frame_raw(), which is
+ * the single choke point all TX paths funnel through, so CPU0's vnet TX and
+ * CPU1's console TX can no longer hand out the same g_tx_slot. See emac.c's
+ * header (tx_frame_raw / EMAC_TX_LOCK_PA) and bc[32] tx_lock_contended.
+ * Residual gap (review D7): emac_link_watchdog() re-runs rings_init() + the DMA
+ * enables WITHOUT the TX lock, guarded only by g_rx_count==0 — which does not
+ * preclude a concurrent guest TX. That corner still wants closing.
  *
  * A second, narrower hazard: vnet_dev.int_status is read-modify-written from
  * BOTH cores (CPU0 clears acked bits on VNET_R_INTERRUPT_ACK writes, sets
