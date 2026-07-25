@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* rsb.c — Allwinner A64 RSB (Reduced Serial Bus) controller driver.
  * Implements rsb.h. See rsb.h for the full citation list (ported verbatim
  * from U-Boot's drivers/i2c/sun8i_rsb.c + arch-sunxi rsb.h/cpu_sun4i.h/

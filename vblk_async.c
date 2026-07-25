@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vblk_async.c — CPU2 bring-up loop for the ROADMAP C2 async eMMC I/O
  * offload milestone. See vblk_async.h for the full design writeup (mailbox
  * protocol, memory ordering, the "third actor on the eMMC lock" note, the

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* trace.h — event-trace ring (ftrace-lite) for the bzdOS EL2 hypervisor.
  *
  * A single global, SMP-safe, lock-free ring of timestamped kernel/hypervisor

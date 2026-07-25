@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* sched.c — fixed-priority PREEMPTIVE scheduler for the bzdOS EL2 microkernel.
  * See sched.h for the API contract; this file is the mechanism.
  *

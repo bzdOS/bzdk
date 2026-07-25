@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* smp.c — SMP bring-up + per-core CNTP tick for the bzdOS EL2 microkernel.
  * See smp.h for the design rationale (why secondaries enable the MMU, the A53
  * SMPEN coherency gotcha, the breadcrumb layout). This file owns:

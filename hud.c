@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hud.c — hypervisor HUD compositor for the bzdOS EL2 hypervisor.
  * See hud.h for the API contract. This file owns ONLY pixels: it draws
  * static chrome once (hud_init) and refreshes dynamic value fields on

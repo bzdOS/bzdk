@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* emac.h — sun8i-emac (Allwinner A64) raw-Ethernet console API for the bzdOS
  * microkernel. Contract shared by main_net.c (caller) and emac.c (impl).
  *

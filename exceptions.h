@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* exceptions.h — EL2 exception vectors / trap frame for the bzdOS microkernel.
  * See exceptions.S for the vector table and the frame-layout contract; the
  * offsets in struct el2_frame MUST match the stores in el2_common. */

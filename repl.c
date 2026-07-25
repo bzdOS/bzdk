@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* repl.c — resident interactive command interpreter for the bzdOS microkernel.
  *
  * A line-oriented "hardware REPL": read a command line from the console, parse

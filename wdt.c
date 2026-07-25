@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* wdt.c — Allwinner A64 watchdog driver (see wdt.h). Bare-metal, MMIO via
  * absolute physical addresses (U-Boot leaves the MMU on with a flat device
  * mapping — same contract as musb.c).

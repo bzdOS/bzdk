@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hwbp.h — EL2-controlled hardware breakpoints + watchpoints on the guest.
  *
  * The bzdOS hypervisor already single-steps the guest (el2_exc.c, MDSCR_EL1.SS

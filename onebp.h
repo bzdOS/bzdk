@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* onebp.h — a one-shot software breakpoint for the guest's earliest boot
  * code, where HW breakpoints/watchpoints/single-step are all masked
  * (PSTATE.D=1 until cninit — see the "chimp-guest-debug-masked" writeup).

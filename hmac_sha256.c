@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hmac_sha256.c -- compact freestanding SHA-256 / HMAC-SHA256, no libc.
  * See hmac_sha256.h for the why (ROADMAP T5 / docs/security-notes.md,
  * -DDBG_AUTH). This is a textbook FIPS 180-4 SHA-256 core plus an RFC 2104

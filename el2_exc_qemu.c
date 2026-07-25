@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* el2_exc_qemu.c — EL2 trap handler for the QEMU `virt` CI target.
  *
  * This is a NEW, minimal el2_trap(), not a reuse of el2_exc.c: the real

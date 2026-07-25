@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hdmi.h — HDMI display pipeline bring-up for the bzdOS microkernel
  * (Allwinner A64 / Banana Pi M64). Scans out a linear XRGB8888 framebuffer
  * from fixed DRAM to an HDMI monitor at a fixed, forced 1280x720@60 mode.

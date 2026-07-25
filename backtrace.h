@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* backtrace.h — AArch64 frame-pointer chain walk for the bzdOS hypervisor.
  *
  * Given a starting (pc, fp=x29, lr=x30, sp) this walks the AAPCS64 frame

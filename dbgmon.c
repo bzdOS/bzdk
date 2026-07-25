@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* dbgmon.c — LIVE hypervisor debug monitor for the bzdOS EL2 hypervisor.
  *
  * See dbgmon.h for the big picture. In one line: dbgmon_service() is called

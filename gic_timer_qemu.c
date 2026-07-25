@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gic_timer_qemu.c — GICv2 + ARM Generic Timer (CNTP/INTID 30) tick driver
  * for the QEMU `virt` CI target. See gic_timer_qemu.h for why this is a
  * separate file from gic_timer.c rather than an #ifdef inside it.

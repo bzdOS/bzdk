@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* usbacm.c — see usbacm.h for the full design rationale (data flow,
  * threading model, the open MUSB-hardware-ownership risk). Freestanding,
  * no libc: only <stdint.h> plus our own headers.

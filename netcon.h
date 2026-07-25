@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* netcon.h — reliable stop-and-wait datagram transport for the bzdOS
  * microkernel debug link, riding on top of emac.c's raw-Ethernet TX/RX
  * (ethertype 0x88B6 — see emac.h). The console (0x88B5, emac_getc/putc) is a

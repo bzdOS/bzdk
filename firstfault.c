@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* firstfault.c — latch the FreeBSD guest's ORIGINAL first EL1 fault.
  *
  * The guest dies in a recursive-exception storm so early that the original

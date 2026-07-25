@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* libmin.c — minimal freestanding mem* the compiler may emit implicitly
  * (e.g. struct copies -> memcpy) in a -nostdlib build. Not a full libc. */
 #include <stdint.h>

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* reboot.h — clean USB-gadget disconnect + watchdog reboot, to stop the
  * recurring U-Boot download-gadget "zombie" after our code runs.
  *

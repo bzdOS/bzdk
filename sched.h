@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* sched.h — fixed-priority PREEMPTIVE scheduler for the bzdOS EL2 microkernel
  * (AArch64, Allwinner A64). RTOS primitive #1: a small, deterministic set of
  * EL2 threads ("tasks"), each with a strict fixed priority, preempted by the

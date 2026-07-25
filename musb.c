@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* musb.c — MUSB (Allwinner A64 USB-OTG) CDC-ACM gadget driver for bzdOS
  * microkernel. Implements musb.h. Freestanding, bare-metal AArch64, no
  * pmap/MMU games: U-Boot leaves the MMU on with a flat device mapping, so

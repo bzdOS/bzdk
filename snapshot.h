@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* snapshot.h — guest checkpoint / restore (VM snapshot) for the bzdOS EL2
  * microkernel (AArch64, Allwinner A64 / Banana Pi M64, 4x Cortex-A53).
  *

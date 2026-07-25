@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* alloc.c — deterministic static region / slab allocator (see alloc.h).
  *
  * No dynamic memory, no OS, no libc: pools are carved out of static or

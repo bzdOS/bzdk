@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gic_timer.h — GICv2 (GIC-400) + ARM Generic Timer (EL2 physical timer)
  * periodic-tick driver for the bzdOS microkernel/hypervisor.
  *

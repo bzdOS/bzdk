@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* smp.h — SMP bring-up for the bzdOS EL2 microkernel (AArch64, Allwinner A64 /
  * BPI-M64 = 4x Cortex-A53). RTOS primitive: light up the other 3 A53 cores via
  * PSCI CPU_ON, give each its own EL2 environment (stack, VBAR, MMU/caches, CNTP

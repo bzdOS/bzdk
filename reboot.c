@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* reboot.c — see reboot.h. Directly pokes the MUSB + watchdog MMIO (no
  * dependency on musb.c), so any image can link it. */
 #include <stdint.h>

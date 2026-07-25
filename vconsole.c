@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vconsole.c — trap-and-emulate virtual UART0 for the FreeBSD/arm64 EL1
  * guest. See vconsole.h for the full rationale, the el2_trap wiring
  * contract, and the capture-ring layout.

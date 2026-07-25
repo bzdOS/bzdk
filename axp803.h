@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* axp803.h — X-Powers AXP803 PMIC telemetry (battery voltage/current/status)
  * over the Allwinner RSB bus (rsb.c/rsb.h), for the bzdOS EL2 hypervisor.
  * ROADMAP milestone B1 ("software-BMC ... server with a real UPS").

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* wdt.h — Allwinner A64 hardware watchdog for the bzdOS microkernel.
  * The A64 WDOG does a full SoC reset in hardware, bypassing U-Boot's
  * (unsupported) software sysreset. Armed at microkernel entry and petted in

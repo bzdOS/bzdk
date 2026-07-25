@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* wcet.c — WCET / deadline monitor. See wcet.h for the API contract.
  *
  * Per-task declared period + budget (in timer ticks); each release is

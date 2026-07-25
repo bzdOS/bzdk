@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gdbstub_hw.c — hardware breakpoint / watchpoint lane for the GDB stub.
  *
  * See gdbstub_hw.h for the contract and docs/gdbstub-design.md §5 for the

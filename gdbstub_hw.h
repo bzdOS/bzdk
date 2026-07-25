@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gdbstub_hw.h — hardware breakpoint / watchpoint lane for the GDB stub.
  *
  * The existing gdbstub.c implements the RSP core and SOFTWARE breakpoints

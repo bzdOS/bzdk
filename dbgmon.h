@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* dbgmon.h — LIVE hypervisor debug monitor for the bzdOS EL2 hypervisor.
  *
  * WHY THIS EXISTS: the guest (a real FreeBSD/EL1 kernel) is preempted every

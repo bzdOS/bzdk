@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* panic.h — persistent (warm-reset-surviving) panic log for the bzdOS EL2
  * microkernel.
  *

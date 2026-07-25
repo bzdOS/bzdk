@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* ksync.h — synchronization primitives for the bzdOS EL2 microkernel:
  *   - kmutex : mutual exclusion with PRIORITY INHERITANCE (bounds inversion)
  *   - ksem   : counting semaphore (blocking wait, optional timeout)

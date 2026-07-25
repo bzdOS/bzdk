@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* emac.c — sun8i-emac (Allwinner A64) driver + raw-Ethernet console for the
  * bzdOS microkernel. Implements emac.h. Freestanding, bare-metal AArch64,
  * MMIO via volatile pointers built from ABSOLUTE physical addresses (U-Boot

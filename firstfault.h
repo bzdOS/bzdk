@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* firstfault.h — catch the FreeBSD guest's ORIGINAL first EL1 fault.
  *
  * Companion to stage2_unmap_guest_vector() (stage2.c): with the guest's EL1

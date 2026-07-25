@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* el2_ncmap.h — EL2 stage-1 remap: make the hypervisor itself a NON-CACHEABLE
  * observer of guest-owned DRAM, so no HV-side cache line can ever go stale or
  * dirty against the guest's non-coherent IDMAC/EMAC DMA. See

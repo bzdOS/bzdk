@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_fbsd.c — auto-boot the real FreeBSD kernel as an EL1 guest under our
  * EL2 hypervisor, with NO network/REPL/command dependency (the lossy link made
  * a network trigger unreliable). U-Boot (via fbsd-boot.py) TFTPs the kernel ELF

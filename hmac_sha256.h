@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hmac_sha256.h -- compact freestanding SHA-256 / HMAC-SHA256, no libc.
  *
  * Part of ROADMAP.md T5 ("HMAC on debug-protocol либо его compile-out") /

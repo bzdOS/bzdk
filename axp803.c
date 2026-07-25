@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* axp803.c — AXP803 PMIC battery telemetry over RSB. Implements axp803.h.
  * See axp803.h for the full citation/confidence breakdown per field — do not
  * strip those comments when editing, they are the record of what is/isn't

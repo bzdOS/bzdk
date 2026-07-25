@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* sd_bio.c — Allwinner A64 SMHC0 / SD-card (mmc0 @ 0x01c0f000) block-I/O.
  * Implements sd_bio.h. Freestanding bare-metal AArch64, MMIO via volatile
  * pointers on identity-mapped Device-nGnRE addresses (same contract as

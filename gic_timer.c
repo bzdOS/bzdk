@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gic_timer.c — GICv2 (GIC-400) + ARM Generic Timer EL2-physical-timer tick.
  * See gic_timer.h for the API contract and what this module deliberately
  * does NOT do (unmask PSTATE.I, touch HCR_EL2).

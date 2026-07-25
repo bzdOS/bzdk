@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* alloc.h — deterministic static region / slab allocator for the bzdOS
  * microkernel (AArch64, EL2, bare-metal, MMU on).
  *

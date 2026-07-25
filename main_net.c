@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_net.c — bzdOS microkernel standalone network test main.
  *
  * A SECOND, INDEPENDENT bring-up channel to the MUSB USB console: brings up
