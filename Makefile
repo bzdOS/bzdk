@@ -112,7 +112,7 @@ $(NET_BIN): $(NET_ELF)
 # REPL pokes at (mi/mp/mpN). start.o + main_repl.o + repl.o + emac.o + musb.o
 # + wdt.o, linked at 0x42000000 via link.ld.
 REPL_OBJS := start.o main_repl.o repl.o emac.o musb.o wdt.o exceptions.o el2_exc.o \
-             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o
+             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o
 $(REPL_ELF): $(REPL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(REPL_OBJS)
 	$(SIZE) $@
@@ -161,7 +161,7 @@ $(GDB_BIN): $(GDB_ELF)
 fbsd: $(FBSD_BIN)
 
 FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
-             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o firstfault.o onebp.o
+             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
 $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(FBSD_OBJS)
 	$(SIZE) $@
@@ -178,7 +178,7 @@ $(FBSD_BIN): $(FBSD_ELF)
 zephyr: $(ZEPHYR_BIN)
 
 ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
-               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o firstfault.o onebp.o
+               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
 $(ZEPHYR_ELF): $(ZEPHYR_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(ZEPHYR_OBJS)
 	$(SIZE) $@

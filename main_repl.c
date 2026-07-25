@@ -52,6 +52,15 @@
 #define BC_STAGE_REPL     7u   /* repl_run() entered (resident) */
 #define BC_STAGE_NOLINK  99u   /* gave up: no link -> WDT reset */
 
+/* Stand-in for dbgmon.c's global of the same name (see main_gdb.c's file
+ * header for the full rationale). el2_exc.c's cmd_call() fault-recovery
+ * path references this `extern`, unconditionally, from every build; the
+ * REPL never links dbgmon.o (repl.c is its own separate command loop, with
+ * no "call a guest function" command that would set this), so el2_exc.c's
+ * guard is simply always false here -- a no-op, exactly like main_gdb.c and
+ * main_fbsd.c's identical stand-in. */
+volatile int dbgmon_call_active = 0;
+
 static inline void bc_write(int i, uint32_t v)
 {
 	volatile uint32_t *p = (volatile uint32_t *)(BC_BASE + (uint32_t)i * 4u);
