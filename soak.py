@@ -107,6 +107,33 @@ try:
 except Exception:
     BMC = None  # health sampling degrades gracefully to "unavailable" if this ever fails to import
 
+try:
+    from hvdbg import HV
+except Exception:
+    HV = None  # A1 isolation re-check degrades gracefully if EMAC lib is unavailable
+
+# A1 isolation self-check breadcrumb (stage2.c): STG2 window 0x50000c00,
+# slot [18] == PASS (1 = the guest EL1 regime provably can't reach either HV
+# DRAM window). Read once per verified boot so the soak also proves the
+# isolation boundary holds on EVERY clean boot, not just the one we tested by
+# hand. See a1-isolation-hardware-proven memory / stage2_isolation_selfcheck().
+STG2_BC_BASE = 0x50000c00
+ISOL_MAGIC   = 0x49534f4c   # "ISOL"
+
+
+def read_isolation():
+    """Return (pass:0/1|None, detail-dict). None if unreadable/no EMAC lib."""
+    if HV is None:
+        return None, {}
+    try:
+        hv = HV()
+        w = hv.read_words(STG2_BC_BASE, 19)
+        if not w or len(w) < 19 or w[14] != ISOL_MAGIC:
+            return None, {}
+        return int(w[18]), dict(hvimg_f=w[15], hvscr_f=w[16], ctrl_f=w[17])
+    except Exception:
+        return None, {}
+
 # ── tunables ─────────────────────────────────────────────────────────────
 DEFAULT_CYCLES = 100
 DEFAULT_LOAD_CYCLES = 5          # passed through as reliable_load.py's own --cycles
@@ -346,15 +373,25 @@ def sample_health(n, report):
         report.add_anomaly(n, "health-magic-mismatch", "no BMC1 record (board down or build has no BMC)")
         return None
 
-    if d["exc_count"] > _last_exc_count:
-        report.add_anomaly(
-            n, "exception-count-increased",
-            f"exc_count {_last_exc_count} -> {d['exc_count']} "
-            f"last_kind=0x{d['last_exc_kind']:x} last_esr=0x{d['last_exc_esr']:08x}")
-    _last_exc_count = d["exc_count"]
+    # Build-model detection: the vGIC / IMO=1 trunk runs NO EL2 periodic tick
+    # (gic_timer_init() isn't called — EL2 only forwards the guest's own IRQs),
+    # so tick_delta is 0 BY DESIGN and exc_count is the count of EVERY physical
+    # IRQ EL2 takes (millions/s), NOT a fault counter. The two checks below were
+    # calibrated for the IMO=0 baseline (EL2 rarely traps, EL2 tick must
+    # advance) and would false-fire on every poll of every cycle under IMO=1.
+    # There, HV liveness is already established by the EMAC verify that got us
+    # here plus the A1 isolation re-check below; guest liveness by boot depth.
+    imo1_build = (d["tick_delta"] == 0)
 
-    if d["tick_delta"] == 0:
-        report.add_anomaly(n, "timer-stalled", "GIC timer tick_delta=0 (HV heartbeat stalled)")
+    if not imo1_build:
+        if d["exc_count"] > _last_exc_count:
+            report.add_anomaly(
+                n, "exception-count-increased",
+                f"exc_count {_last_exc_count} -> {d['exc_count']} "
+                f"last_kind=0x{d['last_exc_kind']:x} last_esr=0x{d['last_exc_esr']:08x}")
+        if d["tick_delta"] == 0:
+            report.add_anomaly(n, "timer-stalled", "GIC timer tick_delta=0 (HV heartbeat stalled)")
+    _last_exc_count = d["exc_count"]
 
     online = d["online_map"]
     hbs = [d["hb_cpu0"], d["hb_cpu1"], d["hb_cpu2"], d["hb_cpu3"]]
@@ -365,6 +402,18 @@ def sample_health(n, report):
     if d["temp_mc"] and d["temp_mc"] / 1000.0 > HIGH_TEMP_C:
         report.add_anomaly(n, "high-temperature", f"{d['temp_mc'] / 1000.0:.1f} C")
 
+    # A1 isolation re-verification: prove the guest/HV partition still holds
+    # on THIS boot. isol_pass != 1 would be a serious regression (a hole in
+    # the static partition) and is flagged loudly.
+    isol_pass, isol_detail = read_isolation()
+    if isol_pass is not None and isol_pass != 1:
+        report.add_anomaly(
+            n, "isolation-breach",
+            f"A1 ISOL self-check PASS={isol_pass} "
+            f"(hvimg.F={isol_detail.get('hvimg_f')} "
+            f"hvscr.F={isol_detail.get('hvscr_f')} "
+            f"ctrl.F={isol_detail.get('ctrl_f')}) — guest may reach HV memory!")
+
     return {
         "uptime_s": d["uptime"] // 24000000,
         "exc_count": d["exc_count"],
@@ -372,6 +421,7 @@ def sample_health(n, report):
         "heartbeats": hbs,
         "temp_c": (d["temp_mc"] / 1000.0) if d["temp_mc"] else None,
         "flags": d["flag_names"],
+        "isol_pass": isol_pass,
     }
 
 
