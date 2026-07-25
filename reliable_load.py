@@ -264,7 +264,30 @@ def auto_mount_root(timeout=45):
         os.close(fd)
 
 
-def reliable_load(expect_vbk=False, max_cycles=5, boot_to_shell=False):
+def _read_isol_pass():
+    """Read the A1 isolation self-check PASS flag (STG2 breadcrumb [18]) so the
+    boot ledger simultaneously records that isolation held on this boot.
+    Returns 1/0, or None if unreadable / no isolation build."""
+    try:
+        hv = HV()
+        w = hv.read_words(0x50000c00, 19)   # STG2 window; [14]="ISOL" [18]=PASS
+        if w and len(w) >= 19 and w[14] == 0x49534f4c:
+            return int(w[18])
+    except Exception:
+        pass
+    return None
+
+
+def _elf_sha():
+    try:
+        import hashlib
+        return hashlib.sha256(open(C.HYP_ELF, "rb").read()).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def reliable_load(expect_vbk=False, max_cycles=5, boot_to_shell=False,
+                  ledger_source="reliable_load"):
     for cyc in range(1, max_cycles + 1):
         C.slog(f"━━━ reliable cycle #{cyc}/{max_cycles} ━━━")
         if not ensure_uboot():
@@ -284,9 +307,24 @@ def reliable_load(expect_vbk=False, max_cycles=5, boot_to_shell=False):
             C.slog(f"🎉 [reliable] LOADED & VERIFIED on cycle #{cyc}")
             if boot_to_shell:
                 auto_mount_root()
+            # Cumulative boot ledger (boot_ledger.py): every clean reload we do
+            # — soak cycle, HDMI test, manual — feeds the v1 "100 clean boots"
+            # streak automatically. Records isolation held (A1 STG2[18]) too.
+            try:
+                import boot_ledger
+                boot_ledger.record(True, isol_pass=_read_isol_pass(),
+                                   sha=_elf_sha(), source=ledger_source)
+            except Exception:
+                pass
             return True
         C.slog("  [reliable] load unverified — retrying cycle")
     C.slog(f"⛔ [reliable] exhausted {max_cycles} cycles")
+    try:
+        import boot_ledger
+        boot_ledger.record(False, sha=_elf_sha(), source=ledger_source,
+                           note=f"exhausted {max_cycles} cycles")
+    except Exception:
+        pass
     return False
 
 

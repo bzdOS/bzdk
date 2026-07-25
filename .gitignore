@@ -11,3 +11,10 @@ test_vnet_ring
 test_kload_modinfo
 test_vconsole_uart
 
+
+# cumulative boot ledger + soak reports (runtime data, accrues on disk)
+boot-ledger.jsonl
+boot-ledger.txt
+soak-*
+!soak.py
+soak-logs/
