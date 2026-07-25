@@ -27,8 +27,17 @@ Then, on the host:
 
 See docs/gdbstub-design.md for the full protocol and the PSTATE.D / watchdog
 caveats around when a live attach is viable.
+
+DBG_AUTH (ROADMAP T5, optional — docs/security-notes.md option 1): if the
+board was built with -DDBG_AUTH, pass the same key here so RSP frames are
+accepted:
+    sudo ./gdb-bridge.py --key a1b2c3...
+Omitting --key (the default) sends byte-for-byte the same unauthenticated
+frames as before -- nothing about the default path changed.
 """
 import argparse
+import hashlib
+import hmac
 import selectors
 import socket
 import struct
@@ -41,19 +50,39 @@ BCAST     = b"\xff" * 6
 CHUNK     = 256          # keep each frame's payload under one Ethernet frame
 MINPAY    = 46           # Ethernet minimum payload; board pads/relies on this
 
+# DBG_AUTH wire envelope (must match emac.c's dbg_auth_check() exactly):
+#   [0:8]   nonce, 8 bytes big-endian uint64, strictly increasing
+#   [8:40]  mac,   32 bytes HMAC-SHA256(key, nonce || cmd)
+#   [40:]   cmd,   the frame's payload bytes, unchanged from the plain wire
+DBG_AUTH_NONCE_LEN = 8
+DBG_AUTH_MAC_LEN   = 32
+
 
 class EmacLink:
     """Raw-Ethernet 0x88B5 link to the board, mirroring hvdbg.py."""
 
-    def __init__(self, iface):
+    def __init__(self, iface, key=None):
+        """`key`: optional hex string (see module docstring). None (the
+        default) is byte-for-byte the pre-DBG_AUTH behavior."""
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                   socket.htons(ETYPE))
         self.sock.bind((iface, ETYPE))
         self.src_mac = self.sock.getsockname()[4]
         self.sock.setblocking(False)
+        self._auth_key = bytes.fromhex(key) if key else None
+        self._nonce = time.time_ns()
 
     def fileno(self):
         return self.sock.fileno()
+
+    def _sign(self, data):
+        """Prepend the DBG_AUTH envelope to one frame's worth of `data`.
+        Only called when self._auth_key is set."""
+        self._nonce += 1
+        nonce = self._nonce.to_bytes(DBG_AUTH_NONCE_LEN, "big")
+        mac = hmac.new(self._auth_key, nonce + data, hashlib.sha256).digest()
+        assert len(mac) == DBG_AUTH_MAC_LEN
+        return nonce + mac + data
 
     def send_bytes(self, data):
         """Ship `data` to the board as one or more 0x88B5 frames. RSP text has
@@ -61,6 +90,8 @@ class EmacLink:
         (the board's emac_getc stops at the first NUL)."""
         for i in range(0, len(data), CHUNK):
             p = data[i:i + CHUNK]
+            if self._auth_key is not None:
+                p = self._sign(p)
             if len(p) < MINPAY:
                 p = p + b"\x00" * (MINPAY - len(p))
             self.sock.send(BCAST + self.src_mac + struct.pack("!H", ETYPE) + p)
@@ -85,6 +116,8 @@ class EmacLink:
         """Send a dbgmon-style text command line (CR-terminated, NUL-padded) —
         used only for the optional `--arm` hand-off before RSP takes over."""
         p = (line + "\r").encode("latin1", "replace")
+        if self._auth_key is not None:
+            p = self._sign(p)
         if len(p) < MINPAY:
             p = p + b"\x00" * (MINPAY - len(p))
         self.sock.send(BCAST + self.src_mac + struct.pack("!H", ETYPE) + p)
@@ -97,9 +130,13 @@ def main():
     ap.add_argument("--arm", action="store_true",
                     help="send the dbgmon `gdb` hand-off line before relaying "
                          "(flips the 0x88B5 channel from text dbgmon to RSP)")
+    ap.add_argument("--key", default=None,
+                    help="hex-encoded DBG_AUTH key (ROADMAP T5, optional) -- "
+                         "only needed against a board built with -DDBG_AUTH; "
+                         "omit for the default unauthenticated protocol")
     args = ap.parse_args()
 
-    link = EmacLink(args.iface)
+    link = EmacLink(args.iface, key=args.key)
 
     if args.arm:
         # Tell the running dbgmon to hand the console channel to the stub. The
