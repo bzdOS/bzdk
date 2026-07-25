@@ -906,6 +906,26 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cmd_t();
 		return;
 	}
+	if (streq(cmd, "gdb")) {
+		/* ROADMAP B2: hand the EMAC 0x88B5 channel over to the GDB RSP stub.
+		 * From here the CPU1 debug loop (smp.c) hosts gdbstub instead of this
+		 * text monitor, and el2_trap diverts guest bp/step/wp to it — so a
+		 * host `gdb; target remote :<port-bridge>` can drive the live guest.
+		 * Weak: no-op in a build that somehow lacks gdbstub.o. */
+		extern volatile uint32_t gdb_channel __attribute__((weak));
+		extern void gdbstub_init(void) __attribute__((weak));
+		if (&gdb_channel) {
+			if (gdbstub_init)
+				gdbstub_init();
+			gdb_channel = 1u;
+			__asm__ volatile("dsb sy" ::: "memory");
+			cputs("gdb: RSP stub now owns this channel — "
+			      "point `target remote` at the bridge.\r\n");
+		} else {
+			cputs("gdb: not built into this image.\r\n");
+		}
+		return;
+	}
 	if (streq(cmd, "ff")) {
 		cmd_ff();
 		return;

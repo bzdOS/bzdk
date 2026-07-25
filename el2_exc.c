@@ -49,6 +49,31 @@ struct el2_frame g_last_guest_frame;
  * atomicity. */
 volatile uint32_t g_last_guest_frame_seq;
 
+/* ------------------------------------------------------------------ *
+ * GDB-stub cross-core stop/resume handshake (ROADMAP B2, see
+ * docs/gdbstub-integration.md §3/§4). A guest debug trap (SW BRK / completed
+ * single-step / HW bp / watchpoint) fires here in el2_trap on CPU0, but the
+ * RSP transport lives on the CPU1 debug core. These three cache-coherent
+ * globals (SMPEN makes plain globals coherent, same as g_last_guest_frame)
+ * are the handshake: CPU0 publishes a stop and parks; CPU1 runs the RSP loop
+ * and writes back a resume decision + any register edits.
+ *   gdb_stop_pending : CPU0 set, CPU1 clears once served.
+ *   gdb_stop_signal  : GDB signal number (5 SIGTRAP).
+ *   gdb_resume_act   : 0xffffffff "no decision yet"; CPU1 writes non-sentinel.
+ * Defined here (always linked) so builds without gdbstub.o still resolve them;
+ * the divert that USES them is gated on the weak gdbstub hooks below, which are
+ * 0 in a build that doesn't link the stub — so this whole path is inert there. */
+volatile uint32_t gdb_stop_pending;
+volatile uint32_t gdb_stop_signal;
+volatile uint32_t gdb_resume_act;
+
+/* Weak: resolve to the real gdbstub.o implementations in the dbg/gdb builds,
+ * to 0 in repl/fbsd/zephyr/hdmi (which link el2_exc.o but not gdbstub.o) — the
+ * divert short-circuits on the null address there, leaving hwbp.c's one-shot
+ * path and the fault breadcrumb exactly as before. */
+int gdbstub_attached(void)  __attribute__((weak));
+int gdbstub_hw_active(void) __attribute__((weak));
+
 void el2_snapshot_guest_frame(struct el2_frame *out)
 {
 	uint32_t s1, s2;
@@ -536,6 +561,40 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 				              frame->elr);
 			}
 		}
+
+		/* ---- GDB divert (ROADMAP B2): only while a host gdb is attached ----
+		 * A guest software BRK (EC 0x3C), a completed single-step we own
+		 * (EC 0x32), or a HW breakpoint/watchpoint gdb armed (EC 0x30/0x34)
+		 * belongs to the RSP debugger, not hwbp.c's one-shot path or the fault
+		 * breadcrumb. Publish the stop to the CPU1 debug core and PARK here
+		 * until it resumes us; CPU1 runs the RSP command loop against the
+		 * shared frame (edits land in g_last_guest_frame), then writes
+		 * gdb_resume_act + sev. Weak-guarded: in a build without gdbstub.o
+		 * gdbstub_attached is 0 (null address) and this is skipped entirely, so
+		 * hwbp.c / the fault path below behave exactly as before. Must sit
+		 * BEFORE hwbp_handle() so its one-shot handler can't clear a slot gdb
+		 * wants sticky. */
+		if (gdbstub_attached && gdbstub_attached() &&
+		    (ec == 0x3Cu ||                                  /* guest SW BRK   */
+		     ec == 0x32u ||                                  /* step complete  */
+		     ((ec == 0x30u || ec == 0x34u) &&                /* HW bp / watch  */
+		      gdbstub_hw_active && gdbstub_hw_active()))) {
+			g_last_guest_frame = *frame;             /* snapshot for CPU1     */
+			gdb_stop_signal = 5u;                    /* SIGTRAP               */
+			gdb_resume_act  = 0xffffffffu;           /* "no decision yet"     */
+			__asm__ volatile("dsb sy" ::: "memory");
+			gdb_stop_pending = 1u;
+			__asm__ volatile("sev" ::: "memory");    /* poke CPU1             */
+			while (gdb_resume_act == 0xffffffffu)     /* CPU1 runs RSP loop    */
+				__asm__ volatile("wfe" ::: "memory");
+			*frame = g_last_guest_frame;             /* apply CPU1 reg edits  */
+			gdb_stop_pending = 0u;
+			/* CPU1 (gdbstub apply()) already set MDSCR_EL1.SS + SPSR.SS in the
+			 * frame for STEP vs CONTINUE. Do NOT advance ELR — for a BRK the
+			 * stub rewinds/reprograms the instruction itself. */
+			return;
+		}
+
 		/* SMC from the guest (trapped by HCR_EL2.TSC=1). Log the PSCI function
 		 * id to a ring at 0x50000200 [0]=count, [1..15]=last-15 fnids so a
 		 * post-reset `md` shows the guest's PSCI call sequence. Intercept
