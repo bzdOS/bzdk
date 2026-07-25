@@ -517,6 +517,18 @@ AXP803 PMIC driver reconfigures rails on boot — including `dldo1`
 because once the guest boots it **owns the RSB bus** (0x01F03400) and the HV's
 `rsb_read()` returns −1.
 
+A follow-up experiment pinned `dldo1` (`vcc-hdmi-dsi`, the DTB `hvcc-supply`
+of the HDMI PHY) as the leading suspect and tried the obvious fix — marking it
+`regulator-always-on` + `regulator-boot-on` in the guest DTB so FreeBSD's
+axp8xx driver can't turn it off as "unused" (its only consumers, the `hdmi`
+nodes, are `status="disabled"`). It did **not** help, and made the register
+picture *worse*: post-boot `PHY_STATUS`, `TCON1_CTRL`, and `DE_GLB_CTL` all
+now read `0x0` and `PLL_VIDEO0`'s enable bit dropped — i.e. the whole display
+clock domain went down, not just the PHY lock. So the naive supply-pin fix is
+refuted. What it *does* prove: changing the guest DTB changes the display
+outcome, so the controlling lever really is FreeBSD's clock/regulator handling
+of that domain — just not `dldo1` always-on specifically. Reverted.
+
 **Lesson (two of them):** first, `PHY_STATUS` bit 7 was treated as "is there a
 signal?" for a long time before it was pinned down as *the analog PLL lock,
 distinct from the still-locked pixel PLL* — a status bit is not a feature until
@@ -524,7 +536,9 @@ you know which of several PLLs it reports. Second, and more fundamental: this
 is the one subsystem in the whole project you **cannot** fully close over the
 network, because the ground-truth oracle ("is there a picture?") is a human
 looking at a monitor. Everything else here is debuggable headless; a display
-is not.
+is not — and without that oracle in the loop, each blind DTB/register
+experiment is as likely to muddy the picture (the `dldo1` attempt above) as to
+clear it.
 
 ## 11. The host driver that ate `/dev/ttyACM0`
 
