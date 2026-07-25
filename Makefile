@@ -112,7 +112,7 @@ $(NET_BIN): $(NET_ELF)
 # REPL pokes at (mi/mp/mpN). start.o + main_repl.o + repl.o + emac.o + musb.o
 # + wdt.o, linked at 0x42000000 via link.ld.
 REPL_OBJS := start.o main_repl.o repl.o emac.o musb.o wdt.o exceptions.o el2_exc.o \
-             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o
+             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o rsb.o
 $(REPL_ELF): $(REPL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(REPL_OBJS)
 	$(SIZE) $@
