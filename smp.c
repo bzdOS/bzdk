@@ -506,12 +506,20 @@ void smp_secondary_main(uint64_t cpuid)
 #ifdef HV_HDMI
 			/* Live HUD refresh on the physical monitor. CPU1 owns the display
 			 * (as it owns the debug console) since CPU0 is inside the guest.
-			 * Rate-limited: hud_update() repaints the whole 1080p frame — far
-			 * too heavy for every loop iteration — so refresh every 2048th pass.
-			 * Uses a consistent guest-frame snapshot (H8 seqlock), the same
-			 * source dbgmon reads, so the on-screen register/trace panels track
-			 * the live guest. */
-			if ((iters & 0x7ff) == 0) {
+			 * hud_update() repaints the whole 1080p frame — HUNDREDS of ms of
+			 * CPU1 time — so it is BOTH delayed and heavily rate-limited as
+			 * simple hygiene: the first ~500k loop passes go entirely to
+			 * usbacm_poll()/dbgmon/eMMC-pinmux while the board is coming up, and
+			 * thereafter the HUD repaints only every 128k-th pass — a few times
+			 * a second, plenty for a status display, so a heavy repaint never
+			 * dominates the other per-iteration servicing this loop does. Uses a
+			 * consistent guest-frame snapshot (H8 seqlock), the same source
+			 * dbgmon reads. (Note: an earlier version blamed this refresh for a
+			 * missing /dev/ttyACM0 — that was actually host-side: the host
+			 * usb_debug driver hijacking the HV's 1d6b:0010 CDC-ACM gadget, see
+			 * the usb-debug-hijacks-ttyacm note. The gadget enumerates fine and
+			 * the guest boots to root under HV_HDMI.) */
+			if (iters > 500000u && (iters & 0x1ffffu) == 0) {
 				struct el2_frame hud_snap;
 				el2_snapshot_guest_frame(&hud_snap);
 				hud_update(&hud_snap);
