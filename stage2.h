@@ -207,4 +207,14 @@ void stage2_selftest(void);
  * after `stage2_enable();` in main_fbsd.c to record the proof each boot. */
 void stage2_at_check(uint64_t va);
 
+/* A1 isolation self-check: HARDWARE proof (via `AT S12E1W`) that the guest's
+ * EL1 translation regime cannot reach either HV DRAM window (hv-image /
+ * hv-scratch). Call ONCE on the boot path AFTER stage2_enable() +
+ * stage2_unmap_guest_vector(), before the guest runs. Returns 1 if the
+ * boundary holds (both HV windows fault, a control DRAM address still
+ * translates), 0 if any HV window is reachable (a hole in the partition).
+ * Records the result in the STG2 breadcrumb window slots [14..18] — see the
+ * function's own comment in stage2.c for the exact layout. */
+int stage2_isolation_selfcheck(void);
+
 #endif /* BZDOS_STAGE2_H */

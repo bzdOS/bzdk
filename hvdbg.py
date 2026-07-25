@@ -262,6 +262,7 @@ class HV:
         5: "CONSOLE",  # vconsole.c: a0=byte a1=direction (0=TX guest->host, 1=RX host->guest)
         6: "TIMER",    # gic_timer.c: a0=CNTV_CTL, a1=signed(CNTV_CVAL-CNTVCT)
         7: "SYNC",     # el2_exc.c: a0=(EC<<32)|ESR, a1=ELR (guest sync trap)
+        8: "HVVIOL",   # el2_exc.c A1: guest->HV stage-2 abort blocked; a0=IPA a1=ELR
     }
 
     def flightrec(self):
@@ -374,6 +375,8 @@ class HV:
                           0x21: "IABT", 0x22: "PC-align", 0x25: "DABT",
                           0x3c: "BRK"}.get(ec, "EC0x%x" % ec)
                 lines.append("SYNC    %-14s esr=0x%x elr=0x%x" % (ecname, esr, a1))
+            elif k == 8:
+                lines.append("HVVIOL  guest->HV blocked ipa=0x%x elr=0x%x" % (a0, a1))
             else:
                 lines.append("KIND=%d  a0=0x%x a1=0x%x" % (k, a0, a1))
         return "\n".join(lines)

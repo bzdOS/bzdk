@@ -221,6 +221,11 @@ int main(void)
 	                                * vector page so the guest's first fault
 	                                * takes a stage-2 abort to EL2, exposing
 	                                * the ORIGINAL ELR_EL1/ESR_EL1/FAR_EL1. */
+	/* A1 isolation self-check: hardware-prove (AT S12E1W) that the guest can't
+	 * reach the hv-image / hv-scratch DRAM windows. Result → STG2 breadcrumb
+	 * [14..18]; see stage2_isolation_selfcheck(). Runs now that all stage-2
+	 * tables (incl. the vector-page split) are final and stage-2 is enabled. */
+	stage2_isolation_selfcheck();
 	DBG_BC(1, 5);
 
 	/* Zero CNTVOFF_EL2 so the guest's virtual counter CNTVCT_EL0 matches CNTPCT_EL0
