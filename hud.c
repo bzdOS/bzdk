@@ -45,10 +45,16 @@
 #define HUD_TITLE_FG    0xFFE8F6F8u /* title bar text */
 
 /* ------------------------------------------------------------------ *
- * Screen + layout constants (fixed 1920x1080 — the verified HDMI mode).
+ * Screen + layout constants — track the ACTUAL forced HDMI mode (hdmi.h)
+ * instead of a hardcoded 1920x1080. The whole HUD layout below is derived
+ * from these (title bar width, right column, bottom strip, regmap height),
+ * so tying them to HDMI_MODE_H/VACTIVE makes the HUD fit whatever mode is
+ * scanned out — at 720p the 1080p-positioned panels used to fall off the
+ * 1280x720 framebuffer's right/bottom edge (clipped by fb.c), which read on
+ * a real monitor as "the picture is bigger than the screen".
  * ------------------------------------------------------------------ */
-#define SCR_W  1920
-#define SCR_H  1080
+#define SCR_W  HDMI_MODE_HACTIVE
+#define SCR_H  HDMI_MODE_VACTIVE
 #define MARGIN 8
 #define TITLE_H 28
 #define PANEL_GAP 8
