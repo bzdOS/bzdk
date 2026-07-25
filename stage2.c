@@ -879,6 +879,64 @@ stage2_at_check(uint64_t va)
 	stg2_bc(STG2_PAR_HI_IDX, (uint32_t)(par >> 32));
 }
 
+/* ------------------------------------------------------------------ *
+ * A1 isolation self-check (ROADMAP milestone A1 DoD: "гость пишет в
+ * HV-адрес → перехват"). Proves — in HARDWARE, via the CPU's own
+ * table-walker, not by re-reading our descriptors in software — that the
+ * guest's EL1 translation regime physically CANNOT reach the two HV DRAM
+ * windows (hv-image / hv-scratch). `AT S12E1W` walks the CURRENT EL1
+ * stage-1 regime AND our stage-2 tables for a WRITE and deposits the
+ * result in PAR_EL1. At the point this runs (right after stage2_enable() +
+ * stage2_unmap_guest_vector(), before the guest kernel executes) EL1
+ * stage-1 is OFF (SCTLR_EL1.M=0), so the input VA is used as a flat IPA and
+ * ONLY stage-2 is applied — exactly the mapping a guest write would hit.
+ *
+ * PAR_EL1.F (bit0): 1 => the combined walk FAULTED (address unreachable) —
+ * this is the WANTED result for an HV window; 0 => it translated (reachable)
+ * — wanted for the control address. So a passing boundary is:
+ *   HVIMG.F == 1  &&  HVSCR.F == 1  &&  control.F == 0
+ *
+ * Breadcrumbs (STG2 window 0x50000c00 — itself inside the hv-scratch window,
+ * written by EL2 so stage-2 never gates it):
+ *   [14] magic 0x49534f4c ("ISOL")   [15] HVIMG PAR.F (want 1)
+ *   [16] HVSCR PAR.F (want 1)         [17] control PAR.F (want 0)
+ *   [18] overall pass (1 = boundary proven, 0 = a window is reachable!)
+ * ------------------------------------------------------------------ */
+static uint64_t
+stage2_at_s12e1w(uint64_t va)
+{
+	uint64_t par;
+	/* AT S12E1W, <Xt>: translate `va` as an EL1 WRITE through stage-1+2. */
+	__asm__ volatile(
+		"at s12e1w, %1\n\t"
+		"isb\n\t"
+		"mrs %0, par_el1"
+		: "=r"(par)
+		: "r"(va)
+		: "memory");
+	return par;
+}
+
+int
+stage2_isolation_selfcheck(void)
+{
+	uint32_t hvimg_f   = (uint32_t)(stage2_at_s12e1w(HVIMG_BASE) & 1u);
+	uint32_t hvscr_f   = (uint32_t)(stage2_at_s12e1w(HVSCR_BASE) & 1u);
+	uint32_t control_f = (uint32_t)(stage2_at_s12e1w(STAGE2_SELFTEST_IPA) & 1u);
+
+	/* Boundary holds iff both HV windows fault (F=1) and the control DRAM
+	 * address still translates (F=0 — proves the check itself isn't just
+	 * faulting on everything). */
+	uint32_t pass = (hvimg_f == 1u && hvscr_f == 1u && control_f == 0u) ? 1u : 0u;
+
+	stg2_bc(14, 0x49534f4c);   /* "ISOL" */
+	stg2_bc(15, hvimg_f);
+	stg2_bc(16, hvscr_f);
+	stg2_bc(17, control_f);
+	stg2_bc(18, pass);
+	return (int)pass;
+}
+
 void
 stage2_selftest(void)
 {

@@ -100,6 +100,8 @@ enum {
 	FLTR_K_TIMER   = 6,   /* CNTV sample at EL2 CNTV-PPI take: a0=CNTV_CTL,
 	                       * a1=signed(CNTV_CVAL-CNTVCT) (vgic deep-dive)   */
 	FLTR_K_SYNC    = 7,   /* guest sync trap: a0=(EC<<32)|ESR, a1=ELR       */
+	FLTR_K_HVVIOL  = 8,   /* A1: guest stage-2 abort into an HV DRAM window
+	                       * (blocked, not corrupted): a0=faulting IPA a1=ELR*/
 };
 
 /* Log one (kind, a0, a1) event into the ring. Never fails, never blocks,

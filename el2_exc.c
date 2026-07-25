@@ -743,6 +743,24 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			exc_bc(17, (uint32_t)tcr);
 			exc_bc(18, (uint32_t)(tcr >> 32));
 		}
+
+		/* A1 isolation ENFORCEMENT report: if this stage-2 abort's faulting
+		 * IPA lands in an HV DRAM window (hv-image 0x42000000..0x42200000 or
+		 * hv-scratch 0x50000000..0x50200000), the guest just tried to touch
+		 * hypervisor memory and was BLOCKED by the stage-2 partition instead
+		 * of silently corrupting it — the whole point of milestone A1. Flag it
+		 * distinctly (dedicated counter breadcrumb + its own flight-recorder
+		 * kind) so a real violation is unmistakable, separate from an ordinary
+		 * guest page fault. hpfar is still in scope from the block above. */
+		{
+			uint64_t ipa = (hpfar & 0xFFFFFFFFF0ULL) << 8;
+			if ((ipa >= 0x42000000ULL && ipa < 0x42200000ULL) ||
+			    (ipa >= 0x50000000ULL && ipa < 0x50200000ULL)) {
+				static uint32_t hvviol_count;
+				exc_bc(19, ++hvviol_count);
+				flightrec_log(FLTR_K_HVVIOL, ipa, frame->elr);
+			}
+		}
 	}
 
 	/* B3 crash-forensics: capture a frame-pointer backtrace into the BTR1
