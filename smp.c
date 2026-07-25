@@ -23,6 +23,7 @@
 #include "wdt.h"
 #ifdef HV_HDMI
 #include "hud.h"    /* hud_update(): live HUD refresh on CPU1 (HV_HDMI build) */
+#include "hdmi.h"   /* hdmi_phy_locked()/hdmi_relock(): PHY lock-loss defense */
 #endif
 
 /* The shared guest-frame snapshot + debug-core flag live in el2_exc.c. */
@@ -73,6 +74,20 @@ volatile uint32_t dbg_usbacm = 1;
  * "every dead-EMAC boot costs a physical power-cycle" into an automatic
  * bounded recovery. Left opt-in until the self-heal path is trusted live. */
 volatile uint32_t dbg_emac_watchdog_reboot = 0;
+
+/* HDMI PHY re-lock defense (HV_HDMI builds), DEFAULT OFF. hdmi_init() brings
+ * the pipeline up with the PHY locked (breadcrumb phy@scanout has bit7=1), but
+ * FreeBSD's CCU init gates the display clocks a second into boot and the analog
+ * PHY drops lock (PHY_STATUS bit7 -> 0, stays 0). hdmi_relock() re-locks
+ * PLL_VIDEO0 + re-asserts the display gates + re-runs phy_init() — but on real
+ * hardware (2026-07-25) that did NOT restore bit7 (relock fires, count climbs,
+ * bit7 stays 0), so it is left OFF by default rather than churning CPU1 with a
+ * ~110 ms PHY reset every ~10 s for no gain. Toggle to 1 over the net to keep
+ * experimenting (best done with a human watching the physical monitor, since
+ * bit7 may not fully track visible signal). The durable fix is more likely to
+ * PROTECT the display CCU bits from the guest (so FreeBSD can't gate them)
+ * than to re-lock after the fact — see the HDMI notes. */
+volatile uint32_t dbg_hdmi_relock = 0;
 
 /* Periodic EMAC-health status line injected into the USB-ACM console — the
  * ONLY channel proven alive when EMAC/dbgmon goes dark. Reads emac.c's own
@@ -471,6 +486,9 @@ void smp_secondary_main(uint64_t cpuid)
 	 * touching EMAC itself, so the two never race the MAC. */
 	if (cpu == SMP_DEBUG_CPU && dbg_core_enable) {
 		uint32_t iters = 0;
+#ifdef HV_HDMI
+		uint32_t last_relock_iters = 0;
+#endif
 		dbg_core_active = 1;
 		__asm__ volatile("dsb sy" ::: "memory");
 		for (;;) {
@@ -523,6 +541,23 @@ void smp_secondary_main(uint64_t cpuid)
 				struct el2_frame hud_snap;
 				el2_snapshot_guest_frame(&hud_snap);
 				hud_update(&hud_snap);
+			}
+
+			/* HDMI PHY lock-loss defense: CPU1 owns the display, so it also
+			 * defends it. Live-board-confirmed (see hdmi_relock()'s comment)
+			 * the guest never actually touches the CCU/DE2/TCON bits
+			 * hdmi_init() programmed -- only the analog PHY's own lock
+			 * status drops sometime after boot. The check itself is one
+			 * cheap MMIO read every pass; only the (bounded, ~200ms) relock
+			 * sequence is rate-limited, via last_relock_iters, so a monitor
+			 * that's simply unplugged doesn't make CPU1 burn all its time
+			 * retrying instead of servicing dbgmon/usbacm/the WDOG kick.
+			 * Gated on the same 500000-iteration warm-up as the HUD repaint
+			 * above so it never fights hdmi_init()'s own bring-up. */
+			if (dbg_hdmi_relock && !hdmi_phy_locked() &&
+			    (iters - last_relock_iters) > 65536u) {
+				hdmi_relock();
+				last_relock_iters = iters;
 			}
 #endif
 			/* USB-OTG CDC-ACM interactive console bridge (usbacm.c):

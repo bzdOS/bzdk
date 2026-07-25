@@ -104,6 +104,14 @@ static inline void bc_write(int idx, uint32_t v)
 
 static int g_timeout_latched = 0; /* first stage that timed out, 0 = none */
 
+/* Stashed away by stage_tcon()/hdmi_init() so a later hdmi_relock() (CPU1,
+ * post-boot PHY lock-loss defense -- see hdmi.h) can redrive the PHY without
+ * recomputing anything: both dividers are fixed for the life of the boot
+ * (v1 has exactly one forced mode, never renegotiated). */
+static uint32_t g_tcon1_div = 1;
+static uint32_t g_phy_div = 1;
+static uint32_t g_relock_count = 0;
+
 static void bc_stage(int stage)
 {
 	bc_write(0, BC_HDMI_MAGIC);
@@ -624,6 +632,8 @@ static void stage_tcon(uint32_t pll3_hz)
 	/* lcdc_enable(): turn the TCON itself on (lcdc.c:45). */
 	set32(TCON_CTRL, TCON_CTRL_TCON_ENABLE);
 
+	g_tcon1_div = div;
+
 	bc_clk_readback(rd32(CCU_BASE + CCU_LCD1_CLK_CFG));
 	bc_write(6, div);
 	bc_stage(HDMI_STAGE_TCON);
@@ -914,6 +924,7 @@ int hdmi_init(void)
 	bc_write(5, HDMI_MODE_PIXEL_CLOCK_HZ / 1000u);
 
 	int phy_div = stage_clocks(&pll3_hz);
+	g_phy_div = (uint32_t)phy_div;
 	stage_de2();
 	stage_tcon(pll3_hz);
 	stage_hdmi_ctrl();
@@ -921,6 +932,75 @@ int hdmi_init(void)
 	stage_scanout();
 
 	return 0; /* always -- breadcrumb + word[4] is the real verdict */
+}
+
+/* ==================================================================== *
+ * Post-boot PHY relock -- see hdmi.h for the full rationale (live-board-
+ * confirmed: none of the CCU/DE2/TCON config registers below actually need
+ * restoring, they never change; the analog PHY's OWN lock status is what
+ * drops). The CCU/DE2/TCON re-assertions are SET-only (set32 = read | OR),
+ * so even though this runs on CPU1 concurrently with the guest driving its
+ * own clocks through the very same CCU_BASE register file, it can never
+ * clear a bit the guest set elsewhere in the same 32-bit register -- it
+ * only ever turns back on the exact few display-specific bits hdmi_init()
+ * itself turned on, bits the guest DTB never references (every display
+ * node is status="disabled").
+ * ==================================================================== */
+int hdmi_phy_locked(void)
+{
+	return (rd32(PHY_STATUS) & 0x80u) ? 1 : 0;
+}
+
+void hdmi_relock(void)
+{
+	/* CRITICAL (2026-07-25): re-lock PLL_VIDEO0 FIRST. FreeBSD's CCU init
+	 * gates/disables PLL_VIDEO0 (the pixel-clock source) as "unused" once the
+	 * guest boots, so the analog PHY has no TMDS clock to lock onto — re-running
+	 * phy_init() alone (as an earlier version did) re-locked NOTHING because the
+	 * clock underneath it was dead. pll_video_pick() re-programs CCU_PLL_VIDEO0_CFG
+	 * (enable + N/M for our pixel clock) and waits for CCM_PLL3_LOCK, exactly as
+	 * stage_clocks() does at boot. */
+	{
+		int pll_div;
+		(void)pll_video_pick(HDMI_MODE_PIXEL_CLOCK_HZ / 1000u, &pll_div);
+	}
+
+	/* Belt-and-suspenders: re-OR exactly the display gate/reset/PLL-enable
+	 * bits stage_clocks()/stage_de2()/stage_tcon() set. */
+	set32(CCU_BASE + CCU_AHB_RESET1_CFG,
+	      (1u << AHB_RESET_OFFSET_DE) | (1u << AHB_RESET_OFFSET_HDMI) |
+	      (1u << AHB_RESET_OFFSET_HDMI2) | (1u << AHB_RESET_OFFSET_LCD1));
+	set32(CCU_BASE + CCU_AHB_GATE1,
+	      (1u << AHB_GATE_OFFSET_DE) | (1u << AHB_GATE_OFFSET_HDMI) |
+	      (1u << AHB_GATE_OFFSET_LCD1));
+	set32(CCU_BASE + CCU_DE_CLK_CFG, CCM_DE2_GATE);
+	set32(CCU_BASE + CCU_HDMI_CLK_CFG, CCM_HDMI_GATE);
+	set32(CCU_BASE + CCU_HDMI_SLOW_CLK, CCM_HDMI_SLOW_DDC_GATE);
+	set32(CCU_BASE + CCU_LCD1_CLK_CFG, CCM_LCD1_GATE | CCM_LCD1_M(g_tcon1_div));
+	set32(DE_CLK_RST_CFG, 1u << 1);
+	set32(DE_CLK_GATE_CFG, 1u << 1);
+	set32(DE_CLK_BUS_CFG, 1u << 1);
+	set32(DE_GLB_CTL, DE2_MUX_GLB_CTL_EN);
+	set32(TCON_CTRL, TCON_CTRL_TCON_ENABLE);
+	set32(TCON1_CTRL, TCON1_CTRL_ENABLE);
+
+	/* The operation that actually restores the signal: redrive the analog
+	 * PHY bring-up sequence with the same divider computed at boot. */
+	phy_init();
+	phy_set(HDMI_MODE_PIXEL_CLOCK_HZ, (int)g_phy_div);
+
+	/* Mirror stage_scanout()'s tail: clear any TMDS overflow, re-apply the
+	 * DE2 double-buffer flip. */
+	{
+		uint8_t inv;
+		hwr8(HDMI_CTRL_BASE + HDMI_MC_SWRSTZ, (uint8_t)~HDMI_MC_SWRSTZ_TMDSSWRST_REQ);
+		inv = hrd8(HDMI_CTRL_BASE + HDMI_FC_INVIDCONF);
+		hwr8(HDMI_CTRL_BASE + HDMI_FC_INVIDCONF, inv);
+		wr32(DE_GLB_DBUFF, 1);
+	}
+
+	bc_phy_status(rd32(PHY_STATUS));
+	bc_write(7, ++g_relock_count);
 }
 
 uint32_t *hdmi_fb(void)   { return (uint32_t *)HDMI_FB_BASE; }

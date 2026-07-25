@@ -61,28 +61,33 @@
 #define HDMI_FB_BASE     0x4D000000UL
 
 /* ------------------------------------------------------------------ *
- * Fixed video mode: 1920x1080@60, CEA-861 mode 16 (a.k.a. VIC 16). This
- * is the most universally supported 1080p HDMI timing, so an arbitrary
- * monitor/TV has the best odds of syncing on the first try. Pixel clock
- * 148.5 MHz (TMDS 1.485 Gbps). Sync polarities are both POSITIVE
- * (active-high) per the CEA-861 mode-16 spec.
+ * Fixed video mode: 1280x720@60, CEA-861 mode 4 (VIC 4). Pixel clock
+ * 74.25 MHz (TMDS 742.5 Mbps). Sync polarities both POSITIVE (active-high)
+ * per the CEA-861 mode-4 spec.
  *
- * (Was 1280x720@60 in v1 — confirmed working to scanout stage 6 on the
- * physical monitor before this bump to 1080p.)
+ * WHY 720p not 1080p (2026-07-25): the 1080p bump (148.5 MHz, PHY PLL
+ * divider path "2") never locked the DWC-HDMI PHY on real hardware — read
+ * live under HV_HDMI, PHY_STATUS bit7 (lock) stayed 0 while DE2+TCON1 were
+ * up, i.e. hdmi_init() timed out at the PHY stage and NO signal reached the
+ * monitor. 720p (74.25 MHz, divider path "4") is the timing this driver was
+ * actually "confirmed working to scanout stage 6 on the physical monitor".
+ * Re-fixing the 1080p PHY PLL config is a separate follow-up; 720p is the
+ * mode that produces a real signal today. Framebuffer 1280x720x4 = 3.7 MiB
+ * still fits the 8 MiB hv-fb reservation.
  * ------------------------------------------------------------------ */
-#define HDMI_MODE_HACTIVE      1920
-#define HDMI_MODE_HFRONT_PORCH   88
-#define HDMI_MODE_HSYNC_LEN      44
-#define HDMI_MODE_HBACK_PORCH   148
-#define HDMI_MODE_HTOTAL       2200  /* 1920+88+44+148 */
+#define HDMI_MODE_HACTIVE      1280
+#define HDMI_MODE_HFRONT_PORCH  110
+#define HDMI_MODE_HSYNC_LEN      40
+#define HDMI_MODE_HBACK_PORCH   220
+#define HDMI_MODE_HTOTAL       1650  /* 1280+110+40+220 */
 
-#define HDMI_MODE_VACTIVE      1080
-#define HDMI_MODE_VFRONT_PORCH    4
+#define HDMI_MODE_VACTIVE       720
+#define HDMI_MODE_VFRONT_PORCH    5
 #define HDMI_MODE_VSYNC_LEN       5
-#define HDMI_MODE_VBACK_PORCH    36
-#define HDMI_MODE_VTOTAL       1125  /* 1080+4+5+36 */
+#define HDMI_MODE_VBACK_PORCH    20
+#define HDMI_MODE_VTOTAL        750  /* 720+5+5+20 */
 
-#define HDMI_MODE_PIXEL_CLOCK_HZ 148500000UL /* 2200 * 1125 * 60 = 148,500,000 */
+#define HDMI_MODE_PIXEL_CLOCK_HZ 74250000UL /* 1650 * 750 * 60 = 74,250,000 */
 #define HDMI_MODE_HSYNC_ACTIVE_HIGH 1
 #define HDMI_MODE_VSYNC_ACTIVE_HIGH 1
 
@@ -122,6 +127,30 @@ int hdmi_stride(void); /* pixels per scanline (== hdmi_width() in v1: no
  * won't see it on a screen that never got scanned out to). */
 void hdmi_demo(void);
 
+/* Live PHY lock check: returns 1 if PHY_STATUS bit7 (lock) is currently set,
+ * 0 otherwise. Cheap (one MMIO read) -- safe to poll from CPU1 every loop
+ * iteration. */
+int hdmi_phy_locked(void);
+
+/* Post-boot PHY relock. Call this from CPU1 (the debug/display-owning core,
+ * see smp.c) when hdmi_phy_locked() reports 0 sometime after a clean
+ * hdmi_init() scanout, to force the analog HDMI PHY to re-lock without
+ * re-running the whole pipeline.
+ *
+ * Live-board-confirmed (2026-07-25): after the guest boots and the monitor
+ * goes dark, EVERY CCU/DE2/TCON/PHY-config register hdmi_init() programmed
+ * (PLL_VIDEO0_CFG, AHB_GATE1, AHB_RESET1_CFG, DE_CLK_*, HDMI_CLK_CFG,
+ * LCD1_CLK_CFG, TCON_CTRL, TCON1_CTRL, DE_GLB_CTL, PHY_CTRL/PLL/CLK/UNK1-3)
+ * still reads back bit-for-bit identical to what was written at boot --
+ * only PHY_STATUS's own lock bit has dropped. So this function's CCU/DE2/
+ * TCON re-assertions are defensive belt-and-suspenders (SET-only, so they
+ * can never clobber a guest-owned bit sharing the same 32-bit register);
+ * the operation that actually restores the signal is redriving the analog
+ * PHY bring-up sequence (phy_init()+phy_set()) using the same divider
+ * hdmi_init() computed at boot. Bounded (~200ms worth of the same
+ * timer-bounded waits hdmi_init() itself uses) -- never hangs. */
+void hdmi_relock(void);
+
 /* ------------------------------------------------------------------ *
  * Breadcrumb: fixed DRAM window at 0x50003000, magic "HDMI", so a post-run
  * `md.l 0x50003000` (from U-Boot, over the existing debug UART/USB path)
@@ -146,9 +175,16 @@ void hdmi_demo(void);
  *   [5] pixclk_khz    achieved PLL_VIDEO pixel clock, kHz (debug extra)
  *   [6] tcon1_div     TCON1/LCD1 module clock divider actually programmed
  *                      (debug extra)
- *   [7] reserved
+ *   [7] relock_count  # times CPU1 (smp.c) observed PHY_STATUS bit7 drop
+ *                      post-boot and called hdmi_relock() to restore it
+ *                      (0 = never needed it yet)
  * ------------------------------------------------------------------ */
-#define BC_HDMI_BASE   0x50003000UL
+/* Relocated 2026-07-25 from 0x50003000 — that address sits INSIDE the
+ * vconsole 64 KiB capture ring (0x50000f10..0x50010f10) and was being
+ * clobbered by guest console bytes, so the pipeline stage/PHY breadcrumb was
+ * unreadable post-boot. 0x50011800 is in the free gap 0x50011100..0x50020000
+ * (past el2_ncmap 0x50011000, before flightrec 0x50012000). */
+#define BC_HDMI_BASE   0x50011800UL
 #define BC_HDMI_MAGIC  0x48444D49u /* "HDMI" */
 
 #define HDMI_STAGE_CLOCKS   1
