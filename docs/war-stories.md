@@ -494,8 +494,9 @@ whole class of interrupts vanishes, suspect the one global gate they share
 pipeline, integrated into the running hypervisor so the HV drives a physical
 monitor with a live HUD (`-DHV_HDMI`, opt-in).
 
-**Status: open** (pipeline + framebuffer + HUD render and the PHY locks *at
-boot*; the signal does not survive the guest's boot).
+**Status: CLOSED** (root-caused live and fixed; the signal now survives guest
+boot and the HUD is on the monitor). It reads as an "open" story below because
+that is how it *felt* for most of its life — the resolution is at the end.
 
 `hdmi_init()` runs to completion — breadcrumb stage 6 (SCANOUT), no stall, and
 `PHY_STATUS` bit 7 (analog PHY lock) set (`0x00086ef4`). The framebuffer at
@@ -529,16 +530,29 @@ refuted. What it *does* prove: changing the guest DTB changes the display
 outcome, so the controlling lever really is FreeBSD's clock/regulator handling
 of that domain — just not `dldo1` always-on specifically. Reverted.
 
-**Lesson (two of them):** first, `PHY_STATUS` bit 7 was treated as "is there a
+**The resolution.** The block came from a wrong assumption that had gone
+unchallenged: "the guest owns the RSB bus, so the HV can't read the AXP live."
+It was refuted by one question — *why can't it?* The HV and the guest drive the
+**same** RSB controller; there is no second bus. The hypervisor can reclaim it:
+`rsb_init()` re-runs the whole controller bring-up, and FreeBSD's rsb driver
+re-inits its side on its next transaction. Reclaiming it and reading the AXP803
+live gave the answer instantly — REG 0x12 = `0x80`: DLDO1 (bit 3) **cleared**.
+FreeBSD had turned the PHY's supply *off*. Not a clock, not the PHY config, not
+the mode — a power pin. The fix writes DLDO1 back on over that reclaimed RSB
+bus and re-runs the PHY bring-up (`hdmi_relock`, now CPU1-default-on); the PHY
+re-locks and holds, and a human confirmed the HUD on the monitor.
+
+**Lesson (three now):** first, `PHY_STATUS` bit 7 was treated as "is there a
 signal?" for a long time before it was pinned down as *the analog PLL lock,
 distinct from the still-locked pixel PLL* — a status bit is not a feature until
-you know which of several PLLs it reports. Second, and more fundamental: this
-is the one subsystem in the whole project you **cannot** fully close over the
-network, because the ground-truth oracle ("is there a picture?") is a human
-looking at a monitor. Everything else here is debuggable headless; a display
-is not — and without that oracle in the loop, each blind DTB/register
-experiment is as likely to muddy the picture (the `dldo1` attempt above) as to
-clear it.
+you know which of several PLLs it reports. Second, the ground-truth oracle
+("is there a picture?") really is a human at a monitor — but it only had to be
+consulted **once, at the end**, to confirm the fix; the diagnosis itself was
+done headless over RSB. Third and most useful: the thing that unblocked this
+was deleting a "can't" that was never true. "The guest owns the bus" sounded
+like a hardware fact; it was an unexamined assumption, and one *why?* dissolved
+it. When you catch yourself narrating why something is impossible, check
+whether it's physics or just habit.
 
 ## 11. The host driver that ate `/dev/ttyACM0`
 
