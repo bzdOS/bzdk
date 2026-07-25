@@ -8,6 +8,41 @@
 
 ---
 
+## Прогресс на 2026-07-25 (снимок; детали в git + memory)
+
+Trunk-based (всё на `master`, зелёный). Сделано с 07-22:
+
+- ✅ **A1 stage-2 изоляция** — hardware-proven: `AT S12E1W` self-check (STG2 bc
+  [14..18]) доказывает, что EL1-регим гостя не достаёт до hv-image/hv-scratch(/hv-fb),
+  пока гость грузится до root. Guest→HV нарушение репортится (FLTR_K_HVVIOL).
+- ✅ **A2 чистый shutdown** — PSCI SYSTEM_OFF→warm-reset (fs_clean).
+- ✅ **B2 GDB-stub** — RSP breakpoint/step STOP подключён в dbg-билд (команда
+  `gdb` → CPU1 хостит RSP), live-verified по 0x88B5 (`$?`→T05, `$g`→регистры).
+- ✅ **B4 flight-recorder** — `flightrec.c`, генерализованный (kind,a0,a1)-ring,
+  использован по всей отладке (SYNC/IRQ/TIMER/HVVIOL).
+- ✅ **C1 virtio-net** — vtnet0, guest↔host ping.
+- ✅ **T1 soak-харнесс** + **кумулятивный boot-ledger** (`boot_ledger.py`):
+  «100 чистых бутов» набегает органически с каждой перезаливки (best streak 35,
+  isolation 35/35 на момент прогона).
+- ✅ **T2 хостовые тесты в CI** + **T3 вторая цель QEMU-virt** — `ci.sh`
+  (=`make test` 5 сьютов + `qemu-ci.sh`), board-free гейт; `QEMU-CI: PASS`.
+- 🟡 **vGIC / IMO=1** (осознанно вне v1, но сделан): FreeBSD грузится до root+init
+  под полным IMO=1 vGIC (Group0-инъекция — ключ; см. memory). master теперь IMO=1.
+- 🟡 **HDMI/HUD** интегрирован в HV (opt-in `-DHV_HDMI`, FB изолирован A1): пайплайн
+  до scanout + PHY-lock на буте, но FreeBSD роняет аналоговый PHY-lock после старта
+  (лид: AXP-рейл `dldo1`/vcc-hdmi-dsi; RSB-подтверждение блокировано захватом шины
+  гостем). Забанкано, relock за флагом (default off).
+
+Осталось до v1-гейта (§2): числа стабильности (100-streak добить soak'ом/работой,
+72h soak, 20 break-glass), реальная W^X (вне static-partitioning — отложено),
+bring-up guide (T4), лицензия/тулчейн (T5). Полировка B1 BMC / B3 forensics.
+
+**NB:** `make repl`/`fbsd`/`zephyr` — pre-broken stale-варианты (не линкуются
+задолго до этой сессии, вне CI-гейта). Активные: `dbg`, `dbg -DHV_HDMI`, `gdb`,
+`qemu`, `test`.
+
+---
+
 ## 0. Идентичность проекта
 
 Не «ещё один гипервизор». Ниша, в которой у проекта уже есть фора и которую надо осознанно сделать флагманом:
