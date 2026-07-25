@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* kload.h — FreeBSD/arm64 kernel loader + boot handoff for the bzdOS EL2
  * hypervisor (Allwinner A64, Cortex-A53).
  *
@@ -326,5 +328,60 @@ uint64_t kload_kernel_end_pa(void);
  * trap back to EL2 exactly like the guest.c preemption path).
  */
 void kload_enter(uint64_t entry, uint64_t modinfo_pa, uint64_t sp) __attribute__((noreturn));
+
+/* ------------------------------------------------------------------ *
+ * ROADMAP B3 (crash forensics) — on-board kernel symbol table access.
+ *
+ * kload_parse_elf() already walks this same in-DRAM ELF's PROGRAM headers
+ * (PT_LOAD, for placement) — it now ALSO makes one bounded pass over the
+ * ELF's SECTION headers (e_shoff/e_shnum, previously parsed into the header
+ * struct but unused) purely to LOCATE, not read, a symbol table: the first
+ * section with sh_type==SHT_SYMTAB, and — via THAT section's sh_link field,
+ * never by matching section-name strings against .shstrtab, which is one
+ * fewer thing that can be stripped/renamed/absent — its paired sh_type==
+ * SHT_STRTAB string table. This is best-effort and never fatal: a stripped
+ * kernel (no .symtab) simply leaves kload_symtab_info() returning 0 forever;
+ * kload_parse_elf()'s core placement contract is completely unaffected
+ * either way (this scan runs after kernbase is already established and
+ * cannot itself fail the overall parse).
+ *
+ * The functions below hand a symbol-resolver (ksym.c) exactly the same
+ * already-known quantities kload.c computed for its OWN placement math
+ * (kernbase, the ELF's own base address) — reused, not recomputed, per the
+ * B3 task brief. Symbol st_value fields in a FreeBSD kernel ELF are KVAs in
+ * the SAME space as every PT_LOAD's p_vaddr, so a caller comparing a live
+ * guest KVA (e.g. a backtrace return address) against st_value needs no
+ * VA<->PA delta at all; kload_kernbase()/kload_kernel_end_va() exist only so
+ * a resolver can cheaply reject an address that isn't even in the loaded
+ * kernel image's own VA range before it bothers scanning the symbol table.
+ */
+
+/* Returns 1 and fills every output if the last successful kload_parse_elf()
+ * located a valid SHT_SYMTAB + paired SHT_STRTAB section pair; returns 0 (no
+ * outputs touched) if no parse has run yet or the kernel ELF has no symbol
+ * table (e.g. stripped). sym_addr/str_addr are absolute addresses (elf_addr
+ * + sh_offset) directly dereferenceable by EL2 — same DRAM-resident-ELF
+ * assumption kload_parse_elf()/kload_place_segments() already make, NOT
+ * offsets the caller must add elf_addr to again. sym_count is the number of
+ * Elf64_Sym entries (sh_size / sh_entsize, sh_entsize already validated by
+ * kload_parse_elf() to be exactly sizeof(Elf64_Sym) == 24, so no ambiguity
+ * about entry stride reaches the caller). str_size bounds every st_name
+ * lookup into the string table. */
+int kload_symtab_info(uint64_t *sym_addr, uint32_t *sym_count,
+                       uint64_t *str_addr, uint64_t *str_size);
+
+/* kernbase: the lowest PT_LOAD p_vaddr, i.e. the low end of the loaded
+ * kernel's own KVA range (same value kload_place_segments() uses for its
+ * dest_pa = pa_base + (p_vaddr - kernbase) math). Returns 0 if no successful
+ * kload_parse_elf() has run. */
+uint64_t kload_kernbase(void);
+
+/* High end of the loaded kernel's own KVA range: max(p_vaddr + p_memsz)
+ * across every PT_LOAD segment, computed directly from the ELF during
+ * kload_parse_elf() — this is a pure VA quantity and, unlike
+ * kload_kernel_end_pa(), needs no pa_base/placement step to exist, so it is
+ * available immediately after a successful parse. Returns 0 if no
+ * successful kload_parse_elf() has run. */
+uint64_t kload_kernel_end_va(void);
 
 #endif /* BZDOS_KLOAD_H */

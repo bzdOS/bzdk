@@ -854,11 +854,16 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	 * backtrace_walk() only ran on-demand (dbgmon's `bt` command), so a
 	 * board that rebooted before an operator typed `bt` had no backtrace at
 	 * all. pc=ELR, fp=x29, lr=x30, same triple panic.c/dbgmon.c use;
-	 * defensive by construction (never faults on a bad fp). */
+	 * defensive by construction (never faults on a bad fp). Also resolve the
+	 * first few frames to symbol+offset (backtrace_symbolize(), backtrace.c)
+	 * into the separate BTS1 breadcrumb — best-effort/additive, a no-op past
+	 * its own header stamp if no FreeBSD kernel has been kload_parse_elf()'d
+	 * this boot; the raw BTR1 addresses above are unaffected either way. */
 	{
 		uint64_t bt_out[16];
-		(void)backtrace_walk(frame->elr, frame->x[29], frame->x[30],
-		                     bt_out, 16);
+		int bt_n = backtrace_walk(frame->elr, frame->x[29], frame->x[30],
+		                          bt_out, 16);
+		backtrace_symbolize(bt_out, bt_n);
 	}
 
 	/* B3 crash-forensics: stream a bounded ELF coredump to the host

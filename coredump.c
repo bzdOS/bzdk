@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* coredump.c — bounded ELF (ET_CORE) coredump over raw Ethernet. See
  * coredump.h for the on-wire framing and the receiver contract. */
 #include <stdint.h>
@@ -17,6 +19,36 @@ extern void emac_poll(void);
  * the 1 GiB the board has; anything outside is refused (never fault reading). */
 #define DRAM_LO 0x40000000ULL
 #define DRAM_HI 0x80000000ULL
+
+/* ROADMAP B3 fix: translate a guest EL1 virtual address to a physical one
+ * before it is handed to region_clamp()/stream_mem() below (which only ever
+ * understand flat physical addresses in [DRAM_LO, DRAM_HI)). Exactly the
+ * same AT S1E1R / PAR_EL1 idiom backtrace.c's bt_read64() already uses for
+ * the guest frame-pointer walk, with the identical MMU-off fallback
+ * (treat the VA as already-physical if translation faults — correct for an
+ * early-boot guest with SCTLR_EL1.M==0, where VA==PA by construction).
+ * `at`/`isb`/`mrs` never themselves fault, so this is safe to call
+ * unconditionally from the fault path. See coredump_send()'s use below: the
+ * automatic "stack window" region used to be built from frame->sp_at_entry,
+ * which is EL2's OWN exception stack pointer (see exceptions.S's frame
+ * layout comment: "sp_at_entry: SP before we pushed the frame" — that's
+ * SP_EL2, never anything the guest owns) — i.e. every coredump ever sent
+ * streamed a window of the HYPERVISOR's stack, not the panicking GUEST's,
+ * and stamped that same wrong value into NT_PRSTATUS's sp register too. */
+static uint64_t gva_to_pa(uint64_t va)
+{
+	uint64_t par, pa;
+
+	__asm__ volatile("at s1e1r, %0" :: "r"(va) : "memory");
+	__asm__ volatile("isb" ::: "memory");
+	__asm__ volatile("mrs %0, par_el1" : "=r"(par));
+
+	if (!(par & 1ull)) {
+		pa = (par & 0x000ffffffffff000ull) | (va & 0xfffull);
+		return pa;
+	}
+	return va;   /* MMU-off guest (VA==PA), or untranslatable: flat fallback */
+}
 
 /* ---- ELF64 constants (only what we need) ---- */
 #define ET_CORE       4
@@ -163,14 +195,28 @@ void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
 	uint8_t  prstatus[PRSTATUS_SZ];
 	uint32_t nreg = 0, hlen, note_off, data_off, seg_off;
 	uint32_t total_bytes, i, j;
-	uint64_t sp, sbase;
+	uint64_t sp1, sp_pa, sbase;
 
 	if (!frame)
 		return;
 
-	/* Region 0: a bounded window around SP (2 pages, SP kept inside). */
-	sp = frame->sp_at_entry;
-	sbase = (sp > 0x1000ULL) ? ((sp - 0x1000ULL) & ~0xFFFULL) : sp;
+	/* Region 0: a bounded window around the GUEST's own stack pointer (2
+	 * pages, SP kept inside) — SP_EL1, read directly, NOT frame->sp_at_entry
+	 * (that field is EL2's OWN exception stack pointer; see the big comment
+	 * on gva_to_pa() above for why that was wrong for a guest post-mortem).
+	 * coredump_send() is only ever invoked for a genuine GUEST (lower-EL)
+	 * fault today — el2_exc.c's B3 call site gates on (kind>>2)==2u before
+	 * calling this — so SP_EL1 here is exactly the panicking kernel's own
+	 * live stack pointer, same register el2_ss_handle() already treats as
+	 * "the guest's SP" elsewhere in this tree. sp1 (the VA) is what's
+	 * recorded into NT_PRSTATUS below, matching every other captured
+	 * register (x0-x30/elr/spsr are also raw, untranslated guest values);
+	 * sp_pa (translated via gva_to_pa()) is only for the actual memory
+	 * region, since region_clamp()/stream_mem() work in flat physical
+	 * addresses. */
+	__asm__ volatile("mrs %0, sp_el1" : "=r"(sp1));
+	sp_pa = gva_to_pa(sp1);
+	sbase = (sp_pa > 0x1000ULL) ? ((sp_pa - 0x1000ULL) & ~0xFFFULL) : sp_pa;
 	if (region_clamp(sbase, 0x2000ULL, &reg[nreg]))
 		nreg++;
 
@@ -184,7 +230,7 @@ void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
 		prstatus[i] = 0;
 	for (i = 0; i < 31u; i++)                               /* x0..x30 */
 		put64(prstatus, PRSTATUS_REGOFF + i * 8u, frame->x[i]);
-	put64(prstatus, PRSTATUS_REGOFF + 31u * 8u, frame->sp_at_entry); /* sp */
+	put64(prstatus, PRSTATUS_REGOFF + 31u * 8u, sp1);                /* sp (guest SP_EL1) */
 	put64(prstatus, PRSTATUS_REGOFF + 32u * 8u, frame->elr);         /* pc */
 	put64(prstatus, PRSTATUS_REGOFF + 33u * 8u, frame->spsr);        /* pstate */
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* coredump.h — bounded, non-blocking ELF (ET_CORE) coredump streamed over raw
  * Ethernet for the bzdOS EL2 microkernel.
  *
@@ -50,12 +52,15 @@ struct el2_frame;   /* exceptions.h */
 #define COREDUMP_REGION_MAX 8u            /* max PT_LOAD segments            */
 #define COREDUMP_MAX_TOTAL  (384u * 1024u)/* hard cap on streamed core bytes */
 
-/* Stream an ELF core to the host. `frame` supplies the register state. The
- * current stack (a bounded window around SP) is captured automatically as one
- * PT_LOAD. `regions` is an optional caller-supplied array of (addr,len) pairs
- * (2*nregions uint64_t words) added as additional PT_LOAD segments; pass NULL
- * / 0 for none. Out-of-DRAM or oversized regions are clamped/skipped. Bounded
- * and non-blocking. */
+/* Stream an ELF core to the host. `frame` supplies the register state (GPRs,
+ * pc, pstate). The current GUEST stack (a bounded window around the guest's
+ * own SP_EL1, read directly — NOT frame->sp_at_entry, which is EL2's own
+ * exception stack pointer and was a bug fixed 2026-07-25: see coredump.c's
+ * gva_to_pa()) is captured automatically as one PT_LOAD. `regions` is an
+ * optional caller-supplied array of (addr,len) pairs (2*nregions uint64_t
+ * words) added as additional PT_LOAD segments; pass NULL / 0 for none.
+ * Out-of-DRAM or oversized regions are clamped/skipped. Bounded and
+ * non-blocking. */
 void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions);
 
 #endif /* BZDOS_COREDUMP_H */

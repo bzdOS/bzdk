@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* kload.c — FreeBSD/arm64 kernel loader + boot handoff. See kload.h for the
  * full API contract and the FreeBSD arm64 boot-protocol writeup (modinfo
  * record layout, every MODINFO_ / MODINFOMD_ tag value + confidence notes).
@@ -137,6 +139,13 @@ extern void *memset(void *dst, int c, unsigned long n);
  *                       bits — a KVA (high word 0xffff0000), the return
  *                       value of kload_build_modinfo(). Confirms the blob
  *                       is handed virtually so locore's map covers it.
+ *   [14] symtab_valid   ROADMAP B3 crash-forensics: 1 if kload_parse_elf()
+ *                       located a .symtab + paired .strtab section pair in
+ *                       this ELF, 0 if not (stripped kernel, or malformed/
+ *                       absent section headers — never fatal to the parse).
+ *   [15] symtab_count   number of Elf64_Sym entries found (0 if [14]==0).
+ *                       See kload_symtab_info()/kload.h for the consumer
+ *                       contract (ksym.c's on-board symbol resolver).
  * ------------------------------------------------------------------ */
 #define KLOAD_BC_BASE  0x50000d00UL
 #define KLOAD_BC_MAGIC 0x4B4C4431u   /* "KLD1" */
@@ -156,6 +165,8 @@ enum {
 	KBC_KERNEND_VA_LO,
 	KBC_DTBP_VA_LO,      /* [12] MODINFOMD_DTBP value emitted (now a KVA), low 32 */
 	KBC_MODULEP_VA_LO,   /* [13] modulep handed to the kernel (KVA), low 32 */
+	KBC_SYMTAB_VALID,    /* [14] ROADMAP B3: 1 if a .symtab/.strtab pair was located */
+	KBC_SYMTAB_COUNT,    /* [15] ROADMAP B3: symtab_count (0 if symtab_valid==0) */
 };
 
 static inline void
@@ -206,6 +217,37 @@ typedef struct {
 #define ELF_EM_AARCH64  183u
 #define ELF_ET_EXEC     2u
 #define ELF_ET_DYN      3u
+
+/* Elf64_Shdr — ROADMAP B3 (crash forensics): the ONLY new field this loader
+ * consults beyond what it already used for PT_LOAD placement. Read purely to
+ * LOCATE (never to read the actual symbol bytes here — that stays in
+ * ksym.c) a SHT_SYMTAB + its sh_link-paired SHT_STRTAB section, so a
+ * backtrace address can later be resolved to "symbol+offset" on-board
+ * instead of only ever host-side via addr2line. Never required for the
+ * primary boot mission (a stripped kernel still places/enters fine — see
+ * the scan in kload_parse_elf() below, which never fails the parse). */
+typedef struct {
+	uint32_t sh_name;
+	uint32_t sh_type;
+	uint64_t sh_flags;
+	uint64_t sh_addr;
+	uint64_t sh_offset;
+	uint64_t sh_size;
+	uint32_t sh_link;
+	uint32_t sh_info;
+	uint64_t sh_addralign;
+	uint64_t sh_entsize;
+} kload_elf64_shdr_t;
+
+#define ELF_SHT_SYMTAB       2u
+#define ELF_SHT_STRTAB       3u
+#define ELF_SYM_ENTSIZE      24u  /* sizeof(Elf64_Sym): fixed by the ELF64 spec */
+
+/* Sanity cap on section headers we're willing to scan looking for .symtab —
+ * mirrors KLOAD_MAX_PHDR's role for program headers: generous headroom (a
+ * real FreeBSD arm64 GENERIC kernel has on the order of 30-40 sections), not
+ * a tight fit, and purely defensive against a corrupt/hostile e_shnum. */
+#define KLOAD_MAX_SHDR 512u
 
 /* MODINFO_ and MODINFOMD_ tag values live in kload.h now (authoritative,
  * with per-value source-header citations). See the big protocol comment
@@ -279,12 +321,24 @@ static struct {
 	uint64_t elf_addr;     /* ELF image base, as given to kload_parse_elf() */
 	uint64_t e_entry;      /* raw ELF entry point (KVA) */
 	uint64_t kernbase;     /* lowest PT_LOAD p_vaddr */
+	uint64_t kernend_va;   /* max(p_vaddr+p_memsz) across every PT_LOAD — a
+	                        * pure VA quantity, known right after parse,
+	                        * unlike kernel_end_pa below which needs pa_base */
 	int      n_seg;
 	struct kload_seg seg[KLOAD_MAX_PHDR];
 
 	uint64_t pa_base;      /* physical load base, as given to place_segments */
 	uint64_t entry_pa;     /* pa_base + (e_entry - kernbase) */
 	uint64_t kernel_end_pa;/* pa_base + (max(p_vaddr+p_memsz) - kernbase) */
+
+	/* ROADMAP B3: located (not read) .symtab/.strtab, see kload_parse_elf().
+	 * symtab_valid==0 means "no symbol table" (e.g. stripped kernel, or no
+	 * successful parse yet) — every other symtab_* field is meaningless. */
+	int      symtab_valid;
+	uint64_t symtab_addr;  /* elf_addr + sh_offset of the SHT_SYMTAB section */
+	uint32_t symtab_count; /* sh_size / ELF_SYM_ENTSIZE */
+	uint64_t strtab_addr;  /* elf_addr + sh_offset of the paired SHT_STRTAB */
+	uint64_t strtab_size;
 } kls;
 
 int
@@ -317,10 +371,12 @@ kload_parse_elf(uint64_t elf_addr)
 	kls.e_entry = eh->e_entry;
 	kls.n_seg = 0;
 	kls.kernbase = ~0ull;
+	kls.kernend_va = 0;
 
 	ph = (const kload_elf64_phdr_t *)(elf_addr + eh->e_phoff);
 	for (i = 0; i < eh->e_phnum; i++) {
 		struct kload_seg *s;
+		uint64_t vend;
 
 		if (ph[i].p_type != ELF_PT_LOAD)
 			continue;
@@ -336,9 +392,60 @@ kload_parse_elf(uint64_t elf_addr)
 
 		if (ph[i].p_vaddr < kls.kernbase)
 			kls.kernbase = ph[i].p_vaddr;
+
+		/* ROADMAP B3: track the VA high-water mark directly from the ELF
+		 * (max p_vaddr+p_memsz) — this is what kload_kernel_end_va() hands
+		 * a symbol resolver for its cheap "is this VA even in the kernel
+		 * image" range check. Pure VA math, no pa_base involved, so it's
+		 * valid immediately after parse, unlike kernel_end_pa. */
+		vend = ph[i].p_vaddr + ph[i].p_memsz;
+		if (vend > kls.kernend_va)
+			kls.kernend_va = vend;
 	}
 	if (kls.n_seg == 0)
 		goto fail;
+
+	/* ROADMAP B3: locate (never read here) an optional .symtab/.strtab pair
+	 * via the ELF's SECTION headers (e_shoff/e_shnum — previously parsed
+	 * into kload_elf64_ehdr_t but never consulted, since PT_LOAD placement
+	 * only needed the program headers). Best-effort and NEVER fatal: a
+	 * missing/malformed section-header table, or a stripped kernel with no
+	 * SHT_SYMTAB at all, just leaves symtab_valid==0 — the core placement
+	 * contract above is already satisfied and returns 1 regardless. */
+	kls.symtab_valid = 0;
+	kls.symtab_addr = 0;
+	kls.symtab_count = 0;
+	kls.strtab_addr = 0;
+	kls.strtab_size = 0;
+	if (eh->e_shoff != 0 && eh->e_shnum > 0 && eh->e_shnum <= KLOAD_MAX_SHDR &&
+	    eh->e_shentsize == sizeof(kload_elf64_shdr_t)) {
+		const kload_elf64_shdr_t *sh =
+			(const kload_elf64_shdr_t *)(elf_addr + eh->e_shoff);
+		uint32_t si;
+
+		for (si = 0; si < eh->e_shnum; si++) {
+			uint32_t link;
+
+			if (sh[si].sh_type != ELF_SHT_SYMTAB)
+				continue;
+			/* Paired string table via sh_link — NOT by matching section
+			 * NAMES against .shstrtab (that string table can itself be
+			 * absent/stripped independently; sh_link is the authoritative,
+			 * always-present ELF linkage for SHT_SYMTAB -> its strings). */
+			link = sh[si].sh_link;
+			if (link >= eh->e_shnum || sh[link].sh_type != ELF_SHT_STRTAB)
+				break;   /* malformed linkage: leave symtab_valid==0 */
+			if (sh[si].sh_entsize != ELF_SYM_ENTSIZE || sh[si].sh_size == 0)
+				break;   /* not a real ELF64 symtab: leave symtab_valid==0 */
+
+			kls.symtab_addr  = elf_addr + sh[si].sh_offset;
+			kls.symtab_count = (uint32_t)(sh[si].sh_size / ELF_SYM_ENTSIZE);
+			kls.strtab_addr  = elf_addr + sh[link].sh_offset;
+			kls.strtab_size  = sh[link].sh_size;
+			kls.symtab_valid = 1;
+			break;   /* first SHT_SYMTAB wins — a kernel image has exactly one */
+		}
+	}
 
 	kls.valid = 1;
 	kload_bc(KBC_MAGIC, KLOAD_BC_MAGIC);
@@ -346,6 +453,8 @@ kload_parse_elf(uint64_t elf_addr)
 	kload_bc(KBC_E_ENTRY_LO, (uint32_t)kls.e_entry);
 	kload_bc(KBC_N_SEG, (uint32_t)kls.n_seg);
 	kload_bc(KBC_KERNBASE_LO, (uint32_t)kls.kernbase);
+	kload_bc(KBC_SYMTAB_VALID, (uint32_t)kls.symtab_valid);
+	kload_bc(KBC_SYMTAB_COUNT, kls.symtab_count);
 	return 1;
 
 fail:
@@ -535,7 +644,18 @@ kload_build_modinfo(uint64_t dtb_src_pa, uint64_t dtb_dst_pa, uint64_t scratch_p
 	     * list fallbacks (vfs_mountroot_conf0 emits one line per token), but a
 	     * single clean device is simplest and sufficient here. */
 	    "vfs.root.mountfrom=ufs:/dev/vtbd0p3\0"
-	    "vfs.mountroot.timeout=20\0"              /* FINDING: even a 1200s wait does NOT auto-mount —
+	    "vfs.mountroot.timeout=45\0"              /* RETEST (2026-07-25): the finding below predates
+	                                               * the vGIC Group0 fix (this session) that made
+	                                               * device-SPI interrupt delivery actually work
+	                                               * end-to-end (vtblk0/vtnet0 now enumerate on REAL
+	                                               * IRQs, not polling). The GEOM-taste stall this
+	                                               * comment describes may have been a symptom of the
+	                                               * same broken interrupt delivery, not an independent
+	                                               * FreeBSD/GEOM bug. Bumped 20->45s to give automatic
+	                                               * mountroot a real window to succeed before falling
+	                                               * to the interactive prompt; if it still needs the
+	                                               * timeout-drop dance, revert to 20 and keep the
+	                                               * auto_mount_root() workaround. FINDING: even a 1200s wait does NOT auto-mount —
                                                * the GPT partitions materialize only when mountroot
                                                * GIVES UP and drops to the interactive prompt (the
                                                * GEOM taste is coupled to the wait ending). So use a
@@ -682,6 +802,36 @@ uint64_t
 kload_kernel_end_pa(void)
 {
 	return kls.placed ? kls.kernel_end_pa : 0;
+}
+
+/* ROADMAP B3 (crash forensics) accessors — see the big comment block above
+ * kload_symtab_info()'s declaration in kload.h for the full contract. These
+ * gate ONLY on kls.valid (a successful kload_parse_elf()), not kls.placed:
+ * kernbase/kernend_va/symtab location are all pure ELF-file properties that
+ * never depended on kload_place_segments() having run. */
+int
+kload_symtab_info(uint64_t *sym_addr, uint32_t *sym_count,
+                  uint64_t *str_addr, uint64_t *str_size)
+{
+	if (!kls.valid || !kls.symtab_valid)
+		return 0;
+	if (sym_addr)  *sym_addr  = kls.symtab_addr;
+	if (sym_count) *sym_count = kls.symtab_count;
+	if (str_addr)  *str_addr  = kls.strtab_addr;
+	if (str_size)  *str_size  = kls.strtab_size;
+	return 1;
+}
+
+uint64_t
+kload_kernbase(void)
+{
+	return kls.valid ? kls.kernbase : 0;
+}
+
+uint64_t
+kload_kernel_end_va(void)
+{
+	return kls.valid ? kls.kernend_va : 0;
 }
 
 void
