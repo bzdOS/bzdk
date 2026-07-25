@@ -21,6 +21,9 @@
                      * EMAC/dbgmon is dark */
 #include "emac.h"   /* emac_link_watchdog() self-heal */
 #include "wdt.h"
+#ifdef HV_HDMI
+#include "hud.h"    /* hud_update(): live HUD refresh on CPU1 (HV_HDMI build) */
+#endif
 
 /* The shared guest-frame snapshot + debug-core flag live in el2_exc.c. */
 extern struct el2_frame g_last_guest_frame;
@@ -500,6 +503,20 @@ void smp_secondary_main(uint64_t cpuid)
 				if (emac_link_watchdog() && dbg_emac_watchdog_reboot)
 					wdt_debug_hold = 1;
 			}
+#ifdef HV_HDMI
+			/* Live HUD refresh on the physical monitor. CPU1 owns the display
+			 * (as it owns the debug console) since CPU0 is inside the guest.
+			 * Rate-limited: hud_update() repaints the whole 1080p frame — far
+			 * too heavy for every loop iteration — so refresh every 2048th pass.
+			 * Uses a consistent guest-frame snapshot (H8 seqlock), the same
+			 * source dbgmon reads, so the on-screen register/trace panels track
+			 * the live guest. */
+			if ((iters & 0x7ff) == 0) {
+				struct el2_frame hud_snap;
+				el2_snapshot_guest_frame(&hud_snap);
+				hud_update(&hud_snap);
+			}
+#endif
 			/* USB-OTG CDC-ACM interactive console bridge (usbacm.c):
 			 * services the MUSB gadget and pumps both vconsole bridge
 			 * rings, independent of the EMAC/dbgmon isolation flag above
