@@ -22,7 +22,7 @@ State machine per cycle:
 Usage: python3 reliable_load.py [--expect-vbk] [--cycles N]
 Exit 0 on verified load, 1 on exhaustion.
 """
-import os, sys, time, argparse, termios, tty
+import os, sys, time, argparse, termios, tty, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chimpd as C
 from hvdbg import HV
@@ -235,7 +235,18 @@ def auto_mount_root(timeout=45):
                 time.sleep(0.05)
             except OSError:
                 time.sleep(0.05)
-            if not sent and b"mountroot>" in buf:
+            # Byte-drop resilient match: the USB-ACM console byte transport
+            # (musb.c's bounded staging ring, see docs/war-stories.md §11-
+            # adjacent findings) has been observed to silently drop a SINGLE
+            # byte under a burst (documented, accepted "drop newest on full"
+            # policy — musb.c:433) — live-observed turning "mountroot>" into
+            # "mountroo>" (missing the 't'), which made an exact-string match
+            # miss the prompt entirely and misreport "never seen" on a guest
+            # that was actually sitting right at the prompt. Match loosely:
+            # "mountroo" + 0-2 filler chars + ">" catches both the intact and
+            # single-byte-dropped forms without weakening specificity (nothing
+            # else in FreeBSD's boot output looks like this).
+            if not sent and re.search(rb"mountroo.{0,2}>", buf):
                 C.slog("  [automount] mountroot> seen, injecting "
                        f"{ROOT_MOUNTFROM}")
                 payload = (ROOT_MOUNTFROM + "\r").encode("ascii")
