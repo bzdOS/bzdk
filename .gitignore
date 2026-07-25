@@ -13,3 +13,10 @@ test_vconsole_uart
 
 # Agent worktrees (isolated per-task git worktrees, not part of the tree)
 .claude/
+
+# cumulative boot ledger + soak reports (runtime data, accrues on disk)
+boot-ledger.jsonl
+boot-ledger.txt
+soak-*
+!soak.py
+soak-logs/
