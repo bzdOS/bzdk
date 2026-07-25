@@ -449,6 +449,113 @@ theory-compatible symptoms right up until someone read the real parser.
 
 ---
 
+## 9. The virtual interrupt that only exists as Group 0
+
+**Subsystem:** `vgic.c`/`gic_timer.c` — GICv2 (GIC-400) virtualization, the
+piece that lets an EL1 guest receive *virtual* interrupts through the
+hypervisor's List Registers instead of the physical CPU interface.
+
+**Status: closed** (FreeBSD boots to root mount + init under full IMO=1 vGIC,
+~11 min uptime), though the whole feature is deliberately *outside* the v1 gate
+(v1 ships the IMO=0 static-partitioning model; this was pursued because it was
+on the milestone list).
+
+Three earlier attempts at "route every physical IRQ to EL2 and forward it to
+the guest as a virtual one" had all regressed — a NULL panic, a 145 kHz
+EHCI/INTID-106 storm (story 1), a guest wedged at `reads=1`. The instrumented
+fourth attempt bisected it on hardware and found the guest booting to **GEOM
+disk-tasting** and then freezing: the flight recorder (story 7's descendant,
+now a generalized `(kind,a0,a1)` ring) showed the guest **polling** the virtio
+ISR-status register 1000+ times — i.e. *not receiving interrupts at all* — and
+the injected List Register for the timer sitting un-EOIed. Both the timer PPI
+and the device SPI were injected as **Group 1**, and *neither* reached the
+guest.
+
+The root cause is a property of the silicon that no amount of List-Register
+juggling changes: the GICv2 **virtual** CPU interface (GICV) has **no security
+banking**. A guest that believes it is non-secure and enables "Group 1" by
+writing `GICC_CTLR` bit 0 actually sets `GICV_CTLR.EnableGrp0` — so a Group-1
+virtual interrupt is never presented. KVM injects everything as **Group 0**
+for exactly this reason, and it is nowhere in the GIC-400 TRM's happy path.
+Flipping injection to Group 0 (`VGIC_GROUP0`, LR.Grp1=0 + `VMCR` VENG0|VENG1)
+was the entire fix: device SPIs *and* the CNTV timer immediately started being
+delivered, `vtblk0`+`vtnet0` enumerated on real interrupts, and the guest ran.
+
+**Lesson:** the earlier three attempts weren't "the timer is hard" — they were
+all the same silent Group-1 delivery failure wearing different symptoms. A
+status bit that reads "injected OK" (the LR accepted the write) says nothing
+about whether the guest's virtual interface will ever *present* it. When a
+whole class of interrupts vanishes, suspect the one global gate they share
+(here, the group enable) before instrumenting each interrupt individually.
+
+## 10. You cannot debug a display you cannot see
+
+**Subsystem:** `hdmi.c`/`fb.c`/`hud.c` — the DE2→TCON1→DWC-HDMI→PHY scanout
+pipeline, integrated into the running hypervisor so the HV drives a physical
+monitor with a live HUD (`-DHV_HDMI`, opt-in).
+
+**Status: open** (pipeline + framebuffer + HUD render and the PHY locks *at
+boot*; the signal does not survive the guest's boot).
+
+`hdmi_init()` runs to completion — breadcrumb stage 6 (SCANOUT), no stall, and
+`PHY_STATUS` bit 7 (analog PHY lock) set (`0x00086ef4`). The framebuffer at
+`0x4D000000` holds real HUD pixels. But a live read a second after the guest
+boots shows `PHY_STATUS = 0x00020600`, bit 7 **dropped, stable** — while
+`DE_GLB_CTL`, `TCON1_CTRL`, and the CCU `PLL_VIDEO0` (the *pixel*-clock PLL) all
+still read exactly what `hdmi_init()` programmed. So the digital pipeline is
+untouched; only the analog PHY's own PLL loses lock.
+
+Every attempted fix chased the wrong layer in turn: it is **not** the 1080p vs
+720p mode (both drop bit 7 identically); it is **not** FreeBSD gating the
+display clocks (a full register-by-register read post-boot showed every CCU/
+DE2/TCON bit `hdmi_init()` wrote is bit-for-bit unchanged); a CPU1 re-lock that
+re-runs `PLL_VIDEO0` + `phy_init()` fires (`hdmi_relock()`, gated behind
+`dbg_hdmi_relock`, default off) but does **not** restore bit 7. The remaining
+suspect is the one domain the digital reads can't see: analog supply. FreeBSD's
+AXP803 PMIC driver reconfigures rails on boot — including `dldo1`
+(`vcc-hdmi-dsi`), the HDMI PHY's supply — but confirming it live was blocked
+because once the guest boots it **owns the RSB bus** (0x01F03400) and the HV's
+`rsb_read()` returns −1.
+
+**Lesson (two of them):** first, `PHY_STATUS` bit 7 was treated as "is there a
+signal?" for a long time before it was pinned down as *the analog PLL lock,
+distinct from the still-locked pixel PLL* — a status bit is not a feature until
+you know which of several PLLs it reports. Second, and more fundamental: this
+is the one subsystem in the whole project you **cannot** fully close over the
+network, because the ground-truth oracle ("is there a picture?") is a human
+looking at a monitor. Everything else here is debuggable headless; a display
+is not.
+
+## 11. The host driver that ate `/dev/ttyACM0`
+
+**Subsystem:** none on the board — this one is entirely host-side, and is here
+because it cost real time being mistaken for a board/HDMI regression.
+
+**Status: closed** (host `modprobe.d` blacklist).
+
+After the **host** dev machine rebooted mid-session, `reliable_load
+--boot-to-shell` / `auto_mount_root` began reporting "/dev/ttyACM0 never
+appeared", so the guest could not be driven past `mountroot>`. The board was
+healthy and its USB console gadget *did* enumerate (`lsusb` showed
+`1d6b:0010 USB Console`). The first hypothesis blamed the freshly-integrated
+HDMI HUD refresh starving CPU1 — a plausible, entirely wrong theory that
+survived one code change (delaying the HUD) that did nothing.
+
+The gadget presents as CDC-ACM, but its "USB Debug" product id **1d6b:0010** is
+claimed by the host's in-tree **`usb_debug`** driver *before* `cdc_acm` can
+bind it — so no `/dev/ttyACM*` node is ever created. A host reboot had reloaded
+`usb_debug` and re-established it as the binder. Unbinding it and binding
+`cdc_acm` by hand made `/dev/ttyACM0` appear instantly; a
+`/etc/modprobe.d/blacklist-usb_debug.conf` makes it permanent.
+
+**Lesson:** when a tool that worked yesterday fails today and the *board*
+looks healthy, check what changed on the **host** before theorizing about the
+firmware you just wrote. "The gadget enumerates but no `ttyACM` appears" is a
+driver-binding symptom, not a device symptom — `lsusb` + the sysfs `driver`
+symlink tell you which layer to blame in ten seconds.
+
+---
+
 ## Further reading in this tree
 
 - `docs/aw-mmc-dma-coherency.md` — the long-form, still-open DMA coherency
