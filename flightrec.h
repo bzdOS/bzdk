@@ -97,6 +97,9 @@ enum {
 	FLTR_K_IRQ     = 3,   /* reserved: IRQ injected into the guest         */
 	FLTR_K_VIRTIO  = 4,   /* reserved: virtio-mmio op (vblk, future net)   */
 	FLTR_K_CONSOLE = 5,   /* reserved: a captured console byte             */
+	FLTR_K_TIMER   = 6,   /* CNTV sample at EL2 CNTV-PPI take: a0=CNTV_CTL,
+	                       * a1=signed(CNTV_CVAL-CNTVCT) (vgic deep-dive)   */
+	FLTR_K_SYNC    = 7,   /* guest sync trap: a0=(EC<<32)|ESR, a1=ELR       */
 };
 
 /* Log one (kind, a0, a1) event into the ring. Never fails, never blocks,

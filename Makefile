@@ -16,7 +16,7 @@ SIZE    := $(CROSS)size
 # binary linked at 0x42000000 (link.ld). -fno-pic/-fno-pie/-no-pie keep the
 # link free of GOT/PLT/dynamic relocations so objcopy -O binary is valid.
 CFLAGS  := -ffreestanding -nostdlib -mgeneral-regs-only -march=armv8-a \
-           -fno-stack-protector -Wall -O2 -fno-pic -fno-pie -g
+           -fno-stack-protector -Wall -O2 -fno-pic -fno-pie -g $(EXTRA_CFLAGS)
 ASFLAGS := -march=armv8-a -g
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none -T link.ld
 

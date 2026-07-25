@@ -52,6 +52,54 @@
 #include <stdint.h>
 #include "exceptions.h"
 
+/* ================================================================
+ *  vGIC virtual-timer (CNTV/INTID 27) deep-dive toggles (2026-07-25).
+ *  The base vGIC (IMO=1 + GICC->GICV redirect) and device-SPI HW-mode
+ *  injection are PROVEN working on hardware; the one un-cracked piece is
+ *  delivering the guest's VIRTUAL TIMER tick through GICV without wedging
+ *  it. These compile toggles let a single build select an injection
+ *  strategy for CNTV so the failure can be bisected on the board without
+ *  editing code between runs. Override any of them with -D on the make
+ *  line (CFLAGS change requires `make clean` — the .d deps don't track it).
+ *
+ *   VGIC_CNTV_HW    1 => tie the CNTV List Register to the physical INTID
+ *                        (HW=1); the guest's virtual EOI deactivates the
+ *                        physical timer line in hardware. 0 (default) =>
+ *                        SOFTWARE vtimer: EL2 masks the physical CNTV
+ *                        (CNTV_CTL.IMASK=1) so its level line de-asserts,
+ *                        fully deactivates it at the GIC (EOIR+DIR), and
+ *                        injects a PURE-VIRTUAL (HW=0) vIRQ the guest EOIs
+ *                        on its own. The guest ISR re-arms CNTV_CVAL /
+ *                        rewrites CNTV_CTL (ENABLE=1,IMASK=0) for next tick.
+ *   VGIC_GROUP0     1 => inject vIRQs as Group 0 (LR.Grp1=0) and preset
+ *                        VMCR.VENG0. The GICv2 VIRTUAL interface (GICV) has
+ *                        NO security banking, so a guest that (believing it
+ *                        is non-secure) writes GICC_CTLR bit0 to "enable
+ *                        Grp1" actually sets GICV_CTLR.EnableGrp0 — i.e. a
+ *                        Grp1 vINTID may never be delivered. KVM injects all
+ *                        vIRQs as Grp0 for exactly this reason. 0 (default)
+ *                        keeps the historical Grp1 injection.
+ *   VGIC_CNTV_EOI_TRACE 1 => set the LR EOI-maintenance bit (GICH_LR_EOI)
+ *                        on the CNTV LR so EL2 takes maintenance INTID 25
+ *                        the instant the guest virtual-EOIs the tick —
+ *                        proof-of-delivery instrumentation (logged via the
+ *                        flightrec ring). Only meaningful with HW=0.
+ * ================================================================ */
+#ifndef VGIC_CNTV_HW
+#define VGIC_CNTV_HW          0
+#endif
+/* VGIC_GROUP0 defaults to 1: on hardware (2026-07-25) this was THE fix that let
+ * the guest boot to root mount + init under IMO=1 — with Grp1 injection (=0) the
+ * GICv2 virtual interface never delivered ANY vIRQ (CNTV or device SPI) because
+ * GICV has no security banking, so the guest's "enable Grp1" actually enabled
+ * Grp0. Only override to 0 to reproduce that historical failure. */
+#ifndef VGIC_GROUP0
+#define VGIC_GROUP0           1
+#endif
+#ifndef VGIC_CNTV_EOI_TRACE
+#define VGIC_CNTV_EOI_TRACE   0
+#endif
+
 /* GIC-400 physical bases (see the DTS citation above). GICH is the only one
  * vgic.c drives directly; GICV/GICC/GICD are exposed here for the stage-2
  * mapping snippet and the GICD trap-emulate helpers. */
@@ -100,6 +148,16 @@ void vgic_init(void);
  * Safe from IRQ context: bounded, no loops beyond the fixed LR scan. Call from
  * el2_trap()'s IRQ arm on each host tick with (VGIC_VTIMER_INTID, 0). */
 void vgic_inject(uint32_t vintid, int priority);
+
+/* Inject the guest's VIRTUAL TIMER tick (CNTV, VGIC_VTIMER_INTID) into a
+ * List Register, honoring the VGIC_CNTV_HW / VGIC_GROUP0 / VGIC_CNTV_EOI_TRACE
+ * toggles above. Includes a one-shot GATE: if a live LR already holds a
+ * pending/active vINTID 27, no second copy is injected (a duplicate vID in two
+ * LRs is UNPREDICTABLE per the GICv2 spec, and the periodic tick is
+ * idempotent). Call from gic_timer_irq() on each physical CNTV arrival, AFTER
+ * the caller has done the physical-side EOI/DIR/mask appropriate to the mode.
+ * Returns 1 if a vIRQ was (re)injected, 0 if gated or dropped. */
+int  vgic_inject_cntv(void);
 
 /* Service the maintenance interrupt (v2: WIRED — call from gic_timer_irq()
  * when the acknowledged physical INTID == VGIC_MAINT_INTID (25), after fully

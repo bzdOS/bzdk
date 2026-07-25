@@ -136,6 +136,19 @@
 #define GICH_VMCR_VPMR_SHIFT   27
 #define GICH_VMCR_VPMR_OPEN    (0x1fu << GICH_VMCR_VPMR_SHIFT)
 
+/* Group selection for injected vIRQs and the preset VMCR (see vgic.h's
+ * VGIC_GROUP0 toggle). Under GICv2 the VIRTUAL interface has no security
+ * banking, so a guest that thinks it enables "Grp1" via GICC_CTLR bit0 may
+ * actually be enabling Grp0 on GICV; VGIC_GROUP0=1 sides with that reality
+ * (KVM-style) by injecting Grp0 and presetting both group-enables in VMCR. */
+#if VGIC_GROUP0
+#define VGIC_LR_GRP     0u
+#define VGIC_VMCR_GRP   (GICH_VMCR_VENG0 | GICH_VMCR_VENG1)
+#else
+#define VGIC_LR_GRP     GICH_LR_GRP1
+#define VGIC_VMCR_GRP   GICH_VMCR_VENG1
+#endif
+
 /* GICv2 spurious range. */
 #define GIC_SPURIOUS_MIN  1020u
 
@@ -226,6 +239,9 @@ static uint32_t vg_inject_ok;
 static uint32_t vg_inject_drop;
 static uint32_t vg_maint_count;
 static uint32_t vg_active;           /* 1 once vgic_init() has completed */
+static uint32_t vg_cntv_inject;      /* CNTV ticks actually placed in an LR   */
+static uint32_t vg_cntv_gate;        /* CNTV ticks skipped: a live 27 LR held */
+static uint32_t vg_cntv_drop;        /* CNTV ticks dropped: no free LR         */
 
 /* ================================================================
  *  LR-exhaustion pending-injection queue (v2, interrupt-virtualization
@@ -312,7 +328,7 @@ static void vgic_lr_write_hw(uint32_t n, uint32_t vintid, uint32_t pintid,
 	uint32_t prio5 = ((uint32_t)priority >> 3) & 0x1fu;
 	uint32_t lr = (vintid & GICH_LR_VID_MASK) |
 	              ((pintid & 0x3ffu) << 10) |
-	              GICH_LR_GRP1 |
+	              VGIC_LR_GRP |
 	              GICH_LR_HW |
 	              GICH_LR_STATE_PENDING |
 	              (prio5 << GICH_LR_PRIO_SHIFT);
@@ -348,7 +364,7 @@ void vgic_init(void)
 	/* Preset the virtual GICC control the guest sees: Group 1 enabled,
 	 * virtual PMR wide open, so an injected priority-0 Grp-1 vIRQ is
 	 * delivered even before the guest programs its own GICV_CTLR/PMR. */
-	vmcr = GICH_VMCR_VENG1 | GICH_VMCR_VPMR_OPEN;
+	vmcr = VGIC_VMCR_GRP | GICH_VMCR_VPMR_OPEN;
 	GICH(GICH_VMCR) = vmcr;
 
 	/* Enable the virtual CPU interface. En only — no maintenance IRQ in v1. */
@@ -412,7 +428,7 @@ void vgic_inject(uint32_t vintid, int priority)
 		if (elrsr & (1u << n)) {
 			prio5 = ((uint32_t)priority >> 3) & 0x1fu;
 			lr = (vintid & GICH_LR_VID_MASK) |
-			     GICH_LR_GRP1 |
+			     VGIC_LR_GRP |
 			     GICH_LR_STATE_PENDING |
 			     (prio5 << GICH_LR_PRIO_SHIFT);
 			GICH(GICH_LR(n)) = lr;
@@ -436,6 +452,85 @@ void vgic_inject(uint32_t vintid, int priority)
 	vg_bc(4, vg_inject_count);
 	vg_bc(6, vg_inject_drop);
 	vg_bc(8, elrsr);
+}
+
+/* ================================================================
+ *  Virtual-timer (CNTV, INTID 27) injection — the deep-dive target.
+ *  See vgic.h for the VGIC_CNTV_HW / VGIC_GROUP0 / VGIC_CNTV_EOI_TRACE
+ *  toggles this honors. Breadcrumbs: [20]=cntv_inject, [21]=cntv_gate,
+ *  [22]=last CNTV LR word, [23]=cntv_drop.
+ * ================================================================ */
+int vgic_inject_cntv(void)
+{
+	uint32_t elrsr, n, lr, free_lr = 0xffffffffu;
+
+	vg_inject_count++;
+
+	/* ONE-SHOT GATE (fix C): if any List Register already holds a live
+	 * (pending and/or active, i.e. NOT invalid) vINTID 27, do NOT inject a
+	 * second copy — two LRs with the same VirtualID is UNPREDICTABLE per the
+	 * GICv2 spec, and a periodic tick is idempotent so dropping the extra is
+	 * harmless. GICH_ELRSR0 bit n == 1 means LR n is EMPTY (invalid); for the
+	 * occupied ones we read the LR and compare the VirtualID field. In the
+	 * same pass we remember the first free LR so we don't scan twice. */
+	elrsr = GICH(GICH_ELRSR0);
+	for (n = 0; n < vg_nr_lr; n++) {
+		if (elrsr & (1u << n)) {
+			if (free_lr == 0xffffffffu)
+				free_lr = n;
+			continue;
+		}
+		lr = GICH(GICH_LR(n));
+		if ((lr & GICH_LR_VID_MASK) == VGIC_VTIMER_INTID) {
+			/* A live 27 is still in flight — the guest hasn't EOIed the
+			 * previous tick yet. Gate this one. */
+			vg_cntv_gate++;
+			vg_bc(21, vg_cntv_gate);
+			vg_bc(8, elrsr);
+			return 0;
+		}
+	}
+
+	if (free_lr == 0xffffffffu) {
+		/* All LRs busy with OTHER vINTIDs — drop this tick (idempotent). */
+		vg_cntv_drop++;
+		vg_bc(23, vg_cntv_drop);
+		vg_bc(8, elrsr);
+		return 0;
+	}
+
+	/* Build the CNTV List Register at priority 0 (top of the range). */
+	n  = free_lr;
+	lr = (VGIC_VTIMER_INTID & GICH_LR_VID_MASK) |
+	     VGIC_LR_GRP |
+	     GICH_LR_STATE_PENDING;   /* priority field 0 => prio5 == 0 */
+#if VGIC_CNTV_HW
+	/* HW=1: tie to the physical CNTV so the guest's virtual EOI deactivates
+	 * the physical timer line in hardware. PhysicalID field = 27. */
+	lr |= GICH_LR_HW | ((VGIC_VTIMER_INTID & 0x3ffu) << 10);
+#else
+	/* HW=0: pure virtual. The caller (gic_timer.c) has already masked and
+	 * deactivated the physical side. Optionally request an EOI-maintenance
+	 * IRQ (INTID 25) so EL2 sees the exact moment the guest virtual-EOIs the
+	 * tick — proof-of-delivery, logged in vgic_maintenance(). */
+#if VGIC_CNTV_EOI_TRACE
+	lr |= GICH_LR_EOI;
+	GICH(GICH_HCR) |= GICH_HCR_UIE;   /* ensure maintenance can fire */
+#endif
+#endif
+
+	GICH(GICH_LR(n)) = lr;
+
+	vg_cntv_inject++;
+	vg_inject_ok++;
+	vg_bc(4, vg_inject_count);
+	vg_bc(5, vg_inject_ok);
+	vg_bc(7, lr);
+	vg_bc(8, elrsr);
+	vg_bc(20, vg_cntv_inject);
+	vg_bc(22, lr);
+	flightrec_log(FLTR_K_IRQ, VGIC_VTIMER_INTID, lr);
+	return 1;
 }
 
 void vgic_maintenance(void)

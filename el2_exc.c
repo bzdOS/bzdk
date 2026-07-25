@@ -518,6 +518,24 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	 * fault path. */
 	if ((kind >> 2) == 2u && (kind & 3u) == EL2_KIND_SYNC) {
 		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
+
+		/* Flight-recorder sync-trap ring (E, 2026-07-25 vgic deep-dive): log
+		 * EVERY guest sync trap — EC folded into a0's high bits so one glance
+		 * separates TVM sysreg (0x18), data abort (0x24), HVC (0x16), etc. —
+		 * interleaved in issue order with the FLTR_K_IRQ injects and the
+		 * FLTR_K_TIMER CNTV samples, so a post-wedge dump reads as one ordered
+		 * timeline. Consecutive-identical (esr,elr) traps are collapsed so a
+		 * tight re-fault loop can't flush the ring's earlier context. */
+		{
+			static uint64_t sync_last_esr, sync_last_elr;
+			if (frame->esr != sync_last_esr || frame->elr != sync_last_elr) {
+				sync_last_esr = frame->esr;
+				sync_last_elr = frame->elr;
+				flightrec_log(FLTR_K_SYNC,
+				              ((uint64_t)ec << 32) | (uint32_t)frame->esr,
+				              frame->elr);
+			}
+		}
 		/* SMC from the guest (trapped by HCR_EL2.TSC=1). Log the PSCI function
 		 * id to a ring at 0x50000200 [0]=count, [1..15]=last-15 fnids so a
 		 * post-reset `md` shows the guest's PSCI call sequence. Intercept
