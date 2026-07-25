@@ -1,0 +1,41 @@
+name: CI
+
+# Board-free regression gate (ROADMAP T2/T3: "хостовые тесты в CI").
+# Runs the same ./ci.sh a developer runs locally:
+#   1. make test    — hosted unit suites (virtqueue ring, stage-2 tables,
+#                      vnet ring, kload modinfo, vconsole UART) on host gcc.
+#   2. ./qemu-ci.sh — builds the QEMU-virt second target and boots it under
+#                      qemu-system-aarch64 -M virt, asserting "QEMU-CI: PASS".
+# No physical board involved or required.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (cross-gcc, dtc, qemu-system-aarch64)
+        run: |
+          sudo apt-get update
+          # Verified against Ubuntu 24.04 (noble, current ubuntu-latest) package names:
+          #   - gcc-aarch64-linux-gnu: provides aarch64-linux-gnu-gcc/-as/-ld etc.
+          #     (matches Makefile's `CROSS ?= aarch64-linux-gnu-`).
+          #   - device-tree-compiler: provides `dtc`.
+          #   - qemu-system-arm: on Debian/Ubuntu this single binary package
+          #     contains BOTH qemu-system-arm and qemu-system-aarch64 (the
+          #     32-bit and 64-bit Arm system emulators are shipped together);
+          #     there is no separate qemu-system-aarch64 package, and
+          #     qemu-system-misc is for other, unrelated architectures
+          #     (mips/sparc/ppc/s390x/riscv/...). Confirmed via Launchpad
+          #     package contents for noble.
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            device-tree-compiler \
+            qemu-system-arm
+
+      - name: Run board-free regression gate (ci.sh)
+        run: ./ci.sh
