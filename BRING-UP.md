@@ -7,17 +7,33 @@ guessing at hardware steps this repo doesn't encode). It supersedes nothing —
 `README.md` remains the practical quick-start; this file is the gap analysis
 plus the consolidated start-to-finish path for the parts that ARE covered.
 
-**Bottom line: not yet reproducible by an independent third party starting
-from a truly blank board, using only what's in this repo.** The steps from
-"board has never had anything on it" to "U-Boot prompt reachable" are not
-part of this tree, and two required boot artifacts (the FreeBSD kernel ELF
-and the board DTB) live outside this repo and aren't built or fetched by
-anything here. See "What's missing" below for the precise list.
+**Bottom line: the CORE hypervisor is now reproducible by an independent third
+party with NO board at all; the full FreeBSD-on-real-hardware path is not yet
+reproducible from a truly blank board using only what's in this repo.** The
+board-free half is new (2026-07-25) and real: `./ci.sh` builds and runs the
+QEMU-virt second target plus the hosted unit suites, so anyone cloning this
+repo can verify stage-2 translation + EL1-guest entry + GICv2 timer preemption
+(the load-bearing HV logic) under `qemu-system-aarch64` with zero hardware or
+external artifacts — see item 0 below. What's still board-specific: the steps
+from "board has never had anything on it" to "U-Boot prompt reachable" are not
+part of this tree, and two required boot artifacts (the FreeBSD kernel ELF and
+the board DTB) live outside this repo and aren't built or fetched by anything
+here. See "What's missing" below for the precise list.
 
 ## What IS covered end-to-end (confirmed from the tooling)
 
+0. **Board-free verification of the core HV (NEW, no hardware needed).**
+   `./ci.sh` = `make test` (five hosted unit suites: virtqueue ring, stage-2
+   table builder, vnet ring, kload modinfo, vconsole UART — pure host `gcc`)
+   plus `./qemu-ci.sh` (builds `make qemu` and boots it under
+   `qemu-system-aarch64 -M virt,gic-version=2,virtualization=on -cpu
+   cortex-a53`, asserting the end-to-end `QEMU-CI: PASS` the HV prints only
+   after EL2 vectors + stage-2 + GICv2 timer + EL1 guest + a timer preemption
+   all succeed). This is the one part a third party can reproduce today from a
+   clean clone with only the toolchain in `TOOLCHAIN.md`. See `docs/qemu-ci.md`.
 1. **Toolchain** — see `TOOLCHAIN.md`: exact verified `aarch64-linux-gnu-gcc`
-   / binutils versions.
+   / binutils / dtc / qemu versions. Build variants: `make dbg` (live-debug,
+   the one loaded below), `make gdb` (RSP-stub variant), `make qemu` (item 0).
 2. **Build** — `make dbg` (see `README.md` "Building"; `Makefile` has the
    authoritative flag/target list). Produces `microkernel-dbg.elf/.bin`.
 3. **Loading onto a board that already has U-Boot on it** —
@@ -32,7 +48,16 @@ anything here. See "What's missing" below for the precise list.
    running: `hvdbg.py`'s `HV()` opens an `AF_PACKET` raw socket on ethertype
    `0x88B5` on interface `br0`. No separate "establish the link" step exists
    beyond having the host's `br0` bridge configured and the board on the
-   same L2 segment (see `docs/security-notes.md` for what this implies).
+   same L2 segment (see `docs/security-notes.md` for what this implies). Over
+   this same channel: the text monitor (`hvdbg.py`), a full **GDB** stub
+   (issue `gdb` in the monitor, then `gdb-bridge.py --arm` → `target remote
+   :1234`; ROADMAP B2), and the A1 **isolation self-check** every boot lays in
+   the STG2 breadcrumb window (`AT S12E1W` proving the guest can't reach the HV
+   DRAM). `boot_ledger.py` accumulates a clean-boot streak across every reload.
+   NOTE (host gotcha): if `/dev/ttyACM0` never appears after a HOST reboot, the
+   `usb_debug` driver has hijacked the board's `1d6b:0010` CDC-ACM gadget —
+   blacklist it (`/etc/modprobe.d/blacklist-usb_debug.conf`), it's not a board
+   fault. See war-stories §11.
 5. **Getting FreeBSD to boot from the loaded image** — automatic: the `dbg`
    build's `main_dbg.c` loads the FreeBSD kernel directly (no U-Boot stage
    for the guest) and enters it; `chimpd.py`'s monitor loop watches for the
