@@ -827,6 +827,19 @@ static void cmd_ffv(void)
  * ------------------------------------------------------------------ */
 static void exec_line(char *line, struct el2_frame *frame)
 {
+#if defined(PROD_NO_DBG)
+	/* ROADMAP T5 prod lockout (docs/security-notes.md option 2,
+	 * -DPROD_NO_DBG): compile the command DISPATCH out entirely. This is
+	 * belt-and-suspenders alongside emac.c's RX-accept gate (which already
+	 * stops 0x88B5 console frames from ever reaching the byte ring this
+	 * function's caller reads from) -- with this flag set, even a line
+	 * that somehow made it into the ring (e.g. some future caller of
+	 * console_getc()'s underlying ring) is a no-op: no peek/poke/call/gdb,
+	 * nothing acted on, ever. */
+	(void)line;
+	(void)frame;
+	return;
+#else
 	char *tok[MAX_TOKENS];
 	int nt = tokenize(line, tok);
 	const char *cmd;
@@ -1000,6 +1013,7 @@ static void exec_line(char *line, struct el2_frame *frame)
 	}
 
 	cputs("?\r\n");
+#endif /* !PROD_NO_DBG */
 }
 
 /* ------------------------------------------------------------------ *

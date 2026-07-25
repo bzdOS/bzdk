@@ -136,7 +136,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
             netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o \
-            gdbstub.o gdbstub_hw.o
+            gdbstub.o gdbstub_hw.o hmac_sha256.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
