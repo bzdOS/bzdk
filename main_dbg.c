@@ -28,6 +28,10 @@
 #include "smp.h"
 #include "dbgmon.h"
 #include "reboot.h"
+#ifdef HV_HDMI
+#include "hdmi.h"
+#include "hud.h"
+#endif
 #include "onebp.h"
 #include "vgic.h"
 #include "vblk_emmc.h"
@@ -340,6 +344,24 @@ int main(void)
 	 * Nothing else needs to change here — vblk_init() (above) already
 	 * brought the eMMC and the virtio-mmio device up before this point;
 	 * this just gives CPU2 something useful to do instead of idling. */
+#ifdef HV_HDMI
+	/* HDMI/HUD integration (ROADMAP B-milestone observability): bring up the
+	 * DE2 -> TCON1 -> DWC-HDMI -> PHY -> scanout pipeline and draw the initial
+	 * HUD frame on the physical monitor BEFORE the guest starts, so the screen
+	 * is live from boot. The framebuffer (HDMI_FB_BASE = 0x4D000000, 8 MiB) is
+	 * carved out of the guest's stage-2 map (stage2.c, HV_HDMI) and reserved
+	 * no-map in the guest DTB (hv-fb@4d000000), so the guest can neither
+	 * allocate over it nor corrupt it. hdmi_init() is bounded (never hangs —
+	 * see hdmi.h). Per-frame LIVE refresh runs on the CPU1 debug core
+	 * (smp_secondary_main), which owns the display just like it owns the debug
+	 * console — CPU0 enters the guest via kload_enter() and never returns. */
+	if (hdmi_init() == 0) {
+		extern struct el2_frame g_last_guest_frame;  /* el2_exc.c, CPU0-authored */
+		hud_init();
+		hud_update(&g_last_guest_frame);   /* first frame (guest not yet running) */
+	}
+#endif
+
 	DBG_BC(1, 0x53591417);   /* 'SY..' about to call smp_init */
 	smp_init();
 	DBG_BC(1, 0x53590417);   /* smp_init returned cleanly */

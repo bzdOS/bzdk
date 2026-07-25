@@ -436,6 +436,21 @@ static void stage2_tlb_flush(void);
 #define HVIMG_L2_IDX  ((unsigned)((HVIMG_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
 #define HVSCR_L2_IDX  ((unsigned)((HVSCR_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
 
+#ifdef HV_HDMI
+/* HDMI framebuffer window (hdmi.h HDMI_FB_BASE = 0x4D000000, 1920x1080x4 ≈
+ * 7.9 MiB → 8 MiB = 4 L2 blocks). Only carved when the HV drives the display:
+ * EL2 and the DE2 scanout DMA own this DRAM, so it is excluded from the guest's
+ * stage-2 map (a guest write there faults, exactly like hv-image/hv-scratch)
+ * AND reserved no-map in the guest DTB (hv-fb@4d000000) so FreeBSD's allocator
+ * never lands on it. The two MUST move together — without the DTB reservation
+ * the guest could allocate here and take an A1 fault, which is why this carve
+ * is gated on the same HV_HDMI that adds hdmi_init() to the boot path. */
+#define HVFB_BASE       0x4D000000UL
+#define HVFB_SIZE       0x800000UL     /* 8 MiB */
+#define HVFB_L2_IDX     ((unsigned)((HVFB_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
+#define HVFB_L2_COUNT   ((unsigned)(HVFB_SIZE >> STAGE2_L2_BLOCK_SHIFT))
+#endif
+
 /* Build the level-2 DRAM table for the 1 GiB block starting at `block_base`
  * into stage2_l2_dram[]: identity Normal-WB executable 2 MiB blocks
  * everywhere, EXCEPT the hv-image/hv-scratch entries, left INVALID
@@ -448,8 +463,12 @@ stage2_build_dram_table(uint64_t block_base)
 {
 	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
 		if (block_base == STAGE2_DRAM_BASE &&
-		    (i == HVIMG_L2_IDX || i == HVSCR_L2_IDX)) {
-			stage2_l2_dram[i] = 0;   /* INVALID: HV image or HV scratch */
+		    (i == HVIMG_L2_IDX || i == HVSCR_L2_IDX
+#ifdef HV_HDMI
+		     || (i >= HVFB_L2_IDX && i < HVFB_L2_IDX + HVFB_L2_COUNT)
+#endif
+		    )) {
+			stage2_l2_dram[i] = 0;   /* INVALID: HV image / scratch / framebuffer */
 			continue;
 		}
 		uint64_t pa = block_base + (uint64_t)i * STAGE2_L2_BLOCK_SIZE;
@@ -923,17 +942,26 @@ stage2_isolation_selfcheck(void)
 	uint32_t hvimg_f   = (uint32_t)(stage2_at_s12e1w(HVIMG_BASE) & 1u);
 	uint32_t hvscr_f   = (uint32_t)(stage2_at_s12e1w(HVSCR_BASE) & 1u);
 	uint32_t control_f = (uint32_t)(stage2_at_s12e1w(STAGE2_SELFTEST_IPA) & 1u);
+#ifdef HV_HDMI
+	/* When the HV drives the display, the framebuffer window is a third
+	 * excluded region and must be equally unreachable from the guest. */
+	uint32_t hvfb_f    = (uint32_t)(stage2_at_s12e1w(HVFB_BASE) & 1u);
+#else
+	uint32_t hvfb_f    = 1u;   /* not carved in this build; treat as "held" */
+#endif
 
-	/* Boundary holds iff both HV windows fault (F=1) and the control DRAM
+	/* Boundary holds iff every HV window faults (F=1) and the control DRAM
 	 * address still translates (F=0 — proves the check itself isn't just
 	 * faulting on everything). */
-	uint32_t pass = (hvimg_f == 1u && hvscr_f == 1u && control_f == 0u) ? 1u : 0u;
+	uint32_t pass = (hvimg_f == 1u && hvscr_f == 1u && hvfb_f == 1u &&
+	                 control_f == 0u) ? 1u : 0u;
 
 	stg2_bc(14, 0x49534f4c);   /* "ISOL" */
 	stg2_bc(15, hvimg_f);
 	stg2_bc(16, hvscr_f);
 	stg2_bc(17, control_f);
 	stg2_bc(18, pass);
+	stg2_bc(10, hvfb_f);       /* framebuffer window unreachable (HV_HDMI) */
 	return (int)pass;
 }
 
