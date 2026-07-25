@@ -644,18 +644,24 @@ kload_build_modinfo(uint64_t dtb_src_pa, uint64_t dtb_dst_pa, uint64_t scratch_p
 	     * list fallbacks (vfs_mountroot_conf0 emits one line per token), but a
 	     * single clean device is simplest and sufficient here. */
 	    "vfs.root.mountfrom=ufs:/dev/vtbd0p3\0"
-	    "vfs.mountroot.timeout=45\0"              /* RETEST (2026-07-25): the finding below predates
-	                                               * the vGIC Group0 fix (this session) that made
-	                                               * device-SPI interrupt delivery actually work
-	                                               * end-to-end (vtblk0/vtnet0 now enumerate on REAL
-	                                               * IRQs, not polling). The GEOM-taste stall this
-	                                               * comment describes may have been a symptom of the
-	                                               * same broken interrupt delivery, not an independent
-	                                               * FreeBSD/GEOM bug. Bumped 20->45s to give automatic
-	                                               * mountroot a real window to succeed before falling
-	                                               * to the interactive prompt; if it still needs the
-	                                               * timeout-drop dance, revert to 20 and keep the
-	                                               * auto_mount_root() workaround. FINDING: even a 1200s wait does NOT auto-mount —
+	    "vfs.mountroot.timeout=20\0"              /* RETESTED (2026-07-25), hypothesis REFUTED: this
+	                                               * session's vGIC Group0 fix made device-SPI
+	                                               * interrupt delivery work end-to-end (vtblk0/vtnet0
+	                                               * now enumerate on REAL IRQs, not polling) — a
+	                                               * plausible reason the old GEOM-taste stall below
+	                                               * might have been fixed as a side effect. Bumped to
+	                                               * 45s and watched the console with ZERO manual
+	                                               * input for 55s post-boot: vblk reads stayed flat
+	                                               * (stuck at device-probe depth, same as always) —
+	                                               * automatic mountroot still does not complete, it
+	                                               * still needs the timeout-to-drop-to-interactive
+	                                               * dance. So the root GEOM-taste stall is A SEPARATE,
+	                                               * STILL-OPEN bug, not a symptom of the interrupt
+	                                               * problem that's now fixed. Reverted to 20s (no
+	                                               * benefit to a longer wait; auto_mount_root() still
+	                                               * does the interactive nudge either way, so shorter
+	                                               * = less wasted boot time per cycle). Do NOT re-run
+	                                               * this exact experiment. FINDING: even a 1200s wait does NOT auto-mount —
                                                * the GPT partitions materialize only when mountroot
                                                * GIVES UP and drops to the interactive prompt (the
                                                * GEOM taste is coupled to the wait ending). So use a
