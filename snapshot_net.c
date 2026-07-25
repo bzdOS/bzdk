@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* snapshot_net.c — stream the guest snapshot store (snapshot.h/snapshot.c)
  * over GbE to/from the host. See snapshot_net.h for the full design rationale
  * (transport choice, zero-skip, the netcon-carried manifest/missing-list

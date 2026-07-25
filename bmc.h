@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* bmc.h — "software BMC": a BMC/IPMI-style out-of-band MANAGEMENT PLANE for
  * the bzdOS EL2 hypervisor on the Banana Pi M64 (Allwinner A64).
  *

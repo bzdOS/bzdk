@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* snapshot_net.h — stream a guest snapshot (see snapshot.h/snapshot.c) over
  * GbE to/from the host, instead of the DRAM-to-DRAM store snapshot.c already
  * implements. ROADMAP D1 v1 scope: freeze -> dump RAM over GbE -> restore.

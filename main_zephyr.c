@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_zephyr.c — auto-boot a standalone Zephyr RTOS image (board: bpi_m64_hv,
  * see zephyr-guest/boards/bzdos/bpi_m64_hv/) as an EL1 guest under our EL2
  * hypervisor, replacing FreeBSD for this boot (see main_fbsd.c, whose flow

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* timer.h — ARM Generic Timer timebase + jitter meter for the bzdOS
  * microkernel/hypervisor.
  *

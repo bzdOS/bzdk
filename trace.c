@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* trace.c — event-trace ring (ftrace-lite) for the bzdOS EL2 hypervisor.
  *
  * See trace.h for the fixed DRAM layout contract (base 0x50004000, "TRC1").

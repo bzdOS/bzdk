@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* snapshot.c — guest checkpoint / restore implementation.
  *
  * See snapshot.h for the API contract and the full inventory of what is /

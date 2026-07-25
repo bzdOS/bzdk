@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* test_vblk_ring.c — hosted (x86_64, plain gcc, no cross-compiler) unit
  * tests for the virtqueue ring-parsing logic in vblk_emmc.c.
  *

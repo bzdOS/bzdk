@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* el2_exc.c — EL2 trap handler for the bzdOS microkernel.
  *
  * Called from el2_common (exceptions.S) on every EL2 exception. Its job for

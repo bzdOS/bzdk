@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* wcet.h — WCET / deadline monitor for the bzdOS EL2 microkernel.
  *
  * Lets a task declare a PERIOD and a per-release BUDGET (both in microseconds),

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* usbacm.h — USB-OTG CDC-ACM interactive console bridge for the bzdOS EL2
  * hypervisor. Glues the already-working MUSB gadget driver (musb.c) to the
  * virtual UART0 console (vconsole.c) that traps the FreeBSD/arm64 EL1

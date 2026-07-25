@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hdmi.c — HDMI display pipeline bring-up for the bzdOS microkernel
  * (Allwinner A64 / Banana Pi M64). See hdmi.h for the API, scope (v1: no
  * EDID/HPD, fixed forced mode, always-bounded waits) and the breadcrumb

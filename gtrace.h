@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gtrace.h — guest early-locore tracing for the bzdOS EL2 hypervisor.
  *
  * The real FreeBSD/arm64 kernel we load as an EL1 guest runs ~6s and then a

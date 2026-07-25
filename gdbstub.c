@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gdbstub.c — GDB Remote Serial Protocol stub for the bzdOS EL2 hypervisor.
  *
  * See gdbstub.h for the big picture and the caller contract. This file is

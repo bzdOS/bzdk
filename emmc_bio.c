@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* emmc_bio.c — Allwinner A64 SMHC2/eMMC (aw_mmc1 @ 0x01c11000) block-I/O
  * helper. Implements emmc_bio.h. Freestanding, bare-metal AArch64, MMIO via
  * volatile pointers built from absolute physical addresses (identity-mapped

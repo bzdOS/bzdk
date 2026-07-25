@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* led.h — GPIO status-LED API for bzdOS microkernel (Allwinner A64, BPI-M64).
  *
  * A third, independent output channel: three on-board LEDs driven directly

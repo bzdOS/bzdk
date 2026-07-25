@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* ktimer.c — software timers / timeouts. See ktimer.h for the API contract.
  *
  * ---------------------------------------------------------------------------

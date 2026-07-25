@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* repl.h — resident interactive REPL for the bzdOS microkernel (Allwinner A64).
  *
  * A line-oriented command interpreter that turns the board into a live

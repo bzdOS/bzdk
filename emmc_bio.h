@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* emmc_bio.h — Allwinner A64 SMHC2/eMMC (aw_mmc1 @ 0x01c11000) block-I/O
  * helper for the bzdOS EL2 microkernel. Contract for emmc_bio.c.
  *

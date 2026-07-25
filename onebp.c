@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* onebp.c — one-shot HVC software breakpoint. See onebp.h. */
 #include "onebp.h"
 

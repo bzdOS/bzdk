@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* rsb.h — Allwinner A64 RSB (Reduced Serial Bus) controller driver for the
  * bzdOS EL2 hypervisor. Contract for rsb.c.
  *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gic_timer_qemu.h — GICv2 + ARM Generic Timer (EL2-visible non-secure
  * physical timer, CNTP) periodic-tick driver for the QEMU `virt` CI target.
  *

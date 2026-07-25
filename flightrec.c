@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* flightrec.c — flight recorder ring buffer. See flightrec.h for the
  * breadcrumb window layout, address choice, and cost rationale.
  *

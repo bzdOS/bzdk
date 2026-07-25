@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* guest.h — EL1 guest-execution infrastructure for bzdOS becoming a Type-1
  * hypervisor on the Allwinner A64 (Cortex-A53).
  *

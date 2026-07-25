@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* ksync.c — mutex (priority inheritance), counting semaphore, mailbox, and the
  * robust block/wake core they share. See ksync.h for the API contract.
  *

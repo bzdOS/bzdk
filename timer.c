@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* timer.c — ARM Generic Timer timebase + jitter meter (see timer.h).
  *
  * Bare-metal, freestanding, EL2, MMU on. Timebase reads the ARM Generic

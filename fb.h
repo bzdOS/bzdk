@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* fb.h — pixel/rect/text drawing layer for the bzdOS microkernel/hypervisor
  * HUD, operating on a linear XRGB8888 (0xAARRGGBB, alpha ignored/opaque)
  * framebuffer. This is the foundation the future hypervisor HUD compositor

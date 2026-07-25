@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* bmc.c — "software BMC" management-plane dispatch for the bzdOS EL2
  * hypervisor. See bmc.h for the big picture and the transport/threading model.
  *

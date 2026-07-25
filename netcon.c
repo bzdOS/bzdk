@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* netcon.c — reliable stop-and-wait datagram transport for the bzdOS
  * microkernel, implementing netcon.h on top of emac.c's raw-Ethernet TX
  * (emac_send_frame, ethertype 0x88B6) and RX demux hook (netcon_rx_frame(),

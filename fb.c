@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* fb.c — pixel/rect/text drawing layer implementation. See fb.h for the
  * API contract.
  *

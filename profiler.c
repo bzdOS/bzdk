@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* profiler.c — non-halting sampling profiler for the bzdOS EL2 hypervisor.
  *
  * See profiler.h for the fixed DRAM layout (base 0x50006800, "PROF"). Each

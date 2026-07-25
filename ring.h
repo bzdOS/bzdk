@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* ring.h — lock-free single-producer/single-consumer (SPSC) byte ring for
  * the bzdOS microkernel's EL2<->EL1 (microkernel<->guest, driver<->consumer)
  * zero-lock data path. One side is the sole producer, the other the sole

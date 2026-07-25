@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_gdb.c — GDB-stub hypervisor build. Same live-debugger skeleton as
  * main_dbg.c (EMAC console up, real FreeBSD kernel booted as a preemptible
  * EL1 guest under stage-2), but the tick-path debugger is gdbstub.c/.h +

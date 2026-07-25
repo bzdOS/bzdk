@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vnet_emac.c — virtio-net over virtio-mmio (modern/v2), multiplexed onto the
  * REAL EMAC (emac.c) alongside the HV's own debug-protocol traffic, for the
  * FreeBSD/arm64 EL1 guest under the bzdOS EL2 hypervisor (Allwinner A64 /

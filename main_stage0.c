@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_stage0.c — bzdOS microkernel Stage-0 self-test.
  *
  * Proves the U-Boot load/exec/return chain works with NO USB involved:

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hv_addrmap.h — single authoritative map of the fixed DRAM "hv-scratch"
  * window (DTB-reserved hv-scratch@0x50000000), the cross-core-coherent,
  * warm-reset-survivable storage the hypervisor uses for breadcrumbs, lock

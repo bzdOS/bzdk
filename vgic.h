@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vgic.h — GICv2 (GIC-400) virtualization: virtual CPU interface + list
  * registers + a virtual (CNTV) timer tick, for the bzdOS EL2 hypervisor on
  * the Allwinner A64 (Cortex-A53, GIC-400 WITH the virtualization extensions).

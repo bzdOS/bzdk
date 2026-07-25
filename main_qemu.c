@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_qemu.c — bzdOS microkernel, QEMU `virt`-machine CI target
  * (ROADMAP.md T3). See docs/qemu-ci.md for the full invocation and what
  * this proves; the file banners of start_qemu.S / stage2.h / guest.h /

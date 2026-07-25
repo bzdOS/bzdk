@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vnet_emac.h — virtio-net (VIRTIO DeviceID 1) over virtio-mmio, multiplexed
  * onto the REAL EMAC (sun8i-emac, emac.c/emac.h) for the FreeBSD/arm64 EL1
  * guest under the bzdOS EL2 hypervisor (Allwinner A64 / Banana Pi M64).

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vblk_async.h — CPU2 bring-up for the ROADMAP C2 milestone: move eMMC
  * block-I/O PIO off the guest's synchronous trap path onto a THIRD core.
  *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* pl011_qemu.h — minimal ARM PL011 UART driver for the QEMU `virt` CI
  * target.
  *

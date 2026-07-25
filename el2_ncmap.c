@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* el2_ncmap.c — build a fresh EL2 stage-1 identity map that treats
  * guest-owned DRAM as Normal Non-cacheable, and switch TTBR0_EL2 to it. See
  * el2_ncmap.h for scope/entry-point contract and docs/el2-nc-guest-dram.md

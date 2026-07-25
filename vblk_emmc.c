@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vblk_emmc.c — virtio-blk over virtio-mmio (modern/v2), backed by the REAL
  * eMMC via emmc_bio.c, for the FreeBSD/arm64 EL1 guest under the bzdOS EL2
  * hypervisor (Allwinner A64 / Banana Pi M64). See vblk_emmc.h for the full

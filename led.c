@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* led.c — GPIO status-LED implementation for bzdOS microkernel.
  * See led.h for the API contract and PROJECT.md for the general board/ABI
  * facts. This module is independent of musb.c/fb.c: plain direct MMIO to

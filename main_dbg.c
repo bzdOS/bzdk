@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_dbg.c — LIVE hypervisor debugger. Brings up the EMAC network console,
  * boots the real FreeBSD kernel as an EL1 guest under stage-2, and arms the
  * CNTP timer tick so the guest is PREEMPTIBLE. On every tick el2_trap calls

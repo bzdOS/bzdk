@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vgic.c — GICv2 (GIC-400) virtualization for the bzdOS EL2 hypervisor on the
  * Allwinner A64. See vgic.h for the cited GIC-400 memory map and the API
  * contract; this file is the implementation plus the exact register-bit

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* test_vnet_ring.c — hosted (x86_64, plain gcc, no cross-compiler) unit
  * tests for the virtqueue + Ethernet-framing logic in vnet_emac.c.
  *

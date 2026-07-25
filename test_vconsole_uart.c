@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* test_vconsole_uart.c — hosted (x86_64, plain gcc, no cross-compiler) unit
  * tests for the trap-and-emulate 16550 UART register-decode/emulation logic
  * in vconsole.c.

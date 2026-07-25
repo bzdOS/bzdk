@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* musb.h — MUSB CDC-ACM gadget console API for bzdOS microkernel (Allwinner A64).
  * Contract shared by main.c (caller) and musb.c (impl). See PROJECT.md. */
 #ifndef BZDOS_MUSB_H

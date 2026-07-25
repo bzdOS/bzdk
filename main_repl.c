@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_repl.c — bzdOS microkernel entry for the RESIDENT interactive REPL.
  *
  * Analogue of main.c / main_net.c, but instead of a fixed heartbeat loop it

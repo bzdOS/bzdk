@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* profiler.h — non-halting sampling profiler for the bzdOS EL2 hypervisor.
  *
  * On every timer tick the tick path samples the interrupted PC (guest ELR, or

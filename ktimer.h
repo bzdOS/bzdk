@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* ktimer.h — software timers / timeouts for the bzdOS EL2 microkernel.
  *
  * RTOS primitive: one-shot and periodic callbacks plus task sleep, layered on

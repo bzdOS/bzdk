@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* ring.c — lock-free SPSC ring buffer (see ring.h).
  *
  * Freestanding, bare-metal AArch64 (Allwinner A64, Cortex-A53, EL2, MMU on,

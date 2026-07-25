@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* vconsole.h — trap-and-emulate virtual UART0 console for the FreeBSD/
  * arm64 EL1 guest running under our from-scratch EL2 hypervisor on the
  * Allwinner A64 (Banana Pi M64).

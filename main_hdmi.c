@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main_hdmi.c — bring up HDMI and draw the HUD-skeleton demo, so we can verify
  * the display pipeline on a physical monitor. Standalone (no network/guest yet).
  * hdmi.c writes pipeline progress to breadcrumb 0x50003000 ("HDMI") — so even

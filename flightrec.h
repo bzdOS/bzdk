@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* flightrec.h — "flight recorder": a generalized ring buffer of the last N
  * thousand events (traps, IRQ injects, virtio ops, console bytes, ...) in
  * reserved RAM, for post-mortem timeline reconstruction after any crash.

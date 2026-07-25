@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* guest_qemu_payload.c — minimal "hello from EL1" guest for the QEMU
  * `virt` CI target (ROADMAP.md T3).
  *

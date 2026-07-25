@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* main.c — bzdOS microkernel Stage-1 firmware main.
  *
  * Brings up the MUSB CDC-ACM gadget console (musb.h/musb.c) and runs a

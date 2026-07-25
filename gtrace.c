@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gtrace.c — guest early-locore tracing (see gtrace.h for the full design
  * rationale + trace-ring layout). Two instruments:
  *

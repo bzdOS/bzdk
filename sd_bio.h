@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* sd_bio.h — Allwinner A64 SMHC0 / SD-card (mmc0 @ 0x01c0f000) block-I/O
  * helper for the bzdOS EL2 microkernel. Contract for sd_bio.c.
  *

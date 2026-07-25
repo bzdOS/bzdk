@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* panic.c — persistent panic log implementation. See panic.h. */
 #include <stdint.h>
 #include "panic.h"

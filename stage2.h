@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* stage2.h — ARMv8-A EL2 stage-2 (IPA -> PA) translation for the bzdOS
  * microkernel-turned-hypervisor on the Allwinner A64 (Cortex-A53, GICv2).
  *

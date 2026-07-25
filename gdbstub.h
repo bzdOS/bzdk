@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* gdbstub.h — GDB Remote Serial Protocol stub for the bzdOS EL2 hypervisor.
  *
  * Lets a real `gdb`/`lldb` attach to the running system (both our EL2 kernel

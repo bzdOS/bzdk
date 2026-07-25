@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hud.h — hypervisor HUD compositor for the bzdOS EL2 hypervisor
  * (Allwinner A64 / Banana Pi M64). Draws the "hacker dashboard": the guest
  * OS shown live in a bordered window, surrounded by diagnostic overlay

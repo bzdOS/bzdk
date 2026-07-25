@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* hwbp.c — EL2-controlled hardware breakpoints + watchpoints. See hwbp.h.
  *
  * Freestanding: <stdint.h> + exceptions.h only, no libc. All state is a few
