@@ -87,19 +87,19 @@ volatile uint32_t dbg_usbacm = 1;
  * bounded recovery. Left opt-in until the self-heal path is trusted live. */
 volatile uint32_t dbg_emac_watchdog_reboot = 0;
 
-/* HDMI PHY re-lock defense (HV_HDMI builds), DEFAULT OFF. hdmi_init() brings
- * the pipeline up with the PHY locked (breadcrumb phy@scanout has bit7=1), but
- * FreeBSD's CCU init gates the display clocks a second into boot and the analog
- * PHY drops lock (PHY_STATUS bit7 -> 0, stays 0). hdmi_relock() re-locks
- * PLL_VIDEO0 + re-asserts the display gates + re-runs phy_init() — but on real
- * hardware (2026-07-25) that did NOT restore bit7 (relock fires, count climbs,
- * bit7 stays 0), so it is left OFF by default rather than churning CPU1 with a
- * ~110 ms PHY reset every ~10 s for no gain. Toggle to 1 over the net to keep
- * experimenting (best done with a human watching the physical monitor, since
- * bit7 may not fully track visible signal). The durable fix is more likely to
- * PROTECT the display CCU bits from the guest (so FreeBSD can't gate them)
- * than to re-lock after the fact — see the HDMI notes. */
-volatile uint32_t dbg_hdmi_relock = 0;
+/* HDMI PHY re-lock defense (HV_HDMI builds), DEFAULT ON. hdmi_init() brings the
+ * pipeline up with the PHY locked, but ~1 s into guest boot FreeBSD's axp8xx
+ * PMIC driver disables AXP803 dldo1 (vcc-hdmi-dsi, the PHY's hvcc-supply) as
+ * "unused" — cutting PHY power — so PHY_STATUS bit7 drops to 0. When CPU1 sees
+ * that (hdmi_phy_locked()==0), it calls hdmi_relock(), which RECLAIMS THE RSB
+ * BUS AND RE-ENABLES dldo1 before re-running the PHY bring-up — the missing
+ * piece that makes it actually re-lock (root cause found + fixed live
+ * 2026-07-25: dldo1 off, not clock-gating). Rate-limited to at most one attempt
+ * per 65536 loop passes; once it re-locks, hdmi_phy_locked()==1 and it stops
+ * firing, so the ~110 ms cost is paid only while the signal is actually down.
+ * Set 0 over the net to disable (e.g. to leave the RSB bus entirely to the
+ * guest). */
+volatile uint32_t dbg_hdmi_relock = 1;
 
 /* Periodic EMAC-health status line injected into the USB-ACM console — the
  * ONLY channel proven alive when EMAC/dbgmon goes dark. Reads emac.c's own

@@ -73,6 +73,7 @@
 #include <stdint.h>
 #include "hdmi.h"
 #include "timer.h"
+#include "rsb.h"    /* re-enable the PHY's dldo1 supply FreeBSD gates off */
 
 /* ==================================================================== *
  * MMIO helpers
@@ -953,7 +954,26 @@ int hdmi_phy_locked(void)
 
 void hdmi_relock(void)
 {
-	/* CRITICAL (2026-07-25): re-lock PLL_VIDEO0 FIRST. FreeBSD's CCU init
+	/* CRITICAL (2026-07-25, live-confirmed root cause): re-enable the HDMI
+	 * PHY's SUPPLY before anything else. A second into guest boot FreeBSD's
+	 * axp8xx PMIC driver disables AXP803 dldo1 ("vcc-hdmi-dsi", the DTB
+	 * hvcc-supply of the PHY) as "unused" — read live over RSB, REG 0x12 goes
+	 * 0x88 -> 0x80, i.e. DLDO1 (bit3) cleared — which cuts PHY power, so
+	 * re-running phy_init() alone re-locks NOTHING (no rail to lock onto).
+	 * Reclaim the RSB bus (init re-does the whole sequence; the guest re-inits
+	 * its side on its next transaction) and set DLDO1 back on. Confirmed live:
+	 * this + the PHY re-init below brings PHY_STATUS bit7 back to 1, stable. */
+	rsb_init();
+	rsb_set_device_address(0x3a3u, 0x2du);   /* AXP803 hw=0x3a3, runtime=0x2d */
+	{
+		uint8_t v = 0;
+		if (rsb_read(0x2du, 0x12u, &v) == 0)
+			rsb_write(0x2du, 0x12u, (uint8_t)(v | 0x08u)); /* set DLDO1 en */
+		else
+			rsb_write(0x2du, 0x12u, 0x88u);   /* best-effort: DC1SW+DLDO1 */
+	}
+
+	/* Re-lock PLL_VIDEO0 next. FreeBSD's CCU init
 	 * gates/disables PLL_VIDEO0 (the pixel-clock source) as "unused" once the
 	 * guest boots, so the analog PHY has no TMDS clock to lock onto — re-running
 	 * phy_init() alone (as an earlier version did) re-locked NOTHING because the
