@@ -260,6 +260,8 @@ class HV:
         4: "VIRTIO",   # vblk_emmc.c vblk_kick (a0=qidx a1=served) or
                        # vnet_emac.c QueueNotify (a0=reg off a1=notified val)
         5: "CONSOLE",  # vconsole.c: a0=byte a1=direction (0=TX guest->host, 1=RX host->guest)
+        6: "TIMER",    # gic_timer.c: a0=CNTV_CTL, a1=signed(CNTV_CVAL-CNTVCT)
+        7: "SYNC",     # el2_exc.c: a0=(EC<<32)|ESR, a1=ELR (guest sync trap)
     }
 
     def flightrec(self):
@@ -351,6 +353,27 @@ class HV:
                 else: ch = "."
                 direction = "RX host->guest" if a1 else "TX guest->host"
                 lines.append("CONSOLE %-15s '%s' (0x%02x)" % (direction, ch, c))
+            elif k == 6:
+                # CNTV sample: a0=CNTV_CTL, a1=signed(CNTV_CVAL-CNTVCT)
+                ctl = a0 & 0x7
+                flags = "".join([
+                    "E" if ctl & 1 else "-",   # ENABLE
+                    "M" if ctl & 2 else "-",   # IMASK
+                    "S" if ctl & 4 else "-",   # ISTATUS (firing)
+                ])
+                dl = a1 - (1 << 64) if a1 >= (1 << 63) else a1
+                lines.append("TIMER   cntv_ctl=%s(0x%x) cval-now=%+d %s"
+                              % (flags, ctl, dl,
+                                 "[past/firing]" if dl < 0 else "[future/re-armed]"))
+            elif k == 7:
+                # guest sync trap: a0=(EC<<32)|ESR, a1=ELR
+                ec = (a0 >> 32) & 0x3f
+                esr = a0 & 0xffffffff
+                ecname = {0x18: "MSR/MRS(TVM)", 0x24: "DABT-lower",
+                          0x16: "HVC", 0x17: "SMC", 0x20: "IABT-lower",
+                          0x21: "IABT", 0x22: "PC-align", 0x25: "DABT",
+                          0x3c: "BRK"}.get(ec, "EC0x%x" % ec)
+                lines.append("SYNC    %-14s esr=0x%x elr=0x%x" % (ecname, esr, a1))
             else:
                 lines.append("KIND=%d  a0=0x%x a1=0x%x" % (k, a0, a1))
         return "\n".join(lines)

@@ -191,6 +191,7 @@
 #include "exceptions.h"
 #include "timer.h"
 #include "vgic.h"
+#include "flightrec.h"
 
 /* ------------------------------------------------------------------ *
  * GIC-400 MMIO bases (see citation above) and the handful of registers
@@ -282,6 +283,53 @@ read_cntp_ctl(void)
 #define CNTP_CTL_ENABLE  (1u << 0)
 #define CNTP_CTL_IMASK   (1u << 1)
 #define CNTP_CTL_ISTATUS (1u << 2)
+
+/* ------------------------------------------------------------------ *
+ * CNTV (EL1 VIRTUAL timer) — the GUEST's timer. FreeBSD uses CNTV, so
+ * when EL2 owns physical IRQs (IMO=1) it takes the guest's CNTV PPI
+ * (INTID 27) here and must forward it as a vIRQ (see vgic_inject_cntv).
+ * These registers are accessible from EL2 and — because we run on the
+ * SAME core as the guest (CPU0) and CNTVOFF_EL2=0 — read/write exactly
+ * the guest's virtual-timer state (NOT a banked/other-core copy, unlike
+ * the GICH/GICC gotcha the vgic memory documents). CNTV_CTL bits mirror
+ * CNTP_CTL: [0]ENABLE [1]IMASK [2]ISTATUS. */
+static inline uint32_t
+read_cntv_ctl(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntv_ctl_el0" : "=r"(v));
+	return (uint32_t)v;
+}
+
+static inline void
+write_cntv_ctl(uint32_t v)
+{
+	__asm__ volatile("msr cntv_ctl_el0, %0\n\tisb" :: "r"((uint64_t)v) : "memory");
+}
+
+static inline uint64_t
+read_cntv_cval(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t
+read_cntvct(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v));
+	return v;
+}
+
+#define CNTV_CTL_ENABLE  (1u << 0)
+#define CNTV_CTL_IMASK   (1u << 1)
+#define CNTV_CTL_ISTATUS (1u << 2)
+/* FLTR_K_TIMER (flightrec.h): a0 = CNTV_CTL_EL0 (bit0 ENABLE, bit1 IMASK,
+ * bit2 ISTATUS), a1 = signed (CNTV_CVAL - CNTVCT): negative => comparator
+ * already in the past (timer still asserting), large positive => the guest
+ * reprogrammed the deadline into the future (its ISR ran). */
 
 /* ------------------------------------------------------------------ *
  * HCR_EL2 — physical-interrupt routing to EL2. See the big note in
@@ -630,14 +678,46 @@ gic_timer_irq(struct el2_frame *frame)
 			return;
 		}
 
-		/* Priority-drop ONLY — do NOT DIR. The physical interrupt is about
-		 * to be tied (HW=1) to a guest List Register; the guest's own
-		 * virtual EOI is what deactivates the physical source, in
-		 * hardware, the instant its driver actually services it. DIR'ing
-		 * it here ourselves — deactivating a level-triggered source the
-		 * guest never got to clear — is exactly the documented failure
-		 * mode of the two prior (reverted) vGIC attempts (the 145 kHz
-		 * EHCI/INTID-106 storm). */
+		if (intid == VGIC_VTIMER_INTID) {
+			/* The guest's VIRTUAL TIMER (CNTV) — the un-cracked piece. First
+			 * OBSERVE (fix A): sample the guest's CNTV state at the exact
+			 * instant EL2 takes this PPI, into the flight-recorder ring so a
+			 * post-wedge dump shows the ordered SYNC/IRQ/TIMER timeline. a0 =
+			 * CNTV_CTL (ENABLE/IMASK/ISTATUS), a1 = signed (CVAL - CNTVCT). */
+			uint32_t vctl  = read_cntv_ctl();
+			int64_t  delta = (int64_t)(read_cntv_cval() - read_cntvct());
+			flightrec_log(FLTR_K_TIMER, vctl, (uint64_t)delta);
+
+#if VGIC_CNTV_HW
+			/* HW=1: priority-drop only; the guest's virtual EOI deactivates
+			 * the physical CNTV in hardware (LR tied to physical INTID 27). */
+			GICC_EOIR = iar;
+			vgic_inject_cntv();
+#else
+			/* SOFTWARE vtimer (HW=0): the physical CNTV is level-triggered
+			 * and still asserting (ISTATUS=1), so if we only priority-drop it
+			 * it re-pends immediately and storms EL2. Instead MASK it at the
+			 * source (CNTV_CTL.IMASK=1) so the line de-asserts, then fully
+			 * deactivate at the GIC (EOIR+DIR), then inject a pure-virtual
+			 * vIRQ. The guest's timer ISR re-arms CNTV_CVAL and rewrites
+			 * CNTV_CTL (ENABLE=1, IMASK=0) which clears our mask for next
+			 * tick — the same thing FreeBSD's one-shot eventtimer does anyway
+			 * after each fire. */
+			write_cntv_ctl(vctl | CNTV_CTL_IMASK);
+			GICC_EOIR = iar;
+			GICC_DIR  = iar;
+			vgic_inject_cntv();
+#endif
+			return;
+		}
+
+		/* Device SPI. Priority-drop ONLY — do NOT DIR. The physical interrupt
+		 * is about to be tied (HW=1) to a guest List Register; the guest's own
+		 * virtual EOI is what deactivates the physical source, in hardware,
+		 * the instant its driver actually services it. DIR'ing it here
+		 * ourselves — deactivating a level-triggered source the guest never
+		 * got to clear — is exactly the documented failure mode of the two
+		 * prior (reverted) vGIC attempts (the 145 kHz EHCI/INTID-106 storm). */
 		GICC_EOIR = iar;
 		vgic_inject_hw(intid, intid, 0);
 		return;
