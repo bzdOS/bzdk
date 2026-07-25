@@ -175,6 +175,31 @@ __attribute__((weak)) int vnet_mmio_fault(struct el2_frame *frame)
 	return 0;
 }
 
+/* virtio-blk-over-eMMC MMIO device (vblk_emmc.c). Same weak-fallback pattern
+ * as vnet_mmio_fault right above: the `repl`/`fbsd`/`zephyr` builds are
+ * narrower milestones that never call vblk_init() and don't link
+ * vblk_emmc.o/emmc_bio.o, so this stub keeps them linking -- the call then
+ * always reports "not my window" (correct: nothing configured that window),
+ * unchanged behavior for every build that DOES link the real vblk_emmc.o. */
+__attribute__((weak)) int vblk_mmio_fault(struct el2_frame *frame)
+{
+	(void)frame;
+	return 0;
+}
+
+/* B3 crash-forensics ELF-over-EMAC stream (coredump.c, coredump_send()).
+ * Weak fallback so the `repl`/`fbsd`/`zephyr` builds -- which never call
+ * emac_init() and don't link coredump.o -- still link; a genuine guest
+ * panic in those builds is still caught and recorded (flightrec_log() +
+ * exc_report_line() below run regardless), it just isn't also streamed as
+ * an ELF core over a network console those builds never bring up. */
+__attribute__((weak)) void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
+{
+	(void)frame;
+	(void)regions;
+	(void)nregions;
+}
+
 /* ------------------------------------------------------------------ *
  * EL2 software single-step of the guest.
  *

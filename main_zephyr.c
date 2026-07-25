@@ -80,6 +80,13 @@
 #define SP_EL1_PLACEHOLDER 0x51000000UL   /* see file header point 3: never
                                             * actually used by Zephyr. */
 
+/* Stand-in for dbgmon.c's global of the same name -- identical to
+ * main_fbsd.c's own copy right next to it (see main_gdb.c's file header for
+ * the full rationale). el2_exc.c's cmd_call() fault-recovery path
+ * references this `extern` unconditionally from every build; this build
+ * never links dbgmon.o, so it's simply always false here -- a no-op. */
+volatile int dbgmon_call_active = 0;
+
 /* Breadcrumb window: 0x50008000 ("ZEP1"). Distinct from every other window
  * already in this tree (see guest.c's header comment for the existing list
  * up to 0x50000f10 / vconsole.c's ring above that) — chosen well clear of
