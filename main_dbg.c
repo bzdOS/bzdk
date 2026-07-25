@@ -43,6 +43,18 @@
  * exceptions.h + its own struct; main_dbg.c only needs the init entry). */
 extern void bmc_init(void);
 
+/* GDB-stub RSP byte transport (ROADMAP B2). gdbstub.c reaches for these three
+ * to move Remote-Serial-Protocol bytes; in the standalone `make gdb` build
+ * main_gdb.c provides them, so the dbg build must too. They ride the SAME
+ * EMAC 0x88B5 console as dbgmon/REPL — the CPU1 debug loop only ever drives
+ * one of {dbgmon, gdbstub} per iteration (gated on gdb_channel, see smp.c), so
+ * they never double-drain the RX ring. gdb_getc() pumps emac_poll() itself
+ * because the stub spins on it while the guest is stopped and EL2 IRQs masked. */
+#include "emac.h"
+int  gdb_getc(void)  { emac_poll(); return emac_getc(); }
+void gdb_putc(int c) { emac_putc(c); }
+void gdb_flush(void) { emac_flush(); }
+
 /* DIAGNOSTIC (temporary): one-shot breakpoint inside pmap_bootstrap_dmap,
  * right after "ldr x0,[x21,#320]" (VA 0xffff000000939940) — x0 there is the
  * address about to be memset(0)'d by memset_early, which faults at FAR=0x1000.

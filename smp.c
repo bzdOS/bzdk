@@ -31,6 +31,18 @@ extern struct el2_frame g_last_guest_frame;
 extern void el2_snapshot_guest_frame(struct el2_frame *out);  /* seqlock read (H8) */
 extern volatile uint32_t dbg_core_active;
 
+/* GDB-stub CPU1 RSP hosting (ROADMAP B2, docs/gdbstub-integration.md §5). The
+ * cross-core stop-state globals live in el2_exc.o (always linked). gdb_channel
+ * + the two stub entry points live in gdbstub.o, which the dbg/gdb builds link
+ * but repl/fbsd/zephyr/hdmi (also using smp.o) do NOT — so they're WEAK: 0
+ * there, and the `&gdb_channel` guard below keeps the whole gdb path inert. */
+extern volatile uint32_t gdb_stop_pending;
+extern volatile uint32_t gdb_stop_signal;
+extern volatile uint32_t gdb_resume_act;
+extern volatile uint32_t gdb_channel __attribute__((weak));
+extern int  gdbstub_poll(struct el2_frame *guest) __attribute__((weak));
+extern void gdbstub_on_debug_event(struct el2_frame *guest, int signal) __attribute__((weak));
+
 /* ISOLATION TEST flag. Default 0 = the debug core runs EMAC/dbgmon normally
  * (the production path). Set to 1 (over the net) to skip EMAC/dbgmon on CPU1
  * and tell apart "CPU1 wedges in dbgmon_service" from "the guest resets the
@@ -510,7 +522,24 @@ void smp_secondary_main(uint64_t cpuid)
 			 * whether the EMAC poll path is what wedges CPU1. If the board now
 			 * stays resident forever (word5 huge, no reset), the wedge is in
 			 * dbgmon_service; restore it once confirmed. */
-			if (!dbg_isolate_no_emac) {
+			if (&gdb_channel && gdb_channel) {
+				/* GDB mode (ROADMAP B2): the `gdb` command routed this channel
+				 * to the RSP stub. Two service points: (a) CPU0 parked in
+				 * el2_trap on a bp/step/wp — run the command loop against the
+				 * shared frame and release it; (b) guest running — poll for an
+				 * async $cmd / Ctrl-C. Both bounded/non-blocking. The weak
+				 * guard above means this is unreachable in a build without
+				 * gdbstub.o. */
+				if (gdb_stop_pending) {
+					if (gdbstub_on_debug_event)
+						gdbstub_on_debug_event(&g_last_guest_frame,
+						                       (int)gdb_stop_signal);
+					gdb_resume_act = 1u;   /* any non-sentinel resumes CPU0 */
+					__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+				} else if (gdbstub_poll) {
+					gdbstub_poll(&g_last_guest_frame);
+				}
+			} else if (!dbg_isolate_no_emac) {
 				struct el2_frame snap;
 				el2_snapshot_guest_frame(&snap);   /* consistent copy (H8) */
 				dbgmon_service(&snap);

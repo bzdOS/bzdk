@@ -458,6 +458,13 @@ static void bp_remove_all(void)
 static int gdb_attached;
 static int gdb_stepping;
 
+/* Channel mode latch (ROADMAP B2 integration into the dbg build). 0 = the CPU1
+ * debug loop runs the text dbgmon as usual; 1 = the operator issued the `gdb`
+ * command, so CPU1 hosts the RSP loop (gdbstub_poll / on_debug_event) on the
+ * shared EMAC 0x88B5 channel instead. Cross-core (CPU0's el2_trap divert reads
+ * it via gdbstub_attached()/this), so volatile. Set by dbgmon.c's `gdb` cmd. */
+volatile uint32_t gdb_channel;
+
 int gdbstub_step_active(void) { return gdb_stepping; }
 int gdbstub_attached(void)    { return gdb_attached; }
 
