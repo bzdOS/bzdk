@@ -112,6 +112,20 @@ static uint32_t g_bad_queue_num;      /* (b) non-power-of-two QueueNum write, re
 static uint32_t g_bad_desc_flags;     /* (d) descriptor W/R flag mismatch, NOT enforced */
 static uint32_t g_kick_not_ready;     /* (e) kick seen before DRIVER_OK, NOT enforced */
 
+/* Live debug (2026-07-27, "vtbd0 hard error, HV breadcrumbs never move" hunt):
+ * unconditional counters distinguishing "guest never notified us" from "we
+ * were notified but the avail ring yielded nothing new" from "we popped a
+ * head but vblk_request() bailed before touching serve_data()". Unlike
+ * g_reads/g_writes (only bumped on a request that reaches the T_IN/T_OUT
+ * branch) these increment on EVERY QueueNotify / EVERY successful
+ * vq_pop_avail(), so they can catch a lost-kick or avail-ring-desync bug
+ * that the existing diagnostics are structurally blind to. bc[31]/bc[32]
+ * were unused (VBLK_BC_SIZE=0x100 leaves room to bc[63]). */
+static uint32_t g_kicks_seen;         /* every vblk_kick() call, unconditional */
+static uint32_t g_heads_popped;       /* every successful vq_pop_avail() */
+static uint32_t g_indirect_seen;      /* VRING_DESC_F_INDIRECT early-exit fired */
+static uint32_t g_short_chain;        /* n<2 early-exit fired */
+
 /* ROADMAP C2 async I/O offload readiness handshake (see vblk_emmc.h and the
  * "ASYNC I/O OFFLOAD" section below). Zero-initialized (.bss) in EVERY build;
  * only vblk_async_cpu2_run() (vblk_async.c, linked ONLY into DBG_OBJS) ever
@@ -202,6 +216,30 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 	for (; p < end; p += 64)
 		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
 	__asm__ volatile("dsb sy" ::: "memory");
+	/* D-cache-only was the 2026-07-22 fix for the GPT/superblock staleness
+	 * bug (see this function's callers) -- correct for that, but this same
+	 * path also serves regular FILE data, including whatever the guest is
+	 * about to EXECUTE (ELF text for /sbin/init, every dynamically-loaded
+	 * program, etc). ARM's I-cache is not automatically coherent with the
+	 * D-cache even after a clean to PoC: a physical page that previously
+	 * held different code (near-certain after any real boot's worth of
+	 * exec/page reuse) can leave the guest's I-cache holding STALE
+	 * instructions for this address, independent of what the D-cache (and
+	 * therefore any plain load) now sees. Without this, the guest can
+	 * fetch-and-execute garbage instead of the freshly-read code the very
+	 * moment it jumps there -- matching the live symptom found 2026-07-27
+	 * (mountroot-real-bug-is-ufs-sblock-offset.md): root mounts fine, but
+	 * a scatter of DIFFERENT userland programs (init, ifconfig, sysctl,
+	 * date, rcorder, kenv, automount -- core files for all of them were
+	 * sitting in the guest's own root directory) crash unpredictably
+	 * shortly after they'd be exec'd, consistent with instruction fetch
+	 * being unreliable rather than one deterministic bug. `ic ivau` +
+	 * barriers is the standard ARMv8 "make freshly-written memory safely
+	 * executable" sequence; cost is the same order as the dc civac loop
+	 * above, i.e. still noise next to the eMMC transfer. */
+	for (p = gpa & ~63ULL; p < end; p += 64)
+		__asm__ volatile("ic ivau, %0" :: "r"(p) : "memory");
+	__asm__ volatile("dsb ish\n\tisb" ::: "memory");
 }
 
 static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
@@ -928,6 +966,7 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		 * OFF (we don't set the feature bit) so the driver never sends one.
 		 * Defensive: treat an indirect desc as a malformed request. */
 		if (flags & VRING_DESC_F_INDIRECT) {
+			vblk_bc(33, ++g_indirect_seen);
 			vblk_used_lock_acquire();   /* CPU2 may publish concurrently */
 			vq_push_used(vq, head, 0);
 			vblk_used_unlock();
@@ -965,6 +1004,7 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		return 1;
 	}
 	if (n < 2) {                          /* need header + status at least */
+		vblk_bc(34, ++g_short_chain);
 		vblk_used_lock_acquire();           /* CPU2 may publish concurrently */
 		vq_push_used(vq, head, 0);
 		vblk_used_unlock();
@@ -974,6 +1014,21 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 	/* desc[0] = 16-byte request header (read-only). */
 	struct { uint32_t type; uint32_t reserved; uint64_t sector; } hdr;
 	gmem_read(chain[0].addr, &hdr, sizeof(hdr));
+
+	/* Live debug (2026-07-27): unconditional record of every request's own
+	 * type/sector as soon as we've read the header, regardless of which
+	 * branch handles it below — lets a live session see exactly what request
+	 * number N was even if it falls into a path that doesn't otherwise touch
+	 * g_reads, the async counters, or vblk_diag. bc[35]=type, bc[36]=sector
+	 * lo32, bc[37]=running count of requests reaching this point (distinct
+	 * from g_heads_popped, which also counts the indirect/truncated/
+	 * short-chain early exits that never get here). */
+	{
+		static uint32_t g_hdrs_read;
+		vblk_bc(35, hdr.type);
+		vblk_bc(36, (uint32_t)hdr.sector);
+		vblk_bc(37, ++g_hdrs_read);
+	}
 
 	/* desc[n-1] = 1-byte status (write-only). */
 	struct vblk_desc *stdesc = &chain[n - 1];
@@ -1000,9 +1055,19 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		status = VIRTIO_BLK_S_IOERR;
 	} else if (hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) {
 		uint32_t is_read = (hdr.type == VIRTIO_BLK_T_IN);
+		int posted;
 
-		if (vblk_async_post(head, is_read, sector, stdesc->addr,
-		                     chain, 1, n - 1)) {
+		/* Live debug (2026-07-27): bc[38]=g_vblk_async_ready at the moment
+		 * of this decision, bc[39]=vblk_async_post()'s own return value —
+		 * distinguishes "never tried async" / "async rejected, fell to
+		 * sync" / "async accepted" for whichever request bc[35..37] just
+		 * captured, since g_async_posts/g_async_fallbacks alone can't tell
+		 * a live session whether THIS specific request moved them. */
+		vblk_bc(38, g_vblk_async_ready);
+		posted = vblk_async_post(head, is_read, sector, stdesc->addr,
+		                          chain, 1, n - 1);
+		vblk_bc(39, (uint32_t)posted);
+		if (posted) {
 			/* Handed off to CPU2 (ROADMAP C2): it will do the PIO, write
 			 * the status byte, push the used-ring entry and inject the
 			 * completion IRQ on its own. Return immediately WITHOUT
@@ -1116,6 +1181,8 @@ static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 	uint16_t head;
 	int served = 0;
 
+	vblk_bc(31, ++g_kicks_seen);
+
 	if (qidx != VBLK_QUEUE)
 		return;
 
@@ -1131,6 +1198,7 @@ static void vblk_kick(struct vblk_dev *d, uint32_t qidx)
 		vblk_bc(30, ++g_kick_not_ready);
 
 	while (vq_pop_avail(vq, &head)) {
+		vblk_bc(32, ++g_heads_popped);
 		if (vblk_request(d, head))
 			served = 1;
 	}
@@ -1173,12 +1241,20 @@ static uint32_t vblk_reg_read(struct vblk_dev *d, uint32_t off)
 	case VBLK_R_DEVICE_ID:     return 2u;                 /* virtio-blk */
 	case VBLK_R_VENDOR_ID:     return VBLK_MMIO_VENDOR;
 	case VBLK_R_DEVICE_FEATURES:
-		/* Modern: only VIRTIO_F_VERSION_1 (word 1, bit 0). Word 0 = 0
-		 * (no blk feature bits offered: no RO, no BLK_SIZE, no MQ — keep the
-		 * device minimal; the driver still gets a working read/write disk). */
+		/* Modern: only VIRTIO_F_VERSION_1 (word 1, bit 0). Word 0:
+		 * VIRTIO_BLK_F_SEG_MAX only (no RO, no BLK_SIZE, no MQ — keep the
+		 * device otherwise minimal). Without SEG_MAX, FreeBSD's
+		 * vtblk_maximum_segments() falls back to a single data segment and
+		 * forces VTBLK_FLAG_BUSDMA_ALIGN, which caps every I/O at 4KB *and*
+		 * requires it to land in one page-aligned physically-contiguous
+		 * buffer — busdma bounces (or fails outright) any bio that doesn't,
+		 * which FreeBSD reports as a generic "hard error" with no HV-visible
+		 * MMIO trap at all (the request never reaches the virtqueue).
+		 * Advertising seg_max=VBLK_CONFIG_SEG_MAX below removes both the
+		 * size cap and the alignment requirement. */
 		if (d->dev_feat_sel == VBLK_FEATWORD_HI)
 			return VBLK_F_VERSION_1_BIT;
-		return 0u;
+		return VBLK_F_SEG_MAX_BIT;
 	case VBLK_R_QUEUE_NUM_MAX:
 		/* D5(a): only queue 0 exists for virtio-blk; a nonexistent queue_sel
 		 * must read back 0 (spec: QueueNumMax==0 tells the driver the queue
@@ -1199,15 +1275,18 @@ static uint32_t vblk_reg_read(struct vblk_dev *d, uint32_t off)
 }
 
 /* D5(c): virtio-blk config-space read, SAS-aware — exact template copy of
- * vnet_config_read() (vnet_emac.c), per the task brief. Only the 8-byte
- * `capacity` field (le64 at config+0) is ever nonzero; every other config
- * offset already reads 0 regardless of width, so narrowing only matters here.
+ * vnet_config_read() (vnet_emac.c), per the task brief. Two fields are ever
+ * nonzero: `capacity` (le64 at config+0) and, since the SEG_MAX fix,
+ * `seg_max` (le32 at config+12 — struct virtio_blk_config leaves +8..+11 as
+ * `size_max`, unused since VIRTIO_BLK_F_SIZE_MAX isn't offered). Every other
+ * config offset still reads 0 regardless of width.
  * FreeBSD's vtblk_read_config() happens to always read capacity as two full
  * 32-bit halves today (sas==2 both times — see the comment this replaces),
  * so this is a defensive correctness fix, not a behavior change for the
  * current guest: for sas==2 it returns byte-for-byte what the old two-line
  * special case did. */
-#define VBLK_CONFIG_CAP_LEN  8u   /* le64 `capacity` field, config+0..+7 */
+#define VBLK_CONFIG_SEG_MAX  16u  /* data segments/request; well under VBLK_MAX_CHAIN */
+#define VBLK_CONFIG_LEN      16u  /* capacity(8) + size_max(4, unused=0) + seg_max(4) */
 
 static uint32_t vblk_config_read(struct vblk_dev *d, uint32_t byte_off, uint32_t sas)
 {
@@ -1216,7 +1295,13 @@ static uint32_t vblk_config_read(struct vblk_dev *d, uint32_t byte_off, uint32_t
 
 	for (uint32_t i = 0; i < nbytes; i++) {
 		uint32_t idx = byte_off + i;
-		uint8_t b = (idx < 8u) ? (uint8_t)(d->capacity >> (8u * idx)) : 0u;
+		uint8_t b;
+		if (idx < 8u)
+			b = (uint8_t)(d->capacity >> (8u * idx));
+		else if (idx >= 12u && idx < 16u)
+			b = (uint8_t)(VBLK_CONFIG_SEG_MAX >> (8u * (idx - 12u)));
+		else
+			b = 0u;
 		v |= (uint32_t)b << (8u * i);
 	}
 	return v;
@@ -1350,6 +1435,21 @@ int vblk_mmio_fault(struct el2_frame *frame)
 	if (ec != ESR_EC_DABT_LOWER)
 		return 0;
 
+	/* Live debug (2026-07-27/28): unconditional counter + last-seen fault IPA,
+	 * BEFORE the address-match check below — tells a live session whether the
+	 * guest is still taking ANY non-UART data abort at all (proves the vCPU
+	 * hasn't gone fully quiet) even when it's stopped hitting OUR window
+	 * specifically. bc[40]=count, bc[41]=this fault's IPA lo32. */
+	{
+		static uint32_t g_dabt_seen;
+		uint64_t hpfar_probe;
+		__asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar_probe));
+		uint64_t addr_probe = ((hpfar_probe & 0xFFFFFFFFF0ULL) << 8) |
+		                       (frame->far & 0xFFFull);
+		vblk_bc(40, ++g_dabt_seen);
+		vblk_bc(41, (uint32_t)addr_probe);
+	}
+
 	/* Reconstruct the faulting IPA: HPFAR_EL2[39:4] = IPA[47:12], OR the
 	 * in-page offset from FAR_EL2[11:0]. (Same as vconsole/virtio.c: FAR_EL2
 	 * alone is the guest VA once the guest MMU is on, which is NOT our base.) */
@@ -1388,7 +1488,7 @@ int vblk_mmio_fault(struct el2_frame *frame)
 		uint64_t val = (srt == SRT_XZR) ? 0 : frame->x[srt];
 		vblk_reg_write(&g_blk, off, (uint32_t)val);
 	} else {
-		uint32_t val = (off >= VBLK_R_CONFIG && off < VBLK_R_CONFIG + VBLK_CONFIG_CAP_LEN)
+		uint32_t val = (off >= VBLK_R_CONFIG && off < VBLK_R_CONFIG + VBLK_CONFIG_LEN)
 		             ? vblk_config_read(&g_blk, off - VBLK_R_CONFIG, sas)
 		             : vblk_reg_read(&g_blk, off);
 		if (srt != SRT_XZR)
