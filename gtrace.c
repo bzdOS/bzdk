@@ -210,6 +210,33 @@ int gtrace_handle_sysreg(struct el2_frame *frame)
 
 	gtrace_record((dir ? 0x40000000u : 0u) | regid, (uint32_t)val);
 
+	/* Self-disabling trace (found live 2026-07-28): gtrace_init()'s own
+	 * header comment calls this "guest early-locore tracing" — meant to
+	 * observe pmap_bootstrap/locore, a one-time early-boot event. But
+	 * HCR_EL2.TVM was only ever turned ON (gtrace_init()), never OFF, so
+	 * EVERY later TTBR0_EL1 write for the guest's entire remaining
+	 * lifetime -- i.e. every process-address-space context switch, for as
+	 * long as the guest runs -- kept paying a full trap-and-emulate EL2
+	 * round trip. Root mount worked but then a normal multiuser boot
+	 * (rc.d spawning many short-lived processes) looked hung: virtio-blk
+	 * breadcrumbs frozen, zero network traffic, ever. Confirmed live: a
+	 * one-off build with TVM force-disabled (-DDBG_NO_TVM) sailed straight
+	 * through to a real `login:` prompt in the same capture window that
+	 * the TVM-on build never got past "Mounting local filesystems".
+	 * gtrace_record() above already stops accumulating NEW events once
+	 * the ring fills (GTRACE_MAX_EVENTS) -- the trap itself has delivered
+	 * zero additional diagnostic value past that point, so this is the
+	 * natural, permanent-cost-free place to turn TVM back off: once the
+	 * ring is full, clear HCR_EL2.TVM (same read-modify-write pattern as
+	 * gtrace_init()'s set) so every subsequent guest sysreg write runs
+	 * natively for the rest of this boot. */
+	if (gtr_rd(1) >= GTRACE_MAX_EVENTS) {
+		uint64_t hcr;
+		__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr));
+		hcr &= ~(1ULL << 26);
+		__asm__ volatile("msr hcr_el2, %0\n\tisb" :: "r"(hcr) : "memory");
+	}
+
 	frame->elr += 4u;   /* skip the trapped instruction; access is emulated */
 	return 1;
 }
