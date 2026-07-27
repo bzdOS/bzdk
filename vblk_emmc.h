@@ -160,6 +160,9 @@
 #define VBLK_FEATWORD_HI          1u
 #define VBLK_F_VERSION_1_BIT      0x1u
 
+/* VIRTIO_BLK_F_SEG_MAX (bit 2) lives in feature word 0. */
+#define VBLK_F_SEG_MAX_BIT        0x4u
+
 /* Only one request queue for virtio-blk. */
 #define VBLK_QUEUE                0u
 #define VBLK_NUM_QUEUES           1u
