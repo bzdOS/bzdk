@@ -136,15 +136,22 @@ class EmmcRaw:
         users collide inside one controller and "corrupt the in-flight
         transfer".
 
-        This class did neither for its whole existence, and the damage was
-        directly observed on 2026-07-30: while the guest was reading the disk in
-        a loop, twelve reads of ONE unchanging sector (LBA 287342) returned
-        three different outcomes -- aarch64 code bytes 9x, a UFS inode 2x
-        (0x41ed == mode 040755, i.e. another sector entirely), and a hard
-        rc=-1 3x. Unsynchronised concurrent access, not bad media: a failing
-        sector does not hand back two different plausible contents. Every
-        emmc_raw measurement taken while the guest did I/O is suspect, and the
-        probing itself was corrupting the guest's transfers.
+        This class did neither for its whole existence, so any measurement it
+        took while the guest was doing virtio-blk I/O was unsound, and the
+        probing could corrupt the guest's in-flight transfers.
+
+        NOTE on what this does NOT fix. Twelve reads of ONE unchanging sector
+        (LBA 287342) returning three different outcomes -- aarch64 code bytes
+        9x, a UFS inode 2x, a hard rc=-1 3x -- was initially blamed on guest
+        contention and appeared to be cured by adding this lock. It was not:
+        the guest issued ZERO reads across that whole window (g_reads frozen at
+        316), so there was no contention to fix. The real cause was
+        emmc_bio_read()'s failure paths returning without settling the
+        controller, letting one spurious error poison the following calls; the
+        lock only helped because its two extra EMAC round-trips spaced the
+        reads apart. That is fixed properly in emmc_bio.c
+        (ebio_fail_settle()). Keep this lock anyway -- it is required by the
+        contract above -- but do not rely on it for read integrity.
 
         Held only around the controller calls, never across the (slow) EMAC
         readback: scratch RAM is private to this class, so releasing early
