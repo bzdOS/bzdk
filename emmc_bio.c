@@ -401,11 +401,51 @@ static inline void ebio_bc(int i, uint32_t v)
 }
 static uint32_t g_ebio_fails;
 
+/* Bounded wait for the card to stop being busy. Cheap when the controller is
+ * already idle (breaks on the first read), so it is safe on a hot path. */
+static void wait_card_idle(void)
+{
+	int i;
+	for (i = 0; i < EMMC_POLL_CAP; i++)
+		if (!(rreg(REG_STAR) & STAR_CARD_BUSY))
+			return;
+}
+
+/* Leave the controller quiescent after a FAILED transfer (found live
+ * 2026-07-30). The "ROOT-CAUSE FIX" below establishes quiescence on the
+ * SUCCESS path only: every failure return jumped straight out with the data
+ * phase still retiring, so the NEXT call cleared RINT while a stale DATA_OVER
+ * was still in flight, saw FIFO_EMPTY+DATA_OVER immediately, drained 0 words
+ * and failed too -- one spurious error sustaining itself. Observed as
+ * cascading pairs from the CPU1 debug path: two failures back to back, then
+ * two more on the next two LBAs, with the documented signature (RINT=0x208,
+ * DATA_OVER set, CMD_DONE clear, nwords=0).
+ *
+ * The same stale-retire window also explains a read that "succeeds" with the
+ * PREVIOUS block's bytes: the earlier transfer keeps pushing into the FIFO
+ * after this call's reset, so 128 words drain cleanly but belong to the wrong
+ * sector. That is a silent wrong-data return, which is worse than the -1.
+ *
+ * Deliberately does NOT wait for DATA_OVER: on a genuinely stuck card that
+ * bit may never arrive and poll_rint() would burn the full EMMC_POLL_CAP. Card
+ * idle plus a FIFO reset is enough to stop the leak into the next call. */
+static void ebio_fail_settle(void)
+{
+	wait_card_idle();
+	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
+	small_delay();
+}
+
 int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 {
 	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
 	unsigned nwords = 0;
 	int i;
+
+	/* Do not start on top of a transfer that is still retiring -- see
+	 * ebio_fail_settle(). Costs nothing when the controller is already idle,
+	 * which is the normal case. */
+	wait_card_idle();
 
 	/* FIFO reset (GCTL bit1) + tiny settle delay. */
 	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
@@ -434,6 +474,7 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 		ebio_bc(4, nwords);
 		ebio_bc(5, rreg(REG_GCTL));
 		ebio_bc(0, ++g_ebio_fails);
+		ebio_fail_settle();
 		return -1; /* timed out before draining a full 512B block */
 	}
 
@@ -457,6 +498,7 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 		ebio_bc(4, 0x10000u | nwords);   /* tag: failed at post-drain wait */
 		ebio_bc(5, rreg(REG_GCTL));
 		ebio_bc(0, ++g_ebio_fails);
+		ebio_fail_settle();
 		return -1;
 	}
 	for (i = 0; i < EMMC_POLL_CAP; i++) {
@@ -499,8 +541,13 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			continue;
 		wreg(REG_FIFO, buf[nwords++]);
 	}
-	if (nwords < 128)
+	if (nwords < 128) {
+		/* Same reason as the read side: bailing mid-transfer leaves the data
+		 * phase retiring and poisons whatever call comes next, read or write.
+		 * See ebio_fail_settle(). */
+		ebio_fail_settle();
 		return -1; /* FIFO never drained enough to accept all words */
+	}
 
 	/* Wait for the controller to report the data phase complete. TIME-capped
 	 * (D4 fix — see the block comment above EMMC_WRITE_DATA_TIMEOUT_MS): the
