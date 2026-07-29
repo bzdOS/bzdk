@@ -85,6 +85,32 @@
  *        diagnostic only — see vblk_request()'s comment)
  *   [30] QueueNotify seen before DRIVER_OK, NOT enforced (D5(e), diagnostic
  *        only — see vblk_kick()'s comment)
+ *
+ * STICKY IOERR FORENSICS (2026-07-30). Everything above that describes a
+ * completion — [8] sector, [9] status, [12] rc, [14..19] vblk_diag() — is
+ * overwritten by the NEXT request, so a failed one's evidence is destroyed by
+ * the following success. That is exactly what hid this bug: the guest's own
+ * used ring, read live out of guest RAM, held two S_IOERR completions
+ * (len=1, i.e. status byte and zero data; then len=24577, i.e. truncated
+ * 24576 of 61440 bytes mid-chain) which a following len=61441 S_OK had
+ * already erased from every breadcrumb. These fields are STICKY: per-cause
+ * totals, plus a full snapshot of the FIRST and the LAST failure, so one
+ * post-mortem read says which cause fired, where, and on which core.
+ *   [42] total completions that reported S_IOERR
+ *   [43] .. of those, serve_data() rc == VBLK_RC_BUSY (eMMC cross-core lock
+ *        acquire timed out — the contention hypothesis)
+ *   [44] .. rc == VBLK_RC_BADPA (data-descriptor PA outside DRAM)
+ *   [45] .. rc == VBLK_RC_UNALIGNED (partial-sector stitch, unimplemented)
+ *   [46] .. any other rc — a real emmc_bio_read/write failure (-1..-9)
+ *   [47] .. rejected for exceeding the advertised capacity (no rc involved)
+ *   [48] .. rejected because emmc_ready == 0 (no rc involved)
+ *   [49] first IOERR: sector lo32        [53] last IOERR: sector lo32
+ *   [50] first IOERR: rc                 [54] last IOERR: rc
+ *   [51] first IOERR: data bytes served  [55] last IOERR: data bytes served
+ *        before failing — compare against the used-ring len the guest saw,
+ *        which is this + 1 for the status byte
+ *   [52] first IOERR: head<<16 | is_read<<1 | on_cpu2
+ *   [56] last  IOERR: head<<16 | is_read<<1 | on_cpu2
  * ------------------------------------------------------------------ */
 /* Address owned by hv_addrmap.h (via vblk_emmc.h). Was 0x50005000, INSIDE the
  * 64 KiB vconsole ring, where console output clobbered these words. */
@@ -592,6 +618,23 @@ static void vblk_inject_irq(void)
  * Request processing.
  * ------------------------------------------------------------------ */
 
+/* serve_data()'s own failure codes, kept far from emmc_bio_read/write's -1..-9
+ * so a caller can tell "we refused this" from "the card failed". Named
+ * (2026-07-30) because the sticky-IOERR classifier below has to compare
+ * against them, and the same magic number in two files is how a mislabeled
+ * post-mortem happens. */
+#define VBLK_RC_UNALIGNED  (-100)   /* partial-sector stitch, unimplemented */
+#define VBLK_RC_BUSY       (-200)   /* eMMC cross-core lock acquire timed out */
+#define VBLK_RC_BADPA      (-300)   /* data-descriptor PA outside DRAM */
+
+/* The exact eMMC LBA serve_data() was on when it last failed. A request's
+ * chain can die several sectors into a descriptor, so neither the request's
+ * start sector nor the bytes-served count pins down the actual sector — and
+ * that sector is what cross-references directly against the guest's own
+ * "vtbd0: hard error cmd=read <first>-<last>" line. Consumed only by
+ * vblk_note_ioerr(); valid solely on the failure path that just set it. */
+static uint32_t g_serve_fail_lba;
+
 /* Serve `len` bytes at guest PA `gpa` for a request whose data starts at eMMC
  * byte offset described by `*sector` (in 512-byte sectors, advanced as we go).
  * `is_read` picks emmc_bio_read (device->guest) vs emmc_bio_write. Returns 0
@@ -621,7 +664,8 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		 * 512-aligned segments, so this branch should not be exercised; if a
 		 * guest ever trips it, fail the request cleanly rather than corrupt
 		 * data. */
-		return -100;
+		g_serve_fail_lba = (uint32_t)*sector;
+		return VBLK_RC_UNALIGNED;
 	}
 
 	uint32_t nsec = len / VBLK_SECTOR_BYTES;
@@ -629,6 +673,11 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		uint64_t buf_gpa = gpa + (uint64_t)s * VBLK_SECTOR_BYTES;
 		uint32_t lba = (uint32_t)(*sector + s);
 		int rc;
+
+		/* Published up front so EVERY failure return below leaves the exact
+		 * sector behind for vblk_note_ioerr(), without repeating the store at
+		 * each one. Meaningless unless this call actually fails. */
+		g_serve_fail_lba = lba;
 
 		/* D2 fix: emmc_bio_read()/emmc_bio_write() take buf_gpa as a raw PA
 		 * and dereference it directly (a real DMA-like buffer handoff, NOT
@@ -643,14 +692,14 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		if (!gpa_in_range(buf_gpa, VBLK_SECTOR_BYTES)) {
 			g_gmem_oob++;
 			vblk_bc(27, g_gmem_oob);
-			return -300;                 /* guest PA outside DRAM -> S_IOERR */
+			return VBLK_RC_BADPA;        /* guest PA outside DRAM -> S_IOERR */
 		}
 
 		/* Serialize this single controller transaction against CPU1 (design
 		 * §8.1). Bounded acquire: if the debug core holds the eMMC too long we
 		 * fail the request cleanly rather than stall CPU0 past the watchdog. */
 		if (!emmc_lock_acquire_bounded())
-			return -200;                 /* controller busy -> S_IOERR */
+			return VBLK_RC_BUSY;         /* controller busy -> S_IOERR */
 
 		if (is_read) {
 			/* Read one eMMC block straight into the guest buffer. buf_gpa is a
@@ -710,6 +759,75 @@ static inline void vblk_diag(uint16_t head, uint32_t chain_len,
 	vblk_bc(17, (uint32_t)(status_pa & 0xFFFFFFFFu));
 	vblk_bc(18, (uint32_t)(status_pa >> 32));
 	vblk_bc(19, used_idx_after);
+}
+
+/* Sticky S_IOERR forensics (2026-07-30) — see the bc[42..56] block near
+ * VBLK_BC_BASE for the full field list and the live evidence that motivated
+ * it. Called by BOTH completion paths at the moment they decide on S_IOERR,
+ * i.e. while the cause is still in hand; every other breadcrumb describing a
+ * completion is overwritten by the next request and so cannot survive to a
+ * post-mortem read.
+ *
+ * `rc` is serve_data()'s return, or 0 for the rejects that never call it
+ * (capacity / !emmc_ready) — those get their own counters instead, so a rc
+ * of 0 here is never ambiguous.
+ *
+ * Plain (non-atomic) increments, deliberately: CPU0's vblk_request() and
+ * CPU2's vblk_async_poll() can both land here, but this file's existing
+ * cross-core counters (g_reads/g_writes, bumped from both) already work this
+ * way, and a lost count on a genuinely concurrent double failure would not
+ * change any conclusion drawn from these fields. */
+static uint32_t g_ioerrs;              /* [42] every S_IOERR completion       */
+static uint32_t g_ioerr_busy;          /* [43] rc == VBLK_RC_BUSY             */
+static uint32_t g_ioerr_badpa;         /* [44] rc == VBLK_RC_BADPA            */
+static uint32_t g_ioerr_unaligned;     /* [45] rc == VBLK_RC_UNALIGNED        */
+static uint32_t g_ioerr_emmc;          /* [46] real emmc_bio failure (-1..-9) */
+static uint32_t g_ioerr_capacity;      /* [47] past advertised capacity       */
+static uint32_t g_ioerr_notready;      /* [48] emmc_ready == 0                */
+
+/* Cause tags for the two rc-less rejects, so one call site shape covers all
+ * five ways a request can end up S_IOERR. */
+#define VBLK_IOERR_SERVE     0u        /* classify by rc                      */
+#define VBLK_IOERR_CAPACITY  1u
+#define VBLK_IOERR_NOTREADY  2u
+
+static void vblk_note_ioerr(uint32_t cause, int rc, uint64_t sector,
+                            uint32_t data_bytes, uint16_t head,
+                            uint32_t is_read, uint32_t on_cpu2)
+{
+	uint32_t first = (g_ioerrs == 0);
+	uint32_t tag   = ((uint32_t)head << 16) | (is_read ? 2u : 0u) |
+	                 (on_cpu2 ? 1u : 0u);
+
+	vblk_bc(42, ++g_ioerrs);
+
+	switch (cause) {
+	case VBLK_IOERR_CAPACITY:
+		vblk_bc(47, ++g_ioerr_capacity);
+		break;
+	case VBLK_IOERR_NOTREADY:
+		vblk_bc(48, ++g_ioerr_notready);
+		break;
+	default:
+		switch (rc) {
+		case VBLK_RC_BUSY:      vblk_bc(43, ++g_ioerr_busy);      break;
+		case VBLK_RC_BADPA:     vblk_bc(44, ++g_ioerr_badpa);     break;
+		case VBLK_RC_UNALIGNED: vblk_bc(45, ++g_ioerr_unaligned); break;
+		default:                vblk_bc(46, ++g_ioerr_emmc);      break;
+		}
+		break;
+	}
+
+	if (first) {
+		vblk_bc(49, (uint32_t)sector);
+		vblk_bc(50, (uint32_t)rc);
+		vblk_bc(51, data_bytes);
+		vblk_bc(52, tag);
+	}
+	vblk_bc(53, (uint32_t)sector);
+	vblk_bc(54, (uint32_t)rc);
+	vblk_bc(55, data_bytes);
+	vblk_bc(56, tag);
 }
 
 /* ------------------------------------------------------------------ *
@@ -837,10 +955,19 @@ void vblk_async_poll(void)
 		uint64_t addr = g_async.data_addr[i];
 		uint32_t len  = g_async.data_len[i];
 		uint64_t end_sec = sector + (len / VBLK_SECTOR_BYTES);
+		int rc;
 
-		if (end_sec > g_blk.capacity) { status = VIRTIO_BLK_S_IOERR; break; }
-		if (serve_data(is_read, addr, len, &sector, &sfill) != 0) {
+		if (end_sec > g_blk.capacity) {
 			status = VIRTIO_BLK_S_IOERR;
+			vblk_note_ioerr(VBLK_IOERR_CAPACITY, 0, sector, used_len,
+			                head, is_read, 1u);
+			break;
+		}
+		rc = serve_data(is_read, addr, len, &sector, &sfill);
+		if (rc != 0) {
+			status = VIRTIO_BLK_S_IOERR;
+			vblk_note_ioerr(VBLK_IOERR_SERVE, rc, g_serve_fail_lba,
+			                used_len, head, is_read, 1u);
 			break;
 		}
 		if (is_read)
@@ -1053,6 +1180,8 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 
 	if (!d->emmc_ready) {
 		status = VIRTIO_BLK_S_IOERR;
+		vblk_note_ioerr(VBLK_IOERR_NOTREADY, 0, sector, 0, head,
+		                hdr.type == VIRTIO_BLK_T_IN, 0u);
 	} else if (hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) {
 		uint32_t is_read = (hdr.type == VIRTIO_BLK_T_IN);
 		int posted;
@@ -1093,12 +1222,18 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 				vblk_bc(29, ++g_bad_desc_flags);
 			/* Bounds-check against advertised capacity. */
 			uint64_t end_sec = sector + (dd->len / VBLK_SECTOR_BYTES);
+			int rc;
 			if (end_sec > d->capacity) {
 				status = VIRTIO_BLK_S_IOERR;
+				vblk_note_ioerr(VBLK_IOERR_CAPACITY, 0, sector,
+				                used_len, head, is_read, 0u);
 				break;
 			}
-			if (serve_data(is_read, dd->addr, dd->len, &sector, &sfill) != 0) {
+			rc = serve_data(is_read, dd->addr, dd->len, &sector, &sfill);
+			if (rc != 0) {
 				status = VIRTIO_BLK_S_IOERR;
+				vblk_note_ioerr(VBLK_IOERR_SERVE, rc, g_serve_fail_lba,
+				                used_len, head, is_read, 0u);
 				break;
 			}
 			if (is_read)
@@ -1512,6 +1647,17 @@ int vblk_init(void)
 	g_reads = g_writes = g_irqs = g_faults = g_truncated = 0;
 
 	vblk_bc(0, VBLK_BC_MAGIC);
+
+	/* Publish the sticky IOERR counters as real zeros. The breadcrumb window
+	 * is uninitialized scratch (reads back 0xFFFFFFFF) until something writes
+	 * it, so without this a reader cannot tell "this build has no IOERR
+	 * fields" from "this build had zero IOERRs" — and only the latter is the
+	 * useful negative result. The per-failure snapshot slots [49..56] are
+	 * deliberately left alone: they mean nothing until [42] is non-zero. */
+	g_ioerrs = g_ioerr_busy = g_ioerr_badpa = g_ioerr_unaligned = 0;
+	g_ioerr_emmc = g_ioerr_capacity = g_ioerr_notready = 0;
+	for (uint32_t i = 42; i <= 48; i++)
+		vblk_bc(i, 0);
 
 	/* Release the eMMC-controller lock unconditionally. It lives in a fixed
 	 * DRAM word (not .bss), so a warm WDT reset (which preserves DRAM) can
