@@ -1,0 +1,254 @@
+# Session status — 2026-07-30: mountroot cracked, vtimer theory retracted, new EIO bug found
+
+Point-in-time snapshot (see `docs/sessions/README.md` for how these age).
+Board: `08688afa045f+` running, matches on-disk tree. All findings below are
+live, hardware-confirmed unless marked otherwise.
+
+## 1. RETRACTED: "permanently lost vtimer" root cause
+
+Earlier same-session claim — EL2 masks the guest's CNTV then re-injects
+through a disabled vGIC (`GICH_HCR=0`), so the timer dies forever and the
+guest sleeps in WFI — is **wrong**. It was built on banked-register reads
+(GICH/HCR_EL2 read over the debug channel describe **CPU1's bank**, not the
+guest core's).
+
+Disproof: added a mask-rescue watchdog (`gic_timer.c:vtimer_mask_watchdog()`,
+`FLTR_K_VTRESCUE` in `flightrec.h`) that would fire if the guest's ISR ever
+failed to clear `CNTV_CTL.IMASK` after EL2 sets it. Live result: TIMER PPIs
+arrive ~1100/s, **zero VTRESCUE records** — the guest's own ISR clears the
+mask every single time. The vtimer handshake works; it was never lost.
+
+The watchdog itself is kept in the tree as harmless defence-in-depth. Memory
+file `vtimer-masked-vgic-off-deadlock.md` has been corrected in place (not
+deleted, so the retraction and the reasoning both stay visible). Task #15
+("gate CNTV mask+reinject on GICH_HCR.En") is now moot — needs re-scoping or
+closing.
+
+## 2. What the guest was ACTUALLY doing: `mountroot>` fast-retry loop, not a hang
+
+Bulk-dumped the vconsole capture ring (`0x50000f10`, 64 KiB) instead of the
+slow `hv.dump()`. The "frozen" guest was cycling through `---<<BOOT>>---` /
+`mountroot>` / `Invalid file system specification` repeatedly — a fast
+software retry loop, not a wedge. All previously-"frozen" vblk counters
+(`g_reads`, `g_irqs`, etc.) were frozen because there was nothing to do at an
+idle prompt, not because anything was stuck.
+
+**Discovery: this build's FreeBSD tree is already instrumented for exactly
+this race.** `grep -rn BZDOS-RACE /opt/bzdos/freebsd-src-earlyboot-wt` finds
+debug `printf`s already inserted at:
+- `sys/kern/vfs_mountroot.c:988` — `vfs_mountroot_wait enter`
+- `sys/kern/vfs_mountroot.c:1026` — `vfs_mountroot_wait_if_neccessary fs=%s dev=%s`
+- `sys/geom/part/g_part.c:1977` — `g_part_taste mp=%s pp=%s`
+- `sys/geom/geom_subr.c:579` — `g_new_provider_event pp=%s`
+
+This is a prior (undocumented-in-memory) attempt at instrumenting the exact
+GEOM-taste-vs-mountroot race described in `mountroot-geom-stall-investigation.md`
+and `rootmount-gpt-healthy-blocker-guestside.md`. Someone built retry logic
+into `vfs_mountroot_wait_if_neccessary` for this.
+
+**Confirmed live: a single bare CR typed at `mountroot>` was enough to get
+the mount to succeed and the guest to proceed past it**, all the way into
+single-user init. This matches `reliable_load.py`'s existing
+`auto_mount_root()` docstring almost exactly ("typing ANYTHING at the
+interactive mountroot> prompt... makes the mount succeed right after") —
+this was already known and automated; this session just directly observed
+it happening rather than relying on the automation.
+
+## 3. Self-inflicted regression, fixed: single-user init loop
+
+While probing, a `?` sent right after the CR landed on init's **next**
+prompt — "Enter full pathname of shell or RETURN for /bin/sh:" — instead of
+mountroot, because the mount had already succeeded and boot had moved on.
+Result: `init: can't exec ? for single user: No such file or directory` →
+"single user shell terminated, restarting" → infinite loop reprinting the
+same prompt.
+
+Fixed by sending one more bare CR (defaults to `/bin/sh`). Lesson for next
+time: after nudging `mountroot>`, wait for the NEXT prompt to actually appear
+before sending the next canned keystroke — don't fire a fixed sequence
+blind, the boot moves faster than expected once unstuck.
+
+## 4. NEW real bug found: single-user shell dies on a genuine disk read error
+
+After the single-user loop was fixed, a new, different, reproducible failure
+appeared — `/bin/sh` itself faults:
+
+```
+g_vfs_done():vtbd0p3[RAD(offset=801767424, length=163840)]error = 5
+... shell terminated, restarting  (signal 10 — SIGBUS, no core dump)
+```
+
+This is a **real EIO from GEOM**, not console noise, and it repeats
+identically every retry (same offset, same length).
+
+### Ruled out (both checked read-only, live):
+
+- **Partition too small.** Read the real GPT off the eMMC directly
+  (`emmc_bio_read`, bypassing virtio entirely): `p3` ("rootfs") spans LBA
+  278562–2858721, i.e. 2,580,160 sectors / 1321 MB. The failing
+  partition-relative sector (`801767424 / 512 = 1565952`) is well inside
+  that range. Not an out-of-bounds read.
+- **Bad physical media at that LBA.** Absolute LBA = `278562 + 1565952 =
+  1844514`. Directly read the first, middle, and last sector of the failing
+  320-sector (163840-byte) span via `emmc_bio_read` — completely bypassing
+  vblk/virtio. All three came back clean, stable, and plausible (looks like
+  termcap/terminfo text: `vt100-nav`, `term 1.0 UCB ascii...`). The eMMC
+  itself is healthy at this location.
+
+### What this points to
+
+The bug is somewhere in the **virtio-blk front end or the guest driver's
+interaction with it**, not the disk. Per `vblk_emmc.c`'s own comments, this
+guest negotiates no `VIRTIO_BLK_F_SEG_MAX`, so FreeBSD's `vtblk` caps every
+descriptor chain to a single page-aligned data segment (`n==3` always:
+header + one ≤4096-byte data desc + status; `VBLK_MAX_CHAIN=32`,
+`VBLK_SECTOR_BYTES=512`). A 163840-byte GEOM-level read is therefore NOT one
+virtio request — it's ~40 separate 8-sector (4096-byte) requests under the
+hood, and only checking 3 of the underlying ~320 sectors does not rule out
+one specific sub-request among those ~40 silently failing to complete.
+
+**This looks like the same bug class as `vblk-lost-kick-mountroot-blocker.md`
+(one specific guest read never reaching `vblk_kick()`), now shown to recur
+at a DIFFERENT LBA** (previously LBA 278882, seen during early GEOM taste;
+now deep inside `p3`'s data area, hit while paging in `/bin/sh` at
+single-user shell exec). That memory file scoped the bug to one fixed
+address — this session's finding contradicts that scoping: **it is a
+general race/bug in the vblk request-completion path, not a one-off tied to
+a specific hardcoded LBA.**
+
+### Not yet done
+
+A full 320-sector re-read via `emmc_raw.py` (to find exactly which
+sub-request-sized chunk fails) was started but the run timed out (stdout
+buffering hid all output until the 180s timeout killed it — `python3 -u`
+needed, and 320 sequential `hv.call()`s at ~0.4s retry granularity is simply
+slow). Not re-run yet this session. This is the concrete next step: rerun
+unbuffered, sector-by-sector (or in the ~8-sector sub-request groups vtblk
+actually issues) across the whole 320-sector span to localize the exact
+failing sub-request, then correlate against `vblk_emmc.c` breadcrumbs
+(`g_kicks_seen`, `g_heads_popped`, `g_dabt_seen`) captured at the same
+moment to see whether that specific request even reached `vblk_kick()`.
+
+## Tooling note
+
+`hvsh.py -f <path>` requires a real file path — `-f /dev/stdin` fed via a
+bash heredoc does not work (the client does a plain `open()`, not a stdin
+read). Write the script to a temp file first.
+
+## 5. LATER THE SAME DAY: the HV is exonerated, and the probe was the problem
+
+Three commits landed after the sections above were written, and they change
+the conclusion of §4 substantially.
+
+### 5a. Sticky S_IOERR forensics (commit `18a1e50`) — decisive negative
+
+§4 ended by planning to catch which sub-request fails. It was built on a
+misreading, now corrected: a short used-ring `len` (the 1 and 24577 seen live)
+does **not** imply S_IOERR. FreeBSD's `vtblk_request_error()` inspects only the
+ack byte and ignores `len` entirely.
+
+`vblk_emmc.c` now records, at the instant either completion path decides on
+S_IOERR, per-cause totals plus a snapshot of the first and last failure —
+exact failing LBA, rc, bytes served before dying, head, direction, and which
+core served it (bc[42..56]; `triage.py` decodes them and now reads all 64
+breadcrumb words instead of stopping at 48). Everything else describing a
+completion is overwritten by the next request, which is precisely why the
+evidence kept vanishing.
+
+Live result on a fresh boot: **`g_ioerrs = 0`, 317/317 requests completed
+S_OK.** The HV's virtio-blk/eMMC path is not failing I/O and not losing the
+eMMC lock. Combined with 5b below, treat "the HV corrupts or fails guest
+reads" as refuted unless new evidence appears.
+
+### 5b. `emmc_raw.py` never held the eMMC lock (commit `842a502`) — ROOT CAUSE of the "bad media" ghost
+
+`vblk_emmc.h`'s `VBLK_EMMC_LOCK_PA` comment always stated the contract:
+virtio-blk takes the controller lock internally, but the CPU1 debug core
+"cannot be hooked at compile time (it enters emmc_bio via a runtime `call`)",
+so a CPU1 caller must bracket its access with
+`vblk_emmc_trylock`/`vblk_emmc_unlock` or the two collide and "corrupt the
+in-flight transfer". `emmc_raw.py` never did.
+
+Measured with the guest reading the disk in a loop — twelve reads of ONE
+unchanging sector (LBA 287342):
+
+| | result |
+|---|---|
+| before | 9 OK but **two different contents** (aarch64 code bytes 9×; a UFS inode 2× — `0x41ed` = mode 040755, a different sector entirely) plus 3 hard `rc=-1`. Neighbours 287340/287341 failed outright. |
+| after | 12/12 OK, one identical content, both neighbours fine. |
+
+A failing sector never returns two different plausible contents. Two
+consequences, the second worse than the first:
+
+1. Every `emmc_raw` measurement taken while the guest was doing virtio-blk I/O
+   is suspect — **including §4's "bad physical media ruled out" claim**. That
+   conclusion happens to be safe (it was taken with the guest idle at a
+   prompt, doing no I/O, and returned stable plausible data) but it was not
+   sound at the time it was made.
+2. The probing itself was corrupting the guest's transfers, i.e. manufacturing
+   the exact class of symptom (EIO / SIGBUS `pager read error` / SIGSEGV on a
+   paged-in binary) it was being used to investigate.
+
+### 5c. `check_build_id()` compared against git, not the ELF (commit `4a4ab42`)
+
+It recomputed the Makefile's BUILD_ID from git state, so any commit that did
+not rebuild reported a bogus skew — including a host-side-only Python commit,
+which cannot change the firmware. Committing 5b made `emmc_raw.py` refuse to
+run against an untouched board. It now reads `g_build_id_str` out of the ELF
+whose symbols it is resolving, with git as fallback for a checkout with no
+build in it.
+
+### 5d. Current guest state
+
+Boots, mounts root, reaches `start_init: trying /sbin/init`, then init's child
+SIGSEGVs every 30s in a loop. In the local image `/bin/sh` is byte-exact valid
+(11 program headers, section table ending exactly at EOF = 167384), as are
+`ld-elf.so.1`, `libc.so.7` and `/sbin/init`; `/bin/init` does not exist at all
+(the console's "bin/init" is `/sbin/init` with dropped bytes). `/bin/sh`,
+`/lib/libedit.so.8` and `/etc/rc` carry the documented uid=1001 defect. A
+byte-for-byte board-vs-image comparison of `/bin/sh` is the open item — the
+board's p3 was hot-patched live earlier by `fix_ownership.py`/`ufs_clean.py`,
+which still carry a stale `SCRATCH_PA` (0x50030000).
+
+### 5e. Snapshots: written, linked, unreachable
+
+`snapshot.c` + `snapshot_net.c` (37 KB) are compiled and linked into the
+running firmware but have **zero callers** — `snapshot_save`/`restore` are
+reached only from `snapshot_net_send`/`recv`, which nothing calls. `snapshot.h`
+names the intended wiring ("a new `snap`/`rest` command" off the dbgmon tick
+path); it was never written. So there is no live checkpoint/rollback today,
+which is what makes every experiment cost a full reload.
+
+Note for whoever wires it: `snapshot.h`'s own "NOT CAPTURED" list excludes MMIO
+device state (**including MMC/eMMC**), GIC state and in-flight DMA — so a
+snapshot is the *wrong* tool for block-I/O bugs specifically, however useful it
+would be for skipping boot.
+
+Hot-patching, by contrast, already works: `hv.patch(pa, insn)` (write +
+I-cache flush), `hv.call(fn_pa, ...)` and `hv.write_word_verified()`. Single
+instructions and flags can be changed with no rebuild and no reload; reach for
+that before a reload cycle.
+
+## Carry-forward for next session
+
+Items 1-3 of the original list (localize the failing sub-request, instrument
+`vblk_kick()`, re-scope task #15) are **done or moot** — see §5. What remains:
+
+1. Finish the byte-for-byte `/bin/sh` comparison, board p3 vs
+   `/opt/bzdos/qemu-test/rootfs-ufs2.raw`, now that `emmc_raw.py` is
+   trustworthy (§5b). This is the one measurement that separates "the image on
+   the medium is wrong" from "something above the medium is wrong".
+2. Then task #14 — rebuild a clean rootfs on the dev VM
+   (`/root/.claude/plans/jolly-honking-snowflake.md`). The uid=1001 defect is
+   confirmed present on the very files in the failing path, the pipeline fix
+   already exists (`bsdos-build.sh`'s `sudo tar`, 2026-07-22) and was simply
+   never re-applied to a fresh image. `WOW_FEATURES.md` §0 rule 7 forbids
+   continuing to hot-patch the live image instead.
+3. Do NOT add more HV-side virtio-blk instrumentation. That avenue produced its
+   answer (`g_ioerrs=0`, 317/317 S_OK) and is now exhausted twice over.
+4. Audit any other host tool that reaches `emmc_bio` via `hv.call` for the same
+   missing-lock bug as §5b — `ufs_clean.py` / `fix_ownership.py` /
+   `fix_pam_ownership.py` are the obvious candidates, and they additionally
+   still carry the stale `SCRATCH_PA = 0x50030000`.
+5. Optional but high-leverage: wire `snap`/`rest` (§5e) to stop paying a full
+   reload per experiment — while remembering it cannot model block-I/O state.
