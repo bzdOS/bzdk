@@ -229,16 +229,82 @@ I-cache flush), `hv.call(fn_pa, ...)` and `hv.write_word_verified()`. Single
 instructions and flags can be changed with no rebuild and no reload; reach for
 that before a reload cycle.
 
+## 6. ROOT CAUSE FOUND AND FIXED: the sync fallback raced CPU2 for the eMMC lock
+
+`vblk_request()`'s synchronous fallback went straight at the controller. But the
+commonest reason that path runs is **"async mailbox busy"** — i.e. CPU2 is
+mid-transfer and holding the eMMC lock. `emmc_lock_acquire_bounded()` then timed
+out and the request completed **S_IOERR**: a hard I/O error handed to the guest
+for a healthy disk. The path was structurally guaranteed to lose, because the
+condition that selects it is the condition that makes the lock unavailable.
+
+The sticky counters from §5a named it on the first try:
+
+```
+g_ioerrs=2, g_ioerr_busy=2 (rc=-200 = VBLK_RC_BUSY)
+FIRST: LBA 513458, served 8192 bytes before failing, head=10, READ, CPU0 (sync)
+LAST:  LBA 279771, served 0 bytes,                   head=3,  READ, CPU0 (sync)
+```
+
+and the guest had printed `hard error cmd=read 513442-513505` /
+`279770-279777` — both HV-recorded LBAs fall **inside** the guest-reported
+ranges. This is what §5a's instrumentation existed for, and it is why the bug
+survived earlier passes: every other completion breadcrumb is overwritten by the
+next request, so one later success erased the evidence.
+
+Fix (`3b56041`): drain the async mailbox via the already-present
+`vblk_async_drain_bounded()` before the sync loop.
+
+### Hardware A/B, same board and image
+
+| | before | after |
+|---|---|---|
+| `g_reads` | 1019 | 3585 |
+| `g_async_fallbacks` | 8 | **88** |
+| `g_ioerrs` / `g_ioerr_busy` | **2 / 2** | **0 / 0** |
+
+The racy path runs 11× more often and fails zero times.
+
+### What it unblocked
+
+Furthest boot ever reached on this board: past `mountroot`, a **complete fsck**
+(SALVAGED — blocks missing in bitmaps, free-block count wrong, summary info bad;
+18389 files, 0.0% fragmentation), `lo0` up, local filesystems mounted, `ldconfig`
+run, into `/etc/rc`.
+
+### New blocker (task #17)
+
+Stops dead right after `/etc/rc: WARNING: $hostname is not set`, console ring
+frozen at 31149 bytes. CPU0's flightrec is **frozen** (no EL2 entries at all)
+while CPU1/CPU2 stay healthy — so the guest is idle in WFI or wedged at EL1, not
+looping. Last FLTR events: repeated guest **stage-2 translation faults**
+(`DFSC=0x06`, level 2) on 4-byte accesses at guest PCs `0xffff00000090c8fc`
+(READ) and `0x90ca5c` (WRITE), interleaved with virtio-blk IRQ 137.
+
+TIMER events also stop, and `triage.py` helpfully points at the vtimer theory —
+**ignore that**, it is the twice-reverted trap (`vtimer-masked-vgic-off-deadlock`).
+The aborts are the lead. The missing datum is the **IPA**: FLTR records ESR and
+ELR but not FAR/HPFAR, so the faulting address is unknown. Surfacing it is the
+next concrete step; `kernel.debug` DWARF already exists to symbolize those PCs.
+
+Cosmetic, not blockers: `swapon: /dev/mmcsd0p4: No such file or directory` (the
+image's fstab uses the bare-metal `mmcsd0pN` names while the guest sees `vtbd0`)
+and the `$hostname` warning.
+
 ## Carry-forward for next session
 
-Items 1-3 of the original list (localize the failing sub-request, instrument
-`vblk_kick()`, re-scope task #15) are **done or moot** — see §5. What remains:
+Items 1-3 of the original list are **done or moot** — see §5 and §6. The EIO
+saga itself is **closed** (§6). What remains:
 
-1. Finish the byte-for-byte `/bin/sh` comparison, board p3 vs
-   `/opt/bzdos/qemu-test/rootfs-ufs2.raw`, now that `emmc_raw.py` is
-   trustworthy (§5b). This is the one measurement that separates "the image on
-   the medium is wrong" from "something above the medium is wrong".
-2. Then task #14 — rebuild a clean rootfs on the dev VM
+1. **Task #17 — the new wedge in `/etc/rc`.** Surface FAR/HPFAR for SYNC
+   flightrec records so the faulting IPA is known, symbolize guest PCs
+   `0x90c8fc` / `0x90ca5c` against `kernel.debug`, and find which unemulated
+   MMIO `/etc/rc` touches. This is now the only thing between the board and a
+   `login:` prompt.
+2. `/bin/sh` and `/libexec/ld-elf.so.1` on the board were **verified
+   byte-identical** to the local image (sha256 over the full files), so the
+   medium is not the problem and that question is settled.
+3. Task #14 — rebuild a clean rootfs on the dev VM
    (`/root/.claude/plans/jolly-honking-snowflake.md`). The uid=1001 defect is
    confirmed present on the very files in the failing path, the pipeline fix
    already exists (`bsdos-build.sh`'s `sudo tar`, 2026-07-22) and was simply
