@@ -1211,6 +1211,26 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		 * way, synchronously, right here — always correct, just not
 		 * accelerated. */
 		g_async_fallbacks++;
+
+		/* ...but do NOT go straight at the controller. The commonest reason
+		 * we are here at all is "mailbox busy", which means CPU2 is mid
+		 * transfer and therefore HOLDING the eMMC lock. Racing it means
+		 * emmc_lock_acquire_bounded() times out and this request completes
+		 * S_IOERR — a hard I/O error handed to the guest for a disk that is
+		 * perfectly healthy. The fallback was structurally guaranteed to
+		 * lose that race: the very condition that sends us down it is the
+		 * condition that makes the lock unavailable.
+		 *
+		 * Confirmed live 2026-07-30 by the sticky counters this file now
+		 * keeps: both recorded failures were rc=VBLK_RC_BUSY on the CPU0
+		 * sync path (bc[43]=2), at LBAs the guest itself reported as
+		 * "vtbd0: hard error cmd=read 513442-513505" and "279770-279777" —
+		 * one after serving 8192 of its bytes, one after serving none.
+		 *
+		 * Wait for CPU2 to finish first (bounded — same cap as the lock
+		 * acquire, and it pets the watchdog). Worst case we waited instead
+		 * of failing; common case the lock is free the moment we ask. */
+		vblk_async_drain_bounded();
 		vblk_bc(26, g_async_fallbacks);
 		for (uint32_t i = 1; i < n - 1; i++) {
 			struct vblk_desc *dd = &chain[i];
