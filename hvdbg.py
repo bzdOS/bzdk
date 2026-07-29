@@ -63,6 +63,13 @@ class HV:
                                   socket.htons(ETYPE))
         self.sock.bind((iface, ETYPE))
         self.src_mac = self.sock.getsockname()[4]
+        self.iface = iface
+        self._dbgraw_sock = None  # lazy: separate AF_PACKET socket for
+                                   # DBGRAW_ETHERTYPE (see dbgtools_peek()) --
+                                   # self.sock is bound to ETYPE at the kernel
+                                   # level (socket.htons(ETYPE) at creation),
+                                   # so it NEVER receives frames of any other
+                                   # ethertype no matter what's on the wire.
         self.timeout = timeout
         self._auth_key = bytes.fromhex(key) if key else None
         # Any strictly-increasing start point works (the board's own replay
@@ -127,8 +134,51 @@ class HV:
         self._send("t")
         return bool(self._drain(timeout).strip())
 
+    # dbgmon's `r` reply is drained as a stream of EMAC frames; measured
+    # live 2026-07-29 on this board: n=4, n=256 and n=512 all complete in
+    # ~0.062-0.066s (the per-command round trip dominates completely, the
+    # payload is free), but n=1024 falls off a cliff to ~22s -- past this
+    # width the reply no longer arrives as one prompt-terminated burst and
+    # _drain() sits out its whole timeout. So batch AT this width, never
+    # past it: read_words() chunks internally, callers can ask for any n.
+    MAX_WORDS_PER_CMD = 512
+
+    def rtt(self, refresh=False):
+        """Measured round-trip time of one trivial dbgmon command, cached.
+
+        Everything else here derives its waits from this instead of from a
+        hardcoded constant: this channel's RTT spans two orders of
+        magnitude depending on board state (~0.06s healthy; ~1.07s per
+        command once MUSB's D+/D- pull-up has been dropped, see project
+        memory reboot-clean-usb-pullup-drop-slows-cpu1), and a fixed
+        `settle` tuned for the slow case wastes 5x the entire exchange in
+        the fast one."""
+        if refresh or getattr(self, "_rtt", None) is None:
+            t0 = time.time()
+            self.cmd("r 0x50000c00 1", 2)
+            self._rtt = max(0.01, time.time() - t0)
+        return self._rtt
+
+    def auto_settle(self):
+        """Inter-retry pause for the *_stable/_verified helpers: one RTT.
+
+        A retry only helps once the board has had time to answer the
+        previous command, and by construction that takes exactly one RTT --
+        there is no separate settling process on the board to wait for. The
+        old hardcoded 0.1-0.2s was ~3x the whole round trip on a healthy
+        channel (measured: read_words_stable(128) 0.32s at settle=0.2 vs
+        0.13s at settle=0), and simultaneously too SHORT to help on a
+        pull-up-degraded one."""
+        return self.rtt()
+
     def read_words(self, pa, n):
         """Read n 32-bit words from physical address pa. Returns list of ints.
+
+        Chunked at MAX_WORDS_PER_CMD (see above) so a caller asking for a
+        wide span gets many fast commands instead of one that stalls; a
+        chunk that comes back incomplete fails the whole read (callers
+        already retry, and a partial result would be indistinguishable
+        from real data).
 
         VALIDATES the echoed address of every reply line against the
         requested range. Without this, a LATE reply from a previous command
@@ -140,6 +190,16 @@ class HV:
         placed by their echoed address, so replies can arrive out of order
         and the result is still positionally correct (holes = read failed,
         caller retries)."""
+        if n > self.MAX_WORDS_PER_CMD:
+            out = []
+            for off in range(0, n, self.MAX_WORDS_PER_CMD):
+                part = self.read_words(pa + 4 * off,
+                                       min(self.MAX_WORDS_PER_CMD, n - off))
+                if not part:
+                    return []        # any bad chunk fails the whole read
+                out += part
+            return out
+        WORDS_PER_LINE = 4   # dbgmon.c cmd_read_words()'s own line width
         r = self.cmd(f"r 0x{pa:x} {n}", max(2, n // 50 + 2))
         slots = [None] * n
         for line in r.split("\n"):
@@ -151,14 +211,32 @@ class HV:
                 continue
             if addr < pa or addr >= pa + 4 * n or (addr - pa) % 4:
                 continue                      # stale stray from a prior cmd
-            i = (addr - pa) // 4
+            i0 = (addr - pa) // 4
+            expected = min(WORDS_PER_LINE, n - i0)
+            # This project's console/reply transport has a documented
+            # byte-drop characteristic (see project memory) that can eat
+            # one character out of an 8-hex-digit token mid-line. The old
+            # parser here silently skipped any non-8-char token WITHOUT
+            # advancing its slot index, which SHIFTS every later word on
+            # that line into the wrong slot instead of just losing one --
+            # confirmed live 2026-07-28: a 128-word bulk read disagreed
+            # with 128 individual single-word reads at exactly one shifted
+            # slot. Parse this line into a scratch list first; only commit
+            # it if it produced EXACTLY the expected word count -- a short
+            # line (a real drop) is discarded entirely (leaves those slots
+            # None) rather than silently misaligning everything after it.
+            words = []
             for p in rest.split():
                 p = p.strip()
-                if len(p) == 8 and i < n:
+                if len(p) == 8:
                     try:
-                        slots[i] = int(p, 16); i += 1
+                        words.append(int(p, 16))
                     except ValueError:
                         pass
+            if len(words) != expected:
+                continue                      # corrupted line -- drop it, let caller retry
+            for k, w in enumerate(words):
+                slots[i0 + k] = w
         if any(s is None for s in slots):
             return [s for s in slots if s is not None][:0]  # incomplete -> []
         return slots
@@ -187,6 +265,81 @@ class HV:
     def write_word(self, pa, val):
         """Write a 32-bit word to physical memory."""
         return self.cmd(f"w 0x{pa:x} 0x{val:x}", 1)
+
+    def read_words_stable(self, pa, n, tries=8, settle=None):
+        """Like read_words(), but for STATIC memory (a disk block staged in
+        scratch RAM, a value nothing else is touching) where the caller
+        wants confidence the transport didn't hand back a subtly-wrong-but-
+        well-formed reply. Confirmed live 2026-07-28: even past
+        read_words()'s own per-line word-count validation, a single hex
+        digit inside an otherwise well-formed 8-char token can still come
+        back wrong (two back-to-back reads of unchanged memory disagreeing
+        at one word, same shape, different value -- nothing structurally
+        invalid to catch). Retries until two CONSECUTIVE reads agree
+        exactly, on the theory that the same transport glitch is unlikely
+        to reproduce identically twice in a row.
+
+        Do NOT use this for live-changing data (breadcrumb counters,
+        heartbeats, anything another core is actively updating) -- it will
+        never see two consecutive reads agree and will just burn through
+        `tries` and return [] every time. Use plain read_words() for that;
+        this method is specifically for the "this shouldn't be changing"
+        case, same channel-independent guarantee either way (works
+        identically whether the underlying debug link is EMAC or, on a
+        board built with a different transport, anything else — the
+        agreement check only depends on parsed reply content, not on how
+        the bytes got here).
+
+        `settle=None` (the default) derives the inter-retry pause from the
+        measured channel RTT -- see auto_settle(). Pass an explicit value
+        only to override that deliberately."""
+        if settle is None:
+            settle = self.auto_settle()
+        # Stabilize PER COMMAND-SIZED CHUNK, not across the whole span.
+        # read_words() happily chunks a wide read, but comparing the joined
+        # result end-to-end makes the agreement test scale badly: one bad
+        # hex digit anywhere fails the comparison for every chunk at once,
+        # so the chance of any single attempt succeeding falls off with
+        # width. Measured live 2026-07-29: n=512 stabilizes in 0.19s, while
+        # n=1024 compared as one span burned all 8 tries and returned
+        # nothing (12.3s). Per-chunk, cost is linear in width and a glitch
+        # only re-reads its own 2 KiB.
+        if n > self.MAX_WORDS_PER_CMD:
+            out = []
+            for off in range(0, n, self.MAX_WORDS_PER_CMD):
+                part = self.read_words_stable(
+                    pa + 4 * off, min(self.MAX_WORDS_PER_CMD, n - off),
+                    tries=tries, settle=settle)
+                if not part:
+                    return []
+                out += part
+            return out
+        prev = None
+        for _ in range(tries):
+            cur = self.read_words(pa, n)
+            if cur and cur == prev:
+                return cur
+            prev = cur
+            time.sleep(settle)
+        return []
+
+    def write_word_verified(self, pa, val, tries=6, settle=None):
+        """write_word() plus confirmation via a stable read. Prefer this
+        over bare write_word() whenever the caller actually depends on the
+        value landing (staging a buffer before a hardware operation reads
+        it, etc.) rather than firing-and-forgetting a register poke.
+
+        `settle=None` derives the pause from the measured RTT, as in
+        read_words_stable()."""
+        if settle is None:
+            settle = self.auto_settle()
+        for _ in range(tries):
+            self.write_word(pa, val)
+            back = self.read_words_stable(pa, 1, tries=2, settle=settle)
+            if back and back[0] == val:
+                return True
+            time.sleep(settle)
+        return False
 
     def patch(self, pa, insn_word):
         """Hot-patch an instruction (write + I-cache flush)."""
@@ -220,7 +373,7 @@ class HV:
             pass
         return None
 
-    def wdt_reset(self):
+    def wdt_reset(self, prefer_fast=False):
         """Force a CLEAN board reset via the A64 watchdog.
 
         CRITICAL: the reset MUST first drop the MUSB D+/D- pull-up so the host
@@ -228,24 +381,67 @@ class HV:
         pull-up stays asserted through the reset window, U-Boot's musb re-inits
         against a host that still thinks a device is attached, and the console
         gadget wedges (host 'device not accepting address, error -71') with NO
-        remote recovery path left (bit us twice on 2026-07-19).
+        remote recovery path left (bit us twice on 2026-07-19, see project
+        memory wdt-reset-needs-usb-disconnect.md). Both paths below honor
+        this — only the MECHANISM differs.
 
-        ROBUST path: call the hypervisor's own reboot_clean() — it does the
-        disconnect + WDOG arm + spin atomically on the board, with ZERO
-        dependence on flaky EMAC reads. hv.call() will time out (reboot_clean
-        never returns — the WDOG resets the SoC), which is expected/fine.
+        DEFAULT path (address-INDEPENDENT, always tried unless prefer_fast):
+        poke the MMIO directly (MUSB pull-up drop, then the WDOG arm
+        sequence), retrying the ISCR/POWER reads until they succeed so the
+        disconnect is NEVER skipped (the old bug: a failed read skipped the
+        disconnect -> wedge). This works regardless of which build is
+        actually running on the board right now.
 
-        FALLBACK (reboot_clean addr unknown): poke the MMIO directly, but RETRY
-        the ISCR/POWER reads until they succeed so the disconnect is NEVER
-        skipped (the old bug: a failed read skipped the disconnect -> wedge)."""
-        addr = self._reboot_clean_addr()
-        if addr is not None:
-            try:
-                self.call(addr)          # atomic clean reset on-board; won't return
-            except Exception:
-                pass
-            return
-        # ---- fallback: MMIO with retried reads (never skip the disconnect) ----
+        OPTIONAL fast path (prefer_fast=True): resolve reboot_clean()'s
+        address from the microkernel-dbg.elf CURRENTLY ON DISK (via `nm`) and
+        call it directly — the hypervisor does disconnect + WDOG arm + spin
+        atomically on-board, with zero dependence on flaky EMAC reads.
+        hv.call() will time out (reboot_clean never returns — the WDOG resets
+        the SoC), which is expected/fine.
+
+        WHY THE DEFAULT CHANGED (2026-07-26): the fast path silently
+        does-nothing whenever the ELF on disk was rebuilt more recently than
+        the board's last cycle — nm resolves an address for a DIFFERENT
+        binary than the one actually running, hv.call() jumps to garbage in
+        the running image, and nothing indicates failure (no exception, no
+        reset). This cost significant live-debugging time chasing a
+        "wdt_reset did nothing" mystery this session. The MMIO fallback has
+        no such build-vs-running-binary skew — it addresses fixed hardware
+        registers, so it's now the default; the symbol-resolved call is only
+        used when the caller explicitly opts in via prefer_fast=True (e.g.
+        interactive use where the caller knows the board is already running
+        exactly what's on disk).
+
+        BUILD-ID GUARD (2026-07-26, dbgtools.h): even with prefer_fast=True,
+        this now checks check_build_id() first. On a confirmed MISMATCH
+        (both sides read successfully and differ) it logs a warning and
+        falls through to the address-independent MMIO path below instead of
+        trusting the nm-resolved address -- this is the exact failure mode
+        that motivated making the MMIO path the default in the first place,
+        now caught explicitly instead of silently doing nothing. An
+        inconclusive check (either side unreadable) does NOT block the fast
+        path -- it proceeds exactly as before, since "can't prove they
+        differ" isn't the same as "known safe" but the fast path was already
+        opt-in for callers who accept that risk."""
+        if prefer_fast:
+            match, expected, actual = self.check_build_id()
+            if match is False:
+                print(f"wdt_reset: build-id MISMATCH (expected {expected!r} "
+                      f"from this checkout, board reports {actual!r}) -- "
+                      f"nm-resolved reboot_clean() address would be for the "
+                      f"WRONG binary; skipping the fast path, using the "
+                      f"address-independent MMIO fallback instead",
+                      file=sys.stderr)
+            else:
+                addr = self._reboot_clean_addr()
+                if addr is not None:
+                    try:
+                        self.call(addr)          # atomic clean reset on-board; won't return
+                    except Exception:
+                        pass
+                    return
+                # fall through to the MMIO path below if the symbol wasn't found
+        # ---- default: MMIO with retried reads (never skip the disconnect) ----
         MUSB = B.MUSB_BASE
         def _read1(pa):
             for _ in range(20):
@@ -263,6 +459,206 @@ class HV:
             self.write_word(MUSB + 0x40, poww & ~0x40)      # clear SOFTCONN (bit6)
         for pa, val in B.WDOG_ARM_SEQUENCE:
             self.write_word(pa, val)
+
+    # ── dbgtools: CPU1 heartbeat / build-id / entry-hold (2026-07-26) ───
+    # See dbgtools.h/hv_addrmap.h (HVMAP_DBGTOOLS_*) for the firmware side.
+    DBGRAW_ETHERTYPE = 0x88B7
+    DBGRAW_MAGIC     = b"DBGT"
+    DBGRAW_REPLY_LEN = 4 + 4 + 4 + 4 + 32   # magic, heartbeat, hold, release, build_id
+
+    def dbgtools_peek(self, tries=3, wait=0.3):
+        """RAW, protocol-independent read of {heartbeat, hold, release,
+        build_id}. Serviced directly inside the board's emac_poll() RX demux
+        (ETHERTYPE_DBGRAW, see emac.c/dbgtools.c) -- NEITHER dbgmon_service()
+        NOR gdbstub_poll()'s command dispatch is involved, so this keeps
+        answering even while CPU1 is deep inside gdbstub's command_loop()
+        servicing an active RSP session (command_loop still calls
+        gdb_getc()->emac_poll() every iteration to receive further packets).
+
+        HONEST LIMITATION: this is NOT lower than software polling -- there
+        is no interrupt-driven RX in this design. If CPU1 has stopped
+        calling emac_poll() at all (a genuine crash / hard hang, as opposed
+        to "busy answering a different protocol"), this gets no reply
+        either, same as everything else. That IS still useful information:
+          - reply arrives, heartbeat climbing on repeated calls -> CPU1 is
+            fully healthy; whatever seems "unresponsive" is a higher-level
+            RSP/dbgmon state issue, not CPU1 itself.
+          - reply arrives, heartbeat FROZEN across repeated calls -> CPU1 is
+            stuck inside one iteration (e.g. gdbstub's command_loop()) but
+            still pumping emac_poll() -- busy, not dead.
+          - no reply after `tries` attempts -> CPU1 has genuinely stopped
+            calling emac_poll() -- the one case this cannot see through.
+
+        Returns {} if no reply arrived in `tries` attempts, else a dict with
+        heartbeat/hold/release (ints) and build_id (str)."""
+        # self.sock is bound to socket.htons(ETYPE) (the console ethertype)
+        # AT THE KERNEL LEVEL (AF_PACKET protocol arg + bind()) -- it will
+        # NEVER receive a DBGRAW_ETHERTYPE reply no matter what dbgtools.c
+        # actually sends (confirmed live: tcpdump saw the board's DBGRAW
+        # reply on the wire, heartbeat climbing between frames, but
+        # self.sock.recv() never delivered it -- a kernel-level protocol
+        # filter, not a parsing bug). Needs its OWN raw socket.
+        if self._dbgraw_sock is None:
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                               socket.htons(self.DBGRAW_ETHERTYPE))
+            s.bind((self.iface, self.DBGRAW_ETHERTYPE))
+            self._dbgraw_sock = s
+        sock = self._dbgraw_sock
+        frame = (BCAST + self.src_mac +
+                 struct.pack("!H", self.DBGRAW_ETHERTYPE) +
+                 b"\x00" * 46)
+        for _ in range(tries):
+            sock.settimeout(0.02)
+            try:
+                while True:
+                    sock.recv(2048)
+            except (socket.timeout, OSError):
+                pass
+            sock.send(frame)
+            sock.settimeout(wait)
+            t0 = time.time()
+            while time.time() - t0 < wait:
+                try:
+                    f = sock.recv(2048)
+                except (socket.timeout, OSError):
+                    break
+                if len(f) < 14 + self.DBGRAW_REPLY_LEN:
+                    continue
+                if struct.unpack("!H", f[12:14])[0] != self.DBGRAW_ETHERTYPE:
+                    continue
+                if f[6:12] != BOARD_MAC:
+                    continue
+                pl = f[14:14 + self.DBGRAW_REPLY_LEN]
+                if pl[0:4] != self.DBGRAW_MAGIC:
+                    continue
+                hb, hold, rel = struct.unpack("<III", pl[4:16])
+                build_id = pl[16:48].split(b"\x00", 1)[0].decode(
+                    "latin1", "replace")
+                return dict(heartbeat=hb, hold=hold, release=rel,
+                            build_id=build_id)
+        return {}
+
+    def heartbeat(self, tries=3, wait=0.3):
+        """Convenience wrapper: just the CPU1 debug-loop heartbeat counter,
+        or None if unreachable (see dbgtools_peek()'s doc for what that
+        does/doesn't tell you). Call twice a beat apart and compare: if it
+        climbed, CPU1 is genuinely spinning; if it's the identical nonzero
+        number both times, CPU1 is alive-but-stuck in one iteration."""
+        r = self.dbgtools_peek(tries=tries, wait=wait)
+        return r.get('heartbeat') if r else None
+
+    def _build_id_from_elf(self, elf="microkernel-dbg.elf"):
+        """Read the build-id string actually COMPILED INTO the ELF on disk, by
+        locating dbgtools.c's g_build_id_str and mapping its vaddr to a file
+        offset through the section table.
+
+        This, not git, is the right source of truth: callers use this check to
+        decide whether symbol addresses resolved from THIS ELF describe the
+        running image, and those addresses come from the ELF's own contents.
+        Deriving the expectation from `git rev-parse HEAD` instead (what this
+        did until 2026-07-30) reports a bogus skew after ANY commit that did
+        not rebuild the ELF -- including a commit touching only host-side
+        Python, which cannot affect the hypervisor binary at all. That
+        false positive blocked emmc_raw.py mid-investigation.
+
+        Returns None if anything is unavailable, meaning "can't compare".
+        """
+        d = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(d, elf)
+        if not os.path.exists(path):
+            return None
+        try:
+            nm = subprocess.check_output(
+                ["aarch64-linux-gnu-nm", path],
+                stderr=subprocess.DEVNULL).decode(errors="replace")
+            addr = None
+            for line in nm.splitlines():
+                p = line.split()
+                if len(p) == 3 and p[2] == "g_build_id_str":
+                    addr = int(p[0], 16)
+                    break
+            if addr is None:
+                return None
+            secs = subprocess.check_output(
+                ["aarch64-linux-gnu-readelf", "-S", "-W", path],
+                stderr=subprocess.DEVNULL).decode(errors="replace")
+            for line in secs.splitlines():
+                # "  [ 2] .rodata  PROGBITS  <vaddr> <off> <size> ..."
+                m = re.search(r"\]\s+(\S+)\s+(\S+)\s+([0-9a-f]+)\s+"
+                              r"([0-9a-f]+)\s+([0-9a-f]+)", line)
+                if not m or m.group(2) == "NOBITS":
+                    continue
+                sa, so, sz = (int(m.group(3), 16), int(m.group(4), 16),
+                              int(m.group(5), 16))
+                if sz and sa <= addr < sa + sz:
+                    with open(path, "rb") as fh:
+                        fh.seek(addr - sa + so)
+                        raw = fh.read(32)
+                    return raw.split(b"\x00", 1)[0].decode("latin1")
+        except Exception:
+            return None
+        return None
+
+    def _expected_build_id(self):
+        """The build-id the ELF on disk carries, falling back to recomputing it
+        the way the Makefile would (`git rev-parse --short=12 HEAD` plus '+'
+        when the tree is dirty) only when the ELF cannot be read -- e.g. a
+        checkout with no build in it yet. None means "can't compare, don't
+        block on it"; the Makefile's date-stamp fallback is not reproducible
+        after the fact and is not attempted."""
+        from_elf = self._build_id_from_elf()
+        if from_elf:
+            return from_elf
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        try:
+            rev = subprocess.check_output(
+                ["git", "rev-parse", "--short=12", "HEAD"],
+                cwd=cwd, stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            return None
+        dirty = subprocess.call(
+            ["git", "diff", "--quiet"], cwd=cwd,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0
+        return rev + ("+" if dirty else "")
+
+    def check_build_id(self):
+        """Compare the LIVE board's build-id (read via the normal dbgmon `r`
+        command -- this check assumes dbgmon is at least somewhat responsive,
+        unlike dbgtools_peek() above which assumes nothing) against what this
+        checkout's git state would have produced. Returns
+        (match: bool or None, expected, actual) -- match is None if either
+        side was unreadable (can't compare, caller should not treat that as
+        a mismatch)."""
+        expected = self._expected_build_id()
+        w = self.read_bytes(0x50021010, 32)   # HVMAP_DBGTOOLS_BUILDID
+        actual = w.split(b"\x00", 1)[0].decode("latin1", "replace") if w else None
+        if expected is None or not actual:
+            return (None, expected, actual)
+        return (expected == actual, expected, actual)
+
+    def hold_guest_before_entry(self):
+        """Arm the pause-before-guest-entry gate (main_dbg.c/main_gdb.c,
+        checked immediately before kload_enter()) via dbgmon's `hold` verb.
+
+        IMPORTANT, NOT SYMMETRIC WITH A COLD LOAD: this word lives in the
+        hv-scratch DRAM window, which a WARM reset (wdt_reset()) preserves
+        but a fresh COLD TFTP load does NOT reliably start from zero either
+        way -- dbgtools_init() (dbgtools.c) explicitly forces it OFF on
+        every cold boot precisely so a stray bit pattern can never wedge a
+        normal chimpd cycle. That means calling this method only ever takes
+        effect on the NEXT WARM reset (self.wdt_reset()) -- it does NOT
+        arm anything for a fresh cold TFTP reload (e.g. reliable_load.py /
+        chimpd's normal cycle), because nothing runs early enough in a cold
+        boot to have read this word before dbgtools_init() clears it. Call
+        this, THEN self.wdt_reset(), in that order, on an ALREADY-RUNNING
+        board -- never expect it to survive a full power-cycle or a fresh
+        TFTP flash."""
+        return self.cmd("hold", 2)
+
+    def release_guest_entry(self):
+        """Release a currently-held boot (see hold_guest_before_entry()).
+        No-op if nothing is currently held."""
+        return self.cmd("release", 2)
 
     # ── breadcrumb shortcuts ───────────────────────────────────────────
     def gict(self):
