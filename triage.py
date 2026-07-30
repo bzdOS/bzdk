@@ -71,6 +71,10 @@ VBK_LABELS = {
     48: "g_ioerr_notready",
     49: "ioerr1_lba", 50: "ioerr1_rc", 51: "ioerr1_bytes", 52: "ioerr1_tag",
     53: "ioerrN_lba", 54: "ioerrN_rc", 55: "ioerrN_bytes", 56: "ioerrN_tag",
+    # Transient write-stall retries. Non-zero retries WITH rescues tracking
+    # them is the card stalling and recovering; retries climbing while rescues
+    # stay flat means the failure is not transient after all.
+    57: "write_retries", 58: "write_retry_ok",
 }
 
 # bc[42..56] decode. Read as signed: serve_data's codes are negative.
