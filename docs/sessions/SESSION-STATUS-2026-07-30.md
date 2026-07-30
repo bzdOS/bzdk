@@ -369,24 +369,157 @@ task #14. A stuck eMMC controller lock (`0x50020100` = 1) was also found and
 cleared — left held it would fail every guest read with S_IOERR, i.e. reproduce
 §6's bug.
 
+## 8. Guest networking: ssh works, and the cause was ours
+
+`ssh -i /root/.ssh/chimp_ed25519 root@192.168.88.82` → `bsdos-chimp`,
+`15.1-RC3 arm64`, `uid=0(root)`. DHCP from the LAN, `sshd_enable=YES` and
+`ifconfig_vtnet0=DHCP` persisted in the guest's `/etc/rc.conf`.
+
+Earlier sessions concluded "sshd runs, the TCP handshake is provably correct via
+tcpdump, the final connect is blocked by a host-specific issue" and stopped.
+That was wrong. `vnet_emac.c`'s TX path called `emac_send_frame()`, which builds
+its own Ethernet header with **dst=broadcast** and discards the destination the
+guest put in the frame — a limitation the file documented and judged "not
+necessarily fatal".
+
+It is fatal for TCP. ARP survives it, because a peer learns the sender's hardware
+address from the ARP payload's sender-HA field rather than the frame header —
+which is exactly why **ping worked and misled everyone**. Linux, however, drops a
+unicast-IP packet delivered to the broadcast MAC, so the guest's SYN-ACK showed
+up in tcpdump with correct sequence numbers and `cksum (correct)`, the host's
+stack ignored it, and the host retransmitted SYN until timeout with `ip neigh`
+stuck in `FAILED`.
+
+One-shot diagnostic: `tcpdump -i br0 -n -e 'src <guest>'` and look at the
+**Ethernet** destination. `> Broadcast` is the bug.
+
+Fixed in `f91aeff`: `tx_frame_raw()` already accepted a destination MAC, so it
+needed only a thin `emac_send_frame_to()` plus the first 6 bytes of the guest's
+own header. `emac_send_frame()` is byte-identical on purpose — the debug console
+is built on it and is the only way back into the board.
+
+Also fixed in place on the live guest (`board is now the build host`, so ordinary
+shell commands, not offline UFS surgery): `/etc/rc.conf` was **missing** (hence
+`$hostname is not set` and the "Amnesiac" hostname) and `/etc/fstab` named
+`mmcsd0pN` while the guest sees `vtbd0` (hence `swapon: /dev/mmcsd0p4: No such
+file or directory`). Both verified by reboot. Deliberately no `ifconfig_awg0`:
+`awg0` is the EMAC the HV owns, and a boot-time network wait is exactly the kind
+of thing that hangs a boot forever.
+
+**uid=1001 is NOT on the board** — `find / -uid 1001 | wc -l` = 0. Only the
+reference image still carries it, and nothing boots from that. Do not "fix" it.
+
+## 9. The soak: what single-boot verification missed
+
+§7 closed the timebase blocker on ONE successful boot. A soak put that at about
+**1 in 5**. Everything below came from running it, and it is the main lesson of
+the day: for intermittent bugs — one lost timer injection in 8047, one stalled
+write in 158 — a single green boot proves almost nothing.
+
+Harness work, all in the existing `soak.py` rather than a parallel tool:
+
+- `--clean-shutdown` (`930999d`): `shutdown -p now` over ssh before each reload,
+  so `el2_exc.c`'s already-default `dbg_clean_off` path runs and the next boot
+  starts on a clean fs instead of one `fsck` has to repair.
+- `--boot-to-shell` was never passed to `reliable_load.py` (`9230f2c`), so the
+  guest sat at `mountroot>` every cycle. **The harness had only ever measured
+  "does the hypervisor load", never "does the guest boot"** — fair enough while
+  the guest could not reach multiuser at all, but no longer.
+- Per-cycle counter capture (`a3c1df5`, `77bbc07`): `vblk_init()` wipes the VBK1
+  window every boot, so a failed cycle's evidence was gone before it could be
+  read. Without this the soak produced tallies and no diagnosis.
+
+### What it then found, with numbers
+
+| finding | evidence |
+|---|---|
+| eMMC lock starvation killed 4 of 5 boots | `ioerr_busy=1`, rc=-200 at LBA 279392, card clean |
+| lock fix works | `lock_retries` 3/0/2/0 with `lock_giveups=0`, `ioerr_busy=0` in every cycle |
+| write retry works | `write_retry_ok=20` in one cycle |
+| retry budget was too small | one cycle burned all 3 with `write_retry_ok=0` → raised to 8 (`ae79193`) |
+| `reboot_clean()` is reliable | 22+ cycles, 0 break-glass — this morning's failure was a one-off, not the norm memory feared |
+
+`VBLK_EMMC_LOCK_TIMEOUT_MS` is already 6000, so a timeout there is not ordinary
+contention: the lock is a plain test-and-set with no queue and both callers
+acquire/release **per sector**, so under sustained two-core load the loser starves
+for seconds. Waiting it out is correct; failing is not (`f523808`).
+
+### bc[54] — a value that looked like a pointer and wasn't
+
+`bc[54]` kept reporting `0x40000104`, which is a plausible guest DRAM address
+(guest DRAM starts at `0x40000000`). I wrote it off as a corrupted channel read,
+then suspected a pointer leaking into the rc slot. Both wrong. `emmc_bio_write()`
+encodes the controller's RINT register into its result:
+
+```
+0x4000_0000 | (RINT & 0x3fff)   DATA_CRC (bit7) / DATA_TIMEOUT (bit8)
+0x2000_0000 | (RINT & 0x3fff)   data phase timed out with neither
+```
+
+Both **positive**, so they matched neither `VBLK_RC_*` nor `emmc_bio`'s -1..-9 —
+and the retry loop skipped them entirely (`23e0b7e`). Consequence for reading the
+counters: `g_ioerr_emmc` lumps these in, which is fair but loses the detail. The
+rc field holds the RINT; read it rather than trusting the label.
+
+Retracted along the way: the "cluster of failing LBAs in p3's metadata"
+(278882/278900/278919/278938) was a property of those boots, not systemic — a
+later run failed at 2013805/2013806/2013853/922338 instead.
+
+## 10. Partial-sector stitch: test first, then the board
+
+`serve_data()`'s unaligned branch returned `VBLK_RC_UNALIGNED` on the assumption,
+stated in its own comment, that FreeBSD only hands over whole-sector segments.
+The soak disproved it: rc=-100 at LBA 922338, `ioerr_unaligned=1`.
+
+This is the one path in the file that can corrupt the guest filesystem
+**silently** — a wrong offset writes real data to the wrong place and `fsck`
+cannot tell. So the arithmetic was proven on the host first
+(`test_vblk_stitch.c`, `a256b44`, 22 assertions, wired into `make test`), and
+only then transcribed into `vblk_emmc.c` (`936b154`). The test covers the carry
+across descriptors, the unaligned tail, that a partial write read-modify-writes
+so bytes outside its window survive, that a full-sector write does NOT pay for
+that read, and that device errors propagate rather than becoming short transfers.
+Keep the two in step: change the test first.
+
+**Not hardware-verified yet.** Acceptance criterion is `ioerr_unaligned` (bc[45])
+staying at 0 across a soak; it reached 1 within 6 cycles before the fix.
+
 ## Carry-forward for next session
 
-The EIO saga (§6) and the timebase wedge (§7) are both **closed**, and the guest
-now reaches an interactive root shell. What remains:
+The EIO saga (§6), the timebase wedge (§7) and guest networking (§8) are closed;
+the rootfs defects were fixed in place (§8) so the clean-rootfs rebuild is no
+longer needed at all — the board is its own build host. What remains, in order:
 
-1. **Task #14 — rebuild a clean rootfs.** Now the top item, and the evidence for
-   it is concrete: `/etc/rc.conf` is missing on the board, `/bin/sh`
-   `/lib/libedit.so.8` `/etc/rc` carry the uid=1001 defect, fstab uses
-   bare-metal `mmcsd0pN` names, and this boot's `fsck` had to SALVAGE three
-   different classes of metadata damage.
-2. Consider whether `VGIC_CNTV_HW=1` is the better long-term answer than §7's
-   watchdog-based recovery — it removes the software mask, and with it the
-   failure mode, entirely. Also still uninvestigated: whether `vgic.c`'s
-   pending-injection queue held the lost tick.
-3. `/bin/sh` and `/libexec/ld-elf.so.1` on the board were **verified
-   byte-identical** to the local image (sha256 over the full files), so the
+1. **Read the soak that was running when this was written.** It is the
+   acceptance test for the last two changes: `ioerr_unaligned` (bc[45]) must
+   stay 0 (the stitch, §10) and `RINT=0x114` failures should stop (retry budget
+   8, `ae79193`). Neither is hardware-verified. `soak-report.json` holds the
+   per-cycle records; read the counters off a FAILING cycle, that is the whole
+   point of `a3c1df5`.
+2. **Strip the `BZDOS-RACE` printfs** from the guest kernel
+   (`/opt/bzdos/freebsd-src-earlyboot-wt`, `vfs_mountroot.c` / `g_part.c` /
+   `geom_subr.c`). They are marked TEMPORARY and dated 2026-07-27, they have
+   served their purpose, and they now make up most of the boot log — they flood
+   the console this session repeatedly struggled to parse, and slow the boot.
+   Deliberately NOT done here: it needs a full guest-kernel cross-build and
+   redeploy, and the running kernel is the only working one. Not worth risking
+   at the end of a session with no budget left to recover.
+3. Known interaction, documented in `vblk_emmc.c` but not restructured: the
+   write-stall retries hold the eMMC lock, so a stalling write can hold it ~16 s
+   and starve everyone else. Survivable only because the acquire side is now
+   patient. Worth fixing if `write_retries` (bc[57]) ever leaves 0 in a real
+   workload — it already has (11 in one cycle), so this is now live, not
+   hypothetical.
+4. `VGIC_CNTV_HW=1` remains the cleaner long-term answer to §7 than the
+   watchdog-based recovery — it removes the software mask and the whole failure
+   mode. Deferred because the current fix works and the vGIC has two reverts
+   behind it. Also still uninvestigated: whether `vgic.c`'s pending-injection
+   queue held the lost tick.
+5. `/bin/sh` and `/libexec/ld-elf.so.1` on the board were **verified
+   byte-identical** to the reference image (sha256 over the full files), so the
    medium is not the problem and that question is settled.
-4. Task #14 detail — rebuild a clean rootfs on the dev VM
+6. `soak.py`'s health check reports `no BMC1 record` as an anomaly every cycle;
+   this build has no software BMC, so it is pure noise. Gate it on BMC presence.
    (`the plan file`). The uid=1001 defect is
    confirmed present on the very files in the failing path, the pipeline fix
    already exists (`bsdos-build.sh`'s `sudo tar`, 2026-07-22) and was simply

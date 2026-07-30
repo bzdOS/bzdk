@@ -1,5 +1,26 @@
 # bzdOS microkernel — progress checkpoint (internal task, Chimp / BPI-M64 / A64)
 
+**MILESTONE 2026-07-30 — the FreeBSD guest boots to an interactive root shell on
+real hardware, and is reachable over ssh** (`root@192.168.88.82`). Four
+hypervisor bugs fixed to get there: the sync fallback racing CPU2 for the eMMC
+lock (`3b56041`), `emmc_bio` not settling the controller on failure paths
+(`e6f1e4e`), a self-latching CNTV mask that killed the guest's timebase on one
+lost injection (`dfc6eda`), and virtio-net TX broadcasting every frame instead of
+using the guest's destination MAC (`f91aeff`). A soak then showed that boot was
+about 1-in-5 reproducible and drove four more fixes; see
+`docs/sessions/SESSION-STATUS-2026-07-30.md` §7-§10 for the numbers, and note
+that the last two (partial-sector stitch, retry budget 8) are **not yet
+hardware-verified**.
+
+**Earlier the same day**: vtimer
+"permanently lost" theory retracted (banked-register misread; watchdog fired
+0 times), `mountroot>` cracked (guest already has BZDOS-RACE retry
+instrumentation, a bare CR unsticks it — matches `auto_mount_root()`), and a
+NEW real bug found past it: single-user `/bin/sh` dies on a genuine GEOM EIO
+(`g_vfs_done():vtbd0p3[RAD(offset=801767424,length=163840)]error=5`) —
+partition bounds and physical media both ruled out live, points to the same
+vblk-lost-kick bug class recurring at a new LBA.
+
 Snapshot of a long multi-track session. Board = Banana Pi M64 (Allwinner A64, 4× Cortex-A53).
 Hypervisor runs at non-secure EL2; boots FreeBSD arm64 as an EL1 guest under stage-2.
 
