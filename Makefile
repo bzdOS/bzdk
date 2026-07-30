@@ -12,11 +12,28 @@ CC      := $(CROSS)gcc
 OBJCOPY := $(CROSS)objcopy
 SIZE    := $(CROSS)size
 
+# Build identifier (dbgtools.c / hv_addrmap.h HVMAP_DBGTOOLS_BUILDID, added
+# 2026-07-26): a git commit hash if this checkout is a git repo, plus a
+# trailing '+' if the tree is dirty (uncommitted changes on top of that
+# commit) -- falls back to a UTC date-time stamp if `git` isn't available or
+# this isn't a git checkout, so the build never fails for lack of it. Written
+# once at HV startup to a fixed DRAM address; host tooling (hvdbg.py) runs
+# the SAME `git rev-parse` from the SAME directory to compute the expected
+# value and compares before trusting any nm-resolved symbol address against
+# the live board -- see dbgtools.h's header comment for the bug this fixes
+# (an `nm`-resolved reboot_clean() address silently misfired against an
+# OLDER build still running on the board).
+BUILD_ID := $(strip $(shell git rev-parse --short=12 HEAD 2>/dev/null)$(shell git diff --quiet 2>/dev/null || echo +))
+ifeq ($(BUILD_ID),)
+BUILD_ID := $(shell date -u +%Y%m%d%H%M%S)
+endif
+
 # Flags per PROJECT.md "Сборка": freestanding, no libc, raw position-fixed
 # binary linked at 0x42000000 (link.ld). -fno-pic/-fno-pie/-no-pie keep the
 # link free of GOT/PLT/dynamic relocations so objcopy -O binary is valid.
 CFLAGS  := -ffreestanding -nostdlib -mgeneral-regs-only -march=armv8-a \
-           -fno-stack-protector -Wall -O2 -fno-pic -fno-pie -g $(EXTRA_CFLAGS)
+           -fno-stack-protector -Wall -O2 -fno-pic -fno-pie -g \
+           -DBZDOS_BUILD_ID='"$(BUILD_ID)"' $(EXTRA_CFLAGS)
 ASFLAGS := -march=armv8-a -g
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none -T link.ld
 
@@ -39,27 +56,36 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr qemu clean clean-qemu test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr qemu holdtest clean clean-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
 # Plain x86_64 gcc, NOT $(CC)/$(CROSS) — these build and run entirely on the
 # dev host, no cross-compiler and no board. They mirror the pure ring-parsing
 # logic of vblk_emmc.c/vnet_emac.c, the pure table-building logic of
-# stage2.c, the pure ELF/modinfo-tag logic of kload.c, and the pure
-# register-decode/IIR-LSR-USR emulation logic of vconsole.c (see the block
-# comments at the top of each test_*.c for exactly why they mirror rather
-# than #include the real .c files: all are full of raw ARMv8 inline asm —
-# cache maintenance, exclusive-monitor spinlocks, system-register access —
-# that plain gcc cannot assemble for x86_64). Fast enough to run on every
-# commit; does not touch vblk_emmc.c/stage2.c/vnet_emac.c/kload.c/vconsole.c
+# stage2.c, the pure ELF/modinfo-tag logic of kload.c, the pure
+# register-decode/IIR-LSR-USR emulation logic of vconsole.c, the pure
+# VA-resolution logic of gdbstub.c's resolve()/kload_va_to_pa(), and the pure
+# cross-core request/poll state machine of gdbstub_hw.c's hwop_run() (see the
+# block comments at the top of each test_*.c for exactly why they mirror
+# rather than #include the real .c files: all are full of raw ARMv8 inline
+# asm — cache maintenance, exclusive-monitor spinlocks, system-register
+# access, debug-register banking — that plain gcc cannot assemble for
+# x86_64). Fast enough to run on every commit; does not touch
+# vblk_emmc.c/stage2.c/vnet_emac.c/kload.c/vconsole.c/gdbstub.c/gdbstub_hw.c
 # themselves.
-test: test_vblk_ring test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart
+test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop
 	./test_vblk_ring
+	./test_vblk_stitch
 	./test_stage2_tables
 	./test_vnet_ring
 	./test_kload_modinfo
 	./test_vconsole_uart
+	./test_gdbstub_resolve
+	./test_gdbstub_hwop
+
+test_vblk_stitch: test_vblk_stitch.c
+	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vblk_ring: test_vblk_ring.c
 	gcc -Wall -Wextra -O2 -o $@ $<
@@ -74,6 +100,12 @@ test_kload_modinfo: test_kload_modinfo.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vconsole_uart: test_vconsole_uart.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_gdbstub_resolve: test_gdbstub_resolve.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_gdbstub_hwop: test_gdbstub_hwop.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 stage0: $(STAGE0_BIN)
@@ -136,7 +168,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
             netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o \
-            gdbstub.o gdbstub_hw.o hmac_sha256.o
+            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
@@ -151,7 +183,7 @@ gdb: $(GDB_BIN)
 GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
-            musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o
+            musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o dbgtools.o
 $(GDB_ELF): $(GDB_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(GDB_OBJS)
 	$(SIZE) $@
@@ -218,6 +250,36 @@ clean-qemu:
 	rm -f start_qemu.o main_qemu.o gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o \
 	      $(QEMU_ELF)
 
+# --- holdtest: throwaway QEMU diagnostic for the "pause guest before its
+# first instruction + software breakpoint" board-hang investigation
+# (2026-07-26/27 session; see main_holdtest_qemu.c's file banner for the
+# full rationale and memory dbgtools-infra-added / hold-gate-plus-
+# breakpoint-crashes-board). Tests ONE narrow hypothesis in isolation: does
+# arming MDCR_EL2.TDE + patching a guest software BRK BEFORE the guest's
+# first-ever instruction behave differently from doing the exact same thing
+# AFTER the guest has already been running for a while.
+#
+# NOT a reuse of the real board's main_gdb.c/gdbstub.c/el2_exc.c/smp.c (see
+# main_holdtest_qemu.c's banner for exactly why) -- reuses ONLY the generic,
+# board-independent QEMU-target pieces (start_qemu.o entry, exceptions.o
+# vector table, pl011_qemu.o console), same as the `qemu` target above.
+# Deliberately skips stage2.o/gic_timer_qemu.o: this hypothesis does not
+# depend on stage-2 translation or a timer tick existing at all.
+HOLDTEST_ELF  := microkernel-holdtest.elf
+HOLDTEST_OBJS := start_qemu.o main_holdtest_qemu.o exceptions.o \
+                 el2_exc_holdtest_qemu.o guest_holdtest_asm.o \
+                 guest_holdtest_payload.o pl011_qemu.o
+
+holdtest: $(HOLDTEST_ELF)
+
+$(HOLDTEST_ELF): $(HOLDTEST_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(HOLDTEST_OBJS)
+	$(SIZE) $@
+
+clean-holdtest:
+	rm -f main_holdtest_qemu.o el2_exc_holdtest_qemu.o guest_holdtest_asm.o \
+	      guest_holdtest_payload.o $(HOLDTEST_ELF)
+
 # Header dependency tracking: -MMD -MP emits a .d per object listing the
 # headers it includes, so editing e.g. vblk_emmc.h rebuilds vblk_emmc.o. This
 # binary is flashed to live hardware — a stale object silently wrong against
@@ -228,17 +290,27 @@ clean-qemu:
 %.o: %.S
 	$(CC) $(ASFLAGS) -MMD -MP -c -o $@ $<
 
+# dbgtools.o embeds BUILD_ID (above), recomputed from `git` on EVERY `make`
+# invocation -- but plain file-timestamp dependency tracking has no way to
+# know that a $(shell ...) value changed if dbgtools.c itself didn't, so
+# without this it could go stale (keep reporting a build-id from whenever it
+# was last ACTUALLY recompiled) after other files change and get rebuilt.
+# FORCE it to always recompile; it's tiny, so the cost is negligible.
+.PHONY: FORCE
+FORCE:
+dbgtools.o: FORCE
+
 -include $(wildcard *.d)
 
 # Remove every build artifact this Makefile can produce (all targets), the
 # per-object .d dependency files, and the hosted test binaries. A blanket
 # *.o/*.d avoids the old hand-maintained list silently going stale as files
 # are added (dbgmon.o, emmc_bio.o, vblk_*.o, … were all missing before).
-clean: clean-qemu
+clean: clean-qemu clean-holdtest
 	rm -f *.o *.d \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
 	      $(FBSD_ELF) $(FBSD_BIN) $(DBG_ELF) $(DBG_BIN) \
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
-	      test_vblk_ring test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart
+	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart
