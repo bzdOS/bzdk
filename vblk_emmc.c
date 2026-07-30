@@ -111,6 +111,10 @@
  *        which is this + 1 for the status byte
  *   [52] first IOERR: head<<16 | is_read<<1 | on_cpu2
  *   [56] last  IOERR: head<<16 | is_read<<1 | on_cpu2
+ *   [57] transient-write-stall retry attempts (emmc_bio_write rc == -2)
+ *   [58] writes those retries rescued — [57] non-zero with [58] tracking it is
+ *        the card stalling and recovering; [57] climbing with [58] flat means
+ *        the retries are not helping and the failure is not transient
  * ------------------------------------------------------------------ */
 /* Address owned by hv_addrmap.h (via vblk_emmc.h). Was 0x50005000, INSIDE the
  * 64 KiB vconsole ring, where console output clobbered these words. */
@@ -627,6 +631,14 @@ static void vblk_inject_irq(void)
 #define VBLK_RC_BUSY       (-200)   /* eMMC cross-core lock acquire timed out */
 #define VBLK_RC_BADPA      (-300)   /* data-descriptor PA outside DRAM */
 
+/* Bounded retries for a transient write stall (emmc_bio_write() rc == -2, "card
+ * never signaled program-done"). See serve_data()'s retry loop for the hardware
+ * evidence; 3 keeps the worst case (3 x EMMC_WRITE_BUSY_TIMEOUT_MS = 12 s) under
+ * the 16 s hardware watchdog, and the loop pets it between attempts anyway. */
+#define VBLK_WRITE_RETRIES  3u
+static uint32_t g_write_retries;    /* [57] retry attempts made      */
+static uint32_t g_write_retry_ok;   /* [58] writes a retry rescued   */
+
 /* The exact eMMC LBA serve_data() was on when it last failed. A request's
  * chain can die several sectors into a descriptor, so neither the request's
  * start sector nor the bytes-served count pins down the actual sector — and
@@ -728,6 +740,32 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			gmem_read(buf_gpa, bounce(), VBLK_SECTOR_BYTES);
 			__asm__ volatile("dsb sy" ::: "memory");
 			rc = emmc_bio_write(lba, BOUNCE_PA);
+			/* Retry a TRANSIENT write stall. emmc_bio_write() returns -2 for
+			 * "card never signaled program-done" -- a real timeout, but a
+			 * retryable one: a cheap eMMC can stall a program operation for
+			 * seconds when it triggers internal garbage collection, and the
+			 * very next attempt at the same LBA then succeeds immediately.
+			 *
+			 * Found on hardware 2026-07-30: one such stall at LBA 278900 (p3's
+			 * cylinder-group metadata) exceeded EMMC_WRITE_BUSY_TIMEOUT_MS, the
+			 * request completed S_IOERR, and FreeBSD turned a single failed
+			 * metadata write into "panic: UFS: root fs would be forcibly
+			 * unmounted" nine seconds into the boot. Retrying the same sector
+			 * from here succeeded on the first attempt, and so did a direct
+			 * HV-side write to both 278900 and 278882 -- the medium is fine.
+			 *
+			 * emmc_raw.py's write_block() has always retried exactly this rc
+			 * for exactly this reason; the hypervisor's own path did not, which
+			 * left the host tool more robust than the thing it debugs. Bounded,
+			 * and the watchdog is fed between attempts because each one can
+			 * burn the full busy timeout. */
+			for (uint32_t t = 0; rc == -2 && t < VBLK_WRITE_RETRIES; t++) {
+				vblk_bc(57, ++g_write_retries);
+				vblk_pet_wdt();
+				rc = emmc_bio_write(lba, BOUNCE_PA);
+			}
+			if (rc == 0 && g_write_retries)
+				vblk_bc(58, ++g_write_retry_ok);
 		}
 		vblk_emmc_unlock();
 		vblk_bc(12, (uint32_t)rc);
