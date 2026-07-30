@@ -534,8 +534,21 @@ def guest_clean_shutdown(settle_s=30.0):
 
 
 VBK_BC = 0x50020000
+EBIO_BC = 0x50020200
 GT_TICKS_PA = 0x42030008
 IRQC_PA = 0x42030068
+
+# emmc_bio.c's own window: the eMMC-LEVEL failure count and the controller
+# state at the last one. Distinct from the VBK1 fields above, which count what
+# reached virtio-blk. Capturing both is what makes the difference readable: an
+# ebio_fails > 0 with g_ioerrs == 0 means the card misbehaved and the retry
+# absorbed it, which is a healthy outcome that VBK1 alone reports as silence.
+# Added 2026-07-30 after reading 12 out of this window with no way to tell which
+# cycle of the run it belonged to (the window was not captured per cycle, and
+# emmc_bio_init did not clear it -- both now fixed).
+EBIO_FIELDS = {0: "ebio_fails", 1: "ebio_lba", 2: "ebio_rint", 3: "ebio_star",
+               4: "ebio_tag", 5: "ebio_gctl", 6: "ebio_hs_state",
+               7: "ebio_hs_step"}
 
 # The subset of vblk_emmc.c's breadcrumbs that says WHY a boot failed. Kept
 # here rather than derived, so a build without the newer fields just reports
@@ -594,6 +607,11 @@ def capture_counters():
                 if name.endswith("_rc") and v >= 0x80000000:
                     v -= 0x100000000  # serve_data's codes are negative
                 out[name] = v
+        e = rw(EBIO_BC, 8)
+        if e:
+            for idx, name in EBIO_FIELDS.items():
+                if e[idx] != 0xFFFFFFFF:
+                    out[name] = e[idx]
         g = rw(GT_TICKS_PA, 2)
         if g:
             out["gt_ticks"] = g[0] | (g[1] << 32)
@@ -624,6 +642,19 @@ def do_cycle(n, args, report):
                            f"(busy={cb.get('ioerr_busy')}, "
                            f"emmc={cb.get('ioerr_emmc')}, "
                            f"lba={cb.get('ioerrN_lba')}, rc={cb.get('ioerrN_rc')})")
+    # eMMC-level failures that the retry absorbed reach neither g_ioerrs nor the
+    # guest, so the check above stays silent on them and the run looks perfectly
+    # clean. That is the state c40964b is meant to move, so it has to be visible
+    # on its own: report it as an observation, and only call it an anomaly when
+    # the retries did NOT save it (i.e. g_ioerrs went up too, already covered
+    # above). ebio_tag says which path: 0x1xxxx read post-drain wait,
+    # 0x2xxxx write data-phase error bit, 0x3xxxx write data-phase timeout.
+    if cb.get("ebio_fails"):
+        log(f"  [diag] previous boot had ebio_fails={cb['ebio_fails']} "
+            f"lba={cb.get('ebio_lba')} rint=0x{cb.get('ebio_rint', 0):x} "
+            f"star=0x{cb.get('ebio_star', 0):x} "
+            f"tag=0x{cb.get('ebio_tag', 0):x} "
+            f"(absorbed: g_ioerrs={cb.get('g_ioerrs', 0)})")
     if cb.get("lock_giveups"):
         report.add_anomaly(n, "emmc-lock-stuck",
                            f"lock_giveups={cb['lock_giveups']} — a leaked "

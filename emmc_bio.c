@@ -285,10 +285,32 @@ static int emmc_cmd_done(uint32_t op, uint32_t arg, uint32_t fl,
 /* ------------------------------------------------------------------ */
 /* emmc_bio_init() — one-time bring-up + card-identification sequence      */
 /* ------------------------------------------------------------------ */
+/* Defined below, next to ebio_bc() (which it uses); forward-declared so
+ * emmc_bio_init() can clear the window before anything writes to it. */
+static void ebio_bc_reset(void);
+
 int emmc_bio_init(void)
 {
 	uint32_t c, resp0;
 	int i;
+
+	/* Clear the breadcrumb window for THIS boot.
+	 *
+	 * Without this the window is never zeroed, while g_ebio_fails IS (it is
+	 * plain .bss and start.S zeroes .bss on every load). So a boot with zero
+	 * failures leaves the LAST failing boot's numbers sitting there, and a
+	 * reader cannot tell "12 failures this boot" from "0 this boot, 12 in some
+	 * earlier one". That ambiguity wasted the verification of c40964b on
+	 * 2026-07-30: the window read 12 after a soak in which every post-fix
+	 * cycle reported g_ioerrs=0, and the two statements could not be
+	 * reconciled from the data. vblk_init() already zeroes its own VBK1 window
+	 * for exactly this reason; this makes the EBIO window behave the same, so
+	 * a value read out of it always belongs to the boot that is running.
+	 *
+	 * Post-mortem evidence is NOT lost by doing this: the soak harness reads
+	 * the window BEFORE triggering the next reload, which is the same pattern
+	 * it already uses for VBK1. */
+	ebio_bc_reset();
 
 	/* PC5 -> func3 (eMMC clock pinmux fix). */
 	c = rd32(PIO_PC_CFG0);
@@ -400,6 +422,16 @@ static inline void ebio_bc(int i, uint32_t v)
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 static uint32_t g_ebio_fails;
+
+/* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
+ * covers every slot any ebio_bc() caller writes, so no stale field survives. */
+#define EBIO_BC_NWORDS 8u
+static void ebio_bc_reset(void)
+{
+	unsigned i;
+	for (i = 0; i < EBIO_BC_NWORDS; i++)
+		ebio_bc((int)i, 0);
+}
 
 /* Bounded wait for the card to stop being busy. Cheap when the controller is
  * already idle (breaks on the first read), so it is safe on a hot path. */
