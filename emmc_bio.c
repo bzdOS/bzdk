@@ -89,6 +89,7 @@
 /* GCTL bits */
 #define GCTL_RESET_ALL     0x00000007u   /* bits 0,1,2: soft+fifo+dma reset */
 #define GCTL_FIFO_RST      0x00000002u   /* bit1 */
+#define GCTL_DMA_RST       0x00000004u   /* bit2 */
 #define GCTL_AHB_INIT      0x80000010u   /* bit31 AHB-FIFO-access | bit4 */
 
 /* CKCR bits */
@@ -422,10 +423,12 @@ static inline void ebio_bc(int i, uint32_t v)
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 static uint32_t g_ebio_fails;
+static uint32_t g_settles;        /* [8] error-recovery runs                */
+static uint32_t g_settle_clkfail; /* [9] of those, clock re-program timeouts */
 
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 8u
+#define EBIO_BC_NWORDS 10u
 static void ebio_bc_reset(void)
 {
 	unsigned i;
@@ -461,11 +464,68 @@ static void wait_card_idle(void)
  * Deliberately does NOT wait for DATA_OVER: on a genuinely stuck card that
  * bit may never arrive and poll_rint() would burn the full EMMC_POLL_CAP. Card
  * idle plus a FIFO reset is enough to stop the leak into the next call. */
+/* REWRITTEN 2026-07-30 to match the reference driver instead of a guess.
+ *
+ * The first version of this function did: wait_card_idle(), set GCTL_FIFO_RST,
+ * small_delay(). That was reasoned from first principles and it was wrong in
+ * three ways. FreeBSD's own aw_mmc driver -- which is not just "a" reference but
+ * the very driver the GUEST runs against this same controller -- does the
+ * following on EVERY command error (aw_mmc_req_done(), sys/arm/allwinner/
+ * aw_mmc.c, under `if (cmd->error != MMC_ERR_NONE)`):
+ *
+ *   1. set GCTL_FIFO_RST | GCTL_DMA_RST     <- BOTH, not just FIFO
+ *   2. poll until GCTL's reset bits self-clear (up to 1000 x DELAY(100)),
+ *      and report "timeout resetting DMA/FIFO" if they never do
+ *   3. aw_mmc_update_clock(sc, 1)           <- re-program the internal clock
+ *
+ * Against that, the old version:
+ *   - omitted DMA_RST. We drive this controller in PIO, so this is the least
+ *     important of the three, but the reference sets it unconditionally on
+ *     error and there is no reason to differ.
+ *   - never WAITED for the reset pulse to finish. A fixed small_delay() is not
+ *     the same as polling the self-clearing bits: if the reset had not completed
+ *     when we returned, the next transfer was issued into a controller that was
+ *     still resetting -- which is the exact failure mode this function exists to
+ *     prevent. It could therefore fail to fix, or even cause, the thing it was
+ *     added for.
+ *   - never re-programmed the clock. This is the one that would not have been
+ *     guessed: on this DesignWare-derived IP the clock domain has to be
+ *     re-programmed after a reset via a CMDR LOAD|PRG_CLK|WAIT_PRE_OVER
+ *     command, and the reference does it as an integral part of error recovery,
+ *     not as a clock-change-only operation. clk_update() already implements
+ *     exactly that handshake here (it was written for emmc_reclock()); this
+ *     path simply never called it.
+ *
+ * Deliberately still does NOT wait for DATA_OVER: on a genuinely stuck card
+ * that bit may never arrive and poll_rint() would burn the full EMMC_POLL_CAP.
+ *
+ * Counted in [8]/[9] so the effect is measurable rather than argued: [8] is how
+ * many times recovery ran, [9] how many times its clock re-program timed out
+ * (the reference's "timeout updating clock", which is a real reported failure
+ * on Allwinner parts -- see the sunxi "fatal err update clk timeout" reports).
+ * A [9] that tracks [8] means recovery itself is failing and the card needs a
+ * heavier reset, not a retry. */
 static void ebio_fail_settle(void)
 {
+	uint32_t i;
+
 	wait_card_idle();
-	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
-	small_delay();
+
+	/* (1) FIFO + DMA reset. */
+	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST | GCTL_DMA_RST);
+
+	/* (2) Wait for the self-clearing reset pulse to actually finish. The
+	 * reference polls all three reset bits (GCTL_RESET) even though it sets
+	 * only two, so do the same. Bounded: a controller that never clears these
+	 * is not going to be rescued by waiting longer. */
+	for (i = 0; i < EMMC_POLL_CAP; i++)
+		if ((rreg(REG_GCTL) & GCTL_RESET_ALL) == 0)
+			break;
+
+	/* (3) Re-program the internal clock after the reset. */
+	ebio_bc(8, ++g_settles);
+	if (clk_update() != 0)
+		ebio_bc(9, ++g_settle_clkfail);
 }
 
 int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
