@@ -562,10 +562,33 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			ri = rreg(REG_RINT);
 			if (ri & RINT_DATA_OVER)
 				break;
-			if (ri & 0x0180u)   /* DATA_CRC(bit7)/DATA_TIMEOUT(bit8) */
+			/* Record the controller state, like the READ path already does.
+			 * Without this a write failure left only its encoded rc and
+			 * nothing about the controller, which is why 0x40000104 could be
+			 * chased for so long (see 2026-07-30): RINT alone does not say
+			 * whether the FIFO had drained, what STAR thought, or whether the
+			 * card was still busy. Same slots the read path uses, plus a tag in
+			 * [4] so a reader can tell a write record from a read one:
+			 * 0x20000 = data-phase error bit, 0x30000 = data-phase timeout. */
+			if (ri & 0x0180u) { /* DATA_CRC(bit7)/DATA_TIMEOUT(bit8) */
+				ebio_bc(1, lba);
+				ebio_bc(2, ri);
+				ebio_bc(3, rreg(REG_STAR));
+				ebio_bc(4, 0x20000u | (ri & 0x3fffu));
+				ebio_bc(5, rreg(REG_GCTL));
+				ebio_bc(0, ++g_ebio_fails);
 				return (int)(0x40000000u | (ri & 0x3fffu));
-			if (rd_cntpct() - start > cap)
-				return (int)(0x20000000u | (rreg(REG_RINT) & 0x3fffu));
+			}
+			if (rd_cntpct() - start > cap) {
+				uint32_t r2 = rreg(REG_RINT);
+				ebio_bc(1, lba);
+				ebio_bc(2, r2);
+				ebio_bc(3, rreg(REG_STAR));
+				ebio_bc(4, 0x30000u | (r2 & 0x3fffu));
+				ebio_bc(5, rreg(REG_GCTL));
+				ebio_bc(0, ++g_ebio_fails);
+				return (int)(0x20000000u | (r2 & 0x3fffu));
+			}
 		}
 	}
 
