@@ -425,10 +425,11 @@ static inline void ebio_bc(int i, uint32_t v)
 static uint32_t g_ebio_fails;
 static uint32_t g_settles;        /* [8] error-recovery runs                */
 static uint32_t g_settle_clkfail; /* [9] of those, clock re-program timeouts */
+static uint32_t g_busy_timeouts;  /* [10] post-write CARD_BUSY wait timeouts */
 
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 10u
+#define EBIO_BC_NWORDS 13u
 static void ebio_bc_reset(void)
 {
 	unsigned i;
@@ -752,6 +753,33 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				 * its successor a busy card. wait_card_idle() is iteration-capped
 				 * (~0.4 ms), so re-waiting on a card we just timed out on costs a
 				 * bounded amount and the FIFO reset happens either way. */
+				/* MEASURE this path (2026-07-30). It is by far the most
+				 * frequent retry trigger and the only one that writes no
+				 * breadcrumb, which is why it stayed invisible: soak10 showed
+				 * ~50-170 write retries per boot with ebio_fails at 0, so
+				 * essentially all of them came from HERE, not from the
+				 * DATA_TIMEOUT this whole investigation was aimed at.
+				 *
+				 * And the arithmetic does not close: at the nominal 4000 ms cap,
+				 * 50 of these would be 200 s, inside a boot that takes ~80 s.
+				 * So either they are not really waiting 4000 ms, or they are not
+				 * really this path. rd_cntpct() reads CNTPCT_EL0 (physical, so
+				 * CNTVOFF_EL2 cannot skew it) and ms_to_ticks() derives from
+				 * CNTFRQ_EL0, so both look right by inspection -- which is
+				 * exactly why this needs measuring rather than more reasoning.
+				 *
+				 * [10] counts them, [11] records how long the last one actually
+				 * waited in ms, [12] the CNTFRQ it was computed from. If [11] is
+				 * ~4000 the card really does stall that long and the retry count
+				 * has to be explained some other way; if it is tiny, the cap is
+				 * expiring early and the timeout math is the bug. */
+				{
+					uint64_t el = rd_cntpct() - start;
+					uint64_t f = rd_cntfrq();
+					ebio_bc(10, ++g_busy_timeouts);
+					ebio_bc(11, f ? (uint32_t)((el * 1000ull) / f) : 0xffffffffu);
+					ebio_bc(12, (uint32_t)f);
+				}
 				ebio_fail_settle();
 				return -2;   /* card never signaled program-done: do NOT claim success */
 			}

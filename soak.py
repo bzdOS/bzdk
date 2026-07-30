@@ -548,8 +548,10 @@ IRQC_PA = 0x42030068
 # emmc_bio_init did not clear it -- both now fixed).
 EBIO_FIELDS = {0: "ebio_fails", 1: "ebio_lba", 2: "ebio_rint", 3: "ebio_star",
                4: "ebio_tag", 5: "ebio_gctl", 6: "ebio_hs_state",
-               7: "ebio_hs_step", 8: "ebio_settles", 9: "ebio_settle_clkfail"}
-EBIO_NWORDS = 10
+               7: "ebio_hs_step", 8: "ebio_settles", 9: "ebio_settle_clkfail",
+               10: "ebio_busy_timeouts", 11: "ebio_busy_wait_ms",
+               12: "ebio_cntfrq"}
+EBIO_NWORDS = 13
 
 # The subset of vblk_emmc.c's breadcrumbs that says WHY a boot failed. Kept
 # here rather than derived, so a build without the newer fields just reports
