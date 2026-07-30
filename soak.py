@@ -548,7 +548,8 @@ IRQC_PA = 0x42030068
 # emmc_bio_init did not clear it -- both now fixed).
 EBIO_FIELDS = {0: "ebio_fails", 1: "ebio_lba", 2: "ebio_rint", 3: "ebio_star",
                4: "ebio_tag", 5: "ebio_gctl", 6: "ebio_hs_state",
-               7: "ebio_hs_step"}
+               7: "ebio_hs_step", 8: "ebio_settles", 9: "ebio_settle_clkfail"}
+EBIO_NWORDS = 10
 
 # The subset of vblk_emmc.c's breadcrumbs that says WHY a boot failed. Kept
 # here rather than derived, so a build without the newer fields just reports
@@ -607,7 +608,7 @@ def capture_counters():
                 if name.endswith("_rc") and v >= 0x80000000:
                     v -= 0x100000000  # serve_data's codes are negative
                 out[name] = v
-        e = rw(EBIO_BC, 8)
+        e = rw(EBIO_BC, EBIO_NWORDS)
         if e:
             for idx, name in EBIO_FIELDS.items():
                 if e[idx] != 0xFFFFFFFF:
@@ -654,7 +655,20 @@ def do_cycle(n, args, report):
             f"lba={cb.get('ebio_lba')} rint=0x{cb.get('ebio_rint', 0):x} "
             f"star=0x{cb.get('ebio_star', 0):x} "
             f"tag=0x{cb.get('ebio_tag', 0):x} "
-            f"(absorbed: g_ioerrs={cb.get('g_ioerrs', 0)})")
+            f"(absorbed: g_ioerrs={cb.get('g_ioerrs', 0)}) "
+            f"settles={cb.get('ebio_settles', '-')}/"
+            f"clkfail={cb.get('ebio_settle_clkfail', '-')}")
+    # Recovery that cannot re-program the clock is not recovery: the reference
+    # driver treats "timeout updating clock" as a reported failure, and on
+    # Allwinner parts it is a real one. If this tracks ebio_settles, retrying is
+    # pointless and the card needs a heavier reset -- worth flagging loudly
+    # rather than leaving in the per-cycle noise.
+    if cb.get("ebio_settle_clkfail"):
+        report.add_anomaly(n, "emmc-recovery-clk-timeout",
+                           f"clk re-program timed out "
+                           f"{cb['ebio_settle_clkfail']}x of "
+                           f"{cb.get('ebio_settles')} recoveries — the reset is "
+                           f"not completing, so retries cannot help")
     if cb.get("lock_giveups"):
         report.add_anomaly(n, "emmc-lock-stuck",
                            f"lock_giveups={cb['lock_giveups']} — a leaked "
