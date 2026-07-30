@@ -295,7 +295,8 @@ class Report:
 CYCLE_RE = re.compile(r"LOADED & VERIFIED on cycle #(\d+)")
 
 
-def run_reliable_load(expect_vbk, load_cycles, timeout_s, log_path):
+def run_reliable_load(expect_vbk, load_cycles, timeout_s, log_path,
+                      boot_to_shell=False):
     """Run reliable_load.py as a subprocess, bounded by an OUTER wall-clock
     timeout regardless of what it's doing internally (this is deliberate:
     the coarse EMAC safety sweep described in the module docstring can
@@ -306,6 +307,15 @@ def run_reliable_load(expect_vbk, load_cycles, timeout_s, log_path):
     args = [sys.executable, "reliable_load.py", "--cycles", str(load_cycles)]
     if expect_vbk:
         args.append("--expect-vbk")
+    if boot_to_shell:
+        # Without this the guest is left sitting at its interactive `mountroot>`
+        # prompt, so it never reaches multiuser, never gets a DHCP lease and
+        # never starts sshd. Every cycle after the first then reports
+        # "guest-unreachable" (measured on the first 3-cycle run). Worth
+        # spelling out: until now this harness only ever measured "does the
+        # hypervisor load", never "does the guest actually boot" -- which was
+        # all it could measure before the guest could reach multiuser at all.
+        args.append("--boot-to-shell")
     t0 = now()
     proc = subprocess.Popen(args, cwd=HERE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -498,12 +508,21 @@ def guest_clean_shutdown(settle_s=30.0):
 
     ssh is expected to die mid-command as the guest goes down, so its exit
     status is deliberately ignored -- reachability is checked first instead."""
-    try:
-        p = subprocess.run(GUEST_SSH + ["true"], capture_output=True,
-                           text=True, timeout=20)
-        if p.returncode != 0:
-            return "guest-unreachable"
-    except Exception:
+    # Wait for the guest to finish booting into multiuser before concluding it
+    # is unreachable: after a reload it still has to mount root, run fsck and
+    # /etc/rc, get a DHCP lease and start sshd. Reporting "unreachable" the
+    # instant the first probe fails just measures the harness's own impatience
+    # (which is what the first 3-cycle run did on cycles 2 and 3).
+    for attempt in range(24):            # ~2 min
+        try:
+            p = subprocess.run(GUEST_SSH + ["true"], capture_output=True,
+                               text=True, timeout=12)
+            if p.returncode == 0:
+                break
+        except Exception:
+            pass
+        time.sleep(5)
+    else:
         return "guest-unreachable"
     try:
         subprocess.run(GUEST_SSH + ["nohup shutdown -p now >/dev/null 2>&1 &"],
@@ -525,7 +544,8 @@ def do_cycle(n, args, report):
         log(f"  [clean] shutdown -p now: {rec['clean_shutdown']}")
 
     ok, elapsed, tail, timed_out, interrupted = run_reliable_load(
-        args.expect_vbk, args.load_cycles, args.per_cycle_timeout_s, log_path)
+        args.expect_vbk, args.load_cycles, args.per_cycle_timeout_s, log_path,
+        boot_to_shell=getattr(args, "clean_shutdown", False))
     rec["reliable_load_s"] = elapsed
     rec["reliable_load_tail"] = tail
     m = CYCLE_RE.search(tail)
