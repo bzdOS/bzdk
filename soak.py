@@ -574,12 +574,16 @@ def capture_counters():
             return {"channel": "down"}
 
         def rw(pa, cnt, tries=10):
-            for _ in range(tries):
-                w = hv.read_words(pa, cnt)
-                if w and len(w) == cnt:
-                    return w
-                time.sleep(0.2)
-            return None
+            """read_words_stable, not read_words: this channel can return a
+            well-formed reply with a single wrong hex digit (documented, and
+            observed here on 2026-07-30 -- an rc field came back as 0x40000114,
+            which is a plausible-looking guest DRAM address and not any code
+            serve_data or emmc_bio can produce). These counters get read off a
+            failing cycle and believed, so they have to be read the careful
+            way; the window is static between boots, which is exactly what
+            read_words_stable() requires."""
+            w = hv.read_words_stable(pa, cnt, tries=tries)
+            return w if w and len(w) == cnt else None
 
         b = rw(VBK_BC, 64)
         if b:
