@@ -869,15 +869,46 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			 * only because the acquire side is now patient (see
 			 * VBLK_LOCK_RETRIES); the cleaner shape is to release and
 			 * re-acquire around each retry. Worth doing if [57] ever climbs in
-			 * a real workload rather than staying at 0. */
-			for (uint32_t t = 0;
-			     VBLK_RC_WR_RETRYABLE(rc) && t < VBLK_WRITE_RETRIES; t++) {
-				vblk_bc(57, ++g_write_retries);
-				vblk_pet_wdt();
-				rc = emmc_bio_write(lba, BOUNCE_PA);
+			 * a real workload rather than staying at 0.
+			 *
+			 * UPDATE 2026-07-30: that condition is now MET. [57] runs ~150-175
+			 * per boot across soak8/soak9 (six boots, real fsck + /etc/rc
+			 * workload), not 0, so the restructure is warranted rather than
+			 * hypothetical. Not done here because it changes the locking shape
+			 * while a separate fix (the write-path settle, c40964b) is still
+			 * being evaluated on the same code, and because the acquire side is
+			 * demonstrably holding up: lock_giveups=0 on every cycle of both
+			 * runs. Do it as its own change, with the same soak as the check. */
+			{
+				uint32_t retried = 0;
+				for (uint32_t t = 0;
+				     VBLK_RC_WR_RETRYABLE(rc) && t < VBLK_WRITE_RETRIES; t++) {
+					vblk_bc(57, ++g_write_retries);
+					retried = 1;
+					vblk_pet_wdt();
+					rc = emmc_bio_write(lba, BOUNCE_PA);
+				}
+				/* Count a rescue only when THIS sector actually retried.
+				 *
+				 * This used to read `rc == 0 && g_write_retries`, which asks
+				 * whether ANY retry has happened since boot -- and g_write_retries
+				 * never returns to zero, so after the very first retry every
+				 * subsequent clean sector-write bumped the "rescued" counter too.
+				 * Live on 2026-07-30 that produced write_retry_ok=5263 against
+				 * write_retries=172 and 152 requests: 30x more rescues than
+				 * attempts, which is what exposed it. The number was not merely
+				 * inflated, it was measuring "successful writes after the first
+				 * retry ever", a quantity nobody wants.
+				 *
+				 * It also means the earlier reading of write_retry_ok=20, cited
+				 * as evidence that the retry mechanism works, established no such
+				 * thing -- it was small enough to look plausible. The mechanism
+				 * still may well work; the point is this counter never showed it.
+				 * With the local flag, [58] is what it claims to be, and [57]/[58]
+				 * finally divide into a meaningful rate. */
+				if (retried && rc == 0)
+					vblk_bc(58, ++g_write_retry_ok);
 			}
-			if (rc == 0 && g_write_retries)
-				vblk_bc(58, ++g_write_retry_ok);
 		}
 done_sector:
 		vblk_emmc_unlock();
