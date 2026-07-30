@@ -610,10 +610,23 @@ def capture_counters():
                 if name.endswith("_rc") and v >= 0x80000000:
                     v -= 0x100000000  # serve_data's codes are negative
                 out[name] = v
-        e = rw(EBIO_BC, EBIO_NWORDS)
+        # Two aligned 8-word requests rather than one of EBIO_NWORDS.
+        # Measured live 2026-07-30: reading 8 words from EBIO_BC works, 5 words
+        # from EBIO_BC+0x20 works, and 64 words from VBK_BC works -- but 10 or 13
+        # words from EBIO_BC returns nothing, with read_words() and
+        # read_words_stable() alike. So it is not a size cap (MAX_WORDS_PER_CMD is
+        # 512); something about that particular multi-line span does not come
+        # back. Not chased further: the debug channel's framing is not what this
+        # harness is for, and two requests in the proven shape cost nothing.
+        e = rw(EBIO_BC, 8)
+        e2 = rw(EBIO_BC + 32, 8)
+        if e and e2:
+            e = list(e) + list(e2)
+        elif e:
+            e = list(e)          # slots 8+ unavailable; keep what we have
         if e:
             for idx, name in EBIO_FIELDS.items():
-                if e[idx] != 0xFFFFFFFF:
+                if idx < len(e) and e[idx] != 0xFFFFFFFF:
                     out[name] = e[idx]
         g = rw(GT_TICKS_PA, 2)
         if g:
