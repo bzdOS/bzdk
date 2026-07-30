@@ -268,6 +268,11 @@ class Report:
         L.append(f"cycles succeeded   : {d['cycles_succeeded']}")
         L.append(f"cycles failed      : {d['cycles_failed']}")
         L.append(f"cycles interrupted : {d['cycles_interrupted']}")
+        gfail = sum(1 for c in d["cycles"] if c.get("guest_multiuser") is False)
+        gtot = sum(1 for c in d["cycles"] if "guest_multiuser" in c)
+        if gtot:
+            L.append(f"guest reached multiuser : {gtot - gfail}/{gtot}"
+                     + ("   <-- HV loaded, GUEST did not boot" if gfail else ""))
         L.append("")
         L.append(f"break-glass invocations : {d['breakglass_invocations']}")
         L.append(f"break-glass sent ok     : {d['breakglass_sent_ok']}")
@@ -493,6 +498,68 @@ GUEST_SSH = [
 ]
 
 
+def verify_guest_multiuser(timeout_s=240.0):
+    """Did the GUEST actually finish booting? Returns (ok: bool, detail: str).
+
+    WHY THIS EXISTS (2026-07-30, and it is the whole point of the fix):
+    this harness reported "6/6 cycles OK" across six consecutive boots of a
+    guest that was dead. It was not lying about what it measured -- it measured
+    whether the HYPERVISOR loads and verifies, which it did, perfectly, every
+    time. Nobody was checking the guest. The guest had dropped to single-user
+    ("/bin/sh on /etc/rc terminated abnormally", one zero-length /bin/cat), so
+    it never reached multiuser, never started sshd, and never wrote a single
+    sector -- and the run summary said everything was fine. That cost hours,
+    and worse, it made a real regression look like a FIX: write retries fell
+    from ~150 per boot to 0, which reads as "the retry cascade is cured" until
+    you notice there were no writes left to retry.
+
+    So the cycle now judges its own boot instead of leaving it to be inferred
+    later. Two INDEPENDENT signals, because each covers the other's blind spot:
+
+      1. ssh reachability -- proves multiuser + network + sshd. Needs DHCP and
+         the vnet path, so it can fail for reasons that are not the guest's
+         fault (that is why it is not the only signal).
+      2. g_writes > 0 in the VBK1 window -- proves the guest got as far as
+         fsck//etc/rc, which is the first thing that writes. Network-
+         independent, and it is the counter that actually exposed the outage.
+
+    Either one passing is treated as "the guest booted", because a guest that
+    is writing but unreachable is a networking problem, not a boot failure, and
+    the harness should not conflate the two. Both failing is a boot failure.
+
+    Never raises: an unreachable board is a normal soak outcome."""
+    t0 = now()
+    reachable = False
+    while now() - t0 < timeout_s:
+        try:
+            p = subprocess.run(GUEST_SSH + ["true"], capture_output=True,
+                               timeout=15)
+            if p.returncode == 0:
+                reachable = True
+                break
+        except Exception:
+            pass
+        if _stop_requested:
+            break
+        time.sleep(5)
+
+    writes = None
+    try:
+        c = capture_counters()
+        writes = c.get("g_writes")
+    except Exception:
+        pass
+
+    wrote = (writes is not None and writes > 0)
+    if reachable or wrote:
+        return True, (f"ssh={'yes' if reachable else 'no'} "
+                      f"g_writes={writes if writes is not None else '?'}")
+    return False, (f"guest never reached multiuser: ssh unreachable after "
+                   f"{timeout_s:.0f}s and g_writes="
+                   f"{writes if writes is not None else 'unreadable'} "
+                   f"(single-user or wedged before /etc/rc)")
+
+
 def guest_clean_shutdown(settle_s=30.0):
     """Ask the guest to power off cleanly, so the next boot starts on a clean fs.
 
@@ -684,6 +751,15 @@ def do_cycle(n, args, report):
                            f"{cb['ebio_settle_clkfail']}x of "
                            f"{cb.get('ebio_settles')} recoveries — the reset is "
                            f"not completing, so retries cannot help")
+    # Zero writes on the previous boot means it never reached fsck or /etc/rc.
+    # verify_guest_multiuser() is the authoritative gate now, but this still
+    # earns its keep on cycle 1, where there was no in-cycle check to run yet,
+    # and it needs no network. Distinguish "absent" from 0: a build without the
+    # field reports nothing rather than a false alarm.
+    if cb.get("g_writes") == 0 and cb.get("g_reads"):
+        report.add_anomaly(n, "prev-boot-no-writes",
+                           f"previous boot did {cb['g_reads']} reads and ZERO "
+                           f"writes — it never reached fsck//etc/rc")
     if cb.get("lock_giveups"):
         report.add_anomaly(n, "emmc-lock-stuck",
                            f"lock_giveups={cb['lock_giveups']} — a leaked "
@@ -765,6 +841,26 @@ def do_cycle(n, args, report):
         rec["duration_s"] = now() - t_cycle0
         report.add_cycle(rec)
         return rec, "continue"
+
+    # The HV is loaded and verified. That is NOT the same as the guest having
+    # booted -- see verify_guest_multiuser(). Only gated on boot-to-shell runs,
+    # because without --boot-to-shell reliable_load deliberately leaves the
+    # guest at mountroot> and "no multiuser" is the expected outcome, not a
+    # failure.
+    if getattr(args, "clean_shutdown", False):
+        g_ok, g_detail = verify_guest_multiuser()
+        rec["guest_multiuser"] = g_ok
+        rec["guest_multiuser_detail"] = g_detail
+        log(f"  [guest] multiuser: {'OK' if g_ok else 'FAILED'} — {g_detail}")
+        if not g_ok:
+            report.add_anomaly(n, "guest-boot-failed", g_detail)
+            rec["result"] = "failed"
+            rec["note"] = g_detail
+            rec["duration_s"] = now() - t_cycle0
+            report.add_cycle(rec)
+            # Keep soaking: the next cycle reloads and may well come up. A
+            # failed guest boot is data, not a reason to stop.
+            return rec, "continue"
 
     # verified load -> health snapshot -> dwell under load
     rec["health_at_verify"] = sample_health(n, report)
@@ -870,10 +966,19 @@ def main():
         report.finish(aborted_reason)
         d = report.data
         log("=" * 60)
+        # Report guest-boot failures on their own line rather than folding them
+        # into "cycles failed". A run where the HV loaded 6/6 times and the
+        # GUEST died 6/6 times is a specific, badly misleading shape (it happened
+        # on 2026-07-30) and it should be impossible to skim past.
+        gfail = sum(1 for c in d["cycles"] if c.get("guest_multiuser") is False)
+        gtot = sum(1 for c in d["cycles"] if "guest_multiuser" in c)
         log(f"soak run complete: {d['cycles_succeeded']}/{d['cycles_attempted']} cycles OK, "
             f"{d['breakglass_invocations']} break-glass invocations "
             f"({d['breakglass_recoveries']} confirmed recovered), "
             f"{d['total_wall_s'] / 3600:.2f}h wall / {d['total_load_s'] / 3600:.2f}h under load")
+        if gtot:
+            log(f"guest boots: {gtot - gfail}/{gtot} reached multiuser"
+                + (f"  ⚠ {gfail} FAILED (HV loaded fine, guest did not)" if gfail else ""))
 
 
 if __name__ == "__main__":
