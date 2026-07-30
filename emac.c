@@ -190,6 +190,14 @@ static const uint8_t OUR_MAC[6] = { 0x02, 0xbd, 0x05, 0x00, 0x00, 0x01 };
  * Demuxed away from both the console ring and netcon_rx_frame() exactly
  * like netcon's own EtherType is demuxed away from the console below. */
 #define ETHERTYPE_SNAPNET 0x88B8u
+/* Raw dbgtools peek/reply (dbgtools.h, added 2026-07-26) — a FOURTH,
+ * independent channel, demuxed away from the console/netcon/snapnet exactly
+ * like the others, straight to dbgtools_rx_frame() (see that file's header
+ * comment for why: it must be servicable from inside emac_poll() itself,
+ * independent of whether dbgmon_service() or gdbstub_poll() is CPU1's
+ * current branch). 0x88B7 sits between netcon (0x88B6) and snapnet (0x88B8)
+ * — confirmed unused by a full-tree grep before picking it. */
+#define ETHERTYPE_DBGRAW  0x88B7u
 static const uint8_t BCAST_MAC[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
 /* netcon.c provides the real implementation when linked in; the weak no-op
@@ -224,6 +232,16 @@ extern void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len);
 __attribute__((weak)) void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 {
     (void)frame; (void)len;   /* no vnet_emac linked in: drop silently */
+}
+
+/* dbgtools.c provides the real implementation (dbg/gdb builds only); same
+ * weak-fallback pattern as netcon_rx_frame above so any build without
+ * dbgtools.o (repl/fbsd/zephyr/hdmi/net/stage0) links cleanly. Same
+ * "payload after the 14-byte Ethernet header" convention as netcon_rx_frame. */
+extern void dbgtools_rx_frame(const uint8_t *payload, uint16_t len);
+__attribute__((weak)) void dbgtools_rx_frame(const uint8_t *payload, uint16_t len)
+{
+    (void)payload; (void)len;   /* no dbgtools linked in: drop silently */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1172,6 +1190,12 @@ int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len)
     return tx_frame_raw(BCAST_MAC, ethertype, payload, (int)len);
 }
 
+int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
+                       const uint8_t *payload, uint16_t len)
+{
+    return tx_frame_raw(dst, ethertype, payload, (int)len);
+}
+
 void emac_putc(int c)
 {
     if (tx_line_len < TX_LINE_MAX)
@@ -1376,8 +1400,17 @@ void emac_poll(void)
                  * framing). */
                 snapshot_net_rx_frame(buf + 14, (uint16_t)(length - 14));
                 note_rx_frame();
+            } else if (et == ETHERTYPE_DBGRAW && (to_us || bcast)) {
+                /* Raw dbgtools peek (see dbgtools.h): serviced HERE, directly
+                 * inside emac_poll(), so it answers regardless of whether
+                 * CPU1's for(;;) loop (smp.c) is currently inside
+                 * dbgmon_service() or gdbstub_poll()/command_loop() — both
+                 * call emac_poll() (via console_poll()/gdb_getc()) on every
+                 * pass, so this branch is reachable from either. */
+                dbgtools_rx_frame(buf + 14, (uint16_t)(length - 14));
+                note_rx_frame();
             } else if (et != ETHERTYPE_CONSOLE && et != ETHERTYPE_NETCON &&
-                       et != ETHERTYPE_SNAPNET) {
+                       et != ETHERTYPE_SNAPNET && et != ETHERTYPE_DBGRAW) {
                 /* Not our debug protocol, not netcon: ROADMAP C1 hook —
                  * hand the whole frame to the virtio-net-over-EMAC
                  * multiplexer (vnet_emac.c) instead of silently dropping
