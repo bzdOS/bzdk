@@ -40,6 +40,7 @@
 #include "vblk_async.h"
 #include "vnet_emac.h"   /* ROADMAP C1: virtio-net multiplexed onto this EMAC */
 #include "el2_ncmap.h"
+#include "dbgtools.h"    /* CPU1 heartbeat / build-id / entry-hold (2026-07-26) */
 
 /* bmc.c — software-BMC management plane. Extern decl only (bmc.h pulls in
  * exceptions.h + its own struct; main_dbg.c only needs the init entry). */
@@ -108,6 +109,13 @@ int main(void)
 
 	el2_install();
 	vconsole_init();
+
+	/* CPU1 heartbeat / build-id / entry-hold breadcrumb lane (dbgtools.h).
+	 * Must run before smp_init() (below) brings CPU1 up, so the cold-vs-
+	 * warm-reset detection + build-id stamp are in place before anything
+	 * could observe them, and before the dbg_hold_before_entry-style gate
+	 * near kload_enter() reads HOLD/RELEASE. */
+	dbgtools_init();
 
 	/* eMMC-backed virtio-blk: bring the eMMC up and register the modern
 	 * virtio-mmio device at 0x0A000000 BEFORE stage2_init()/stage2_enable()
@@ -299,6 +307,20 @@ int main(void)
 	 * at the distributor in this build). */
 	gic_timer_cpuif_init();
 	vgic_init();
+	/* Arm EL2's own CNTP tick after all. The comment above says dbgmon does not
+	 * need a periodic tick, and that is still true -- but vtimer_mask_watchdog()
+	 * does. gic_timer.c masks the guest's CNTV (VGIC_CNTV_HW=0) before injecting
+	 * the virtual tick, and that mask is SELF-LATCHING: masked means no further
+	 * CNTV PPI, which means no further chance to inject, so a single injection
+	 * that vgic_inject_cntv() gates or drops (all List Registers busy, or a live
+	 * vINTID 27 still un-EOIed) costs the guest its timebase for the rest of the
+	 * boot. Measured live 2026-07-30: 8047 ticks forwarded fine, then one was
+	 * lost mid-ldconfig and the guest idled in WFI forever with a perfectly
+	 * healthy kernel. The watchdog is called only from the tick handler, so
+	 * without this the recovery it implements is unreachable -- FLTR_K_VTRESCUE
+	 * stayed 0 not because the bug never happened but because nothing could run.
+	 * Preserving-CNTVOFF variant: see its header comment. */
+	gic_timer_arm_preserving_cntvoff(10000u);   /* 10 ms: recovery within ~20 ms */
 	{
 		uint64_t hcr;
 		__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr));
@@ -412,6 +434,36 @@ int main(void)
 				__asm__ volatile("wfe" ::: "memory");
 			}
 		}
+	}
+
+	/* PAUSE-BEFORE-ENTRY GATE (dbgtools.h HOLD/RELEASE, 2026-07-26): unlike
+	 * dbg_no_guest above (a PERMANENT "never enter the guest" diagnostic),
+	 * this is a TEMPORARY hold a host tool can RELEASE, meant to let it
+	 * plant breakpoints/watch the very first guest instructions instead of
+	 * racing the clock. Same wdt_pet()+wfe idiom as dbg_no_guest so the
+	 * dead-man's-switch watchdog stays fed while held.
+	 *
+	 * Default OFF (both words start 0 on a cold boot — see dbgtools_init())
+	 * so this is a no-op, byte-for-byte identical to today's boot-straight-
+	 * through behavior, on every ordinary chimpd cold-TFTP cycle: nothing
+	 * runs early enough in a cold load to arm HOLD before this point, so it
+	 * reads 0 and falls straight through to kload_enter() below exactly as
+	 * before this change. It ONLY takes effect across a WARM
+	 * hv.wdt_reset()-style reload, where a host tool wrote HOLD=1 (dbgmon's
+	 * `hold` verb) before triggering the reset and DRAM survives it — see
+	 * dbgtools.h/hv_addrmap.h for exactly why. Release with dbgmon's
+	 * `release` verb (sets RELEASE nonzero); the host may also just watch
+	 * for DBG_BC(1, 0x60008) below over `bc 0x50000e00` to confirm it's
+	 * actually held before proceeding. */
+	if (dbgtools_hold_get()) {
+		DBG_BC(1, 0x60008);
+		for (;;) {
+			wdt_pet();
+			if (dbgtools_release_get())
+				break;
+			__asm__ volatile("wfe" ::: "memory");
+		}
+		DBG_BC(1, 0x60009);   /* released -- falling through to kload_enter() */
 	}
 
 	kload_enter(entry, mi, SP_EL1);   /* noreturn -> FreeBSD at EL1, we debug it live */
