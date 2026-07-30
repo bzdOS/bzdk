@@ -639,6 +639,17 @@ static void vblk_inject_irq(void)
 static uint32_t g_write_retries;    /* [57] retry attempts made      */
 static uint32_t g_write_retry_ok;   /* [58] writes a retry rescued   */
 
+/* Extra bounded acquires before a lock timeout becomes the guest's problem.
+ * Each is a full VBLK_EMMC_LOCK_TIMEOUT_MS (6 s) and pets the watchdog while it
+ * spins, so 4 means ~30 s of patience before we concede -- deliberately far
+ * beyond any legitimate holder, because the alternative is an S_IOERR that UFS
+ * turns into a dead /bin/sh. If [60] ever moves, the lock is genuinely stuck
+ * rather than merely contested, and THAT is a different bug (a leaked unlock)
+ * which more waiting will never fix. */
+#define VBLK_LOCK_RETRIES   4u
+static uint32_t g_lock_retries;     /* [59] extra acquires needed    */
+static uint32_t g_lock_giveups;     /* [60] gave up -> S_IOERR       */
+
 /* The exact eMMC LBA serve_data() was on when it last failed. A request's
  * chain can die several sectors into a descriptor, so neither the request's
  * start sector nor the bytes-served count pins down the actual sector — and
@@ -710,8 +721,34 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		/* Serialize this single controller transaction against CPU1 (design
 		 * §8.1). Bounded acquire: if the debug core holds the eMMC too long we
 		 * fail the request cleanly rather than stall CPU0 past the watchdog. */
-		if (!emmc_lock_acquire_bounded())
-			return VBLK_RC_BUSY;         /* controller busy -> S_IOERR */
+		/* Do NOT give up after one bounded acquire. Handing the guest an
+		 * S_IOERR because we lost a lock race is far worse than waiting: UFS
+		 * treats a failed read of its own metadata as fatal, so one lost race
+		 * kills /bin/sh and drops the boot into single user. Measured in a
+		 * 5-cycle soak (2026-07-30): 4 of 5 boots died exactly this way, with
+		 * g_ioerr_busy=1 at LBA 279392 and zero card-level errors -- the
+		 * medium was fine, the request simply could not get the lock.
+		 *
+		 * Six seconds is already a generous cap for a per-sector PIO that
+		 * takes milliseconds, so a timeout here is not ordinary contention:
+		 * VBLK_EMMC_LOCK_PA is a plain test-and-set with no queue, so under
+		 * sustained two-core load (CPU0's sync path vs CPU2's async path, each
+		 * acquiring and releasing once PER SECTOR of a multi-sector request)
+		 * the loser can be starved for seconds on end. Retrying is the correct
+		 * response to starvation; failing is not. emmc_lock_acquire_bounded()
+		 * pets the hardware watchdog while it spins, so a long wait here is
+		 * safe -- and the guest has nowhere else to go anyway. */
+		{
+			uint32_t tries = 0;
+			while (!emmc_lock_acquire_bounded()) {
+				vblk_bc(59, ++g_lock_retries);
+				if (++tries >= VBLK_LOCK_RETRIES) {
+					vblk_bc(60, ++g_lock_giveups);
+					return VBLK_RC_BUSY;   /* truly stuck -> S_IOERR */
+				}
+				vblk_pet_wdt();
+			}
+		}
 
 		if (is_read) {
 			/* Read one eMMC block straight into the guest buffer. buf_gpa is a
@@ -758,7 +795,16 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			 * for exactly this reason; the hypervisor's own path did not, which
 			 * left the host tool more robust than the thing it debugs. Bounded,
 			 * and the watchdog is fed between attempts because each one can
-			 * burn the full busy timeout. */
+			 * burn the full busy timeout.
+			 *
+			 * KNOWN INTERACTION, not yet restructured: these retries run with
+			 * the eMMC lock still HELD, so a stalling write can hold it for up
+			 * to 3 x EMMC_WRITE_BUSY_TIMEOUT_MS on top of the first attempt --
+			 * roughly 16 s, which starves every other user. That is survivable
+			 * only because the acquire side is now patient (see
+			 * VBLK_LOCK_RETRIES); the cleaner shape is to release and
+			 * re-acquire around each retry. Worth doing if [57] ever climbs in
+			 * a real workload rather than staying at 0. */
 			for (uint32_t t = 0; rc == -2 && t < VBLK_WRITE_RETRIES; t++) {
 				vblk_bc(57, ++g_write_retries);
 				vblk_pet_wdt();
@@ -1721,8 +1767,9 @@ int vblk_init(void)
 	 * counter". Observed reading back 0xFFFFFFFF on the first boot that needed
 	 * no retries at all. */
 	g_write_retries = g_write_retry_ok = 0;
-	vblk_bc(57, 0);
-	vblk_bc(58, 0);
+	g_lock_retries = g_lock_giveups = 0;
+	for (uint32_t i = 57; i <= 60; i++)
+		vblk_bc(i, 0);
 
 	/* Release the eMMC-controller lock unconditionally. It lives in a fixed
 	 * DRAM word (not .bss), so a warm WDT reset (which preserves DRAM) can

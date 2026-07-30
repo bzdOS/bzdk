@@ -75,6 +75,10 @@ VBK_LABELS = {
     # them is the card stalling and recovering; retries climbing while rescues
     # stay flat means the failure is not transient after all.
     57: "write_retries", 58: "write_retry_ok",
+    # Lock-acquire patience. [59] moving is ordinary two-core starvation being
+    # absorbed instead of handed to the guest as an S_IOERR. [60] moving means
+    # the lock is genuinely STUCK (a leaked unlock), which waiting cannot fix.
+    59: "lock_retries", 60: "lock_giveups",
 }
 
 # bc[42..56] decode. Read as signed: serve_data's codes are negative.
