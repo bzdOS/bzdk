@@ -569,7 +569,31 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			 * whether the FIFO had drained, what STAR thought, or whether the
 			 * card was still busy. Same slots the read path uses, plus a tag in
 			 * [4] so a reader can tell a write record from a read one:
-			 * 0x20000 = data-phase error bit, 0x30000 = data-phase timeout. */
+			 * 0x20000 = data-phase error bit, 0x30000 = data-phase timeout.
+			 *
+			 * The breadcrumb those slots produced immediately paid for itself and
+			 * explains the ebio_fail_settle() calls below (added 2026-07-30, same
+			 * day, one soak run apart): STAR read 0x0100c301 at the moment of a
+			 * real RINT=0x104 DATA_TIMEOUT — FIFO NOT empty and CARD_BUSY set, so
+			 * the write had stalled mid-transfer with words still undelivered,
+			 * rather than the card simply not responding. Both of these returns
+			 * then jumped out leaving exactly that state behind. That is the same
+			 * self-sustaining failure ebio_fail_settle()'s own comment describes
+			 * for the read path: the next attempt clears RINT and writes a new
+			 * CMDR on top of a still-retiring data phase and fails too. It also
+			 * explains why raising VBLK_WRITE_RETRIES from 3 to 8 earlier the same
+			 * day did not help at all — every retry inherited the dirty controller
+			 * its predecessor left, so a bigger budget just bought more attempts
+			 * at the same poisoned state.
+			 *
+			 * NOTE the FIFO reset discards the undelivered words. That is correct
+			 * here and only here: these are single-block CMD24 transfers, so the
+			 * caller (vblk_emmc.c serve_data) re-pushes the whole 512 B sector
+			 * from the bounce buffer on retry — nothing is half-written from the
+			 * host's side. This does NOT abort the data phase on the CARD's side;
+			 * if ebio fails keeps climbing after this, an explicit CMD12
+			 * STOP_TRANSMISSION (or a controller soft reset) is the next step, and
+			 * the fails counter staying flat is what says it isn't needed. */
 			if (ri & 0x0180u) { /* DATA_CRC(bit7)/DATA_TIMEOUT(bit8) */
 				ebio_bc(1, lba);
 				ebio_bc(2, ri);
@@ -577,6 +601,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				ebio_bc(4, 0x20000u | (ri & 0x3fffu));
 				ebio_bc(5, rreg(REG_GCTL));
 				ebio_bc(0, ++g_ebio_fails);
+				ebio_fail_settle();
 				return (int)(0x40000000u | (ri & 0x3fffu));
 			}
 			if (rd_cntpct() - start > cap) {
@@ -587,6 +612,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				ebio_bc(4, 0x30000u | (r2 & 0x3fffu));
 				ebio_bc(5, rreg(REG_GCTL));
 				ebio_bc(0, ++g_ebio_fails);
+				ebio_fail_settle();
 				return (int)(0x20000000u | (r2 & 0x3fffu));
 			}
 		}
@@ -625,8 +651,18 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 		for (;;) {
 			if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
 				break;
-			if (rd_cntpct() - start > cap)
+			if (rd_cntpct() - start > cap) {
+				/* Settle for the same reason as the data-phase returns above:
+				 * this bails with CARD_BUSY still set by definition, which is
+				 * precisely the state that poisons the next call. -2 is the code
+				 * vblk_emmc.c's write-retry loop has always retried, so before
+				 * this it was the one retryable write error GUARANTEED to hand
+				 * its successor a busy card. wait_card_idle() is iteration-capped
+				 * (~0.4 ms), so re-waiting on a card we just timed out on costs a
+				 * bounded amount and the FIFO reset happens either way. */
+				ebio_fail_settle();
 				return -2;   /* card never signaled program-done: do NOT claim success */
+			}
 		}
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
