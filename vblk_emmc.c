@@ -706,25 +706,40 @@ static uint32_t g_serve_fail_lba;
 static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
                       uint64_t *sector, uint32_t *sector_fill)
 {
-	/* *sector_fill = bytes already accumulated into the current partial
-	 * sector's bounce buffer from a previous descriptor (0 in the aligned
-	 * fast path). This function only fully implements the ALIGNED fast path;
-	 * the unaligned stitch is a TODO backstop. */
-	if (*sector_fill != 0 || (len % VBLK_SECTOR_BYTES) != 0) {
-		/* TODO(board/correctness): implement cross-descriptor partial-sector
-		 * stitching. In practice FreeBSD's virtio_blk hands whole-sector,
-		 * 512-aligned segments, so this branch should not be exercised; if a
-		 * guest ever trips it, fail the request cleanly rather than corrupt
-		 * data. */
-		g_serve_fail_lba = (uint32_t)*sector;
-		return VBLK_RC_UNALIGNED;
-	}
-
-	uint32_t nsec = len / VBLK_SECTOR_BYTES;
-	for (uint32_t s = 0; s < nsec; s++) {
-		uint64_t buf_gpa = gpa + (uint64_t)s * VBLK_SECTOR_BYTES;
-		uint32_t lba = (uint32_t)(*sector + s);
+	/* *sector_fill = bytes of the CURRENT sector already consumed by previous
+	 * descriptors (0 on a sector boundary). It is left pointing at the partial
+	 * tail this call ends on, so the next descriptor resumes mid-sector.
+	 *
+	 * The unaligned case used to return VBLK_RC_UNALIGNED from here, on the
+	 * assumption -- stated in the old comment -- that FreeBSD only ever hands
+	 * over whole-sector, 512-aligned segments. A soak on 2026-07-30 disproved
+	 * it: a real guest request failed with rc=-100 at LBA 922338
+	 * (ioerr_unaligned=1), and UFS turns a failed metadata I/O into a dead
+	 * boot. A virtio-blk request's data region is a whole number of sectors IN
+	 * TOTAL, but any single descriptor may start and/or end mid-sector.
+	 *
+	 * The arithmetic below is a transcription of stitch_serve() in
+	 * test_vblk_stitch.c, which proves it on a fake device: the carry across
+	 * descriptors, the unaligned tail, that a partial write read-modify-writes
+	 * so the bytes outside its window survive, and that a full-sector write
+	 * does NOT pay for that read. This is the one path here that can corrupt
+	 * the guest filesystem silently, so keep the two in step -- change the
+	 * test first, then this. */
+	uint32_t done = 0;
+	while (done < len) {
+		uint32_t off = *sector_fill;
+		uint32_t chunk = VBLK_SECTOR_BYTES - off;
+		uint32_t lba = (uint32_t)*sector;
+		/* Whole-sector chunks keep the original fast path: the read goes
+		 * STRAIGHT into the guest buffer (with the gmem_cmo publish below), no
+		 * bounce, no read-modify-write. Only a partial chunk pays for those. */
+		uint32_t whole;
+		uint64_t buf_gpa = gpa + done;
 		int rc;
+
+		if (chunk > len - done)
+			chunk = len - done;
+		whole = (off == 0u && chunk == VBLK_SECTOR_BYTES);
 
 		/* Published up front so EVERY failure return below leaves the exact
 		 * sector behind for vblk_note_ioerr(), without repeating the store at
@@ -741,7 +756,10 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		 * acquiring the eMMC lock so a rejected request doesn't even briefly
 		 * hold the controller. See gpa_in_range()'s block comment for the
 		 * exact bounds and what this does/doesn't protect. */
-		if (!gpa_in_range(buf_gpa, VBLK_SECTOR_BYTES)) {
+		/* `chunk`, not a whole sector: a partial chunk only ever touches
+		 * `chunk` guest bytes, and checking a full 512 past buf_gpa would
+		 * reject a legitimate descriptor that ends exactly at the top of DRAM. */
+		if (!gpa_in_range(buf_gpa, chunk)) {
 			g_gmem_oob++;
 			vblk_bc(27, g_gmem_oob);
 			return VBLK_RC_BADPA;        /* guest PA outside DRAM -> S_IOERR */
@@ -782,7 +800,8 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		if (is_read) {
 			/* Read one eMMC block straight into the guest buffer. buf_gpa is a
 			 * guest PA == EL2 PA (identity), 512-aligned here, Normal-WB. */
-			rc = emmc_bio_read(lba, buf_gpa);
+			rc = whole ? emmc_bio_read(lba, buf_gpa)
+			           : emmc_bio_read(lba, BOUNCE_PA);
 			/* PUBLISH TO PoC (root cause of "336 clean reads but GEOM finds no
 			 * GPT / mount error 19", found live 2026-07-22). emmc_bio_read fills
 			 * buf_gpa via CACHED EL2 stores (SCTLR_EL2.C=1) and only dsb's — it
@@ -795,15 +814,32 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			 * transfer "succeeded" (S_OK, IRQ delivered). Clean+invalidate the
 			 * destination to PoC here so the guest's refetch sees the real
 			 * sector. Exact mirror of gmem_write()'s trailing gmem_cmo(). */
-			if (rc == 0)
-				gmem_cmo(buf_gpa, VBLK_SECTOR_BYTES);
+			if (rc == 0) {
+				if (whole) {
+					gmem_cmo(buf_gpa, VBLK_SECTOR_BYTES);
+				} else {
+					/* Partial: the sector landed in our own bounce, so hand
+					 * the guest only its slice. gmem_write() publishes to PoC
+					 * itself, so no separate gmem_cmo() here. */
+					gmem_write(buf_gpa, bounce() + off, chunk);
+				}
+			}
 		} else {
 			/* Bounce guest bytes into our block, then push to eMMC. Using the
 			 * bounce (rather than emmc_bio_write(lba, buf_gpa) directly) keeps
 			 * the eMMC FIFO source in an EL2-private, definitely-aligned buffer
 			 * and isolates the guest buffer's cache state from the write path.
 			 * TODO(perf): the direct form is valid too and saves a copy. */
-			gmem_read(buf_gpa, bounce(), VBLK_SECTOR_BYTES);
+			/* A partial write MUST read the sector first, or the bytes outside
+			 * [off, off+chunk) are destroyed. That is the silent corruption
+			 * test_vblk_stitch.c's t_partial_write_preserves() pins down; a
+			 * whole-sector write correctly skips it. */
+			if (!whole) {
+				rc = emmc_bio_read(lba, BOUNCE_PA);
+				if (rc != 0)
+					goto done_sector;
+			}
+			gmem_read(buf_gpa, bounce() + off, chunk);
 			__asm__ volatile("dsb sy" ::: "memory");
 			rc = emmc_bio_write(lba, BOUNCE_PA);
 			/* Retry a TRANSIENT write stall. emmc_bio_write() returns -2 for
@@ -843,6 +879,7 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			if (rc == 0 && g_write_retries)
 				vblk_bc(58, ++g_write_retry_ok);
 		}
+done_sector:
 		vblk_emmc_unlock();
 		vblk_bc(12, (uint32_t)rc);
 
@@ -852,8 +889,18 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 
 		if (rc != 0)
 			return rc;
+
+		/* Advance over what this chunk actually consumed. A sector is finished
+		 * (and *sector moves) only when the chunk reaches its end; otherwise
+		 * the tail is carried to the next descriptor via *sector_fill. */
+		done += chunk;
+		if (off + chunk == VBLK_SECTOR_BYTES) {
+			*sector += 1;
+			*sector_fill = 0;
+		} else {
+			*sector_fill = off + chunk;
+		}
 	}
-	*sector += nsec;
 	return 0;
 }
 
