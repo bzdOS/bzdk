@@ -291,20 +291,102 @@ Cosmetic, not blockers: `swapon: /dev/mmcsd0p4: No such file or directory` (the
 image's fstab uses the bare-metal `mmcsd0pN` names while the guest sees `vtbd0`)
 and the `$hostname` warning.
 
+## 7. MILESTONE: the guest boots to an interactive root shell
+
+```
+FreeBSD/arm64 (Amnesiac) (ttyu0)
+
+login: root
+...
+root@:~ # echo BZDOS-SHELL-OK; uname -m; id
+BZDOS-SHELL-OK
+arm64
+uid=0(root) gid=0(wheel) groups=0(wheel),5(operator)
+```
+
+### The last blocker: a self-latching CNTV mask
+
+With `VGIC_CNTV_HW=0`, `gic_timer.c` masks the guest's CNTV *before* injecting
+the virtual tick. That mask is **self-latching**: masked means no further CNTV
+PPI reaches EL2, which means no further chance to inject, so recovery depends
+entirely on the guest's ISR clearing IMASK. `vgic_inject_cntv()` returns 0 when
+it *gates* a tick (a live vINTID 27 still un-EOIed) or *drops* it (all List
+Registers busy) — and either one then kills the timebase permanently.
+
+Measured on `3b56041`: 8047 ticks forwarded correctly, then one lost during the
+heavy `ldconfig` burst (peak LR pressure) → `gt_cntv_el2_masked=1` forever and
+the guest idled in WFI with a completely healthy kernel. Proven healthy by
+injecting INTID 137 (`GICD_ISPENDR` 0x01C81210 bit 9): the guest woke, ran a
+textbook vtblk ISR, and went straight back to sleep — 40 injections, exactly 3.0
+events each, zero console progress. So it was waiting on *time*, nothing else.
+
+`vtimer_mask_watchdog()` already implemented the recovery, but it is called only
+from a CNTP tick handler `main_dbg.c` never armed. `FLTR_K_VTRESCUE = 0` meant
+**unreachable**, not "never needed".
+
+### Fix (`dfc6eda`) — two parts, and the second is the non-obvious one
+
+1. `main_dbg.c` arms the tick via a new `gic_timer_arm_preserving_cntvoff(10ms)`.
+   It save/restores `CNTVOFF_EL2` around the existing `gic_timer_init()`, which
+   zeroes it as an old pre-vGIC `DELAY()` workaround — the guest ticks fine on
+   ATF's value, so changing that as well would alter a working virtual timebase
+   and confound a single-boot verification.
+2. `gic_timer_irq()`: `if (vgic_active() && intid != TIMER_INTID)`. **Arming the
+   tick alone does nothing** — with vgic active, INTID 30 was swallowed by the
+   generic "Device SPI" arm into `vgic_inject_hw()`, so the tick handler, and
+   `vtimer_mask_watchdog()` with it, never ran. Safe: `irq_counter[30]` measured
+   0 across a full boot, i.e. this guest uses CNTV and never programs CNTP.
+
+Verified on hardware in **one** reload, first attempt: `gt_ticks` 1646→3219
+(~105/s, matches the period), `irq30` climbing in lockstep (handled locally),
+`gt_cntv_el2_masked` oscillating 0/1 (mask set *and* cleared), console advancing
+past the old stall point, boot completing through entropy/network to `login:`.
+
+### Also worth keeping: live recovery with no reboot
+
+The same wedge was first cleared **without any reload**. Both vgic calls in
+`gic_timer_irq` are tail calls, and `vgic_inject_cntv()` is global and
+argument-less, so redirecting one instruction is enough:
+
+```
+hv.patch(0x4200307c, 0x140030f3)   # b vgic_inject_hw -> b vgic_inject_cntv
+<inject INTID 137 so CPU0 runs it on its OWN GICH bank>
+hv.patch(0x4200307c, 0x14003242)   # restore immediately
+```
+
+Encoding: `0x14000000 | ((target-pc)/4)`; validate the formula against the
+existing branch at `0x420030ec`, which must reproduce `0x140030d7`. Calling
+`vgic_inject_cntv()` via `hv.call` would be useless — that runs on CPU1 and
+writes the wrong (banked) GICH.
+
+### Cosmetic leftovers, not blockers
+
+`/etc/rc.conf` is **missing** on the board's p3 although present in the
+reference image (hence `$hostname is not set` and the "Amnesiac" hostname), and
+`swapon: /dev/mmcsd0p4: No such file or directory` because the image's fstab
+uses bare-metal `mmcsd0pN` names while the guest sees `vtbd0`. Both belong to
+task #14. A stuck eMMC controller lock (`0x50020100` = 1) was also found and
+cleared — left held it would fail every guest read with S_IOERR, i.e. reproduce
+§6's bug.
+
 ## Carry-forward for next session
 
-Items 1-3 of the original list are **done or moot** — see §5 and §6. The EIO
-saga itself is **closed** (§6). What remains:
+The EIO saga (§6) and the timebase wedge (§7) are both **closed**, and the guest
+now reaches an interactive root shell. What remains:
 
-1. **Task #17 — the new wedge in `/etc/rc`.** Surface FAR/HPFAR for SYNC
-   flightrec records so the faulting IPA is known, symbolize guest PCs
-   `0x90c8fc` / `0x90ca5c` against `kernel.debug`, and find which unemulated
-   MMIO `/etc/rc` touches. This is now the only thing between the board and a
-   `login:` prompt.
-2. `/bin/sh` and `/libexec/ld-elf.so.1` on the board were **verified
+1. **Task #14 — rebuild a clean rootfs.** Now the top item, and the evidence for
+   it is concrete: `/etc/rc.conf` is missing on the board, `/bin/sh`
+   `/lib/libedit.so.8` `/etc/rc` carry the uid=1001 defect, fstab uses
+   bare-metal `mmcsd0pN` names, and this boot's `fsck` had to SALVAGE three
+   different classes of metadata damage.
+2. Consider whether `VGIC_CNTV_HW=1` is the better long-term answer than §7's
+   watchdog-based recovery — it removes the software mask, and with it the
+   failure mode, entirely. Also still uninvestigated: whether `vgic.c`'s
+   pending-injection queue held the lost tick.
+3. `/bin/sh` and `/libexec/ld-elf.so.1` on the board were **verified
    byte-identical** to the local image (sha256 over the full files), so the
    medium is not the problem and that question is settled.
-3. Task #14 — rebuild a clean rootfs on the dev VM
+4. Task #14 detail — rebuild a clean rootfs on the dev VM
    (`/root/.claude/plans/jolly-honking-snowflake.md`). The uid=1001 defect is
    confirmed present on the very files in the failing path, the pipeline fix
    already exists (`bsdos-build.sh`'s `sudo tar`, 2026-07-22) and was simply
