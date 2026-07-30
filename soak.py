@@ -533,11 +533,97 @@ def guest_clean_shutdown(settle_s=30.0):
     return "sent"
 
 
+VBK_BC = 0x50020000
+GT_TICKS_PA = 0x42030008
+IRQC_PA = 0x42030068
+
+# The subset of vblk_emmc.c's breadcrumbs that says WHY a boot failed. Kept
+# here rather than derived, so a build without the newer fields just reports
+# 0xFFFFFFFF for them (unwritten scratch) instead of breaking the harness.
+VBK_FIELDS = {6: "g_reads", 7: "g_writes", 42: "g_ioerrs", 43: "ioerr_busy",
+              44: "ioerr_badpa", 45: "ioerr_unaligned", 46: "ioerr_emmc",
+              47: "ioerr_capacity", 48: "ioerr_notready",
+              49: "ioerr1_lba", 50: "ioerr1_rc", 53: "ioerrN_lba",
+              54: "ioerrN_rc", 57: "write_retries", 58: "write_retry_ok",
+              59: "lock_retries", 60: "lock_giveups"}
+
+
+def capture_counters():
+    """Snapshot the hypervisor's own counters BEFORE the next reload wipes them.
+
+    This is the difference between a soak that produces a pass/fail tally and
+    one that produces a diagnosis. Every counter in the VBK1 window is reset by
+    vblk_init() on each boot, so a cycle's evidence is gone the moment the board
+    reloads -- which is exactly when a failed cycle is most interesting. Learned
+    the hard way on 2026-07-30: a 5-cycle run lost 4 boots to a guest that never
+    reached multiuser, and by the time anything was read the board was already
+    two boots further on.
+
+    Read what these mean off the failing cycle: ioerr_busy => eMMC lock
+    starvation, lock_giveups => the lock is genuinely stuck (a leaked unlock,
+    which waiting cannot fix), ioerr_emmc => the card itself, write_retries =>
+    a transient write stall was absorbed, all-empty => the debug channel was
+    already down, which is itself the finding.
+
+    Never raises: a board that cannot answer is a normal soak outcome."""
+    out = {}
+    try:
+        import hvdbg
+        hv = hvdbg.HV()
+        if not hv.alive(timeout=5):
+            return {"channel": "down"}
+
+        def rw(pa, cnt, tries=10):
+            for _ in range(tries):
+                w = hv.read_words(pa, cnt)
+                if w and len(w) == cnt:
+                    return w
+                time.sleep(0.2)
+            return None
+
+        b = rw(VBK_BC, 64)
+        if b:
+            for idx, name in VBK_FIELDS.items():
+                v = b[idx]
+                if v == 0xFFFFFFFF:
+                    continue          # field absent in this build
+                if name.endswith("_rc") and v >= 0x80000000:
+                    v -= 0x100000000  # serve_data's codes are negative
+                out[name] = v
+        g = rw(GT_TICKS_PA, 2)
+        if g:
+            out["gt_ticks"] = g[0] | (g[1] << 32)
+        c = rw(IRQC_PA, 40)
+        if c:
+            out["cntv_irqs"] = c[27]
+            out["hv_tick_irqs"] = c[30]
+    except Exception as exc:
+        out["capture_error"] = str(exc)[:120]
+    return out
+
+
 def do_cycle(n, args, report):
     log(f"────────── soak cycle #{n} ──────────")
     t_cycle0 = now()
     rec = {"n": n, "start": stamp(), "breakglass_calls": 0}
     log_path = os.path.join(DEFAULT_LOGDIR, f"cycle-{n:04d}.log")
+
+    # Before anything reloads the board and wipes them.
+    rec["counters_before_reload"] = capture_counters()
+    cb = rec["counters_before_reload"]
+    if cb.get("g_ioerrs"):
+        log(f"  [diag] previous boot had g_ioerrs={cb['g_ioerrs']} "
+            f"busy={cb.get('ioerr_busy')} emmc={cb.get('ioerr_emmc')} "
+            f"lba={cb.get('ioerrN_lba')} rc={cb.get('ioerrN_rc')}")
+        report.add_anomaly(n, "guest-io-error",
+                           f"previous boot: {cb.get('g_ioerrs')} S_IOERR "
+                           f"(busy={cb.get('ioerr_busy')}, "
+                           f"emmc={cb.get('ioerr_emmc')}, "
+                           f"lba={cb.get('ioerrN_lba')}, rc={cb.get('ioerrN_rc')})")
+    if cb.get("lock_giveups"):
+        report.add_anomaly(n, "emmc-lock-stuck",
+                           f"lock_giveups={cb['lock_giveups']} — a leaked "
+                           f"unlock, not contention; waiting cannot fix it")
 
     if getattr(args, "clean_shutdown", False):
         rec["clean_shutdown"] = guest_clean_shutdown()
