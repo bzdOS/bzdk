@@ -1716,6 +1716,13 @@ int vblk_init(void)
 	g_ioerr_emmc = g_ioerr_capacity = g_ioerr_notready = 0;
 	for (uint32_t i = 42; i <= 48; i++)
 		vblk_bc(i, 0);
+	/* Same reasoning for the write-retry pair: "no write ever stalled" is only
+	 * a useful statement if it can be told apart from "this build has no such
+	 * counter". Observed reading back 0xFFFFFFFF on the first boot that needed
+	 * no retries at all. */
+	g_write_retries = g_write_retry_ok = 0;
+	vblk_bc(57, 0);
+	vblk_bc(58, 0);
 
 	/* Release the eMMC-controller lock unconditionally. It lives in a fixed
 	 * DRAM word (not .bss), so a warm WDT reset (which preserves DRAM) can
