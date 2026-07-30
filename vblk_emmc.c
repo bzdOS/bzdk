@@ -635,6 +635,27 @@ static void vblk_inject_irq(void)
  * never signaled program-done"). See serve_data()'s retry loop for the hardware
  * evidence; 3 keeps the worst case (3 x EMMC_WRITE_BUSY_TIMEOUT_MS = 12 s) under
  * the 16 s hardware watchdog, and the loop pets it between attempts anyway. */
+/* emmc_bio_write() does not only return small negatives. Its data-phase watch
+ * encodes the controller's RINT register into the result:
+ *   0x4000_0000 | (RINT & 0x3fff)  — a DATA_CRC (bit7) or DATA_TIMEOUT (bit8)
+ *                                    error bit came up during the data phase
+ *   0x2000_0000 | (RINT & 0x3fff)  — the data phase timed out without either
+ * Both are POSITIVE ints, so they match none of the VBLK_RC_* codes and none of
+ * emmc_bio's -1..-9. That cost real time on 2026-07-30: bc[54] kept reporting
+ * 0x40000104, which looks exactly like a guest DRAM address (guest DRAM starts
+ * at 0x40000000), so it was first written off as a corrupted read and then
+ * suspected of being a pointer leaking into the rc slot. It was neither -- it
+ * was a faithfully reported DATA_TIMEOUT with RINT=0x104.
+ *
+ * They are also TRANSIENT in the same way rc==-2 is, and the retry loop below
+ * missed them: it only re-tried on -2, so a first attempt returning -2 followed
+ * by a second returning 0x4000_0104 exited the loop with that value and failed
+ * the request (observed: write_retries=1, write_retry_ok=0). */
+#define VBLK_RC_IS_WR_ENCODED(rc) \
+	(((uint32_t)(rc) & 0xE0000000u) == 0x40000000u || \
+	 ((uint32_t)(rc) & 0xE0000000u) == 0x20000000u)
+#define VBLK_RC_WR_RETRYABLE(rc)  ((rc) == -2 || VBLK_RC_IS_WR_ENCODED(rc))
+
 #define VBLK_WRITE_RETRIES  3u
 static uint32_t g_write_retries;    /* [57] retry attempts made      */
 static uint32_t g_write_retry_ok;   /* [58] writes a retry rescued   */
@@ -805,7 +826,8 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			 * VBLK_LOCK_RETRIES); the cleaner shape is to release and
 			 * re-acquire around each retry. Worth doing if [57] ever climbs in
 			 * a real workload rather than staying at 0. */
-			for (uint32_t t = 0; rc == -2 && t < VBLK_WRITE_RETRIES; t++) {
+			for (uint32_t t = 0;
+			     VBLK_RC_WR_RETRYABLE(rc) && t < VBLK_WRITE_RETRIES; t++) {
 				vblk_bc(57, ++g_write_retries);
 				vblk_pet_wdt();
 				rc = emmc_bio_write(lba, BOUNCE_PA);
