@@ -424,7 +424,7 @@ static inline void ebio_bc(int i, uint32_t v)
 }
 static uint32_t g_ebio_fails;
 static uint32_t g_settles;        /* [8] error-recovery runs                */
-static uint32_t g_settle_clkfail; /* [9] of those, clock re-program timeouts */
+/* [9] was g_settle_clkfail; the clk_update() it counted is gone (see below). */
 static uint32_t g_busy_timeouts;  /* [10] post-write CARD_BUSY wait timeouts */
 
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
@@ -523,10 +523,36 @@ static void ebio_fail_settle(void)
 		if ((rreg(REG_GCTL) & GCTL_RESET_ALL) == 0)
 			break;
 
-	/* (3) Re-program the internal clock after the reset. */
+	/* (3) Re-program the internal clock after the reset -- REMOVED, it broke
+	 * the guest (2026-07-30, same day it was added).
+	 *
+	 * Deploying the clk_update() call here regressed guest boot immediately and
+	 * reproducibly: 5 of 6 soak cycles, the guest stopped at g_writes=0 and
+	 * g_reads=715 (against 152/1178 on the build before it), never reaching
+	 * fsck or /etc/rc, and never becoming ssh-reachable. triage.py: CPU0 frozen
+	 * with CPU1/CPU2 healthy and the eMMC lock free -- the guest wedged, the HV
+	 * was fine. Note how that regression MASQUERADED as a fix: write retries
+	 * fell from ~50-170 per boot to 0, which looked like the retry cascade had
+	 * been cured, when in fact there were no writes left to retry.
+	 *
+	 * The reference driver genuinely does re-program the clock here
+	 * (aw_mmc_req_done -> aw_mmc_update_clock), and that part of the reading was
+	 * correct. What was wrong was importing it into THIS driver: clk_update()
+	 * issues a command on CMDR, and this file's own header warns, in as many
+	 * words, not to re-derive the sequence from a generic sunxi-mmc reading
+	 * because subtle reordering has bitten this project before. aw_mmc does it
+	 * inside a full clock state machine, including the clock-off/on framing that
+	 * emmc_reclock() reproduces and that this path does not have -- and per the
+	 * header, NTSR/SAMP_DL only latch while the card clock is DISABLED. A bare
+	 * clock-program command with the clock running is exactly the class of thing
+	 * that warning is about.
+	 *
+	 * Kept, because neither introduces a new command and both were genuinely
+	 * missing: the DMA_RST bit, and actually WAITING for the reset pulse to
+	 * clear instead of a fixed small_delay(). If the clock really must be
+	 * re-programmed after a reset, it needs the full clock-off/update/on framing
+	 * around it, not this one call, and it needs its own soak. */
 	ebio_bc(8, ++g_settles);
-	if (clk_update() != 0)
-		ebio_bc(9, ++g_settle_clkfail);
 }
 
 int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
