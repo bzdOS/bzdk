@@ -468,7 +468,19 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 	} else {
 		const uint8_t *payload = g_tx_stage + VNET_HDR_LEN + VNET_ETH_HDR_LEN;
 		uint32_t plen = total - VNET_HDR_LEN - VNET_ETH_HDR_LEN;
-		int ok = emac_send_frame(ethertype, payload, (uint16_t)plen);
+		/* Preserve the guest's own Ethernet destination instead of
+		 * broadcasting (the "MAC IDENTITY NOTE" above described the old
+		 * behaviour). ARP tolerated broadcast because a peer learns the
+		 * sender's hardware address from the ARP payload's sender-HA field,
+		 * not the frame header -- but TCP does not: Linux drops a unicast-IP
+		 * packet delivered to the broadcast MAC, so the guest's SYN-ACK
+		 * showed up in tcpdump and was ignored by the host's stack, leaving
+		 * the host retransmitting SYN until it gave up (measured live
+		 * 2026-07-30, with `ip neigh` stuck FAILED for the guest). The dst
+		 * MAC is the first 6 bytes of the guest's Ethernet header, which sits
+		 * immediately after the virtio_net_hdr in the staging buffer. */
+		const uint8_t *dst = g_tx_stage + VNET_HDR_LEN;
+		int ok = emac_send_frame_to(dst, ethertype, payload, (uint16_t)plen);
 		if (ok)
 			vnet_bc(6, ++g_tx_sent);
 		else

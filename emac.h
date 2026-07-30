@@ -73,6 +73,20 @@ int emac_getc(void);
  * usable for any ethertype that isn't 0x88B5 (the console owns that one). */
 int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len);
 
+/* As emac_send_frame(), but to a caller-supplied Ethernet destination instead
+ * of broadcast. Needed by the bridged virtio-net TX path: emac_send_frame()
+ * discards the guest's own destination MAC and broadcasts, which ARP survives
+ * (a peer learns the sender's HA from the ARP payload, not the frame header)
+ * but TCP does not -- Linux drops a unicast-IP packet delivered to the
+ * broadcast MAC, so the guest's SYN-ACK was seen by tcpdump and ignored by the
+ * host's stack, and every connection hung retransmitting SYN (measured
+ * 2026-07-30). Source MAC is still the EMAC's own, which is correct here: the
+ * guest is deliberately assigned the same MAC (VNET_GUEST_MAC == OUR_MAC).
+ * emac_send_frame() itself is left byte-identical -- the debug console depends
+ * on it, and this channel is the only way back in. */
+int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
+                       const uint8_t *payload, uint16_t len);
+
 /* CPU1 debug-loop link watchdog: call every loop iteration (cheap — rate-
  * limited internally to one real check per ~8 s). If EMAC has NEVER accepted
  * a single RX frame, re-runs the bounded PHY bring-up + rings/DMA/MAC enable
