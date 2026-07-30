@@ -656,7 +656,15 @@ static void vblk_inject_irq(void)
 	 ((uint32_t)(rc) & 0xE0000000u) == 0x20000000u)
 #define VBLK_RC_WR_RETRYABLE(rc)  ((rc) == -2 || VBLK_RC_IS_WR_ENCODED(rc))
 
-#define VBLK_WRITE_RETRIES  3u
+/* Was 3, raised on evidence: a soak cycle burned all three on one sector
+ * (write_retries=3 with write_retry_ok=0, RINT=0x114) and still failed the
+ * guest's request, while another cycle in the same run showed retries genuinely
+ * rescuing writes (write_retry_ok=20). So the mechanism works and the budget
+ * was simply too small. Each attempt is bounded by the write timeouts and the
+ * loop pets the watchdog between them, so the cost of a larger budget is only
+ * latency on a sector that is failing anyway -- against a guest that treats one
+ * failed metadata write as fatal. */
+#define VBLK_WRITE_RETRIES  8u
 static uint32_t g_write_retries;    /* [57] retry attempts made      */
 static uint32_t g_write_retry_ok;   /* [58] writes a retry rescued   */
 
