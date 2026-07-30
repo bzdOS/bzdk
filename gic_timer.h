@@ -60,6 +60,30 @@
  */
 void gic_timer_init(uint32_t period_us);
 
+/* gic_timer_init() but leaving CNTVOFF_EL2 exactly as it was.
+ *
+ * For the IMO=1 / vGIC policy (main_dbg.c), where the ONLY reason to want
+ * this module's CNTP tick is that vtimer_mask_watchdog() -- the recovery for a
+ * self-latching CNTV mask -- is called from the tick handler and is otherwise
+ * unreachable. Found the hard way 2026-07-30: one lost virtual CNTV injection
+ * left CNTV_CTL.IMASK set, which stops further CNTV PPIs, which removes every
+ * chance to re-inject, which killed the guest's timebase for the rest of the
+ * boot. An independent EL2 tick is the only thing that can notice and undo it.
+ *
+ * gic_timer_init() zeroes CNTVOFF_EL2 (see its own comment: a workaround for a
+ * FreeBSD DELAY() hang under the OLD pre-vGIC policy). Under the current
+ * policy the guest boots and ticks fine on the CNTVOFF ATF left in place --
+ * 8047 forwarded CNTV ticks were measured before the mask latched -- so
+ * changing it here would alter a working virtual timebase for no reason, and
+ * would confound any single-boot verification. Save and restore it instead.
+ *
+ * Claiming INTID 30 is safe on this board: irq_counter[30] was measured 0
+ * across a full boot, i.e. the FreeBSD guest never programs CNTP (it uses
+ * CNTV). gic_timer_irq() also has to route INTID 30 to EL2's own tick rather
+ * than forwarding it like any other physical IRQ -- see its vgic_active()
+ * condition. */
+void gic_timer_arm_preserving_cntvoff(uint32_t period_us);
+
 /* Just the CPU-interface-wide + distributor-group-enable half of
  * gic_timer_init() above (GICD_CTLR=0x3, GICC_PMR=0xff, GICC_CTLR=0x3|
  * EOImode) — NOT per-INTID (no CNTP arm, no INTID-30-specific GICD writes,

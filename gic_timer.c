@@ -328,6 +328,140 @@ read_cntvct(void)
 #define CNTV_CTL_ENABLE  (1u << 0)
 #define CNTV_CTL_IMASK   (1u << 1)
 #define CNTV_CTL_ISTATUS (1u << 2)
+
+/* ------------------------------------------------------------------ *
+ * Guest CNTV mask watchdog — recovery for the software-vtimer handshake.
+ *
+ * THE BUG THIS FIXES (found on hardware 2026-07-29). The VGIC_CNTV_HW=0
+ * path below masks the guest's virtual timer AT THE SOURCE
+ * (CNTV_CTL.IMASK=1) so the level-triggered CNTV line de-asserts, then
+ * hands the tick to the guest as a pure-virtual vIRQ. Clearing that mask is
+ * left ENTIRELY to the guest: its timer ISR rewrites CNTV_CTL (ENABLE=1,
+ * IMASK=0) as a side effect of re-arming, which is exactly what FreeBSD's
+ * one-shot eventtimer does anyway.
+ *
+ * That makes the guest's whole timebase depend on EVERY SINGLE injection
+ * being received. Miss one — for any reason — and the mask EL2 set is never
+ * cleared, no further CNTV PPI can ever fire, and the guest has no timer for
+ * the rest of the boot. Observed exactly that: the flight-recorder ring
+ * (flightrec.h) showed 446 healthy FLTR_K_TIMER events, each sampling
+ * CNTV_CTL=5 (ENABLE=1, IMASK=0, ISTATUS=1 — i.e. the guest HAD cleared the
+ * previous tick's mask, so the handshake was working), then TIMER events
+ * stopped dead ~696 events before the freeze and never resumed. virtio-blk
+ * kept running (its physical EDGE SPI is delivered natively), and once its
+ * completions drained the guest went to WFI awaiting a tick that could never
+ * arrive. CPU1 and CPU2 stayed healthy; only the guest core was idle.
+ *
+ * WHY THE FIX IS NOT "find the lost injection". The reason that one handoff
+ * failed is not established — and deliberately not what this guards. A
+ * one-shot loss (a full List Register, a guest ISR that took an unexpected
+ * path, a race with the guest rewriting CNTV_CTL under us) is a hiccup; a
+ * one-shot loss that permanently kills the timebase is a design defect. The
+ * defect is that EL2 masks a source and then relies on the GUEST to unmask
+ * it, with no recovery if the guest never does. So: EL2 must clean up after
+ * itself.
+ *
+ * HOW. gic_timer.c already owns a periodic EL2 tick (TIMER_INTID/CNTP,
+ * handled at the bottom of gic_timer_irq()) that runs ON THE GUEST'S CORE,
+ * which is what makes reading the guest's banked CNTV_CTL from here
+ * meaningful at all — the same read issued by the CPU1 debug core would
+ * report CPU1's bank and be worthless. On each EL2 tick, if a mask WE set is
+ * still standing after a short grace period, clear it ourselves.
+ *
+ * `gt_cntv_el2_masked` tracks OUR mask specifically, so a guest that masks
+ * its own timer on purpose is never overridden — we only ever undo a write
+ * this file made.
+ *
+ * Un-masking while the comparator is still in the past re-asserts CNTV
+ * immediately, so EL2 takes the PPI again, masks again, and re-injects. That
+ * is intended: it becomes a retry at EL2-tick rate (a handful of PPIs per
+ * second), not the 145 kHz storm that masking exists to prevent, and each
+ * retry gives the guest another chance to receive the tick. Bounded either
+ * way — the grace counter only advances on our own tick.
+ *
+ * Self-gating: under VGIC_CNTV_HW=1, or in a build where vgic_active() is
+ * false, nothing here ever sets IMASK, so gt_cntv_el2_masked stays 0 and the
+ * watchdog is a no-op.
+ * ------------------------------------------------------------------ */
+/* EL2 ticks to wait before overriding. 2 (not 1) so a guest ISR that simply
+ * lands a little after our tick boundary is never pre-empted — the normal
+ * path must stay untouched; this only ever fires on a genuinely stuck mask. */
+#define CNTV_MASK_GRACE_TICKS 2u
+
+static uint32_t gt_cntv_el2_masked;     /* 1 = WE set IMASK, guest hasn't cleared */
+static uint32_t gt_cntv_masked_ticks;   /* EL2 ticks our mask has survived        */
+static uint32_t gt_cntv_rescues;        /* times we had to unmask it ourselves    */
+
+/* Called from the EL2 tick, on the guest's core, IRQ context. Bounded: a
+ * couple of system-register accesses and at most one breadcrumb store. */
+static void
+vtimer_mask_watchdog(void)
+{
+	uint32_t ctl;
+
+	if (!gt_cntv_el2_masked)
+		return;                  /* nothing of ours outstanding */
+
+	ctl = read_cntv_ctl();
+	if (!(ctl & CNTV_CTL_IMASK)) {
+		/* Guest ISR ran and rewrote CNTV_CTL — the handshake worked. */
+		gt_cntv_el2_masked = 0;
+		gt_cntv_masked_ticks = 0;
+		return;
+	}
+
+	if (++gt_cntv_masked_ticks < CNTV_MASK_GRACE_TICKS)
+		return;
+
+	/* Our mask outlived the grace period: the guest never got the tick.
+	 * Undo our own write so CNTV can fire again. */
+	write_cntv_ctl(ctl & ~CNTV_CTL_IMASK);
+	gt_cntv_el2_masked = 0;
+	gt_cntv_masked_ticks = 0;
+	gt_cntv_rescues++;
+
+	/* Record it in the flight recorder and NOWHERE ELSE. This file's own
+	 * GICT breadcrumb window would be the obvious place, but confirmed live
+	 * 2026-07-29 that it is unusable: GICT sits at 0x00018200 in
+	 * GUEST-WRITABLE SRAM and read back as random bytes (magic not "GICT"),
+	 * and vgic.c's window at 0x50001c00 read back as ASCII console text
+	 * because it falls inside vconsole's 64 KiB postmortem capture ring
+	 * (0x50000f10..0x50010f10 — flightrec.h's header already warns that
+	 * every window nominally in that range gets clobbered). Parking a value
+	 * there would silently be someone else's bytes. The FLTR ring is the one
+	 * instrument that survived, so use it alone.
+	 *
+	 * THROTTLED logging. A rescue on every tick is a legitimate steady state
+	 * (it means the guest is getting no ticks at all, which is exactly the
+	 * condition worth seeing), but logging each one floods the ring: measured
+	 * 2026-07-29 at ~2200 events/s, which wraps FLTR's 2048 slots in under a
+	 * second and destroys its value as a post-mortem record — including any
+	 * one-shot entry written earlier in the boot. So sample instead: rate is
+	 * still obvious from the count carried in the record, and the ring keeps
+	 * holding real history.
+	 *
+	 * The record deliberately carries the state of the INJECTION PATH, read
+	 * HERE, on the guest's own core. This is the only place in the tree that
+	 * can answer "can the vGIC actually deliver?": GICH_* and HCR_EL2 are
+	 * banked per PE, so reading them over the debug channel returns CPU1's
+	 * bank (never initialised, reads as zero) and yields a confident wrong
+	 * answer — confirmed the hard way on 2026-07-29. a0 = CNTV_CTL,
+	 * a1 = (rescues << 32) | (GICH_HCR.En << 1) | HCR_EL2.IMO.
+	 *
+	 * Uses its OWN kind (FLTR_K_VTRESCUE) rather than tagging a bit inside
+	 * FLTR_K_TIMER's payload — see that enum's comment for the bug the first
+	 * attempt caused. */
+	if ((gt_cntv_rescues & 0xFFu) == 1u) {
+		uint64_t hcr_el2;
+		uint32_t gich_hcr = *(volatile uint32_t *)(0x01c84000UL);
+
+		__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr_el2));
+		flightrec_log(FLTR_K_VTRESCUE, ctl,
+		              ((uint64_t)gt_cntv_rescues << 32)
+		              | (uint64_t)((gich_hcr & 1u) << 1)
+		              | (uint64_t)((hcr_el2 >> 4) & 1u));
+	}
+}
 /* FLTR_K_TIMER (flightrec.h): a0 = CNTV_CTL_EL0 (bit0 ENABLE, bit1 IMASK,
  * bit2 ISTATUS), a1 = signed (CNTV_CVAL - CNTVCT): negative => comparator
  * already in the past (timer still asserting), large positive => the guest
@@ -429,6 +563,19 @@ gic_timer_cpuif_init(void)
 /* ------------------------------------------------------------------ *
  * Init: GIC (distributor + CPU interface, one PPI only) + CNTHP.
  * ------------------------------------------------------------------ */
+void
+gic_timer_arm_preserving_cntvoff(uint32_t period_us)
+{
+	uint64_t saved;
+
+	/* See this function's header comment for why the guest's virtual timebase
+	 * must survive arming the tick. Read-arm-restore rather than duplicating
+	 * gic_timer_init()'s body, so the two can never drift apart. */
+	__asm__ volatile("mrs %0, cntvoff_el2" : "=r"(saved));
+	gic_timer_init(period_us);
+	__asm__ volatile("msr cntvoff_el2, %0\n\tisb" :: "r"(saved) : "memory");
+}
+
 void
 gic_timer_init(uint32_t period_us)
 {
@@ -668,7 +815,15 @@ gic_timer_irq(struct el2_frame *frame)
 	 * while everything else gets EOI-only (priority-drop). Nothing is
 	 * silently dropped: vgic_inject_hw() queues on LR exhaustion instead of
 	 * discarding (see vgic.c's pending-injection queue). */
-	if (vgic_active()) {
+	/* TIMER_INTID (30) is EL2's OWN tick and must never be forwarded, exactly
+	 * like VGIC_MAINT_INTID inside the block below. Without this exclusion the
+	 * generic "Device SPI" arm at the end of that block swallows it into
+	 * vgic_inject_hw(), so the tick handler further down -- and with it
+	 * vtimer_mask_watchdog(), the ONLY recovery for a self-latching CNTV mask
+	 * -- never runs. That is why "just arm the CNTP tick" was not by itself a
+	 * fix (2026-07-30). Safe: the guest uses CNTV, never CNTP
+	 * (irq_counter[30] measured 0 across a full boot). */
+	if (vgic_active() && intid != TIMER_INTID) {
 		if (intid == VGIC_MAINT_INTID) {
 			/* Never placed in a List Register — nothing else will ever
 			 * deactivate it, so fully EOI+DIR it ourselves (exactly like
@@ -706,6 +861,12 @@ gic_timer_irq(struct el2_frame *frame)
 			 * tick — the same thing FreeBSD's one-shot eventtimer does anyway
 			 * after each fire. */
 			write_cntv_ctl(vctl | CNTV_CTL_IMASK);
+			/* Claim the mask so vtimer_mask_watchdog() (see its header
+			 * comment) can undo it if the guest never does. Without this
+			 * one line, a single lost injection costs the guest its
+			 * timebase for the rest of the boot. */
+			gt_cntv_el2_masked = 1;
+			gt_cntv_masked_ticks = 0;
 			GICC_EOIR = iar;
 			GICC_DIR  = iar;
 			vgic_inject_cntv();
@@ -787,6 +948,12 @@ gic_timer_irq(struct el2_frame *frame)
 	GICC_DIR = iar;
 
 	gt_ticks++;
+
+	/* Undo our own CNTV mask if the guest never cleared it. Deliberately
+	 * placed on EVERY tick, not inside the REPORT_EVERY block below: the
+	 * whole point is a short, bounded recovery window, and REPORT_EVERY is
+	 * a diagnostics cadence, not a control-loop period. */
+	vtimer_mask_watchdog();
 
 	if ((gt_ticks % REPORT_EVERY) == 0) {
 		jitter_report_bc(&gt_jitter);
