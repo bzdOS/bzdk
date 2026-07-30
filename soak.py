@@ -476,11 +476,53 @@ def dwell(n, args, report):
 
 
 # ── one full soak cycle: reload -> verify -> dwell -> record ───────────
+GUEST_SSH = [
+    "ssh", "-i", "/root/.ssh/chimp_ed25519",
+    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", "root@192.168.88.82",
+]
+
+
+def guest_clean_shutdown(settle_s=30.0):
+    """Ask the guest to power off cleanly, so the next boot starts on a clean fs.
+
+    `shutdown -p now` runs the full rc.shutdown sequence (sync + unmount) and
+    only THEN issues PSCI SYSTEM_OFF; el2_exc.c honours that one SMC with a
+    controlled warm reset (dbg_clean_off, default on) rather than the
+    stay-alive path it uses for an ambiguous SYSTEM_RESET.
+
+    Returns a short status string for the cycle record. Never raises: a guest
+    that cannot be reached is a normal soak outcome (this is the harness that
+    exists to find that), and the caller falls through to the ordinary reload,
+    which is exactly the pre-existing behaviour.
+
+    ssh is expected to die mid-command as the guest goes down, so its exit
+    status is deliberately ignored -- reachability is checked first instead."""
+    try:
+        p = subprocess.run(GUEST_SSH + ["true"], capture_output=True,
+                           text=True, timeout=20)
+        if p.returncode != 0:
+            return "guest-unreachable"
+    except Exception:
+        return "guest-unreachable"
+    try:
+        subprocess.run(GUEST_SSH + ["nohup shutdown -p now >/dev/null 2>&1 &"],
+                       capture_output=True, text=True, timeout=25)
+    except Exception:
+        pass
+    time.sleep(settle_s)     # rc.shutdown + the ~2s WDOG warm reset
+    return "sent"
+
+
 def do_cycle(n, args, report):
     log(f"────────── soak cycle #{n} ──────────")
     t_cycle0 = now()
     rec = {"n": n, "start": stamp(), "breakglass_calls": 0}
     log_path = os.path.join(DEFAULT_LOGDIR, f"cycle-{n:04d}.log")
+
+    if getattr(args, "clean_shutdown", False):
+        rec["clean_shutdown"] = guest_clean_shutdown()
+        log(f"  [clean] shutdown -p now: {rec['clean_shutdown']}")
 
     ok, elapsed, tail, timed_out, interrupted = run_reliable_load(
         args.expect_vbk, args.load_cycles, args.per_cycle_timeout_s, log_path)
@@ -594,6 +636,17 @@ def main():
     ap.add_argument("--breakglass-retries", type=int, default=DEFAULT_BREAKGLASS_RETRIES)
     ap.add_argument("--expect-vbk", action="store_true",
                      help="require the VBK1 breadcrumb (virtio-blk build) at verify")
+    ap.add_argument("--clean-shutdown", action="store_true",
+                     help="before each reload, ssh into the guest and 'shutdown -p "
+                          "now' so the filesystem is unmounted cleanly. Without "
+                          "this every cycle is an unclean stop and the next boot's "
+                          "fsck has to repair the fs (observed SALVAGE of block "
+                          "bitmaps / free-block counts / summary info), so a long "
+                          "soak is also a long run of chances to corrupt it for "
+                          "real. Needs guest ssh (see guest-ssh-access-works) and "
+                          "el2_exc.c's dbg_clean_off, which is on by default: the "
+                          "guest's PSCI SYSTEM_OFF is honoured with a controlled "
+                          "warm reset instead of the stay-alive path.")
     ap.add_argument("--report", default=DEFAULT_REPORT)
     args = ap.parse_args()
 
