@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Run shell commands in the booted FreeBSD guest over its console.
 
 The guest reached a real root shell on 2026-07-30, which makes it its own
@@ -36,6 +37,28 @@ def _open():
 
 
 _echo_off = False
+
+
+def ensure_shell(fd, tries=3):
+    """Get to a shell prompt, logging in as root if the console is at `login:`.
+
+    Needed after every boot, so it belongs here rather than in each caller --
+    the soak harness in particular re-enters this on every cycle. Root has no
+    password on this image, so `login: root` lands straight in a shell."""
+    global _echo_off
+    for _ in range(tries):
+        _send(fd, "\r")
+        out = _drain_quiet(fd, quiet_for=0.5, cap=8.0).decode("utf-8", "replace")
+        if "# " in out and "login:" not in out[-40:]:
+            return True
+        if "login:" in out:
+            _send(fd, "root\r")
+            # The MOTD plus getty's terminal-size probe make this chatty.
+            got = _drain_quiet(fd, quiet_for=0.8, cap=25.0).decode("utf-8", "replace")
+            if "# " in got:
+                _echo_off = False       # fresh shell: its echo is on again
+                return True
+    return False
 
 
 def _quiet_the_shell(fd):
@@ -108,6 +131,7 @@ def run(cmd, timeout=25.0, fd=None, quiet=False):
     if own:
         fd = _open()
     try:
+        ensure_shell(fd)
         _quiet_the_shell(fd)
         _drain_quiet(fd, quiet_for=0.4, cap=8.0)   # discard the backlog
         tag = "M%d" % (int(time.time() * 1000) % 1000000)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 bzd_board.py — single source of truth for the host-side Python tooling's
 board constants: USB VID:PIDs, the USB sysfs port node, the EMAC console

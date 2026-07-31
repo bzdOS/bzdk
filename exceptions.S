@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* exceptions.S — EL2 exception vector table + full-context save for the bzdOS
  * microkernel (AArch64, Allwinner A64).
  *

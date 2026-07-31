@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 # push.py <file> <hexaddr> — HOT RELOAD: залить блоб в резидентный REPL по сети
 # (raw 0x88B5), без reset/U-Boot/YMODEM. Шлёт "rx <addr> <len>", стримит байты
 # кадрами, сверяет sum. Повтор при потере (канал лоссовый). Затем можно `c <addr>`.

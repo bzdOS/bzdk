@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 microkernel_recipe.py -- dev-stand recipe for the bzdOS microkernel.
 

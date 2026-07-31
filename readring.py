@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 import sys, time, re
 sys.path.insert(0, "/opt/bzdos/microkernel")
 import loady_over_acm as L

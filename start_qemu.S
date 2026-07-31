@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* start_qemu.S — bzdOS microkernel entry point for the QEMU `virt` CI target
  * (see link_qemu.ld / main_qemu.c / docs/qemu-ci.md).
  *

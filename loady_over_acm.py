@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 loady_over_acm.py -- host-side loader for the bzdOS microkernel over U-Boot's
 USB-OTG CDC-ACM console (/dev/ttyACM0), no board access needed to run this

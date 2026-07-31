@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Recursively scan the guest's UFS2 root for the systemic bpi-image.sh
 packaging defect: regular files owned by a stray build-time uid (1001)
 instead of root. Found first on /etc/pam.d/*, /usr/lib/pam_*.so.6, then

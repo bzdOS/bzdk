@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """triage.py -- ONE command that answers "what state is the board actually in".
 
 WHY: diagnosing the 2026-07-29 guest freeze took ~15 separate ad-hoc board

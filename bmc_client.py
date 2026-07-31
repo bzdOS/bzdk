@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 bmc_client.py — host-side CLI for the bzdOS "software BMC" management plane.
 

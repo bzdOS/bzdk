@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Locate (and optionally patch) the guest's on-disk /etc/fstab via the HV's
 emmc_bio PIO driver, over the EMAC debug channel. READ-ONLY unless --write."""
 import sys, time, subprocess, argparse

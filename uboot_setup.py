@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """uboot_setup.py — one-shot: catch U-Boot at its prompt and program a robust,
 self-healing autonomous boot into the env, then saveenv.
 

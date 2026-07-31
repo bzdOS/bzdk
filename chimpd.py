@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 chimpd.py — autonomous board supervisor for the bzdOS microkernel/hypervisor
 debug path on Banana Pi M64 (Allwinner A64).
