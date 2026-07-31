@@ -74,6 +74,10 @@ all: $(STAGE0_BIN) $(MAIN_BIN)
 # x86_64). Fast enough to run on every commit; does not touch
 # vblk_emmc.c/stage2.c/vnet_emac.c/kload.c/vconsole.c/gdbstub.c/gdbstub_hw.c
 # themselves.
+#
+# test_automount.py is the exception to that mirror-don't-include rule and the
+# stronger kind of test: it drives the REAL reliable_load.auto_mount_root()
+# over a pty, so it CAN catch a transcription error. No board required.
 test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop
 	./test_vblk_ring
 	./test_vblk_stitch
@@ -83,6 +87,7 @@ test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_klo
 	./test_vconsole_uart
 	./test_gdbstub_resolve
 	./test_gdbstub_hwop
+	python3 test_automount.py
 
 test_vblk_stitch: test_vblk_stitch.c
 	gcc -Wall -Wextra -O2 -o $@ $<
