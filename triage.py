@@ -52,7 +52,32 @@ GICD = 0x01C81000
 GICH = 0x01C84000
 
 FLTR_MAGIC = 0x464C5452
+# IPA -> device, so a DABT record names the device instead of making a human
+# remember the MMIO map. Three wrong diagnoses on 2026-08-01 came from reading
+# vblk's counters for what turned out to be vnet traffic; the address said so
+# all along.
+MMIO_DEVICES = [
+    (0x0A000000, 0x200, "vblk"),
+    (0x0A001000, 0x200, "vnet"),
+]
+VIRTIO_REGS = {0x00: "MagicValue", 0x04: "Version", 0x08: "DeviceID",
+               0x30: "QueueSel", 0x38: "QueueNumMax", 0x44: "QueueReady",
+               0x50: "QueueNotify", 0x60: "InterruptStatus",
+               0x64: "InterruptACK", 0x70: "Status"}
+
+
+def describe_ipa(ipa):
+    """'0xa001050 (vnet+0x50 QueueNotify)' — or just hex if unknown."""
+    for base, size, name in MMIO_DEVICES:
+        if base <= ipa < base + size:
+            off = ipa - base
+            reg = VIRTIO_REGS.get(off)
+            return f"0x{ipa:x} ({name}+0x{off:02x}" + (f" {reg})" if reg else ")")
+    return f"0x{ipa:x}"
+
+
 FLTR_KINDS = {1: "FAULT", 2: "TRAP", 3: "IRQ", 4: "VIRTIO", 5: "CONSOLE",
+              10: "DABT",
               6: "TIMER", 7: "SYNC", 8: "HVVIOL"}
 
 VBK_LABELS = {
@@ -425,7 +450,7 @@ def dump_fltr(hv, out, tail=40):
         a1 = (slots[o + 4] << 32) | slots[o + 3]
         key = (k, a0)
         txt = f"    -{j + 1:<3d} {FLTR_KINDS.get(k, k):<8s} a0={a0:#018x} a1={a1:#018x}"
-        if k == 7:                       # SYNC: a0 = (EC<<32)|ESR, a1 = ELR
+        if k in (7, 10):                 # SYNC: a1=ELR | DABT: a1=faulting IPA
             # EC alone is nearly useless in a timeline (every guest fault is
             # 0x24); DFSC + WnR is what distinguishes "read InterruptStatus"
             # from "write InterruptACK" at a glance.
@@ -433,6 +458,9 @@ def dump_fltr(hv, out, tail=40):
             keep = [ln.strip() for ln in d
                     if ln.strip().startswith(("EC ", "DFSC", "WnR", "SAS", "SRT"))]
             txt += "\n         " + "; ".join(keep)
+            # For a DABT the address is the whole point: name the device.
+            if k == 10:
+                txt += f"\n         at {describe_ipa(a1)}"
         if k == 6:                       # TIMER: a0 = CNTV_CTL
             txt += f"\n         {armdec.decode_cntv_ctl(a0)[0]}"
         if key == prev_key:

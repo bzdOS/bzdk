@@ -101,9 +101,45 @@ enum {
 	FLTR_K_CONSOLE = 5,   /* reserved: a captured console byte             */
 	FLTR_K_TIMER   = 6,   /* CNTV sample at EL2 CNTV-PPI take: a0=CNTV_CTL,
 	                       * a1=signed(CNTV_CVAL-CNTVCT) (vgic deep-dive)   */
-	FLTR_K_SYNC    = 7,   /* guest sync trap: a0=(EC<<32)|ESR, a1=ELR       */
+	FLTR_K_SYNC    = 7,   /* guest sync trap: a0=(EC<<32)|ESR, a1=ELR.
+	                       * NOT used for EC==0x24 — see FLTR_K_DABT.       */
 	FLTR_K_HVVIOL  = 8,   /* A1: guest stage-2 abort into an HV DRAM window
 	                       * (blocked, not corrupted): a0=faulting IPA a1=ELR*/
+	FLTR_K_DABT    = 10,  /* guest DATA ABORT (EC==0x24): a0=(EC<<32)|ESR,
+	                       * a1 = the faulting IPA (HPFAR_EL2[39:4]<<8 |
+	                       * FAR_EL2[11:0]) — NOT the ELR.
+	                       *
+	                       * WHY THE IPA AND NOT THE ELR (2026-08-01): a whole
+	                       * evening was lost diagnosing a hang from a ring that
+	                       * recorded only ESR+ELR. The ELR resolved (via
+	                       * kernel.debug + addr2line) to generic_bs_r_4 /
+	                       * generic_bs_w_4 — arm64's bus_space MMIO leaf
+	                       * accessors, which every device driver funnels
+	                       * through, so it identified nothing. The IPA names
+	                       * the DEVICE outright: 0x0a000000 is vblk, 0x0a001000
+	                       * is vnet, +0x50 is QueueNotify. Three successive
+	                       * wrong diagnoses (all pinned on the block layer)
+	                       * would each have died in a minute against one IPA:
+	                       * the guest was hammering vnet the whole time.
+	                       * Dedup keys on (ESR,IPA), so a re-fault loop on a
+	                       * NEW address still shows up.                       */
+	FLTR_K_VTRESCUE = 9,  /* gic_timer.c's vtimer_mask_watchdog() had to undo
+	                       * a CNTV mask EL2 set because the guest never did:
+	                       * a0 = CNTV_CTL, a1 = (rescues<<32)
+	                       * | (GICH_HCR.En<<1) | HCR_EL2.IMO, both read on
+	                       * the GUEST'S core (they are banked per PE, so a
+	                       * read over the debug channel gets CPU1's bank and
+	                       * lies). Throttled, see that function.
+	                       *
+	                       * A DISTINCT KIND on purpose: the first cut marked
+	                       * these by setting bit 63 of a1, which collides
+	                       * with FLTR_K_TIMER's own a1 — a signed
+	                       * CVAL-CNTVCT delta that is NEGATIVE (so bit 63
+	                       * set) on every expired timer, i.e. almost always.
+	                       * That made ordinary samples decode as rescues and
+	                       * produced two confidently wrong readings before
+	                       * anyone noticed. Never discriminate records by a
+	                       * bit that another record's payload can carry. */
 };
 
 /* Log one (kind, a0, a1) event into the ring. Never fails, never blocks,
