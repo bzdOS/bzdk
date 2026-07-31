@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """uboot_rescue.py — aggressively break into U-Boot during the 3s bootdelay and
 neutralise the broken autonomous bootcmd (which does bootelf on a stale-cache
 TFTP'd ELF -> jumps to garbage -> crashes the board every boot). Spams Ctrl-C

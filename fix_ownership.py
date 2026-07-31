@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Fix root-ownership/permission bits on specific files in the guest's UFS2
 root, directly via the HV's emmc_bio driver — needed because login/PAM
 refuse to use files not owned by uid 0 or that are group/other-writable.
@@ -21,7 +22,10 @@ from hvdbg import HV
 import ufs2walk
 
 PART_START = 278562
-SCRATCH_PA = 0x50030000
+# 0x50030000 is vnet_emac.c's breadcrumb window (VNET_BC_BASE), not free
+# scratch DRAM -- confirmed live 2026-07-28 (see ufs2fuse.py). Use the
+# confirmed-free gap instead (0x50021040..0x50030000, hv_addrmap.h).
+SCRATCH_PA = 0x50022000
 DEV_BSIZE = 512
 
 DI_MODE = 0     # uint16
@@ -46,13 +50,6 @@ TARGETS = ["/etc/login.conf", "/etc/pam.d/login", "/etc/pam.d/system"] + [
 ]
 
 hv = HV()
-def _rw(a, n):
-    for _ in range(40):
-        w = hv.read_words(a, n)
-        if w:
-            return w
-        time.sleep(0.3)
-    return None
 
 nm = subprocess.run(["aarch64-linux-gnu-nm", "microkernel-dbg.elf"],
                     capture_output=True, text=True).stdout
@@ -74,9 +71,11 @@ def read_block(lba):
     rc = rc if rc < 0x80000000 else rc - 0x100000000
     if rc != 0:
         raise IOError(f"emmc_bio_read(lba={lba}) rc={rc}")
-    w = _rw(SCRATCH_PA, 128)
+    # hv.read_words_stable(): shared read-until-two-agree reliability
+    # primitive (hvdbg.py) -- see ufs2fuse.py's 2026-07-28 chase.
+    w = hv.read_words_stable(SCRATCH_PA, 128, tries=8, settle=0.2)
     if not w:
-        raise IOError(f"EMAC readback failed for lba={lba}")
+        raise IOError(f"EMAC readback never stabilized for lba={lba}")
     return b"".join(x.to_bytes(4, "little") for x in w)
 
 def write_block(lba, data):

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Self-healing board supervisor — keeps the HV loaded and recoverable with
 ZERO human power-cycles. Prints ONE line per state transition / action (so a
 Monitor watching it notifies only on meaningful events, never floods).

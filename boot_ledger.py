@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 boot_ledger.py — persistent, cumulative boot-success ledger for the bzdOS
 hypervisor's v1 "100 clean boots in a row" gate (ROADMAP §2).

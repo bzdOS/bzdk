@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """emmc_raw.py — shared raw eMMC 512-byte block I/O over the HV debug
 channel (hvdbg.HV), reading/writing the guest's on-disk filesystem directly
 without any guest cooperation.

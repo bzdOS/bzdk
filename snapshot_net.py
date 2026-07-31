@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """snapshot_net.py — host-side pull/push for the bzdOS "snapshot over GbE"
 transport (ROADMAP D1). Companion to snapshot_net.h/.c on the board.
 

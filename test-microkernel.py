@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 # test-microkernel.py — ДВА теста в ОДНОЙ U-Boot-сессии (максимум с 1 передёрга):
 #   Stage-0: loady microkernel-stage0.bin → go → возврат в U-Boot → md.l 0x42010000
 #            → ждём сигнатуру B2D05000 == пайплайн loady/go/RETURN доказан.

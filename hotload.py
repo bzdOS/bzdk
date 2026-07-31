@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 # hotload.py <file> <hexaddr> — надёжный hot-reload через netcon (0x88B6):
 # 1) "nrx <addr> <len>" по консоли 0x88B5 → плата входит в netcon_recv
 # 2) send_blob по 0x88B6 (seq/ack/crc, ретрансмиты) — не теряет кадры

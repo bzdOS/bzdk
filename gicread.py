@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 # Read (via EMAC/hvdbg) the live GIC distributor state for the MMC SPIs while
 # the guest sits at mountroot, plus the vconsole ring's mount/mmc lines.
 import sys, time, re

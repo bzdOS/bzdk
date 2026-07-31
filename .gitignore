@@ -10,6 +10,10 @@ test_stage2_tables
 test_vnet_ring
 test_kload_modinfo
 test_vconsole_uart
+test_vblk_stitch
+test_gdbstub_resolve
+test_gdbstub_hwop
+test_automount
 
 # Agent worktrees (isolated per-task git worktrees, not part of the tree)
 .claude/
@@ -20,3 +24,6 @@ boot-ledger.txt
 soak-*
 !soak.py
 soak-logs/
+soak*.log
+soak*-report.json
+soak*-report.txt

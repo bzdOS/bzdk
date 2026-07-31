@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 # repl-cmd.py — шлёт команды резидентному REPL по сети (raw 0x88B5) и печатает
 # ответы. Аргументы: пары "cmd" wait_sec ... Пример:
 #   repl-cmd.py "mi" 3 "mpN 400000" 12 "bc 0x50000000 24" 3

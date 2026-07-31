@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 soak.py — unattended overnight soak-test harness for the bzdOS hypervisor on
 Banana Pi M64. This is the tool ROADMAP.md T1 asks for: it turns the proven

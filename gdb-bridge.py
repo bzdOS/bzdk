@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 gdb-bridge.py — host-side TCP <-> EMAC relay for the bzdOS GDB stub.
 

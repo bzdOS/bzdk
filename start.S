@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
 /* start.S — bzdOS microkernel entry point (AArch64, Allwinner A64 / BPI-M64).
  *
  * U-Boot's `go 0x42000000` calls this as:

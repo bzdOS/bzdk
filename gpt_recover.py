@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Compute a GPT 'recover' for the Chimp eMMC: the ~2.5GB image was dd'd onto an
 8GB (DISK_BLOCKS=15269888) eMMC, so the backup GPT header sits at LBA 4955906
 (the image end) instead of the disk end, GEOM flags the secondary GPT corrupt +

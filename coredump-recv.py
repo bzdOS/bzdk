@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """coredump-recv.py — host-side reassembler for the bzdOS EL2 hypervisor's
 bounded ELF-core streamer, ethertype 0x88B7. Companion to coredump.c/.h on
 the board (coredump_send()) and to netcon.py/repl-client.py's raw-Ethernet

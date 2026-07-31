@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Inspect (and, with --write, mark clean) the root UFS2 superblock's clean
 flag directly on the live eMMC, via the HV's emmc_bio driver over EMAC.
 
@@ -10,14 +11,20 @@ research this session did for the full citation trail.
 READ-ONLY by default. --write requires --i-verified-the-dump-above (a second
 explicit flag) as a deliberate speed bump before touching a live disk.
 """
-import sys, time, subprocess, argparse, struct
+import os, sys, time, subprocess, argparse, struct
 
-sys.path.insert(0, "/tmp/claude-0/-opt-bzdos/dd035069-c4a1-41c1-ae8a-9af1253403f0/scratchpad")
+# Was hardcoded to a now-gone previous-session scratchpad path; use this
+# script's own directory instead (where hvdbg.py/ufs_sblock_search.py
+# actually live), fixed 2026-07-27 while adding the cg-search cross-check.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hvdbg import HV
 
 PART_START = 278562          # GPT p3 (freebsd-ufs "rootfs") first LBA
 SBLOCK_OFF_BYTES = 65536     # SBLOCK_UFS2 (fs.h) — byte offset within partition
-SCRATCH_PA = 0x50030000
+# 0x50030000 is vnet_emac.c's breadcrumb window (VNET_BC_BASE), not free
+# scratch DRAM -- confirmed live 2026-07-28 (see ufs2fuse.py). Use the
+# confirmed-free gap instead (0x50021040..0x50030000, hv_addrmap.h).
+SCRATCH_PA = 0x50022000
 
 # struct fs byte offsets (gcc offsetof, verified against sizeof(struct fs)==1376)
 OFF_SBSIZE        = 104
@@ -30,6 +37,17 @@ OFF_FS_PENDINGINO  = 1112   # uint32
 OFF_FS_CKHASH      = 1304   # uint32
 OFF_FS_METACKHASH  = 1308   # uint32
 OFF_FS_FLAGS       = 1312   # int32
+
+# Added 2026-07-27 for the mountroot-real-bug-is-ufs-sblock-offset
+# investigation (project memory) -- offsets confirmed via `gdb -batch -ex
+# 'print (size_t)&((struct fs*)0)->fs_fpg' kernel.debug` (DWARF from the
+# actual built kernel, not hand-counted), cross-checked: fs_magic came back
+# 1372, matching OFF_FS_MAGIC above exactly.
+OFF_FS_SBLKNO      = 8      # int32 -- fragment addr of superblock within a cg
+OFF_FS_FSIZE       = 52     # int32 -- fragment size, bytes
+OFF_FS_NCG         = 44     # int32 -- number of cylinder groups
+OFF_FS_FSBTODB     = 100    # int32 -- frag-to-disk-block shift count
+OFF_FS_FPG         = 188    # int32 -- fragments per cylinder group
 
 FS_UFS2_MAGIC   = 0x19540119
 FS_UNCLEAN      = 0x00000001
@@ -146,6 +164,41 @@ def main():
     print(f"fs_metackhash    @{OFF_FS_METACKHASH} = 0x{fs_metackhash:08x}  "
           f"(CK_SUPERBLOCK {'SET -- checksum enforcement ACTIVE, must recompute' if fs_metackhash & CK_SUPERBLOCK else 'clear -- no checksum enforcement, safe to skip'})")
     print(f"fs_ckhash        @{OFF_FS_CKHASH}    = 0x{fs_ckhash:08x}")
+
+    # --- mountroot-real-bug-is-ufs-sblock-offset cross-check (2026-07-27) --
+    # The primary superblock at the standard location IS readable here (we
+    # already passed the magic check above to get this far) -- so use its
+    # own recorded geometry to settle which cylinder group the guest
+    # kernel's ffs_sbsearch() recovery scan is landing on at byte 98304
+    # (see project memory for the full chain). Read-only, always runs.
+    fs_sblkno, = struct.unpack_from("<i", buf, OFF_FS_SBLKNO)
+    fs_fsize, = struct.unpack_from("<i", buf, OFF_FS_FSIZE)
+    fs_ncg, = struct.unpack_from("<i", buf, OFF_FS_NCG)
+    fs_fpg, = struct.unpack_from("<i", buf, OFF_FS_FPG)
+    print(f"\n--- cg-search cross-check (mountroot-real-bug-is-ufs-sblock-offset) ---")
+    print(f"fs_sblkno={fs_sblkno}  fs_fsize={fs_fsize}  fs_ncg={fs_ncg}  fs_fpg={fs_fpg}")
+    import ufs_sblock_search as usb
+    cg0 = usb.cg0_offset(fs_fpg=fs_fpg, fs_sblkno=fs_sblkno, fs_fsize=fs_fsize)
+    print(f"sanity check: cg0 offset = {cg0} (expect {usb.SBLOCK_UFS2}) "
+          f"-> {'OK' if cg0 == usb.SBLOCK_UFS2 else 'MISMATCH -- geometry read is suspect'}")
+    hits = usb.find_cg_for_byte_offset(fs_fpg=fs_fpg, fs_sblkno=fs_sblkno,
+                                        fs_fsize=fs_fsize, fs_ncg=fs_ncg,
+                                        target_bytes=98304)
+    if hits:
+        print(f"*** MATCH: cylinder group(s) {hits} land exactly on byte "
+              f"offset 98304 -- this IS what the guest's ffs_sbsearch() "
+              f"recovery scan is finding. Root cause fully explained: the "
+              f"kernel's recovery-search mechanism is working exactly as "
+              f"designed, given this filesystem's real geometry; the open "
+              f"question becomes ONLY why the primary read at 65536 needed "
+              f"this fallback in the first place.")
+    else:
+        print(f"NO cylinder group lands on byte offset 98304 with this "
+              f"geometry -- the live 98304 finding is NOT explained by a "
+              f"plain ffs_sbsearch() cg-scan on these parameters. Worth "
+              f"re-reading ffs_sbsearch()/cgsblock() again with fresh eyes, "
+              f"or checking whether the guest is reading DIFFERENT (stale/"
+              f"corrupt) geometry than what's actually stored here.")
 
     need_ckhash = bool(fs_metackhash & CK_SUPERBLOCK)
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 # repl-client.py — грузит microkernel-repl.elf в U-Boot и говорит с резидентным
 # REPL по сырым Ethernet-кадрам (ethertype 0x88B5) через AF_PACKET на br0.
 # Фаза 1: catch U-Boot → WDT off → autostart/bootdelay → loady ELF → bootelf.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """reliable_load.py — DETERMINISTIC, self-healing HV loader.
 
 Replaces the "usually a fresh chimpd catches it" dance with a bounded,

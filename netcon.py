@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """netcon.py — host-side library + CLI for the bzdOS "netcon" reliable
 datagram transport, ethertype 0x88B6, layered on top of emac.c/netcon.c on
 the board. Companion to repl-client.py's console channel (0x88B5) — netcon

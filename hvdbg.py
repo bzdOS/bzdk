@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """
 hvdbg.py — reusable host-side library for the bzdOS EL2 hypervisor live
 debugger.  Wraps the raw-Ethernet EMAC console protocol (ethertype 0x88B5)
