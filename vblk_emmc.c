@@ -577,6 +577,28 @@ static uint16_t vq_push_used(struct vblk_vq *vq, uint16_t head, uint32_t used_le
 	return new_idx;
 }
 
+/* used->idx as it stood when the guest ISR last read InterruptStatus, i.e. when
+ * it began the scan window whose upper bound is the used->idx it observes. The
+ * InterruptACK handler compares against this to decide whether a completion
+ * landed DURING that window and could therefore have been acked away unseen.
+ *
+ * It must be sampled at the status READ, not at injection: a completion also
+ * injects, so a watermark taken there would be moved by the very event we are
+ * trying to detect and the comparison could never fire. (Learned the hard way
+ * — the first version of this fix did exactly that and test_vblk_ring's
+ * ack_window_rearm case caught it as a no-op before it reached hardware.) */
+static uint16_t g_isr_scan_used_idx;
+static uint32_t g_irq_rearms;
+
+/* Same num==0/used==0 guard as vq_push_used(): after a driver reset, reading
+ * vq->used + 2 would be a load from PA 0x2. */
+static uint16_t vq_used_idx(struct vblk_vq *vq)
+{
+	if (vq->num == 0u || vq->used == 0u)
+		return g_isr_scan_used_idx;
+	return gmem_ld16(vq->used + 2u);
+}
+
 /* ------------------------------------------------------------------ *
  * IRQ injection (IMO=0): raise VBLK_INTID as pending in the REAL GICD so the
  * passed-through GICv2 delivers it to the guest EL1. GICD_ISPENDR is a bitmap:
@@ -1610,6 +1632,11 @@ static uint32_t vblk_reg_read(struct vblk_dev *d, uint32_t off)
 	case VBLK_R_QUEUE_READY:   return vq->ready;
 	case VBLK_R_INTERRUPT_STATUS:
 		vblk_bc(21, ++g_isr_status_reads);
+		/* Open the ISR's scan window: remember where the used ring stood as the
+		 * guest starts looking. Anything published after this point may fall
+		 * outside the scan it is about to do, and its notification would then be
+		 * destroyed by the ack that follows — see VBLK_R_INTERRUPT_ACK. */
+		g_isr_scan_used_idx = vq_used_idx(&d->vq[VBLK_QUEUE]);
 		return d->int_status;
 	case VBLK_R_STATUS:        return d->status;
 	case VBLK_R_CONFIG_GENERATION: return d->config_gen;
@@ -1738,6 +1765,42 @@ static void vblk_reg_write(struct vblk_dev *d, uint32_t off, uint32_t val)
 		 * completion sits unseen in the used ring. Take the same lock. */
 		vblk_used_lock_acquire();
 		d->int_status &= ~val;           /* driver acked these bits */
+
+		/* LOST-COMPLETION FIX (found live 2026-08-01 by growfs deadlocking the
+		 * guest: device-side everything was finished — kicks==heads==hdrs,
+		 * async posts==completes, zero ioerrs, used lock free — while the guest
+		 * spun QueueNotify -> InterruptACK forever waiting for a completion it
+		 * already had in the ring but never looked at).
+		 *
+		 * The lock above only makes this RMW atomic against CPU2. It does NOT
+		 * fix the real race, which needs no torn write at all:
+		 *
+		 *   1. we push used entry N, set VRING, inject
+		 *   2. guest ISR reads InterruptStatus (VRING), scans the ring up to the
+		 *      used->idx it read
+		 *   3. AFTER that read we push entry N+1: VRING is already set, so the
+		 *      |= is a no-op, and we inject again -> GICD pending latches
+		 *   4. guest writes InterruptACK(VRING) -> the bit is cleared, including
+		 *      the notification that belonged to entry N+1
+		 *   5. the latched IRQ from (3) fires, the ISR reads InterruptStatus==0,
+		 *      concludes "not mine" and returns WITHOUT scanning the ring
+		 *   6. entry N+1 is never consumed. Nothing will ever notify again,
+		 *      because the next notification could only come from work the guest
+		 *      itself must first submit. Deadlock, not slowness.
+		 *
+		 * So on every ack: if the ring advanced since the guest opened its scan
+		 * window (its InterruptStatus read), that advance may have been acked
+		 * away unseen. Re-set VRING and inject again. This converges — the next
+		 * ISR's status read re-samples the watermark, so an ack with nothing new
+		 * in its window re-arms nothing — and costs at most one extra IRQ per
+		 * genuinely new completion, which a driver that finds an already-drained
+		 * ring simply acks again. */
+		if ((val & VBLK_INT_VRING) &&
+		    vq_used_idx(&d->vq[VBLK_QUEUE]) != g_isr_scan_used_idx) {
+			d->int_status |= VBLK_INT_VRING;
+			vblk_inject_irq();
+			vblk_bc(61, ++g_irq_rearms);
+		}
 		vblk_used_unlock();
 		vblk_bc(22, ++g_isr_acks);
 		break;
@@ -1857,8 +1920,14 @@ int vblk_init(void)
 	g_blk.base       = VBLK_MMIO_BASE;
 	g_blk.config_gen = 0;
 	g_reads = g_writes = g_irqs = g_faults = g_truncated = 0;
+	g_isr_scan_used_idx = 0;
+	g_irq_rearms = 0;
 
 	vblk_bc(0, VBLK_BC_MAGIC);
+	/* Publish the re-arm counter as a real zero: the window reads back
+	 * 0xFFFFFFFF until written, so without this "no re-arms" and "this build
+	 * has no re-arm counter" look identical from the host. */
+	vblk_bc(61, 0);
 
 	/* Publish the sticky IOERR counters as real zeros. The breadcrumb window
 	 * is uninitialized scratch (reads back 0xFFFFFFFF) until something writes

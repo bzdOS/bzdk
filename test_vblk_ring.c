@@ -91,6 +91,8 @@ struct vblk_vq {
 #define VRING_DESC_F_WRITE    0x2u
 #define VRING_DESC_F_INDIRECT 0x4u
 #define VBLK_MAX_CHAIN        32u
+/* mirrors vblk_emmc.h:157 — InterruptStatus bit "used ring advanced" */
+#define VBLK_INT_VRING        0x1u
 
 /* ------------------------------------------------------------------ *
  * Guest-memory helpers — mirrors vblk_emmc.c:126-151, MINUS the gmem_cmo()
@@ -549,6 +551,123 @@ static void test_used_ring_wraparound(void)
 }
 
 /* ==================================================================== *
+ * InterruptACK window — regression test for the LOST-COMPLETION deadlock
+ * found live 2026-08-01 (growfs wedged the guest: device-side everything was
+ * finished, guest spun QueueNotify -> InterruptACK forever waiting on a
+ * completion already sitting in the used ring).
+ *
+ * Mirrors vblk_emmc.c's injection watermark + the re-arm in
+ * VBLK_R_INTERRUPT_ACK. The losing interleaving needs no torn write, so the
+ * used-lock that was already there cannot prevent it:
+ *   push N, notify, guest scans to the idx it read, THEN push N+1 (VRING
+ *   already set, so |= is a no-op), guest acks -> N+1's notification is gone.
+ * ==================================================================== */
+static uint16_t t_scan_idx;           /* == g_isr_scan_used_idx */
+static uint32_t t_int_status;
+static uint32_t t_injections;
+static uint32_t t_rearms;
+
+static void t_inject(void)
+{
+	t_injections++;
+}
+
+static void t_notify(void)
+{
+	t_int_status |= VBLK_INT_VRING;
+	t_inject();
+}
+
+/* The guest ISR reading InterruptStatus. This is where the HV samples the
+ * watermark — NOT at injection: a completion injects too, so a watermark taken
+ * there is moved by the very event we want to detect. */
+static uint32_t t_read_status(struct vblk_vq *vq)
+{
+	t_scan_idx = gmem_ld16(vq->used + 2u);
+	return t_int_status;
+}
+
+/* The fixed InterruptACK handler. `rearm_enabled` lets the test run the OLD
+ * behaviour too, so it proves the bug is real rather than only that the new
+ * code does something. */
+static void t_ack(struct vblk_vq *vq, uint32_t val, int rearm_enabled)
+{
+	t_int_status &= ~val;
+	if (rearm_enabled && (val & VBLK_INT_VRING) &&
+	    gmem_ld16(vq->used + 2u) != t_scan_idx) {
+		t_int_status |= VBLK_INT_VRING;
+		t_inject();
+		t_rearms++;
+	}
+}
+
+static void run_ack_window(int rearm_enabled, uint32_t *out_status,
+                           uint32_t *out_rearms, struct vblk_vq *vqp)
+{
+	reset_guest_mem();
+	struct vblk_vq vq; vq_setup(&vq, 8);
+	t_scan_idx = 0; t_int_status = 0; t_injections = 0; t_rearms = 0;
+
+	/* 1. completion N lands, device notifies */
+	vq_push_used(&vq, 0, 513);
+	t_notify();
+	assert(t_int_status & VBLK_INT_VRING);
+
+	/* 2. guest ISR reads status (opening its scan window) and scans the ring up
+	 *    to the used->idx it observed */
+	assert(t_read_status(&vq) & VBLK_INT_VRING);
+	uint16_t guest_saw = t_scan_idx;
+	assert(guest_saw == 1);
+
+	/* 3. completion N+1 lands AFTER that read. VRING is already set, so the
+	 *    |= changes nothing — this is what makes the bit ambiguous. */
+	vq_push_used(&vq, 1, 513);
+	t_notify();
+
+	/* 4. guest acks what it believes it fully handled */
+	t_ack(&vq, VBLK_INT_VRING, rearm_enabled);
+
+	*out_status = t_int_status;
+	*out_rearms = t_rearms;
+	*vqp = vq;                 /* hand the ring out so the caller can ack again */
+
+	/* The ring really does hold an entry the guest never consumed. */
+	assert(gmem_ld16(vq.used + 2u) == 2);
+	assert(guest_saw == 1);
+}
+
+static void test_ack_window_rearm(void)
+{
+	uint32_t status_old = 0, rearms_old = 0;
+	uint32_t status_new = 0, rearms_new = 0;
+	struct vblk_vq vq_old, vq_new;
+
+	/* OLD behaviour: the ack clears VRING and nothing re-notifies. The guest's
+	 * next ISR would read InterruptStatus==0, skip the scan, and the unconsumed
+	 * completion would sit there forever. This assert IS the bug. */
+	run_ack_window(0, &status_old, &rearms_old, &vq_old);
+	assert((status_old & VBLK_INT_VRING) == 0u);
+	assert(rearms_old == 0u);
+
+	/* FIXED behaviour: the ring advanced past the watermark, so VRING is
+	 * re-asserted and a fresh IRQ injected — the guest gets another ISR that
+	 * finds a non-zero status and rescans. */
+	run_ack_window(1, &status_new, &rearms_new, &vq_new);
+	assert((status_new & VBLK_INT_VRING) != 0u);
+	assert(rearms_new == 1u);
+
+	/* Convergence: the re-armed IRQ makes the guest run its ISR again — status
+	 * read (re-sampling the watermark), rescan, ack. Nothing new landed inside
+	 * THAT window, so this ack must re-arm NOTHING, or the fix would be an
+	 * interrupt storm instead of a fix. */
+	uint32_t rearms_before = t_rearms;
+	assert(t_read_status(&vq_new) & VBLK_INT_VRING);
+	t_ack(&vq_new, VBLK_INT_VRING, 1);
+	assert(t_rearms == rearms_before);
+	assert((t_int_status & VBLK_INT_VRING) == 0u);
+}
+
+/* ==================================================================== *
  * main() — runs every test, reports pass/fail, exits nonzero on failure.
  * ==================================================================== */
 struct test_case { const char *name; void (*fn)(void); };
@@ -561,6 +680,7 @@ static const struct test_case k_tests[] = {
 	{ "indirect_descriptor_rejected", test_indirect_descriptor_rejected },
 	{ "avail_ring_wraparound",      test_avail_ring_wraparound },
 	{ "used_ring_wraparound",       test_used_ring_wraparound },
+	{ "ack_window_rearm",           test_ack_window_rearm },
 };
 
 int main(void)
