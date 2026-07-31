@@ -185,9 +185,46 @@ def verify(expect_vbk):
     return True
 
 
-def auto_mount_root(timeout=45):
+_PROMPT_RE = re.compile(rb"mountroo.{0,2}>")
+
+
+def _squeeze_ws(b):
+    """Drop all whitespace/NULs so a match survives BYTE INSERTION.
+
+    The ACM console has been live-observed inserting bytes as well as dropping
+    them (a typed command echoed back as "siz e 0", i.e. a space appearing
+    mid-token). "mountroot>" contains no whitespace of its own, so squeezing it
+    out of the haystack costs no specificity and makes the match immune to an
+    inserted space/newline splitting the token."""
+    return re.sub(rb"[ \t\r\n\x00]+", b"", b)
+
+
+def auto_mount_root(timeout=120, poke_every=4.0):
     """Automate the mountroot> workaround over the guest's USB-ACM console
     (usbacm.c bridges /dev/ttyACM0 <-> the guest UART RX/TX rings).
+
+    WHY THIS POKES INSTEAD OF JUST LISTENING (found 2026-07-31): waiting
+    passively for the prompt is unreliable BY CONSTRUCTION, and it produced a
+    false "mountroot> never seen" on a guest that was sitting right at the
+    prompt (soak13). Two independent mechanisms hide a prompt that is really
+    there:
+
+      1. musb_putc() drops the NEWEST byte when its TX staging ring is full
+         (musb.c:1595, a deliberate "losing the tail of a flood is acceptable"
+         policy). Nothing drains /dev/ttyACM0 during serial_load, verify(), or
+         the 10s wait for the gadget to re-enumerate — so the guest's early
+         boot output is being staged into a ring with no reader and can be
+         discarded wholesale. FreeBSD prints "mountroot> " exactly ONCE and
+         then blocks in gets(); if that single print is the byte that got
+         dropped, no amount of further listening will ever produce it.
+      2. Byte drop/insertion inside the token itself (see _squeeze_ws and the
+         loose _PROMPT_RE).
+
+    So: listen, but if nothing matches, send a bare CR every `poke_every` s to
+    make the guest REPRINT its prompt. A bare CR is safe in every state the
+    guest can plausibly be in here — at mountroot> it re-asks, at login: it
+    re-prompts, at a shell it is a no-op. This turns a one-shot observation
+    we can miss into a question we can re-ask.
 
     ROOT CAUSE (found live 2026-07-24): FreeBSD's vfs_mountroot automatic
     path (kload.c's vfs.root.mountfrom=ufs:/dev/vtbd0p3 kenv) does NOT
@@ -223,43 +260,56 @@ def auto_mount_root(timeout=45):
             tty.setraw(fd)
         except termios.error:
             pass
+        def slow_write(payload):
+            """Byte-at-a-time with backpressure retry — the gadget's RX path
+            cannot absorb a burst."""
+            for byte in payload:
+                for _ in range(40):
+                    try:
+                        os.write(fd, bytes([byte])); break
+                    except BlockingIOError:
+                        time.sleep(0.02)
+                time.sleep(0.003)
+
         buf = b""
+        seen = b""            # everything read, kept for the failure dump
         t0 = time.time()
         sent = False
+        pokes = 0
+        # Give the guest a moment to speak for itself before prodding it, so a
+        # normal boot is caught passively and the log stays quiet. Scaled to
+        # the timeout so a short window still gets poked at least once (a fixed
+        # delay longer than the timeout silently disables poking entirely).
+        next_poke = t0 + min(6.0, timeout / 4.0)
         while time.time() - t0 < timeout:
             try:
                 d = os.read(fd, 4096)
                 if d:
                     buf += d
+                    if not sent:
+                        seen += d
             except BlockingIOError:
                 time.sleep(0.05)
             except OSError:
                 time.sleep(0.05)
-            # Byte-drop resilient match: the USB-ACM console byte transport
-            # (musb.c's bounded staging ring, see docs/war-stories.md §11-
-            # adjacent findings) has been observed to silently drop a SINGLE
-            # byte under a burst (documented, accepted "drop newest on full"
-            # policy — musb.c:433) — live-observed turning "mountroot>" into
-            # "mountroo>" (missing the 't'), which made an exact-string match
-            # miss the prompt entirely and misreport "never seen" on a guest
-            # that was actually sitting right at the prompt. Match loosely:
-            # "mountroo" + 0-2 filler chars + ">" catches both the intact and
-            # single-byte-dropped forms without weakening specificity (nothing
-            # else in FreeBSD's boot output looks like this).
-            if not sent and re.search(rb"mountroo.{0,2}>", buf):
-                C.slog("  [automount] mountroot> seen, injecting "
-                       f"{ROOT_MOUNTFROM}")
-                payload = (ROOT_MOUNTFROM + "\r").encode("ascii")
-                for byte in payload:
-                    for _ in range(40):
-                        try:
-                            os.write(fd, bytes([byte])); break
-                        except BlockingIOError:
-                            time.sleep(0.02)
-                    time.sleep(0.003)
+            if not sent and _PROMPT_RE.search(_squeeze_ws(buf)):
+                C.slog("  [automount] mountroot> seen"
+                       + (f" (after {pokes} poke(s))" if pokes else "")
+                       + f", injecting {ROOT_MOUNTFROM}")
+                slow_write((ROOT_MOUNTFROM + "\r").encode("ascii"))
                 sent = True
                 buf = b""     # only look at what comes AFTER our own input
                 t0 = time.time()   # give it a fresh window to confirm
+                continue
+            if not sent and time.time() >= next_poke:
+                # Ask again rather than keep waiting for a byte that may have
+                # already been dropped. See this function's docstring.
+                pokes += 1
+                if pokes == 1:
+                    C.slog("  [automount] no prompt yet — poking with CR to "
+                           "force a reprint")
+                slow_write(b"\r")
+                next_poke = time.time() + poke_every
                 continue
             if sent and (b"Trying to mount root from" in buf or
                          b"start_init" in buf or b"root@" in buf):
@@ -269,7 +319,17 @@ def auto_mount_root(timeout=45):
             C.slog("  [automount] sent mount command but no confirmation "
                    "seen within timeout (may still have worked)")
             return True
-        C.slog("  [automount] mountroot> never seen within timeout")
+        # Never fail silently: without this dump the 2026-07-31 false negative
+        # was undiagnosable after the fact (the log said only "never seen",
+        # which is indistinguishable from a dead guest and from a dropped
+        # prompt). Show what the console actually produced.
+        C.slog(f"  [automount] mountroot> never seen within {timeout:.0f}s "
+               f"({pokes} poke(s), {len(seen)} console bytes read)")
+        if seen:
+            C.slog(f"  [automount] console tail: {seen[-240:]!r}")
+        else:
+            C.slog("  [automount] console produced NOTHING — guest is silent "
+                   "or the ACM bridge is down (not merely a missed prompt)")
         return False
     finally:
         os.close(fd)
