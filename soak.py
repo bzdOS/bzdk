@@ -574,7 +574,19 @@ def guest_clean_shutdown(settle_s=30.0):
     which is exactly the pre-existing behaviour.
 
     ssh is expected to die mid-command as the guest goes down, so its exit
-    status is deliberately ignored -- reachability is checked first instead."""
+    status cannot be trusted -- which is why this both PRE-FLIGHTS the binary
+    and VERIFIES the guest actually went down afterwards.
+
+    WHY (2026-07-31): this function used to fire the command with
+    `>/dev/null 2>&1`, ignore the status on purpose, sleep, and return "sent"
+    unconditionally. /sbin/shutdown on the board turned out to be corrupt
+    (ENOEXEC, exit 126 -- one inode shared with /sbin/poweroff, db[] with no
+    usable block pointer), so EVERY clean shutdown this session silently did
+    nothing: the error went to /dev/null and the log still said "sent". The
+    board was then reloaded out from under a live guest with a mounted rw
+    filesystem every single cycle, and each unclean stop could leave a
+    half-applied metadata write -- a ratchet that kept producing the very
+    corruption we were chasing. "Sent" is not "done"."""
     # Wait for the guest to finish booting into multiuser before concluding it
     # is unreachable: after a reload it still has to mount root, run fsck and
     # /etc/rc, get a DHCP lease and start sshd. Reporting "unreachable" the
@@ -591,13 +603,38 @@ def guest_clean_shutdown(settle_s=30.0):
         time.sleep(5)
     else:
         return "guest-unreachable"
+    # PRE-FLIGHT: prove the binary can execute at all before trusting it with
+    # the shutdown. Run with NO arguments -- shutdown(8) then prints its usage
+    # and exits without touching the system, so this is side-effect free, and
+    # it is exactly the check whose absence hid a 100%-failing shutdown.
+    try:
+        p = subprocess.run(GUEST_SSH + ["/sbin/shutdown 2>&1 | head -2"],
+                           capture_output=True, text=True, timeout=20)
+        pre = ((p.stdout or "") + (p.stderr or "")).strip()
+    except Exception as e:
+        pre = f"<preflight error: {e}>"
+    if "usage:" not in pre.lower():
+        return f"shutdown-unusable: {pre[:120] or 'no output'}"
+
     try:
         subprocess.run(GUEST_SSH + ["nohup shutdown -p now >/dev/null 2>&1 &"],
                        capture_output=True, text=True, timeout=25)
     except Exception:
         pass
     time.sleep(settle_s)     # rc.shutdown + the ~2s WDOG warm reset
-    return "sent"
+
+    # VERIFY: a guest still answering ssh did NOT power off, whatever the
+    # command appeared to do. Only an unreachable guest counts as stopped.
+    for _ in range(6):       # up to ~30s past settle_s
+        try:
+            p = subprocess.run(GUEST_SSH + ["true"], capture_output=True,
+                               text=True, timeout=10)
+            if p.returncode != 0:
+                return "clean-off"
+        except Exception:
+            return "clean-off"
+        time.sleep(5)
+    return "shutdown-ignored"
 
 
 VBK_BC = 0x50020000
@@ -768,6 +805,18 @@ def do_cycle(n, args, report):
     if getattr(args, "clean_shutdown", False):
         rec["clean_shutdown"] = guest_clean_shutdown()
         log(f"  [clean] shutdown -p now: {rec['clean_shutdown']}")
+        # An unclean stop is not cosmetic: the board is about to be reloaded
+        # out from under a live guest holding a mounted rw filesystem, which is
+        # how half-applied metadata writes (and the corruption this harness
+        # kept rediscovering) get made. Surface it instead of logging a string
+        # nobody reads. "guest-unreachable" keeps its pre-existing meaning and
+        # is left alone.
+        if rec["clean_shutdown"].startswith(("shutdown-unusable",
+                                             "shutdown-ignored")):
+            report.add_anomaly(n, "unclean-stop",
+                               f"{rec['clean_shutdown']} — the guest was NOT "
+                               f"powered off; this reload is an unclean stop "
+                               f"and can corrupt the guest filesystem")
 
     ok, elapsed, tail, timed_out, interrupted = run_reliable_load(
         args.expect_vbk, args.load_cycles, args.per_cycle_timeout_s, log_path,
