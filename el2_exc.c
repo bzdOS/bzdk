@@ -69,12 +69,54 @@ volatile uint32_t gdb_stop_pending;
 volatile uint32_t gdb_stop_signal;
 volatile uint32_t gdb_resume_act;
 
-/* Weak: resolve to the real gdbstub.o implementations in the dbg/gdb builds,
- * to 0 in repl/fbsd/zephyr/hdmi (which link el2_exc.o but not gdbstub.o) — the
- * divert short-circuits on the null address there, leaving hwbp.c's one-shot
- * path and the fault breadcrumb exactly as before. */
+/* ------------------------------------------------------------------ *
+ * GDB-stub hw-breakpoint/watchpoint cross-core op request — the OPPOSITE
+ * direction of the handshake above (CPU1 asking CPU0 to do something,
+ * instead of CPU0 publishing a stop for CPU1). See gdbstub-hwbp-wrong-core
+ * memory: DBGBVR/DBGBCR/DBGWVR/DBGWCR are per-PE banked registers, so
+ * gdbstub_hw.c's Z1..Z4 handlers (which ALWAYS run on CPU1 — same call
+ * chain as the stop handshake above) must not arm them directly; they'd
+ * silently arm CPU1's own debug unit, which never executes guest code.
+ *
+ * This only needs to work while CPU0 is ALREADY PARKED in the `wfe` loop
+ * a few lines below (a real GDB stop is active — e.g. gdb sitting at a
+ * breakpoint hit) — that is precisely the scope gdbstub_hw.c restricts
+ * itself to (see its hwop_run()): if CPU0 is instead running the guest
+ * freely, arming/clearing a real hardware debug register transparently
+ * would require asynchronously interrupting it (a new SGI/IPI path), which
+ * was deliberately NOT built this pass (see gdbstub_hw.c's block comment
+ * for the full rationale) — gdbstub_hw_insert()/_remove() detect that case
+ * themselves (gdb_stop_pending == 0) and refuse cleanly instead of using
+ * this mechanism.
+ *   gdb_hw_op_pending : CPU1 sets to post a request, CPU0 clears once done
+ *                       (mirrors gdb_stop_pending, opposite direction/owner).
+ *   gdb_hw_op_kind/slot/va/lsc : the request (see gdbstub_hw.c's HWOP_*).
+ *   gdb_hw_op_result  : CPU0 writes hwbp_set()/hwbp_clear()'s return value
+ *                       (0 == success) before clearing gdb_hw_op_pending.
+ * Defined here (always linked, harmless/unused where gdbstub.o isn't linked)
+ * so the wfe-loop extension below compiles in every build; gdbstub_hw_apply_op
+ * (the weak hook that actually performs the op) is 0 in a build without
+ * gdbstub_hw.o, so the `if` short-circuits and this is a no-op there. */
+volatile uint32_t gdb_hw_op_pending;
+volatile int32_t  gdb_hw_op_kind;
+volatile int32_t  gdb_hw_op_slot;
+volatile uint64_t gdb_hw_op_va;
+volatile uint32_t gdb_hw_op_lsc;
+volatile int32_t  gdb_hw_op_result;
+
+/* Weak: resolve to the real gdbstub.o/gdbstub_hw.o implementations in the
+ * dbg/gdb builds, to 0 in repl/fbsd/zephyr/hdmi (which link el2_exc.o but not
+ * gdbstub.o) — the divert short-circuits on the null address there, leaving
+ * hwbp.c's one-shot path and the fault breadcrumb exactly as before. */
 int gdbstub_attached(void)  __attribute__((weak));
 int gdbstub_hw_active(void) __attribute__((weak));
+
+/* Executes the queued gdb_hw_op_* request (CPU0 side, called from inside the
+ * parked wfe loop below) — the actual hwbp_set()/hwbp_clear()/DBGWCR-LSC-patch
+ * calls live in gdbstub_hw.c, which already has every piece needed (it used
+ * to call them directly, on the wrong core; see its block comment). Weak so
+ * builds without gdbstub_hw.o still link. */
+void gdbstub_hw_apply_op(void) __attribute__((weak));
 
 void el2_snapshot_guest_frame(struct el2_frame *out)
 {
@@ -579,13 +621,32 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		 * timeline. Consecutive-identical (esr,elr) traps are collapsed so a
 		 * tight re-fault loop can't flush the ring's earlier context. */
 		{
-			static uint64_t sync_last_esr, sync_last_elr;
-			if (frame->esr != sync_last_esr || frame->elr != sync_last_elr) {
+			static uint64_t sync_last_esr, sync_last_key;
+			uint64_t key = frame->elr;
+			uint32_t kind_log = FLTR_K_SYNC;
+
+			/* For a DATA ABORT the ELR is worthless: it resolves to
+			 * generic_bs_r_4/generic_bs_w_4, the bus_space MMIO leaves every
+			 * arm64 driver funnels through, so it names no device. The faulting
+			 * IPA does name one (0x0a000000=vblk, 0x0a001000=vnet, +0x50 =
+			 * QueueNotify). Log that instead, under its own kind so no reader
+			 * mistakes a1 for an ELR. See FLTR_K_DABT's comment for the evening
+			 * this cost. Dedup then keys on (ESR,IPA) rather than (ESR,ELR), so
+			 * a re-fault loop that moves to a NEW address is still recorded. */
+			if (ec == 0x24u) {
+				uint64_t hpfar;
+				__asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
+				key = ((hpfar & 0xFFFFFFFFF0ULL) << 8) |
+				      (frame->far & 0xFFFull);
+				kind_log = FLTR_K_DABT;
+			}
+
+			if (frame->esr != sync_last_esr || key != sync_last_key) {
 				sync_last_esr = frame->esr;
-				sync_last_elr = frame->elr;
-				flightrec_log(FLTR_K_SYNC,
+				sync_last_key = key;
+				flightrec_log(kind_log,
 				              ((uint64_t)ec << 32) | (uint32_t)frame->esr,
-				              frame->elr);
+				              key);
 			}
 		}
 
@@ -612,10 +673,32 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			__asm__ volatile("dsb sy" ::: "memory");
 			gdb_stop_pending = 1u;
 			__asm__ volatile("sev" ::: "memory");    /* poke CPU1             */
-			while (gdb_resume_act == 0xffffffffu)     /* CPU1 runs RSP loop    */
+			while (gdb_resume_act == 0xffffffffu) {   /* CPU1 runs RSP loop    */
 				__asm__ volatile("wfe" ::: "memory");
+				/* Service a queued hw bp/wp op (Z1..Z4/z1..z4) from CPU1
+				 * WITHOUT leaving this parked loop — see the gdb_hw_op_*
+				 * block comment above for why this must run HERE (on CPU0,
+				 * the core that actually owns the guest's live debug
+				 * register bank) rather than on CPU1 directly. Bounded: a
+				 * single call, then straight back to the same wfe/condition
+				 * check, so a request that (somehow) never arrives just
+				 * means we keep waiting on gdb_resume_act exactly as before. */
+				if (gdb_hw_op_pending && gdbstub_hw_apply_op) {
+					gdbstub_hw_apply_op();
+					__asm__ volatile("dsb sy" ::: "memory");
+					gdb_hw_op_pending = 0u;
+					__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+				}
+			}
 			*frame = g_last_guest_frame;             /* apply CPU1 reg edits  */
-			gdb_stop_pending = 0u;
+			/* gdb_stop_pending is CPU1's to clear (see smp.c debug-core
+			 * loop), and it already did so before setting gdb_resume_act —
+			 * i.e. before this wfe could ever wake up. Do NOT clear it here:
+			 * that used to be CPU0's job, but CPU0 waking from wfe races
+			 * against CPU1's own loop re-checking the flag, so clearing on
+			 * the slow (CPU0) side let CPU1 spuriously re-enter the debug
+			 * event handler against a stale frame. Single-writer-per-value
+			 * now: CPU0 only ever sets this to 1, CPU1 only ever clears it. */
 			/* CPU1 (gdbstub apply()) already set MDSCR_EL1.SS + SPSR.SS in the
 			 * frame for STEP vs CONTINUE. Do NOT advance ELR — for a BRK the
 			 * stub rewinds/reprograms the instruction itself. */
