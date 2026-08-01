@@ -637,11 +637,40 @@ PE** and CPU1 — which owns EMAC, usbacm and therefore the console path — was
 the one core guaranteed unwatched. That is the third time per-PE banking has
 misled this project.
 
-Armed on all four cores, with the region zeroed and the zeros verified, it
-returned a *useful negative*: the bytes reappear and **no CPU instruction on
-any core writes them**. The guest cannot either (stage-2 carves the whole 2 MiB
-block; `hvscr_f=1`). That leaves a DMA master, and turns the next search from
-"grep the source" into "check descriptor and buffer bases".
+Armed on all four cores, with the region zeroed and the zeros "verified", it
+returned a *useful negative*: no CPU instruction on any core writes those
+bytes. I turned that correct answer into a fifth wrong one — "then it must be a
+DMA master" — and went looking for descriptor bases. There were none: EMAC's
+DMA scratch is at 0x50100000, MUSB's window ends at 0x50000090, the eMMC's at
+0x50020xxx. Nothing reaches 0x50001d00.
+
+### There was no writer. Ever.
+
+`dbgmon.c`'s `w`/`wb` commands were a bare store — no `dc civac`, no `dsb` —
+while every breadcrumb writer in this tree (`vc_store32`, `vblk_bc`,
+`vnet_bc`, ...) has always done both. So:
+
+- the host's zeros landed in CPU1's cache and never reached DRAM;
+- the read-back immediately after hit that same cache and **confirmed the
+  write**, so the instrument lied in the most convincing way possible
+  (`hvdbg.write_word_verified()` cannot catch this either — it verifies by
+  reading);
+- a warm reset discarded the dirty line and the original DRAM content
+  reappeared.
+
+The tell was in front of me from the first iteration and I walked past it three
+times: the text came back **byte-for-byte identical**. A writer has to
+reproduce that exactly; an un-erased region merely keeps it.
+
+Fixed by giving both write handlers the same `dc civac + dsb sy` every other
+writer uses. Proven by two opposite runs on hardware: before the fix the zeros
+never survived a reload, after it they do. The watchpoint had been right all
+along.
+
+**The wider consequence, and the real value of the evening: every host-side
+write in this project's history could silently have failed to reach DRAM, with
+read-back verification hiding it.** How many past experiments that spoiled is
+unknowable; the class is now closed.
 
 ### The root cause of the collision itself
 

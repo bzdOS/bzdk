@@ -55,6 +55,15 @@ extern int  backtrace_walk(uint64_t pc, uint64_t fp, uint64_t lr,
  * file's self-contained discipline (no bmc.h include). */
 extern void bmc_dispatch(char **argv, int argc, struct el2_frame *frame);
 
+/* dbgtools.c — pause-before-entry gate setters (2026-07-26). Extern decl
+ * only, per this file's self-contained discipline (no dbgtools.h include).
+ * Durable (dc civac + dsb) writes -- see dbgtools.h for why the generic `w`
+ * command (cmd_write_word() below, a plain store) isn't used for these two
+ * specifically: they must survive a WARM RESET that may follow shortly
+ * after. */
+extern void dbgtools_hold_set(void);
+extern void dbgtools_release_set(void);
+
 /* ------------------------------------------------------------------ *
  * Tiny freestanding I/O + string helpers (mirrors repl.c's style, but is
  * an independent copy -- dbgmon.c does not include or call repl.c).
@@ -325,10 +334,43 @@ static void cmd_dump(unsigned long addr, uint32_t len)
 	}
 }
 
+/* CACHE MAINTENANCE ON THE DEBUG WRITE PATH — do not remove.
+ *
+ * Both writers below used to be a bare store. That made every host-side write
+ * land in THIS core's (CPU1's) cache and, for DRAM, frequently never reach
+ * memory at all. The failure is silent and actively deceptive:
+ *
+ *   - a read-back immediately after hits the same cache and returns the value
+ *     you just wrote, so the write LOOKS durable — hvdbg's own
+ *     write_word_verified() is fooled for exactly this reason;
+ *   - a warm reset (which deliberately preserves DRAM, so every breadcrumb in
+ *     this tree survives one) discards the dirty line, and the ORIGINAL DRAM
+ *     content reappears.
+ *
+ * Found 2026-08-01 the expensive way. Trying to identify what kept refilling
+ * four breadcrumb windows, I zeroed them from the host, confirmed the zeros,
+ * rebooted, and watched the old text return — byte-for-byte identical, every
+ * time. That reads exactly like an active writer, and I chased one through
+ * three wrong theories (stale DRAM, U-Boot, the guest) and then a fourth (a
+ * DMA master) after an EL2 watchpoint armed on all four cores recorded ZERO
+ * hits. The watchpoint was right: nothing ever wrote those bytes. Nothing had
+ * ever erased them either. The byte-identical "reappearance" was the tell —
+ * a writer must reproduce the text, an un-erased region merely keeps it.
+ *
+ * Every breadcrumb writer in this tree (vc_store32, vblk_bc, vnet_bc, ...)
+ * already does exactly this dc civac + dsb sy; the debug console was the one
+ * write path that did not, which is why it could not be trusted for the one
+ * job it exists to do. See docs/war-stories.md §12. */
+static void dbg_write_flush(unsigned long addr)
+{
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(addr) : "memory");
+}
+
 /* w <addr> <val>: write a 32-bit word of PHYSICAL memory. */
 static void cmd_write_word(unsigned long addr, unsigned long val)
 {
 	*(volatile uint32_t *)addr = (uint32_t)val;
+	dbg_write_flush(addr);
 	cputs("wrote "); print_addr(addr); cputs(" = "); print_hex32((uint32_t)val); newline();
 }
 
@@ -336,6 +378,7 @@ static void cmd_write_word(unsigned long addr, unsigned long val)
 static void cmd_write_byte(unsigned long addr, unsigned long val)
 {
 	*(volatile uint8_t *)addr = (uint8_t)val;
+	dbg_write_flush(addr);
 	cputs("wrote "); print_addr(addr); cputs(" = "); print_hex8((uint8_t)val); newline();
 }
 
@@ -692,6 +735,8 @@ static void cmd_help(void)
 	cputs("  patch <pa> <word>  write instruction + I-cache flush (hot-patch)\r\n");
 	cputs("  poweroff | off     inject 'shutdown -p now' -> clean fs + warm reset\r\n");
 	cputs("  bmc <verb> ...     software-BMC mgmt plane (bmc help)\r\n");
+	cputs("  hold               arm pause-before-guest-entry (takes effect NEXT warm reset)\r\n");
+	cputs("  release            release a currently-held pause-before-guest-entry\r\n");
 	cputs("  h | ?              this help\r\n");
 }
 
@@ -915,6 +960,24 @@ static void exec_line(char *line, struct el2_frame *frame)
 			return;
 		}
 		cmd_write_byte(a0, a1);
+		return;
+	}
+	if (streq(cmd, "hold")) {
+		/* Arm the pause-before-guest-entry gate (main_dbg.c, checked right
+		 * before kload_enter()). Only takes effect if this write reaches
+		 * DRAM before a SUBSEQUENT warm reset AND before main_dbg.c's
+		 * check point on THIS boot hasn't happened yet -- i.e. call this,
+		 * then hv.wdt_reset(), never the reverse. See dbgtools.h. */
+		dbgtools_hold_set();
+		cputs("hold armed (HVMAP_DBGTOOLS_HOLD=1) -- takes effect on the "
+		      "NEXT warm reset, not this boot\r\n");
+		return;
+	}
+	if (streq(cmd, "release")) {
+		/* Let a currently-held CPU0 (main_dbg.c's hold loop) proceed into
+		 * kload_enter(). No-op if nothing is currently held. */
+		dbgtools_release_set();
+		cputs("release signaled (HVMAP_DBGTOOLS_RELEASE=1)\r\n");
 		return;
 	}
 	if (streq(cmd, "t")) {
