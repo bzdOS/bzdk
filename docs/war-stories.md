@@ -584,6 +584,92 @@ symlink tell you which layer to blame in ten seconds.
 
 ---
 
+## 12. Four wrong answers about who wrote 64 KiB of console log
+
+**2026-08-01.** `growfs` on the guest root wedged the board. Over the next few
+hours I produced four confident diagnoses, in this order, and every one was
+wrong:
+
+1. **A lost virtqueue kick.** Refuted by the counters: `g_kicks_seen ==
+   g_heads_popped == g_hdrs_read`, every kick seen and consumed.
+2. **A lost completion in the ack window.** A real race — the ack clears
+   `VRING` even for a completion published after the guest read
+   InterruptStatus, and the used-lock cannot prevent it because the losing
+   interleaving needs no torn write. I fixed it, wrote a test that caught a
+   genuine bug in my own first attempt (a watermark sampled at injection is
+   moved by the very event it must detect), shipped it — and it changed
+   nothing. Slot [61] stayed 0 and the hang reproduced **at the identical
+   sector**, which alone disproves a race. Kept in the tree with an explicit
+   retraction in its commit message; the race is real, the credit was not.
+3. **"The kick never reaches `vblk_kick()`."** Built on `g_dabt_seen` climbing
+   while `g_kicks_seen` did not. But `g_dabt_seen` lives in vblk's window and
+   increments **before** the window-address check, so it counts every guest
+   data abort including other devices'. vblk's own in-window counter
+   (`g_faults`) never moved at all. The guest was hammering virtio-**net**.
+4. **"The filesystem is full."** Plausible — 106% used, `-51M` available, and
+   `growfs` does need free blocks in the existing fs. Refuted by freeing
+   137 MB and watching it wedge again at the same LBA.
+
+### What actually made these possible
+
+Not one of the four failed on reasoning. They failed on **measurement
+hygiene**, in three recurring ways:
+
+- **Reading a frozen value as a live one.** `last_fault_ipa` held
+  `0xa001050` for minutes; I read it as "where the guest is faulting now". A
+  last-value slot needs a delta, or a label saying it is not one.
+- **Reading one subsystem's counter for another's problem.** See (3). A
+  counter named `dabt_seen` sitting inside vblk's window must count vblk's
+  aborts.
+- **Non-hermetic experiments.** I zeroed 16 bytes and read 128, then called
+  the untouched tail "the text came back". Later I zeroed before boot A and
+  drew conclusions after boot B. Each time the fix was the same: zero, *verify
+  the zeros*, then perturb exactly one thing.
+
+### The instrument that ended it
+
+The writer was found only after building one: `hwbp_set_wp_el2()`, a
+watchpoint that matches **EL2** stores (`HMC=1, PAC=0b10`). Every watchpoint in
+the tree until then matched EL1&EL0 only, so "which of our own instructions
+wrote this?" was literally unanswerable. Its first version armed on CPU0 alone
+and produced a fifth wrong answer, because `DBGWVR`/`DBGWCR` are **banked per
+PE** and CPU1 — which owns EMAC, usbacm and therefore the console path — was
+the one core guaranteed unwatched. That is the third time per-PE banking has
+misled this project.
+
+Armed on all four cores, with the region zeroed and the zeros verified, it
+returned a *useful negative*: the bytes reappear and **no CPU instruction on
+any core writes them**. The guest cannot either (stage-2 carves the whole 2 MiB
+block; `hvscr_f=1`). That leaves a DMA master, and turns the next search from
+"grep the source" into "check descriptor and buffer bases".
+
+### The root cause of the collision itself
+
+Separately from the hang: those windows were being clobbered because
+vconsole's capture buffer was **derived** from its neighbour
+(`RING_BASE + HDR_SIZE`) and later grown 3 KiB -> 64 KiB, so it marched through
+six other subsystems' windows. Two things kept it invisible — a comment
+asserting "vconsole ends 0x50001b10", true only of the 3 KiB version, and a
+host constant saying 4 KiB while the firmware wrote 64 KiB, so nobody ever read
+far enough to see the damage. The overlap itself was *documented and
+deliberate* ("fine while chasing the guest root-mount"); the hunt ended, the
+trade did not.
+
+The fix worth copying: the buffer base is now **absolute, not derived**, the
+header is **self-describing** (version, base, size) so host and firmware cannot
+drift, and `hv_addrmap.h` grew a compile-time non-overlap chain for the low
+block. The pre-existing chain covered only `0x50020000..`, which is precisely
+why it missed this. Restoring the old derived address now fails the build.
+
+### Rules this earned
+
+- A breadcrumb window's address must never be computed from a neighbour's.
+- Publish every counter as a real zero at init, or "never happened" and "this
+  build has no such counter" (`0xffffffff`) are indistinguishable.
+- Anything shared between host and firmware should be self-describing.
+- Before concluding *anything* from a counter, sample it twice.
+- When a hypothesis needs a fifth revision, stop and build the instrument.
+
 ## Further reading in this tree
 
 - `docs/aw-mmc-dma-coherency.md` — the long-form, still-open DMA coherency
