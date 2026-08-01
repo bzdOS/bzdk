@@ -23,6 +23,8 @@
                      * EMAC/dbgmon is dark */
 #include "emac.h"   /* emac_link_watchdog() self-heal */
 #include "wdt.h"
+#include "hv_addrmap.h"   /* HVMAP_DBGTOOLS_HEARTBEAT: CPU1 debug-loop heartbeat */
+#include "hwbp.h"          /* hwbp_set_wp_el2(): per-core EL2 self-watch arm */
 #ifdef HV_HDMI
 #include "hud.h"    /* hud_update(): live HUD refresh on CPU1 (HV_HDMI build) */
 #include "hdmi.h"   /* hdmi_phy_locked()/hdmi_relock(): PHY lock-loss defense */
@@ -488,6 +490,24 @@ void smp_secondary_main(uint64_t cpuid)
 	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
 	smp_bc(1, g_online);
 
+	/* EL2 SELF-WATCH, per-core arm (opt-in, see main_dbg.c's copy).
+	 *
+	 * DBGWVR/DBGWCR are BANKED PER PE. Arming from main_dbg.c covers CPU0 and
+	 * ONLY CPU0, so a store from this core is invisible to it — which produced
+	 * a confidently wrong "no CPU wrote it, must be DMA" reading on 2026-08-01
+	 * before the gap was spotted. CPU1 in particular owns EMAC + usbacm, i.e.
+	 * the console path, so it is the LIKELIEST writer of console bytes, and it
+	 * was the one core guaranteed not to be watched.
+	 *
+	 * This tree has been bitten by per-PE banking twice before (see project
+	 * memory: a GICH_HCR read that returned CPU1's bank, and banked GIC PPI
+	 * state read from the wrong core). Arm every secondary too, so "our own
+	 * instructions" means all of them. */
+#if defined(EL2_SELFWATCH_ADDR) && (EL2_SELFWATCH_ADDR)
+	hwbp_set_wp_el2(0, (uint64_t)(EL2_SELFWATCH_ADDR));
+	smp_bc(8, 0x5e1f0000u | cpu);   /* selfwatch armed on this core */
+#endif
+
 	/* ---- CPU1 = dedicated EMAC/dbgmon DEBUG CORE ------------------------
 	 * The whole point (fix for "the debugger dies when the guest wedges"):
 	 * this core does NOTHING but poll EMAC and service dbgmon in a tight
@@ -520,6 +540,25 @@ void smp_secondary_main(uint64_t cpuid)
 					*pc = (v & ~(0xFu << 20)) | (3u << 20);
 			}
 			smp_bc_nodsb(5, ++iters); /* pre-service counter (word 5), NO dsb */
+			/* dbgtools heartbeat (hv_addrmap.h HVMAP_DBGTOOLS_HEARTBEAT):
+			 * bumped UNCONDITIONALLY every pass of this loop, regardless
+			 * of which branch below (gdb / dbgmon / neither) it takes —
+			 * deliberately a SEPARATE word from SMP1's word[5]/`iters`
+			 * above rather than reusing it: that one is "NO dsb" (best-
+			 * effort, meant for a live `bc` read while things are
+			 * healthy), whereas this one IS dc-civac+dsb'd so a raw,
+			 * protocol-independent EMAC peek (dbgtools.c's
+			 * ETHERTYPE_DBGRAW, answered straight from emac_poll() —
+			 * see emac.c) always observes the true latest value, even
+			 * mid-iteration. See dbgtools.h for the full rationale and
+			 * its documented limitation. */
+			{
+				volatile uint32_t *hb = (volatile uint32_t *)
+					HVMAP_DBGTOOLS_HEARTBEAT;
+				*hb = iters;
+				__asm__ volatile("dc civac, %0\n\tdsb sy"
+				                  :: "r"(hb) : "memory");
+			}
 			/* ISOLATION TEST: dbgmon_service() TEMPORARILY DISABLED to prove
 			 * whether the EMAC poll path is what wedges CPU1. If the board now
 			 * stays resident forever (word5 huge, no reset), the wedge is in
@@ -536,6 +575,20 @@ void smp_secondary_main(uint64_t cpuid)
 					if (gdbstub_on_debug_event)
 						gdbstub_on_debug_event(&g_last_guest_frame,
 						                       (int)gdb_stop_signal);
+					/* Clear BEFORE waking CPU0 (matches the handshake
+					 * contract documented in el2_exc.c: "CPU0 set, CPU1
+					 * clears once served"). Ownership used to sit with
+					 * CPU0 instead (cleared after its wfe wake-up), which
+					 * left a window where this loop could come back around
+					 * to the check above while gdb_stop_pending was still
+					 * 1 (CPU0 hadn't woken from wfe yet) and re-enter
+					 * gdbstub_on_debug_event() a second time against the
+					 * same stale frame — sending GDB an unsolicited extra
+					 * stop-reply that desyncs its running/stopped state.
+					 * Clearing here, before the resume signal even goes
+					 * out, closes that window: by the time CPU0 can
+					 * possibly run again, this flag already reads 0. */
+					gdb_stop_pending = 0u;
 					gdb_resume_act = 1u;   /* any non-sentinel resumes CPU0 */
 					__asm__ volatile("dsb sy\n\tsev" ::: "memory");
 				} else if (gdbstub_poll) {

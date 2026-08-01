@@ -30,6 +30,7 @@
 #include "smp.h"
 #include "dbgmon.h"
 #include "reboot.h"
+#include "hwbp.h"
 #ifdef HV_HDMI
 #include "hdmi.h"
 #include "hud.h"
@@ -237,6 +238,24 @@ int main(void)
 	DBG_BC(6, (uint32_t)entry);
 
 	guest_config();
+
+	/* EL2 SELF-WATCH (opt-in, off unless built with -DEL2_SELFWATCH_ADDR=0x...):
+	 * arm a write watchpoint that matches OUR OWN (EL2) stores to one address,
+	 * so the hardware names the instruction instead of us guessing which
+	 * subsystem wrote a breadcrumb window. Armed HERE — after guest_config(),
+	 * before the guest can run — because the writes worth catching happen during
+	 * guest bring-up, leaving no window for the host to arm it over EMAC.
+	 *
+	 * A hit is a current-EL sync exception: el2_trap() records it in flightrec
+	 * (FLTR_K_FAULT, a0=ESR a1=ELR), steps ELR past the store, and carries on.
+	 * So this costs one flightrec entry per hit and cannot wedge the boot.
+	 * Read it back with triage.py and resolve the ELR:
+	 *   aarch64-linux-gnu-addr2line -f -e microkernel-dbg.elf <elr> */
+#if defined(EL2_SELFWATCH_ADDR) && (EL2_SELFWATCH_ADDR)
+	hwbp_set_wp_el2(0, (uint64_t)(EL2_SELFWATCH_ADDR));
+	DBG_BC(2, 0x5e1f0000u | 0u);   /* selfwatch armed on WP slot 0 */
+#endif
+
 #ifndef DBG_NO_TVM
 	{ uint64_t vb = gtrace_vbar_el1();
 	  __asm__ volatile("msr vbar_el1, %0\n\tisb" :: "r"(vb)); }
