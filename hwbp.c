@@ -189,6 +189,24 @@ static void hwbp_init(void)
 #define WCR_ARM(lsc) ((1u << 0) | (0x3u << 1) | ((uint32_t)(lsc) << 3) | (0xffu << 5))
 #define WCR_LSC_STORE 0x2u
 
+/* SELF-WATCH (EL2) variant — "which of OUR OWN instructions wrote this
+ * address?". The guest-facing builder above can never answer that: PAC=0b11 +
+ * HMC=0 matches Non-secure EL1&EL0 only, so an EL2 store sails straight past
+ * it. Per the ARM ARM's (SSC, HMC, PAC) selection table, EL2 needs
+ * HMC=1(bit13) + PAC=0b10(bits[2:1]) + SSC=0b00(bits[15:14]).
+ *
+ * Written for a concrete hunt (2026-08-01): four breadcrumb windows kept being
+ * refilled with guest console text after being zeroed, and a tree-wide grep
+ * found no writer — nothing outside vconsole.c even computes that address. At
+ * that point guessing had already produced three wrong answers, so the honest
+ * move was to stop reasoning about who COULD write it and let the hardware name
+ * the instruction. A hit lands as a current-EL sync exception, which el2_trap()
+ * already funnels into flightrec (FLTR_K_FAULT, a0=ESR a1=ELR) and advances
+ * ELR past — so the ELR in that record IS the culprit, resolvable with
+ * `aarch64-linux-gnu-addr2line -f -e microkernel-dbg.elf <elr>`. */
+#define WCR_ARM_EL2(lsc) ((1u << 0) | (0x2u << 1) | ((uint32_t)(lsc) << 3) | \
+                          (0xffu << 5) | (1u << 13))
+
 int hwbp_set(int idx, uint64_t va, int is_write_wp)
 {
 	if (!hwbp_inited)
@@ -221,6 +239,39 @@ int hwbp_set(int idx, uint64_t va, int is_write_wp)
 		bp_en[idx] = 1;
 	}
 
+	set_mde(1);
+	set_tde(1);
+	bc_bitmaps();
+	return 0;
+}
+
+/* Arm a WRITE watchpoint that matches EL2 (our own) stores. See WCR_ARM_EL2.
+ * Deliberately a separate entry point rather than a flag on hwbp_set(): every
+ * existing caller means "watch the guest", and silently changing what they
+ * match would be the kind of quiet behaviour swap this tree keeps getting
+ * bitten by. Returns 0 on success, -1 on a bad index. */
+int hwbp_set_wp_el2(int idx, uint64_t va)
+{
+	uint64_t base;
+
+	if (!hwbp_inited)
+		hwbp_init();
+	if (idx < 0 || idx >= n_wp)
+		return -1;
+
+	base = va & ~7ull;                  /* DBGWVR is doubleword-aligned */
+	wr_wcr(idx, 0);
+	__asm__ volatile("isb" ::: "memory");
+	wr_wvr(idx, base);
+	wr_wcr(idx, WCR_ARM_EL2(WCR_LSC_STORE));
+	__asm__ volatile("isb" ::: "memory");
+	wp_va[idx] = va;
+	wp_en[idx] = 1;
+
+	/* MDE enables breakpoints/watchpoints at all. TDE is about routing EL1/EL0
+	 * debug exceptions to EL2 and is irrelevant for an EL2-taken one, but
+	 * hwbp_set() sets it and leaving the module's state consistent avoids a
+	 * surprise for whoever arms a guest watchpoint next. */
 	set_mde(1);
 	set_tde(1);
 	bc_bitmaps();

@@ -51,6 +51,14 @@ int hwbp_set(int idx, uint64_t va, int is_write_wp);
  * Idempotent; bad index returns -1. */
 int hwbp_clear(int idx, int is_write_wp);
 
+/* Arm a WRITE watchpoint matching EL2 — i.e. watch what the HYPERVISOR ITSELF
+ * writes, not the guest. hwbp_set()'s watchpoints match Non-secure EL1&EL0 only
+ * and cannot see an EL2 store at all. A hit arrives as a current-EL sync
+ * exception; el2_trap() logs it (FLTR_K_FAULT: a0=ESR, a1=ELR) and steps over
+ * it, so the recorded ELR names the storing instruction. Resolve with
+ * addr2line against microkernel-dbg.elf. See WCR_ARM_EL2 in hwbp.c. */
+int hwbp_set_wp_el2(int idx, uint64_t va);
+
 /* Disable every breakpoint and watchpoint (used by the `bpc` command). */
 void hwbp_clear_all(void);
 
