@@ -671,10 +671,25 @@ class HV:
             period=w[4], init_done=w[6], ctl_live=w[7])
 
     def vconsole(self):
-        """Read vconsole capture ring header. Returns dict."""
-        w = self.read_words(B.VCONSOLE_HDR_PA, 4)
-        if len(w) < 4: return {}
-        return dict(magic=w[0], total_bytes=w[1], fault_count=w[2])
+        """Read the vconsole ring header. Returns dict.
+
+        From layout v2 the header is SELF-DESCRIBING: word[3]=version,
+        word[4]=buffer base, word[5]=size. Trust those over B.VCONSOLE_RING_*,
+        which are only fallbacks for a pre-v2 board. The whole point: this file
+        used to read a hardcoded 4 KiB at a hardcoded address while the firmware
+        wrote 64 KiB somewhere else, and neither side could notice."""
+        w = self.read_words(B.VCONSOLE_HDR_PA, 8)
+        if not w or len(w) < 4:
+            return {}
+        d = dict(magic=w[0], total_bytes=w[1], fault_count=w[2])
+        ver = w[3] if len(w) >= 4 else 0
+        # A pre-v2 firmware wrote 0 here; a plausible version is small.
+        if 1 <= ver <= 64 and len(w) >= 6 and w[4]:
+            d.update(layout=ver, buf_base=w[4], buf_size=w[5])
+        else:
+            d.update(layout=0, buf_base=B.VCONSOLE_RING_PA,
+                     buf_size=B.VCONSOLE_RING_SZ)
+        return d
 
     def vconsole_text(self, length=None):
         """Dump and return the vconsole ring data as text."""
@@ -682,7 +697,9 @@ class HV:
         n = hdr.get('total_bytes', 0)
         if n == 0: return b""
         if length: n = min(n, length)
-        return self.dump(B.VCONSOLE_RING_PA, min(n, B.VCONSOLE_RING_SZ))
+        # Size from the header, so a firmware/host size drift can't silently
+        # truncate the read or corrupt wrap arithmetic.
+        return self.dump(hdr['buf_base'], min(n, hdr['buf_size']))
 
     # ── flight recorder (flightrec.c/.h, ROADMAP B4) ────────────────────
     # Generic (kind, a0, a1) event ring at 0x50012000, magic "FLTR". See

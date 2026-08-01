@@ -116,19 +116,41 @@
 #define VCONSOLE_RING_BASE   0x50000f00UL
 #define VCONSOLE_MAGIC       0x55415254u   /* "UART" */
 
-#define VCONSOLE_HDR_WORDS   4u                       /* magic/total/faults/reserved */
-#define VCONSOLE_HDR_SIZE    (VCONSOLE_HDR_WORDS * 4u) /* 16 bytes -> buffer @ +0x10 */
-#define VCONSOLE_BUF_BASE    (VCONSOLE_RING_BASE + VCONSOLE_HDR_SIZE) /* 0x50000f10 */
+#define VCONSOLE_HDR_WORDS   8u                       /* see layout above       */
+#define VCONSOLE_HDR_SIZE    (VCONSOLE_HDR_WORDS * 4u) /* 32 bytes               */
+
 /* 64 KiB capture window (was 3 KiB): a full FreeBSD verbose boot is ~40 KiB, so
- * the ENTIRE boot log fits with no wrap — the mountroot failure + "List of GEOM
- * managed disk devices" + aw_mmc/mmcsd attach lines survive even the cngrab
- * panic-loop (each panic dump is ~600 B, 64 KiB >> that). Buffer spans
- * 0x50000f10..0x50010f10; this overlaps the (currently unused-in-this-boot)
- * gtrace/firstfault/hdmi/... breadcrumb windows, which is fine while chasing
- * the guest root-mount. Guest RAM is 0x40000000-0x80000000 but the guest does
- * not clobber this low breadcrumb region during early boot (same reason the
- * 3 KiB ring survived). */
-#define VCONSOLE_BUF_SIZE    0x10000u                  /* 64 KiB capture window */
+ * the ENTIRE boot log fits with no wrap.
+ *
+ * RELOCATED 2026-08-01, and NOT derived from VCONSOLE_RING_BASE any more.
+ * When the buffer grew 3 KiB -> 64 KiB it stayed glued to the header at
+ * 0x50000f10, so it ran to 0x50010f10 and swallowed FIVE other subsystems'
+ * breadcrumb windows. That was a KNOWN, DELIBERATE trade — the comment this
+ * replaces said so, "which is fine while chasing the guest root-mount". That
+ * hunt is long over, and the cost was still being paid: read live on hardware,
+ * vgic (0x50001c00), vgic-self-test (0x50001d00), gtrace (0x50002000), the
+ * first-fault latch (0x50002400), the single-step ring (0x50002800) and the
+ * HDMI window (0x50003000) ALL held console text instead of their magics, i.e.
+ * six subsystems could not report anything. Worse, project memory records a
+ * RETRACTED vtimer theory built on vgic-window readings — those reads could
+ * never have been trustworthy.
+ *
+ * 0x50040000 is clear: hv-scratch is DTB-reserved 0x50000000+0x200000 (2 MiB),
+ * and a full-tree grep for 0x50[0-9a-f]{6} finds nothing between the vnet
+ * window's end (0x50030050) and 0x50200000. An explicit absolute base, not
+ * BASE+HDR_SIZE, so growing the header can never march the buffer into a
+ * neighbour again — which is exactly how this happened. */
+#define VCONSOLE_BUF_BASE    0x50040000UL              /* explicit, NOT adjacent */
+#define VCONSOLE_BUF_SIZE    0x10000u                  /* 64 KiB capture window  */
+
+/* Bumped whenever the header layout or the buffer's location/size changes, so a
+ * host reader can refuse to guess. The firmware/host size disagreement this
+ * replaces was silent for exactly this reason: bzd_board.py said the ring was
+ * 4 KiB while the firmware wrote 64 KiB, so the host never read far enough to
+ * notice the overlap, and its wrap arithmetic (total_bytes % 4 KiB against a
+ * 64 KiB ring) produced the "byte counts don't sum" reconstructions that wasted
+ * time earlier the same day. Readers should take base/size FROM THE HEADER. */
+#define VCONSOLE_LAYOUT_VER  2u
 
 /* Lay down the ring's magic + zero its counters/buffer. Call once before
  * the guest can fault on UART0 (i.e. before stage2_enable() in

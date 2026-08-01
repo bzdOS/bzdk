@@ -275,7 +275,16 @@ vconsole_init(void)
 	vc_store32(0, VCONSOLE_MAGIC);   /* word[0]: magic "UART"        */
 	vc_store32(1, 0);                /* word[1]: total_bytes         */
 	vc_store32(2, 0);                /* word[2]: fault_count         */
-	vc_store32(3, 0);                /* word[3]: reserved/padding    */
+	/* Self-describing tail (layout v2): the buffer no longer follows the
+	 * header, so publish where it actually is and how big it is. A host that
+	 * assumed adjacency and a hardcoded size is precisely how the firmware
+	 * (64 KiB) and bzd_board.py (4 KiB) drifted apart unnoticed — see
+	 * vconsole.h's VCONSOLE_LAYOUT_VER comment. */
+	vc_store32(3, VCONSOLE_LAYOUT_VER);            /* word[3]: layout version */
+	vc_store32(4, (uint32_t)VCONSOLE_BUF_BASE);    /* word[4]: buffer base    */
+	vc_store32(5, (uint32_t)VCONSOLE_BUF_SIZE);    /* word[5]: buffer size    */
+	vc_store32(6, 0);                              /* word[6]: reserved       */
+	vc_store32(7, 0);                              /* word[7]: reserved       */
 
 	/* Zero the byte buffer for deterministic state on a fresh boot.
 	 * Init-time only (never called from exception context), so a

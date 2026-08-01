@@ -188,8 +188,17 @@ static inline void write_cntvoff_el2(uint64_t v)
 }
 
 /* ================================================================
- *  Breadcrumb window: 0x50001c00 ("VGIC"). Sits in the free gap between
- *  vconsole (ends 0x50001b10) and gtrace (starts 0x50002000). Layout:
+ *  Breadcrumb window: 0x50001c00 ("VGIC"). Sits between the vconsole ring
+ *  header and gtrace (0x50002000).
+ *
+ *  HISTORY, because this comment was wrong for months: it used to claim
+ *  "vconsole (ends 0x50001b10)". That held only while the capture ring was
+ *  3 KiB. When it grew to 64 KiB the buffer stayed glued at 0x50000f10 and ran
+ *  to 0x50010f10 — straight through THIS window. Read live on 2026-08-01, the
+ *  words below held console text, not the magic, so anything read out of here
+ *  was console bytes reinterpreted as GICH state. Project memory records a
+ *  RETRACTED vtimer theory built on readings from this window. The buffer now
+ *  lives at 0x50040000 (see vconsole.h) and this window is real again. Layout:
  *   [0]  magic 0x56474943 ("VGIC")
  *   [1]  vtr           raw GICH_VTR
  *   [2]  nr_lr         number of List Registers (VTR[5:0]+1; GIC-400 => 4)
