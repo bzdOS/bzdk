@@ -33,8 +33,13 @@ non-overlap-checked on the C side today; the rest of the map (including
 everything below) is comment-documented only, on both sides.
 
   0x50000000..0x50000eff  early boot / GIC / misc breadcrumbs (GICT @0x800)
-  0x50000f00..0x50010f0f  vconsole 64 KiB capture ring (header @0xf00)
+  0x50000f00..0x50000f1f  vconsole ring HEADER only (magic/total/faults/ver/
+                           base/size) — the 64 KiB data buffer used to follow
+                           it here and ran to 0x50010f0f, burying the vgic,
+                           gtrace, first-fault, single-step and HDMI windows;
+                           moved to 0x50040000 on 2026-08-01
   0x50012000..            flightrec "FLTR" ring
+  0x50040000..0x5004ffff  vconsole 64 KiB capture buffer (v2)
   0x50020000..0x50020fff  virtio-blk / eMMC / SD I/O storage (HVMAP_VBLK_BC
                            in hv_addrmap.h == VBLK_BC_PA below == the "VBK1"
                            breadcrumb reliable_load.py's --expect-vbk checks)
@@ -99,9 +104,16 @@ WDOG_ARM_SEQUENCE = ((WDOG_CFG_PA, 1), (WDOG_MODE_PA, 0x21), (WDOG_CTRL_PA, 0x14
 MUSB_BASE = 0x01c19000
 
 # ── hv-scratch breadcrumb addresses (DRAM, board-physical) ──────────────────
-VCONSOLE_HDR_PA = 0x50000f00     # vconsole ring header: magic/total_bytes/faults
-VCONSOLE_RING_PA = 0x50000f10    # vconsole ring data start
-VCONSOLE_RING_SZ = 0x1000        # ring is 4 KiB
+VCONSOLE_HDR_PA = 0x50000f00     # vconsole ring header: magic/total/faults/ver/base/size
+# Fallbacks ONLY. The header is self-describing from layout v2 on (word[3]=ver,
+# word[4]=buffer base, word[5]=size) — read it, do not assume. These constants
+# said 4 KiB while the firmware wrote 64 KiB at 0x50000f10, so the host never
+# read far enough to see that the ring had swallowed five other subsystems'
+# breadcrumb windows, and its wrap arithmetic (total_bytes % 4 KiB over a 64 KiB
+# ring) produced self-contradictory reconstructions. Buffer relocated to
+# 0x50040000 on 2026-08-01.
+VCONSOLE_RING_PA = 0x50040000    # vconsole ring data start (v2)
+VCONSOLE_RING_SZ = 0x10000       # 64 KiB
 
 GICT_BC_DRAM_PA = 0x50000800     # GICT breadcrumb per hvdbg.py's HV.gict() and
                                   # per chimpd.py's OWN module docstring (see the
