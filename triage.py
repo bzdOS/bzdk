@@ -77,7 +77,7 @@ def describe_ipa(ipa):
 
 
 FLTR_KINDS = {1: "FAULT", 2: "TRAP", 3: "IRQ", 4: "VIRTIO", 5: "CONSOLE",
-              10: "DABT",
+              10: "DABT", 11: "GFAULT", 12: "GFAR",
               6: "TIMER", 7: "SYNC", 8: "HVVIOL"}
 
 VBK_LABELS = {
@@ -461,6 +461,20 @@ def dump_fltr(hv, out, tail=40):
             # For a DABT the address is the whole point: name the device.
             if k == 10:
                 txt += f"\n         at {describe_ipa(a1)}"
+        if k in (11, 12):
+            # GUEST's own exception, via gtrace's VBAR_EL1 trampoline. The one
+            # bit that matters most first: did a PROCESS die or the KERNEL?
+            # Hours went into not knowing that while growfs was SIGSEGV-ing.
+            lvl = (a0 >> 40) & 1
+            esr = a0 & 0xFFFFFFFF
+            d = armdec.decode_esr(esr)
+            keep = [ln.strip() for ln in d
+                    if ln.strip().startswith(("EC ", "DFSC", "WnR", "SAS", "SRT"))]
+            who = "EL0 — a USERLAND PROCESS" if lvl == 0 else "EL1 — the guest KERNEL"
+            what = "PC" if k == 11 else "faulting address"
+            txt += f"\n         from {who}"
+            txt += f"\n         {'; '.join(keep)}"
+            txt += f"\n         {what} = {a1:#018x}"
         if k == 6:                       # TIMER: a0 = CNTV_CTL
             txt += f"\n         {armdec.decode_cntv_ctl(a0)[0]}"
         if key == prev_key:
