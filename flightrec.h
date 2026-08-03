@@ -123,6 +123,53 @@ enum {
 	                       * the guest was hammering vnet the whole time.
 	                       * Dedup keys on (ESR,IPA), so a re-fault loop on a
 	                       * NEW address still shows up.                       */
+	FLTR_K_GFAULT  = 11,  /* A guest synchronous exception caught by gtrace.c's
+	                       * VBAR_EL1 trampoline.
+	                       *   a0 = (level<<40) | (EC<<32) | ESR_EL1[31:0]
+	                       *        level: 0 = from EL0, 1 = from EL1
+	                       *   a1 = ELR_EL1 — the faulting PC, FULL 64 bits
+	                       * Abort ECs get a second FLTR_K_GFAR with FAR_EL1.
+	                       *
+	                       * SCOPE — READ THIS BEFORE RELYING ON IT: this only
+	                       * sees the EARLY-BOOT window, before the guest kernel
+	                       * installs its own VBAR_EL1. It CANNOT observe a
+	                       * userland crash in a running guest, and I proved
+	                       * that the expensive way on 2026-08-03: added this
+	                       * expecting to catch growfs' SIGSEGV, ran it on
+	                       * hardware, got ZERO records.
+	                       *
+	                       * The reason is architectural, not a gap to fix here.
+	                       * gtrace's trampoline is installed ONCE before guest
+	                       * entry; FreeBSD then points VBAR_EL1 at its own
+	                       * vectors, and a write to VBAR_EL1 cannot be trapped
+	                       * — HCR_EL2.TVM covers only the memory-management
+	                       * registers (SCTLR/TTBR/TCR/ESR/FAR/AFSR/MAIR/AMAIR/
+	                       * CONTEXTIDR), not vectors. And a userland null-deref
+	                       * faults in the guest's OWN stage-1 translation, so
+	                       * it never reaches stage-2 either. EL2 is genuinely
+	                       * blind to it. gtrace is named "early-locore tracing"
+	                       * for exactly this reason; I tried to use it outside
+	                       * its design.
+	                       *
+	                       * TO CATCH A RUNNING GUEST'S CRASH, use a hardware
+	                       * breakpoint (hwbp.c, EL1 matching) on the guest
+	                       * kernel's signal-delivery path — resolve trapsignal/
+	                       * sendsig from kernel.debug — and ARM IT ON THE
+	                       * GUEST'S CORE: DBGBVR/DBGBCR are banked per PE, and
+	                       * arming from CPU1 is why project memory records
+	                       * hardware breakpoints as "never fire".
+	                       *
+	                       * What this record IS worth: the pre-existing ring
+	                       * truncated the PC to 32 bits (losing the top half of
+	                       * 0xffff0000........ addresses) and the FFL1 latch
+	                       * kept only the FIRST fault of the boot. Early-boot
+	                       * faults now arrive full-width, every one of them,
+	                       * with the EL0-vs-EL1 bit. Early boot is this
+	                       * project's most-debugged window, so that is real —
+	                       * just not what I first claimed.                    */
+	FLTR_K_GFAR    = 12,  /* companion to FLTR_K_GFAULT for abort classes:
+	                       * a0 identical, a1 = FAR_EL1 (the faulting address).
+	                       * Same early-boot-only scope as FLTR_K_GFAULT.      */
 	FLTR_K_VTRESCUE = 9,  /* gic_timer.c's vtimer_mask_watchdog() had to undo
 	                       * a CNTV mask EL2 set because the guest never did:
 	                       * a0 = CNTV_CTL, a1 = (rescues<<32)

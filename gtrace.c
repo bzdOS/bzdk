@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include "gtrace.h"
 #include "exceptions.h"
+#include "flightrec.h"
 
 /* ---- cache-coherent trace-ring store, same pattern as the rest of the
  * tree: *p = v; dc civac, p; dsb sy. ---- */
@@ -315,6 +316,36 @@ int gtrace_handle_hvc(struct el2_frame *frame)
 	}
 
 	ec1 = (uint32_t)((esr1 >> 26) & 0x3Fu);
+
+	/* Full-width record of this fault into the flightrec.
+	 *
+	 * The two existing records below are lossy in ways that mattered: the FFL1
+	 * latch above keeps only the FIRST fault of the boot (an early harmless
+	 * kernel fault claims it), and gtrace_record() truncates the PC to 32 bits,
+	 * discarding the top half of a 0xffff0000........ kernel address. Both stay
+	 * as they are — dbgmon reads them — and this adds a lossless one alongside.
+	 * SPSR_EL1.M[3:2] gives the originating level, so one bit says EL0 vs EL1.
+	 *
+	 * SCOPE: this function only runs while OUR trampoline is the guest's
+	 * VBAR_EL1, i.e. early boot. Once FreeBSD installs its own vectors nothing
+	 * here is reached again, and VBAR_EL1 writes cannot be trapped (TVM covers
+	 * memory-management registers only). Verified on hardware 2026-08-03:
+	 * deliberately crashing growfs in a running guest produced ZERO records.
+	 * Do not expect userland-crash visibility from here — see FLTR_K_GFAULT's
+	 * comment in flightrec.h for why, and for the hardware-breakpoint route
+	 * that does work. */
+	{
+		uint32_t from_el = (uint32_t)((spsr1 >> 2) & 0x3u);
+		uint64_t a0 = ((uint64_t)(from_el ? 1u : 0u) << 40) |
+		              ((uint64_t)ec1 << 32) | (uint32_t)esr1;
+
+		flightrec_log(FLTR_K_GFAULT, a0, elr1);
+		/* FAR only means something for aborts (EC 0x20/0x21 instruction,
+		 * 0x24/0x25 data). Skip it otherwise so the common case stays at one
+		 * ring slot. */
+		if (ec1 == 0x20u || ec1 == 0x21u || ec1 == 0x24u || ec1 == 0x25u)
+			flightrec_log(FLTR_K_GFAR, a0, far1);
+	}
 
 	tag_info = 0x80000000u | ((vec & 0xFu) << 24) | ((ec1 & 0x3Fu) << 8);
 	tag_far  = 0xA0000000u | ((vec & 0xFu) << 24);
