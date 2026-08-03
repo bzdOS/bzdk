@@ -558,6 +558,75 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	 * no human, no manual reset. See SESSION-RULES.md R2/R3. */
 	wdt_pet();
 
+	/* GUEST-BREAKPOINT KEEP-ALIVE (opt-in: -DGUEST_BP_ADDR=0x...).
+	 *
+	 * MDSCR_EL1.MDE (bit 15) is the master enable for breakpoints and
+	 * watchpoints — and MDSCR_EL1 belongs to the GUEST. hwbp_set() sets MDE
+	 * before guest entry, then FreeBSD initialises its own debug state and
+	 * clears it, silently disarming everything. Observed exactly that on
+	 * 2026-08-03: a breakpoint on trapsignal, armed on CPU0 (verified:
+	 * armed-bp bitmap 0x1) with a correct address (verified against the
+	 * DEPLOYED kernel's own symbol table, not just kernel.debug), recorded
+	 * ZERO hits while growfs was demonstrably SIGSEGV-ing.
+	 *
+	 * So re-assert it. This runs on the GUEST'S core — the only place the
+	 * value is not somebody else's bank, which is the trap that has now
+	 * misled this project three times. Cost is one mrs+msr on a trap we are
+	 * already taking, and only in a build that asked for it. */
+#if defined(GUEST_BP_ADDR) && (GUEST_BP_ADDR)
+	if ((kind >> 2) == 2u) {
+		uint64_t mdscr, mdcr, oslsr;
+
+		/* All three read HERE, on the guest's own core. Every one of them is
+		 * banked per PE, and reading them over the debug channel gets CPU1's
+		 * copy — the mistake that has now cost this project three separate
+		 * wrong conclusions. */
+		__asm__ volatile("mrs %0, mdscr_el1" : "=r"(mdscr));
+		__asm__ volatile("mrs %0, mdcr_el2"  : "=r"(mdcr));
+		__asm__ volatile("mrs %0, oslsr_el1" : "=r"(oslsr));
+
+		/* Publish the raw values so each precondition is a READING, not a
+		 * belief: [0x638] MDSCR_EL1, [0x63c] MDCR_EL2, [0x640] OSLSR_EL1. */
+		{
+			volatile uint32_t *p = (volatile uint32_t *)0x50000638UL;
+			p[0] = (uint32_t)mdscr;
+			p[1] = (uint32_t)mdcr;
+			p[2] = (uint32_t)oslsr;
+			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+		}
+
+		/* MDSCR_EL1.MDE (bit 15): master enable for breakpoints/watchpoints,
+		 * and MDSCR_EL1 belongs to the guest — FreeBSD clears it during its
+		 * own debug init, silently disarming us. Measured, not assumed. */
+		if (!(mdscr & (1ull << 15))) {
+			mdscr |= (1ull << 15);
+			__asm__ volatile("msr mdscr_el1, %0\n\tisb" :: "r"(mdscr) : "memory");
+		}
+		/* MDCR_EL2.TDE (bit 8): route EL1/EL0 debug exceptions to EL2. Without
+		 * it the breakpoint fires INTO THE GUEST, which handles it as its own
+		 * debug exception and we never see a thing. hwbp_set() sets it before
+		 * guest entry; re-assert in case anything since has cleared it. */
+		if (!(mdcr & (1ull << 8))) {
+			mdcr |= (1ull << 8);
+			__asm__ volatile("msr mdcr_el2, %0\n\tisb" :: "r"(mdcr) : "memory");
+		}
+		/* OS LOCK — the one that actually silenced us, and the last thing I
+		 * would have guessed. OSLSR_EL1.OSLK (bit 1) read 1 on hardware
+		 * 2026-08-03: with the OS lock LOCKED the PE suppresses debug
+		 * exceptions outright, no matter that MDE, TDE and an armed DBGBCR
+		 * slot were all verified correct. That is very likely the real reason
+		 * project memory records hardware breakpoints as "never fire" —
+		 * three correct preconditions and one silent veto.
+		 *
+		 * Writing 0 to OSLAR_EL1 unlocks. FreeBSD locks it during its own
+		 * debug init, so re-open it here, on the guest's core, every trap. */
+		if (oslsr & (1ull << 1)) {
+			uint64_t zero = 0;
+			__asm__ volatile("msr oslar_el1, %0\n\tisb" :: "r"(zero) : "memory");
+		}
+	}
+#endif
+
 	/* Snapshot the guest frame for the SMP debug core (CPU1) — only when that
 	 * core is actually up (dbg_core_active). Inert/zero-overhead otherwise. */
 	if (dbg_core_active && (kind >> 2) == 2u) {

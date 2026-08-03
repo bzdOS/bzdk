@@ -256,6 +256,31 @@ int main(void)
 	DBG_BC(2, 0x5e1f0000u | 0u);   /* selfwatch armed on WP slot 0 */
 #endif
 
+	/* GUEST-KERNEL BREAKPOINT (opt-in: -DGUEST_BP_ADDR=0x...).
+	 *
+	 * This is how EL2 observes a USERLAND crash, which it cannot do directly:
+	 * a null-deref faults in the guest's own stage-1 translation and never
+	 * reaches stage-2, and gtrace's VBAR_EL1 trampoline is gone as soon as the
+	 * guest installs its own vectors (proved on hardware — see FLTR_K_GFAULT).
+	 * So instead: break on the guest KERNEL's signal-delivery path, which does
+	 * run at EL1 where a hardware breakpoint can match. Resolve the address
+	 * from kernel.debug, e.g.
+	 *   aarch64-linux-gnu-nm kernel.debug | grep ' trapsignal$'
+	 * -> 0xffff000000529924 for the kernel currently deployed.
+	 *
+	 * Armed HERE, on CPU0, deliberately: DBGBVR/DBGBCR are banked per PE and
+	 * CPU0 is the core that runs the guest. Project memory records hardware
+	 * breakpoints as "never fire", armed instead from CPU1 — the same per-PE
+	 * banking that made this week's EL2 watchpoint report a confident nothing.
+	 *
+	 * Safe against the "breakpoint kills the board" history: hwbp_handle() is
+	 * one-shot — it records the hit and disarms the slot, so the guest steps
+	 * past on eret instead of re-faulting forever. */
+#if defined(GUEST_BP_ADDR) && (GUEST_BP_ADDR)
+	hwbp_set(0, (uint64_t)(GUEST_BP_ADDR), 0);
+	DBG_BC(3, 0x6b700000u);   /* guest breakpoint armed on BP slot 0 */
+#endif
+
 #ifndef DBG_NO_TVM
 	{ uint64_t vb = gtrace_vbar_el1();
 	  __asm__ volatile("msr vbar_el1, %0\n\tisb" :: "r"(vb)); }
