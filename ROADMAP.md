@@ -15,7 +15,16 @@ Trunk-based (всё на `master`, зелёный). Сделано с 07-22:
 - ✅ **A1 stage-2 изоляция** — hardware-proven: `AT S12E1W` self-check (STG2 bc
   [14..18]) доказывает, что EL1-регим гостя не достаёт до hv-image/hv-scratch(/hv-fb),
   пока гость грузится до root. Guest→HV нарушение репортится (FLTR_K_HVVIOL).
-- ✅ **A2 чистый shutdown** — PSCI SYSTEM_OFF→warm-reset (fs_clean).
+- 🟡 **A2 чистый shutdown** — механизм есть (PSCI SYSTEM_OFF→warm-reset), но
+  end-to-end **НЕ закрыт**, галочка снята 2026-08-04. Доказательство: в этот день
+  гостевая ФС оказалась помечена грязной, из-за чего ядро отказало в rw-монтировании
+  (`R/W mount of / denied. Filesystem is not clean`), корень остался read-only и
+  `/etc/rc` не доработал — ни sshd, ни писабельного /tmp. То есть fs_clean-сага
+  жива. Причина не в EL2-стороне: ловится SYSTEM_OFF исправно, ломается ГОСТЕВОЙ
+  триггер (`shutdown -p`) — см. memory `unclean-stop-ratchet-corrupt-shutdown`,
+  где `/sbin/shutdown` был ENOEXEC, так что «чистое выключение» никогда и не
+  выполнялось, и каждый цикл был unclean-stop. DoD этого пункта («10 циклов
+  подряд без fsck-грязи») не проверялся ни разу.
 - ✅ **B2 GDB-stub** — RSP breakpoint/step STOP подключён в dbg-билд (команда
   `gdb` → CPU1 хостит RSP), live-verified по 0x88B5 (`$?`→T05, `$g`→регистры).
 - ✅ **B4 flight-recorder** — `flightrec.c`, генерализованный (kind,a0,a1)-ring,
@@ -33,9 +42,20 @@ Trunk-based (всё на `master`, зелёный). Сделано с 07-22:
   (лид: AXP-рейл `dldo1`/vcc-hdmi-dsi; RSB-подтверждение блокировано захватом шины
   гостем). Забанкано, relock за флагом (default off).
 
+- ✅ **C2 async I/O на CPU2** — `async_posts == async_completes`, живёт под нагрузкой.
+- ✅ **Путь ЗАПИСИ устоялся** (закрывает «settle-фикс убил каскад DATA_TIMEOUT»,
+  измерено 2026-08-04 на реальной нагрузке: fsck с починкой + `growfs` на 6 новых
+  групп цилиндров + 157 МБ данных = **3214 запросов записи**):
+  `write_retries=7 / write_retry_ok=7` (восстановились ВСЕ, доля повторов 0.22%),
+  `g_ioerrs=0` и все под-счётчики ioerr в нуле, `lock_retries=0 / lock_giveups=0`.
+  Прежняя подпись бага — лавина повторов с отказами; теперь 7 одиночных успешных.
+  Гонка sync-fallback за eMMC-лок (memory `vblk-sync-fallback-raced-cpu2`) не
+  воспроизводится.
+
 Осталось до v1-гейта (§2): числа стабильности (100-streak добить soak'ом/работой,
-72h soak, 20 break-glass), реальная W^X (вне static-partitioning — отложено),
-bring-up guide (T4), лицензия/тулчейн (T5). Полировка B1 BMC / B3 forensics.
+72h soak, 20 break-glass), **A2 end-to-end (см. выше — галочка снята)**, реальная
+W^X (вне static-partitioning — отложено), bring-up guide (T4), лицензия/тулчейн
+(T5). Полировка B1 BMC / B3 forensics.
 
 **NB:** `make repl`/`fbsd`/`zephyr` — pre-broken stale-варианты (не линкуются
 задолго до этой сессии, вне CI-гейта). Активные: `dbg`, `dbg -DHV_HDMI`, `gdb`,
