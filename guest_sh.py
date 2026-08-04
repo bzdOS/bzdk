@@ -61,6 +61,29 @@ def ensure_shell(fd, tries=3):
     return False
 
 
+def _abort_partial_line(fd):
+    """Discard whatever the shell is still waiting to finish reading.
+
+    This console drops AND inserts bytes, so a fair fraction of command lines
+    arrive mangled. That is usually harmless (the command just fails), but when
+    the damage lands inside a quote, sh switches to its continuation prompt and
+    swallows every command sent afterwards as more of the same unterminated
+    string. The channel then looks completely dead -- no markers, no echo, no
+    prompt -- while the guest itself is perfectly healthy and its timer, block
+    layer and flight recorder all keep running.
+
+    That failure mode is indistinguishable from a wedged guest from the host
+    side, and it cost most of a session's probes: `md5 /sbin/growfs` was
+    declared hung (and its binary suspected corrupt) when the truth was that a
+    mangled line three commands earlier had parked the shell in a quote. INTR
+    is what discards a partial line, so send it before every command and start
+    from a known-clean line editor."""
+    for _ in range(2):
+        _send(fd, "\x03")
+        time.sleep(0.2)
+    _drain_quiet(fd, quiet_for=0.3, cap=3.0)
+
+
 def _quiet_the_shell(fd):
     """Turn OFF the guest tty's own echo, once per session.
 
@@ -125,32 +148,63 @@ def _send(fd, s):
         time.sleep(0.012)
 
 
-def run(cmd, timeout=25.0, fd=None, quiet=False):
-    """Run one command, return its output as text (markers stripped)."""
+def _run_once(cmd, timeout, fd):
+    _abort_partial_line(fd)
+    ensure_shell(fd)
+    _quiet_the_shell(fd)
+    _drain_quiet(fd, quiet_for=0.4, cap=8.0)   # discard the backlog
+    tag = "M%d" % (int(time.time() * 1000) % 1000000)
+    beg, end = f"-{tag}-BEG-", f"-{tag}-END-"
+    # Send the markers SPLIT BY AN EMPTY QUOTE PAIR: sh concatenates the word
+    # and prints "-tag-BEG-", but the line the tty echoes back still contains
+    # "-tag-BE''G-", which does not match what we search for. So the frame can
+    # only ever be found in real command OUTPUT, never in the echo.
+    #
+    # This replaces relying on `stty -echo`: that silently does nothing when its
+    # own command line is one of the mangled ones, and the old code marked echo
+    # as disabled regardless. The result framed the echo instead of the output
+    # and returned the command text back as if it were the answer -- which is
+    # far worse than no reply, because it looks like a successful call.
+    beg_src = f"-{tag}-BE''G-"
+    end_src = f"-{tag}-EN''D-"
+    # printf rather than echo: no trailing-newline or escape surprises.
+    _send(fd, f"printf '%s\\n' {beg_src}; {cmd}; printf '%s\\n' {end_src}\r")
+    out = b""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        out += _drain(fd, 1.0)
+        if end.encode() in out:
+            break
+    txt = out.decode("utf-8", "replace")
+    i, j = txt.find(beg), txt.rfind(end)
+    if i < 0 or j <= i:
+        return None                            # frame never arrived intact
+    return txt[i + len(beg):j].strip("\r\n")
+
+
+def run(cmd, timeout=25.0, fd=None, quiet=False, tries=4):
+    """Run one command, return its output as text (markers stripped).
+
+    Retries on a missing frame rather than returning the partial garbage it
+    scraped: with a channel this lossy a single attempt succeeds only about half
+    the time, and every caller was otherwise obliged to build its own retry
+    loop (several did, slightly differently, and one of them mistook the
+    resulting silence for a hung guest). Returns "" only when the command
+    genuinely produced no output; None if the channel never framed a reply."""
     own = fd is None
     if own:
         fd = _open()
     try:
-        ensure_shell(fd)
-        _quiet_the_shell(fd)
-        _drain_quiet(fd, quiet_for=0.4, cap=8.0)   # discard the backlog
-        tag = "M%d" % (int(time.time() * 1000) % 1000000)
-        beg, end = f"-{tag}-BEG-", f"-{tag}-END-"
-        # printf rather than echo: no trailing-newline or escape surprises.
-        _send(fd, f"printf '%s\\n' {beg}; {cmd}; printf '%s\\n' {end}\r")
-        out = b""
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            out += _drain(fd, 1.0)
-            if end.encode() in out:
-                break
-        txt = out.decode("utf-8", "replace")
-        i, j = txt.find(beg), txt.rfind(end)
-        body = txt[i + len(beg):j] if (i >= 0 and j > i) else txt
-        body = body.strip("\r\n")
+        for _ in range(tries):
+            body = _run_once(cmd, timeout, fd)
+            if body is not None:
+                if not quiet:
+                    print(body, flush=True)
+                return body
+            time.sleep(0.5)
         if not quiet:
-            print(body, flush=True)
-        return body
+            print("!! no framed reply after %d tries" % tries, flush=True)
+        return None
     finally:
         if own:
             os.close(fd)
