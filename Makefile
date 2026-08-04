@@ -56,7 +56,7 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr qemu holdtest clean clean-qemu clean-holdtest test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu qemu holdtest clean clean-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -253,7 +253,42 @@ $(QEMU_ELF): $(QEMU_OBJS) link_qemu.ld
 
 clean-qemu:
 	rm -f start_qemu.o main_qemu.o gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o \
-	      $(QEMU_ELF)
+	      $(QEMU_ELF) main_zephyr_qemu.o el2_exc_zephyr_qemu.o $(ZEPHYR_QEMU_ELF)
+
+# --- Zephyr guest on QEMU virt: the board-free half of the `zephyr` target
+# (see main_zephyr_qemu.c's banner for the full argument). Runs the SAME
+# guest-loading sequence `make zephyr` runs on real hardware -- kload_parse_elf
+# -> kload_place_segments -> guest_config -> stage2 -> kload_enter -- on a
+# target `zephyr-qemu-ci.sh` can execute with no board attached, with the
+# guest's console served by the real vconsole.c 16550 trap-emulator.
+#
+# Object list = the `qemu` target's board-free skeleton (start_qemu.o entry,
+# exceptions.o vectors, pl011_qemu.o HV console, stage2.o, guest.o, libmin.o),
+# MINUS the timer/demo-payload pieces this target does not use
+# (gic_timer_qemu.o, timer.o, guest_qemu_payload.o -- no tick is armed, see
+# main_zephyr_qemu.c), PLUS the three objects that make it a real guest boot
+# rather than a hand-written payload:
+#   kload.o      -- ELF parse/place, UNCHANGED from the board build
+#   vconsole.o   -- the 16550 trap-emulator, UNCHANGED from the board build
+#   wdt.o        -- only for wdt_note_progress(), which vconsole.o calls on
+#                   every guest THR write; it just timestamps CNTPCT into a
+#                   variable. wdt_pet()/wdt_init(), the parts that poke the
+#                   A64 WDOG at 0x01c20cb0 (nonexistent under QEMU), are
+#                   never called from this target.
+#   flightrec.o  -- likewise pulled in by vconsole.o (one flightrec_log() per
+#                   console byte); writes only DRAM at 0x50012000 and needs
+#                   no init, so it is portable as-is.
+# and el2_exc_zephyr_qemu.o in place of el2_exc_qemu.o.
+ZEPHYR_QEMU_ELF  := microkernel-zephyr-qemu.elf
+ZEPHYR_QEMU_OBJS := start_qemu.o main_zephyr_qemu.o exceptions.o guest.o stage2.o \
+                    kload.o vconsole.o wdt.o flightrec.o \
+                    el2_exc_zephyr_qemu.o pl011_qemu.o libmin.o
+
+zephyr-qemu: $(ZEPHYR_QEMU_ELF)
+
+$(ZEPHYR_QEMU_ELF): $(ZEPHYR_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(ZEPHYR_QEMU_OBJS)
+	$(SIZE) $@
 
 # --- holdtest: throwaway QEMU diagnostic for the "pause guest before its
 # first instruction + software breakpoint" board-hang investigation

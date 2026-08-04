@@ -21,7 +21,11 @@
 
 int main(void)
 {
-	printk("\r\nbzdOS/Zephyr: hello from EL1 (board: bpi_m64_hv)\r\n");
+	/* CONFIG_BOARD, not a literal: this app is built for two boards that
+	 * differ only in one devicetree node (bpi_m64_hv on real hardware,
+	 * qemu_virt_hv under QEMU), and a hardcoded name here made a QEMU log
+	 * claim to be the board it is standing in for. */
+	printk("\r\nbzdOS/Zephyr: hello from EL1 (board: " CONFIG_BOARD ")\r\n");
 
 	uint32_t beat = 0;
 
