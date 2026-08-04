@@ -100,16 +100,27 @@ def wait_for_uboot(timeout_s):
 
 def fs_state():
     """Facts about the guest filesystem, or None if unreachable."""
+    # `grep -c` ALWAYS prints a count, and exits 1 when that count is zero. An
+    # `|| echo 0` fallback therefore fires on the healthy path and appends a
+    # SECOND zero, giving "0\n0" -- which compares unequal to "0" and failed a
+    # cycle that had in fact passed. Fixed by asking for one number and parsing
+    # the first integer out of whatever comes back, rather than string-matching
+    # an exact "0".
     rc, out, _ = guest(
         'mount | head -1; echo "|"; df -k / | tail -1; echo "|"; '
         'grep -ci "WAS MODIFIED\\|UNEXPECTED SOFT UPDATE" /var/log/messages '
-        '2>/dev/null || echo 0', 60)
+        '2>/dev/null; true', 60)
     if rc != 0:
         return None
     parts = [p.strip() for p in out.split("|")]
     if len(parts) < 3:
         return None
-    return {"mount": parts[0], "df": parts[1], "repairs": parts[2],
+    repairs = 0
+    for tok in parts[2].split():
+        if tok.isdigit():
+            repairs = int(tok)
+            break
+    return {"mount": parts[0], "df": parts[1], "repairs": repairs,
             "readonly": "read-only" in parts[0]}
 
 
@@ -173,7 +184,7 @@ def one_cycle(n, args):
     if after["readonly"]:
         rec.update(ok=False, why="root mounted READ-ONLY -> filesystem was dirty")
         return rec
-    if after["repairs"] not in ("0", ""):
+    if after["repairs"]:
         rec.update(ok=False, why=f"fsck repaired something (count={after['repairs']})")
         return rec
 
