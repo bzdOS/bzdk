@@ -131,6 +131,27 @@ class BMC(HV):
 
 
 # ── pretty printers ─────────────────────────────────────────────────────
+def _avail(v, bits=32):
+    """None if the field is an all-ones 'never written' sentinel, else v.
+
+    Every breadcrumb window in this tree is left as 0xff.. until its owner
+    writes it, and several of the fields latched into the BMC1 record have no
+    owner in the current build at all: the EXC window is not written by this
+    build (triage.py says so in as many words -- "do NOT read the all-ones as
+    data"), CPU3 idles in WFI and never posts a heartbeat, and the tick counter
+    was reading 0xffffffffffffffff.
+
+    Printing those verbatim made the management plane report `timer STALLED`,
+    `exc_count=4294967295` and a dead CPU3 on a completely healthy board. A BMC
+    that cries wolf is worse than no BMC, because the one time it is right
+    nobody looks. Distinguish "no data" from a measurement."""
+    return None if v is None or v == (1 << bits) - 1 else v
+
+
+def _fmt(v, unit=""):
+    return "n/a" if v is None else f"{v}{unit}"
+
+
 def print_health(d):
     if not d:
         print("no BMC1 record (board down, or magic mismatch)")
@@ -138,13 +159,26 @@ def print_health(d):
     up_s = d["uptime"] // 24000000  # A64 arch timer 24 MHz -> seconds (approx)
     print(f"BMC health  v{d['version'] >> 16}.{d['version'] & 0xffff}")
     print(f"  uptime      ~{up_s}s  (cnt=0x{d['uptime']:x})")
-    print(f"  timer       ticks={d['ticks']}  delta={d['tick_delta']}  "
-          f"({'LIVE' if d['tick_delta'] else 'STALLED'})")
+    ticks = _avail(d["ticks"], 64)
+    if ticks is None:
+        # No tick counter in this build -- say so instead of inferring a stall
+        # from a delta that was never computed from real data.
+        print("  timer       n/a (this build publishes no tick counter)")
+    else:
+        print(f"  timer       ticks={ticks}  delta={d['tick_delta']}  "
+              f"({'LIVE' if d['tick_delta'] else 'STALLED'})")
     print(f"  guest_pc    0x{d['guest_pc']:x}")
-    print(f"  exceptions  count={d['exc_count']}  last_kind=0x{d['last_exc_kind']:x}"
-          f"  last_esr=0x{d['last_exc_esr']:08x}")
-    print(f"  cores       online=0x{d['online_map']:x}  "
-          f"hb=[{d['hb_cpu0']} {d['hb_cpu1']} {d['hb_cpu2']} {d['hb_cpu3']}]")
+    exc = _avail(d["exc_count"])
+    if exc is None:
+        print("  exceptions  n/a (EXC breadcrumb not written by this build)")
+    else:
+        print(f"  exceptions  count={exc}  last_kind=0x{d['last_exc_kind']:x}"
+              f"  last_esr=0x{d['last_exc_esr']:08x}")
+    hb = [_avail(d[f"hb_cpu{i}"]) for i in range(4)]
+    # A core with no heartbeat is not necessarily faulty: CPU3 parks in WFI by
+    # design and never posts one. Mark it "idle" rather than as a dead number.
+    hb_s = " ".join("idle" if v is None else str(v) for v in hb)
+    print(f"  cores       online=0x{d['online_map']:x}  hb=[{hb_s}]")
     print(f"  console     bytes={d['cons_bytes']}  faults={d['cons_faults']}  "
           f"ffv={d['ffv_count']}")
     t = d["temp_mc"]
@@ -152,9 +186,17 @@ def print_health(d):
     print(f"  flags       0x{d['flags']:x}  {d['flag_names']}")
     print(f"  wdt_hold    {d['wdt_hold']}")
     if d.get("axp_ok"):
-        print(f"  battery     vbat={d['vbat_mv']}mV  ichg={d['ichg_ma']}mA  "
-              f"idischg={d['idischg_ma']}mA  ts={d['batt_ts_mv']}mV(raw, not calibrated)  "
-              f"{d['batt_status_names']}")
+        # chip_ok with every reading at zero means the PMIC answered but no
+        # battery telemetry came back -- typically no pack on the connector.
+        # Reporting "vbat=0mV" as a measurement invites a hunt for a flat
+        # battery that was never plugged in.
+        if not any(d[k] for k in ("vbat_mv", "ichg_ma", "idischg_ma", "batt_ts_mv")):
+            print(f"  battery     AXP803 present, no readings "
+                  f"(no pack attached?)  {d['batt_status_names']}")
+        else:
+            print(f"  battery     vbat={d['vbat_mv']}mV  ichg={d['ichg_ma']}mA  "
+                  f"idischg={d['idischg_ma']}mA  ts={d['batt_ts_mv']}mV(raw, not calibrated)  "
+                  f"{d['batt_status_names']}")
     else:
         print("  battery     no AXP803 detected (RSB probe failed or absent)")
 

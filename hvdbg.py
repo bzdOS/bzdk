@@ -201,7 +201,18 @@ class HV:
                 out += part
             return out
         WORDS_PER_LINE = 4   # dbgmon.c cmd_read_words()'s own line width
-        r = self.cmd(f"r 0x{pa:x} {n}", max(2, n // 50 + 2))
+        # COUNT MUST BE HEX. dbgmon.c parses EVERY numeric argument with
+        # parse_hex() -- including this count -- so a decimal-looking "29" was
+        # read as 0x29 = 41. That silently over-read for years, and worse, it
+        # BROKE the read outright whenever n was not a multiple of 4: the extra
+        # words push the last in-range line to a full 4 words while the
+        # `expected` check below wants only n-i0 of them, the line is discarded
+        # as corrupt, a slot stays None, and the whole read returns [].
+        # Measured live 2026-08-04: n=25..27,29..31,33 failed 0/2, n=28 and
+        # n=32 passed 2/2. `bmc_client.py health --raw` asks for exactly 29
+        # words, so the BMC's read-it-even-mid-wedge path -- the entire reason
+        # a software BMC exists -- had never once worked.
+        r = self.cmd(f"r 0x{pa:x} 0x{n:x}", max(2, n // 50 + 2))
         slots = [None] * n
         for line in r.split("\n"):
             if ":" not in line: continue
@@ -244,7 +255,11 @@ class HV:
 
     def read_bytes(self, pa, n):
         """Read n bytes from physical address pa. Returns bytes."""
-        r = self.cmd(f"rb 0x{pa:x} {n}", max(2, n // 100 + 2))
+        # Hex count, same dbgmon parse_hex() contract as read_words() above.
+        # This one merely wasted bandwidth rather than corrupting: "rb ... 100"
+        # fetched 0x100 = 256 bytes and the slice below trimmed it back to 100,
+        # so the DATA was right while the transfer was 2.5x larger than asked.
+        r = self.cmd(f"rb 0x{pa:x} 0x{n:x}", max(2, n // 100 + 2))
         hexstr = ""
         for line in r.split("\n"):
             if ":" not in line: continue
@@ -253,7 +268,10 @@ class HV:
 
     def dump(self, pa, length):
         """Hex+ASCII dump. Returns the ASCII-column text."""
-        r = self.cmd(f"d 0x{pa:x} {length}", max(2, length // 60 + 2))
+        # Hex length, same contract. Unlike read_bytes() this one has no
+        # trimming slice, so a decimal length returned MORE dump text than the
+        # caller asked for -- e.g. `d addr 64` dumped 0x64 = 100 bytes.
+        r = self.cmd(f"d 0x{pa:x} 0x{length:x}", max(2, length // 60 + 2))
         ascii_text = b""
         for line in r.split("\n"):
             if "|" not in line: continue
