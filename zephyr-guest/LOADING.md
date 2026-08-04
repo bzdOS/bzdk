@@ -14,21 +14,26 @@ out explicitly.
 make zephyr        # -> microkernel-zephyr.elf / microkernel-zephyr.bin
 ```
 
-(New Makefile target; mirrors `make fbsd` exactly — see `main_zephyr.c`'s
-header comment for what its object list is and why it's identical to
-`FBSD_OBJS` bar the one source file. Note: at the time this was written,
-`make fbsd` itself fails to link in this worktree with pre-existing
-"undefined reference to `musb_puts`/`emac_link_watchdog`/..." errors from
-`smp.c` — those symbols live in `musb.c`/`emac.c`, owned by a different
-lane/agent and not buildable from this worktree snapshot. `make zephyr`
-hits the exact same pre-existing gap, for the exact same reason — it is
-NOT something this pass introduced. `main_zephyr.c` itself was verified to
-compile cleanly standalone (`aarch64-linux-gnu-gcc -c main_zephyr.c`,
-zero warnings). Whoever next has a worktree where `make fbsd` links
-successfully will find `make zephyr` links successfully too.)
+(Mirrors `make fbsd` exactly — see `main_zephyr.c`'s header comment for
+what its object list is and why it's identical to `FBSD_OBJS` bar the one
+source file.
+
+**RESOLVED, 2026-08-04.** This paragraph used to record that `make zephyr`
+did not link, with undefined references to `musb_puts` /
+`emac_link_watchdog` from `smp.c` — symbols that live in `musb.c`/`emac.c`,
+missing from the object list in the worktree this file was written in. That
+was fixed by commit `203247f` ("build: fix stale OBJS lists so
+repl/fbsd/zephyr link again", 2026-07-25), which added `musb.o`/`usbacm.o`/
+`emac.o` to both `FBSD_OBJS` and `ZEPHYR_OBJS`; the note simply outlived the
+bug. Re-verified from scratch (`rm -f *.o` before each target): `zephyr`,
+`fbsd`, `repl`, `dbg`, `gdb` and `qemu` all link, `zephyr` at 49 883 B text.)
 
 **b) The Zephyr guest image** (built and verified working in this pass —
 see `../zephyr-guest/` and the accompanying report for full detail):
+
+All of the below is now wrapped in one script — `./build.sh bpi_m64_hv`,
+which prints the resulting ELF path as its last line. Use that; the manual
+form is kept only so the flags stay explainable.
 
 ```
 export ZEPHYR_BASE=/path/to/zephyr        # v4.4.1 tested
@@ -109,9 +114,16 @@ Concretely, in a `reliable_load.py`/`chimpd.py`-style flow:
   heartbeat 1
   ...
   ```
-  (exact banner/text confirmed by an equivalent QEMU run in this pass —
-  see the report; not yet confirmed on real UART0 timing/wiring, since
-  that requires board access this worktree does not have).
+  **This exact text was reproduced board-free on 2026-08-04**, from THIS
+  image (not an equivalent, not a QEMU-specific rebuild — the same
+  `bpi_m64_hv` ELF this section tells you to TFTP), running under
+  `make zephyr-qemu` on QEMU virt: `./zephyr-qemu-ci.sh`, ~1.6 s, 5/5 and
+  8/8 runs PASS, now part of `ci.sh`. That covers the whole chain up to and
+  including the vconsole 16550 emulation, so if the board shows nothing the
+  suspects are narrowed to what QEMU cannot model: real UART0 wiring/timing,
+  the watchdog `main_zephyr.c` arms, and the GIC (which QEMU silently
+  swallows — see `../docs/zephyr-guest.md`, "What a pass therefore does NOT
+  prove").
 - A new breadcrumb window at physical `0x50008000` ("ZEP1", see
   `main_zephyr.c`) advances through stages 1–7 the same way
   `main_fbsd.c`'s `0x50000e00` ("FBS1") window does; word[1] climbing to 7

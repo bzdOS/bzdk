@@ -29,3 +29,15 @@ Programming and Debugging
 **************************
 
 See ``../../../LOADING.md``.
+
+Running without the board
+*************************
+
+This image boots unmodified under the bzdOS hypervisor's QEMU-virt target --
+not via ``west build -t run`` (see ``board.cmake``), but::
+
+    ZEPHYR_BASE=<zephyr-4.4.x> ../../../../zephyr-qemu-ci.sh
+
+UART0 works there because the hypervisor trap-emulates it, so its address
+being the A64's is irrelevant. What such a run does *not* prove (the GIC,
+above all) is spelled out in ``../../../../docs/zephyr-guest.md``.
