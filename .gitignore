@@ -25,3 +25,4 @@ soak-logs/
 soak*.log
 soak*-report.json
 soak*-report.txt
+test_vgic_pendq

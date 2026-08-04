@@ -104,11 +104,43 @@
 
 /* GIC-400 physical bases (see the DTS citation above). GICH is the only one
  * vgic.c drives directly; GICV/GICC/GICD are exposed here for the stage-2
- * mapping snippet and the GICD trap-emulate helpers. */
+ * mapping snippet and the GICD trap-emulate helpers.
+ *
+ * OVERRIDABLE (-D on the make line), and why: these four defaults are the
+ * A64's and stay the A64's — every board target compiles vgic.c with exactly
+ * the addresses above, byte for byte as before. The #ifndef guards exist so
+ * that the SAME vgic.c can also be compiled against QEMU virt's GICv2, which
+ * genuinely does implement the virtualization extensions (GICH + GICV), and
+ * therefore lets this file's List-Register/GICV delivery chain be executed and
+ * asserted with no board attached (see the `vgic-qemu` target in the Makefile
+ * and vgic-qemu-ci.sh). QEMU virt's addresses are cited, not guessed — read
+ * out of the machine's OWN devicetree (`-machine dumpdtb=`), node intc@8000000
+ * (compatible "arm,cortex-a15-gic"):
+ *
+ *     reg = <0x08000000 0x10000>,   // GICD  distributor
+ *           <0x08010000 0x10000>,   // GICC  physical CPU interface
+ *           <0x08030000 0x10000>,   // GICH  hypervisor control
+ *           <0x08040000 0x10000>;   // GICV  virtual CPU interface
+ *     interrupts = <1 9 4>;         // PPI 9 => INTID 25, same maintenance
+ *                                   // INTID as the A64's GIC-400
+ *
+ * NOTE that on the QEMU target VGIC_GICC_BASE is deliberately pointed at
+ * GICV, because that target has no stage-2 GICC->GICV redirect: the self-test
+ * payload below reaches the virtual interface directly instead of through the
+ * remap. So a passing QEMU run proves the GICH/LR/GICV chain but says nothing
+ * about the stage-2 redirect — that half stays hardware-only. */
+#ifndef VGIC_GICD_BASE
 #define VGIC_GICD_BASE   0x01c81000UL   /* distributor (passed through in v1) */
+#endif
+#ifndef VGIC_GICC_BASE
 #define VGIC_GICC_BASE   0x01c82000UL   /* physical CPU i/f — guest IPA target */
+#endif
+#ifndef VGIC_GICH_BASE
 #define VGIC_GICH_BASE   0x01c84000UL   /* hypervisor control — driven here   */
+#endif
+#ifndef VGIC_GICV_BASE
 #define VGIC_GICV_BASE   0x01c86000UL   /* virtual CPU i/f — mapped to guest  */
+#endif
 
 /* The guest's virtual timer PPI: CNTV = GIC_PPI 11 -> INTID 16+11 = 27 (per
  * the sun50i-a64.dtsi arm,armv8-timer node). This is the vINTID we inject on
