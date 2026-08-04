@@ -16,6 +16,21 @@ serial port is already busy. **Do not skip it** — several long debugging
 sessions in this project were spent chasing a "wedged board" that was a stale
 image, a busy tty, or a stuck line editor.
 
+## One tool for the board lifecycle
+
+```sh
+python3 bzdctl.py status          # state in one screen (EMAC only, safe anytime)
+python3 bzdctl.py serve           # read-only web dashboard on :8088
+python3 bzdctl.py power reset|hold|release|uboot
+python3 bzdctl.py console [--follow] [--inject TEXT]
+python3 bzdctl.py boot-watch      # wait for liveness, record in the ledger
+python3 bzdctl.py crash           # bundle status + triage (+ optional coredump)
+python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
+```
+
+`status` and `serve` never open the tty, so they are safe while a reload runs.
+`power uboot` is the one subcommand that needs it.
+
 ## Read next, in this order
 
 | Doc | What it is |
