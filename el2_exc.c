@@ -157,10 +157,44 @@ volatile uint32_t dbg_block_reset = 1;
  * hardware would on `shutdown -p`, instead of us hand-patching the superblock
  * (ufs_clean.py) after every hard reset. Clear this over the net if a debug
  * session wants the old catch-and-stay-alive behavior on SYSTEM_OFF too.
- * NOTE: SYSTEM_RESET (0x84000009) is deliberately NOT auto-honored — it is
- * ambiguous (an intentional `reboot` vs a panic auto-reboot) and stays on the
- * dbg_block_reset stay-alive path so crash-reboots can still be inspected. */
+ * SYSTEM_RESET (0x84000009): see dbg_clean_reset below. */
 volatile uint32_t dbg_clean_off = 1;
+
+/* When 1 (default since 2026-08-05), a guest PSCI SYSTEM_RESET (0x84000009) is
+ * ALSO honored with a clean warm reset, for the same reasons as SYSTEM_OFF.
+ *
+ * This reverses an earlier deliberate decision, so here is why. SYSTEM_RESET
+ * used to fall through to dbg_block_reset's "report success, reset nothing,
+ * stay alive so a crash-reboot can be inspected" path. The cost of that was
+ * measured on 2026-08-05: FreeBSD's cpu_reset() (arm64/vm_machdep.c:138-140)
+ * asks the platform to reset and, when the call returns, spins in a two-
+ * instruction `while(1)`. Lying to it therefore does not keep a guest
+ * inspectable — it parks the guest FOREVER in that spin, PC/LR one instruction
+ * apart, indistinguishable from a hang to anything watching from outside. That
+ * is what an A2 cycle run reported as "guest never came back after reload", and
+ * it makes unattended boot-reliability measurement impossible: any guest that
+ * decides to reboot (e.g. a panic auto-reboot during boot) wedges permanently.
+ *
+ * The "so it can be inspected" argument does not survive contact with the
+ * facts either: everything worth inspecting happened BEFORE the reset request
+ * — the panic, the fault, the console output — and all of it lives in the
+ * flight recorder, the console capture ring and the breadcrumb windows, ALL of
+ * which deliberately survive a warm WDT reset (that is the entire design). So
+ * honoring the reset loses no evidence and converts a permanent wedge into an
+ * automatic recovery the supervisor can act on.
+ *
+ * This is NOT the 2026-07-18 failure mode that dbg_block_reset exists to
+ * prevent. That was FORWARDING the guest's SMC to EL3, which hard-resets the
+ * SoC and drops the board off the USB bus entirely. reboot_clean() is the
+ * controlled path instead: it drops the MUSB pull-up first and then arms the
+ * WDOG, and it is the same call SYSTEM_OFF has been using — proven on hardware
+ * 2026-08-04, board landed in U-Boot and was caught by the supervisor in ~1s.
+ *
+ * Clear this over the net (`sw` / dbg flags) to get the old stay-alive-and-
+ * inspect behaviour back for a session that specifically wants to catch a guest
+ * mid-reboot-request. The PSCI ring at 0x50000200 records the fnid either way,
+ * with 0x0FF0FF09 marking "clean reset honored" (0x0FF0FF0F = clean off). */
+volatile uint32_t dbg_clean_reset = 1;
 
 /* 0x50000400 — the DOCUMENTED exc window that the READERS (hud.c, dbgmon.c
  * cmd_ff DBGMON_EXC_BASE) already expect. The writer was wrongly pointing at
@@ -816,6 +850,18 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 				__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
 				wdt_debug_hold = 1;   /* release both pet paths so WDOG fires */
 				reboot_clean();       /* USB drop + ~2s WDOG warm reset; no return */
+			}
+			/* SYSTEM_RESET (0x84000009): honor it the same controlled
+			 * way. See dbg_clean_reset's comment for why lying to
+			 * cpu_reset() is worse than resetting -- it parks the guest
+			 * in an eternal two-instruction spin that looks exactly like
+			 * a hang, and the evidence a "stay alive" path was meant to
+			 * preserve already survives the warm reset in DRAM. */
+			if (fnid == 0x84000009ull && dbg_clean_reset) {
+				r[1u + ((idx - 1u) & 0xFu)] = 0x0FF0FF09u; /* bc: clean-reset */
+				__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
+				wdt_debug_hold = 1;   /* let the WDOG actually fire */
+				reboot_clean();       /* USB drop + WDOG warm reset; no return */
 			}
 			if ((fnid == 0x84000009ull || fnid == 0x84000008ull) &&
 			    dbg_block_reset) {
