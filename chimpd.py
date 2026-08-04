@@ -30,7 +30,12 @@ LOOP:
      e. guest regs `gr`: ELR — where is the guest PC?
   8. Verdict + action:
      - console progressing → log new text, keep monitoring
-     - frozen (ticks alive, bytes static) for N samples → HANG → reset → loop
+     - frozen (ticks alive, console static AND no disk I/O) for N samples →
+       HANG → reset → loop.  Console silence ALONE is not a hang: a booting
+       FreeBSD is quiet for well over 40 s at a stretch while hammering the
+       eMMC, so vblk's request counters count as progress too.
+     - a guest that reached mountroot/login and then went quiet is left ALIVE
+       (an idle system produces neither console output nor I/O)
      - panic detected → record → reset → loop
      - mountroot/login markers in console → BOOT OK, keep monitoring
 
@@ -356,7 +361,12 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
     frozen_count = 0
     last_ticks = None
     last_vcon_bytes = None
+    last_io = None
     boot_ok = False
+    pokes = 0
+    # Bounded so a genuinely dead guest still reaches a verdict instead of being
+    # poked forever; each poke costs ~5s and the 600s cap below still applies.
+    MAX_POKES = 3
     max_monitor = 600  # 10 min cap per cycle
 
     slog("  [monitor] EMAC опрос breadcrumbs каждые %ds" % interval)
@@ -366,6 +376,11 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
     while time.time() - t0 < max_monitor:
         sample += 1
 
+        # NOTE: dbgmon parses EVERY numeric argument with parse_hex(), the
+        # word/byte COUNT included -- so a decimal-looking count means
+        # something else entirely (13 asked for 0x13 = 19 words). The reads
+        # below therefore spell their counts in hex. The old decimal ones
+        # happened to work only because the extra words were unused.
         # ── GICT: timer alive? ──
         words = parse_words(nc.cmd(f"r 0x{BC_GICT:x} 8", 1.5))
         ticks_lo = words[1] if len(words) > 1 else 0
@@ -387,7 +402,8 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
                  f"(+{vcon_bytes-(last_vcon_bytes or 0)}), faults={vcon_faults}")
 
             # ── dump new console text ──
-            dump = nc.cmd(f"d 0x{VCON_RING:x} {min(vcon_bytes - sess.last_vcon_bytes, VCON_RING_SZ)}", 3)
+            dump = nc.cmd(f"d 0x{VCON_RING:x} "
+                          f"0x{min(vcon_bytes - sess.last_vcon_bytes, VCON_RING_SZ):x}", 3)
             ascii_text = parse_dump_ascii(dump)
             if ascii_text:
                 sess.con(ascii_text)
@@ -419,7 +435,7 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
 
         # ── exception breadcrumb ──
         if sample <= 2 or sample % 10 == 0:
-            ew = parse_words(nc.cmd(f"r 0x{BC_EXC:x} 13", 1.5))
+            ew = parse_words(nc.cmd(f"r 0x{BC_EXC:x} 0xd", 1.5))
             if len(ew) > 3 and ew[0] != 0:
                 exc_count = ew[1]
                 if exc_count > 0 and sample > 2:
@@ -427,14 +443,75 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
                     sess.raw(f"\n# [EXC #{exc_count} kind=0x{ew[2]:x} esr=0x{ew[3]:x} "
                              f"elr=0x{ew[5]:x}{ew[4]:08x}]\n".encode())
 
+        # ── disk I/O: is the guest doing work it just isn't talking about? ──
+        # A booting FreeBSD goes quiet for well over 40s at a stretch (fsck,
+        # device probing, waiting on the eMMC) while hammering the disk the
+        # whole time. Judging liveness on console growth alone therefore
+        # condemns healthy boots: on 2026-08-04 this fired twice, ~50s in, on
+        # the very boot that went on to reach `login:` with working ssh, and
+        # WDT-reset it both times -- so no test needing the guest to reach
+        # userland could run under chimpd at all. vblk's request counters
+        # advance whenever the guest touches the disk, which is the missing
+        # signal.
+        io_growing = False
+        try:
+            iw = parse_words(nc.cmd(f"r 0x{B.VBLK_BC_PA:x} 0x28", 2))
+            if len(iw) > 32:
+                # reads, writes, kicks_seen -- any one moving means progress
+                io = (iw[6], iw[7], iw[31])
+                io_growing = (last_io is not None and io != last_io)
+                if io_growing:
+                    slog(f"  [monitor] #{sample} vblk r/w/kicks {last_io} → {io}")
+                last_io = io
+        except Exception:
+            pass          # never let a diagnostic read change the verdict
+
         # ── hang detection ──
-        # "frozen" = timer alive (ticks advancing) but vconsole not growing
+        # "frozen" = timer alive (ticks advancing) but NEITHER the console nor
+        # the disk making progress. Anything still moving means alive.
         if last_ticks is not None and last_vcon_bytes is not None:
-            if timer_alive and not vcon_growing:
+            if timer_alive and not vcon_growing and not io_growing:
                 frozen_count += 1
                 slog(f"  [monitor] frozen sample {frozen_count}/{hang_samples}")
                 if frozen_count >= hang_samples:
-                    slog(f"  [monitor] ❄ HANG detected (timer alive, console static "
+                    # POKE BEFORE CONDEMNING. Quiet is not the same as dead:
+                    # an idle guest at `login:` or a shell prompt produces no
+                    # console output and no disk I/O by definition, and
+                    # `mountroot>` is printed exactly ONCE and then waits (musb
+                    # drops undrained bytes, so passive listening can never see
+                    # it -- project memory: automount-must-poke-not-listen).
+                    # `bmc con inject` with no tokens pushes a bare CR into the
+                    # guest's UART RX, which any responsive getty/shell/prompt
+                    # echoes. If the console grows after that, the guest was
+                    # merely quiet and we must NOT reset it.
+                    if pokes < MAX_POKES:
+                        pokes += 1
+                        slog(f"  [monitor] quiet {frozen_count} samples — poking "
+                             f"the guest console (CR) {pokes}/{MAX_POKES}")
+                        nc.cmd("bmc con inject", 2)
+                        time.sleep(3)
+                        pw = parse_words(nc.cmd(f"r 0x{BC_VCON:x} 0x4", 1.5))
+                        after = pw[1] if len(pw) > 1 else vcon_bytes
+                        if after != vcon_bytes:
+                            slog(f"  [monitor] ✅ guest ANSWERED the poke "
+                                 f"({vcon_bytes}→{after}) — alive but idle, "
+                                 f"not a hang")
+                            # Reset the poke budget too: it counts CONSECUTIVE
+                            # UNANSWERED pokes, not pokes ever sent. Counting
+                            # every poke would condemn a healthy idle guest on
+                            # its fourth quiet stretch -- moving the false HANG
+                            # from 40s out to a couple of minutes instead of
+                            # removing it, which is the bug this whole change
+                            # exists to fix.
+                            pokes = 0
+                            frozen_count = 0
+                            last_vcon_bytes = after
+                            last_ticks = ticks
+                            time.sleep(interval)
+                            continue
+                        slog("  [monitor] no answer to the poke")
+                    slog(f"  [monitor] ❄ HANG detected (timer alive; console, "
+                         f"disk I/O and a console poke all produced nothing "
                          f"for {frozen_count} samples)")
                     # grab a final guest-reg snapshot and backtrace
                     gr = nc.cmd("gr", 2)
@@ -445,7 +522,7 @@ def monitor(sess, nc, interval, hang_samples, no_reset):
                     slog(f"  [monitor] backtrace:\n{bt}")
                     
                     # read VGIC breadcrumbs from SRAM C
-                    vgbc = nc.cmd(f"r 0x{B.VGIC_BC_SRAM_PA:x} 16", 2)
+                    vgbc = nc.cmd(f"r 0x{B.VGIC_BC_SRAM_PA:x} 0x10", 2)
                     slog(f"  [monitor] VGIC BC:\n{vgbc}")
                     
                     if boot_ok:
@@ -543,7 +620,15 @@ def main():
             break
 
         # auto-reset on hang/panic (unless --no-reset)
-        if verdict in ("HANG", "PANIC", "FIRSTFAULT", "BOOT_OK_THEN_HANG") and not args.no_reset:
+        # BOOT_OK_THEN_HANG deliberately NOT here. It used to be, which made the
+        # `elif` below -- whose own message reads "плата дошла до boot —
+        # оставляем живой" -- unreachable, so the stated intent never ran. The
+        # consequence was that a guest which booted all the way to `login:` and
+        # then went quiet (exactly what an idle system does: no console output,
+        # no disk I/O) got WDT-reset anyway, and the board could never stay up
+        # under supervision. Reaching a boot marker and then falling silent is
+        # success, not a hang.
+        if verdict in ("HANG", "PANIC", "FIRSTFAULT") and not args.no_reset:
             if nc:
                 try:
                     nc2 = NetCon()
