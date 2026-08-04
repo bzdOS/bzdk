@@ -56,7 +56,7 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu qemu holdtest clean clean-qemu clean-holdtest test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu vgic-qemu qemu holdtest clean clean-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -78,7 +78,7 @@ all: $(STAGE0_BIN) $(MAIN_BIN)
 # test_automount.py is the exception to that mirror-don't-include rule and the
 # stronger kind of test: it drives the REAL reliable_load.auto_mount_root()
 # over a pty, so it CAN catch a transcription error. No board required.
-test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop
+test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -87,6 +87,7 @@ test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_klo
 	./test_vconsole_uart
 	./test_gdbstub_resolve
 	./test_gdbstub_hwop
+	./test_vgic_pendq
 	python3 test_automount.py
 
 test_vblk_stitch: test_vblk_stitch.c
@@ -111,6 +112,9 @@ test_gdbstub_resolve: test_gdbstub_resolve.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_gdbstub_hwop: test_gdbstub_hwop.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_vgic_pendq: test_vgic_pendq.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 stage0: $(STAGE0_BIN)
@@ -253,7 +257,8 @@ $(QEMU_ELF): $(QEMU_OBJS) link_qemu.ld
 
 clean-qemu:
 	rm -f start_qemu.o main_qemu.o gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o \
-	      $(QEMU_ELF) main_zephyr_qemu.o el2_exc_zephyr_qemu.o $(ZEPHYR_QEMU_ELF)
+	      $(QEMU_ELF) main_zephyr_qemu.o el2_exc_zephyr_qemu.o $(ZEPHYR_QEMU_ELF) \
+	      main_vgic_qemu.o el2_exc_vgic_qemu.o vgic_qemu.o vgic_qemu.d $(VGIC_QEMU_ELF)
 
 # --- Zephyr guest on QEMU virt: the board-free half of the `zephyr` target
 # (see main_zephyr_qemu.c's banner for the full argument). Runs the SAME
@@ -288,6 +293,64 @@ zephyr-qemu: $(ZEPHYR_QEMU_ELF)
 
 $(ZEPHYR_QEMU_ELF): $(ZEPHYR_QEMU_OBJS) link_qemu.ld
 	$(CC) $(LDFLAGS_QEMU) -o $@ $(ZEPHYR_QEMU_OBJS)
+	$(SIZE) $@
+
+# --- vGIC on QEMU virt: the board-free gate for INTERRUPT VIRTUALIZATION
+# (see main_vgic_qemu.c's banner for the full argument, and vgic-qemu-ci.sh).
+#
+# Runs vgic.c's own bare-metal self-test guest — which nothing had ever run,
+# on the board or off it — against QEMU virt's real GICv2 virtualization
+# extensions (GICH 0x08030000 / GICV 0x08040000, cited from the machine's own
+# devicetree in vgic.h). This is the ONLY board-free check that touches GIC
+# virtualization at all: qemu-ci.sh proves only EL2's own physical GIC use,
+# and zephyr-qemu-ci.sh's guest GIC accesses go to a black hole by
+# construction (its banner says so).
+#
+# vgic_qemu.o is the REAL vgic.c — same source file the board targets link —
+# recompiled with ONLY the four GIC base addresses overridden. Nothing about
+# vgic.c or the board builds changes; vgic.h's defaults are unchanged and are
+# what every other target still gets (the #ifndef guards there are the entire
+# diff). Note GICC is deliberately pointed at GICV: this target has no
+# stage-2 GICC->GICV redirect, so the self-test payload reaches the virtual
+# interface directly and the redirect itself stays hardware-only.
+#
+# Object list = the `qemu` target's skeleton (start_qemu.o, exceptions.o,
+# guest.o, stage2.o, timer.o, gic_timer_qemu.o, pl011_qemu.o, libmin.o) with
+# el2_exc_vgic_qemu.o in place of el2_exc_qemu.o, no guest_qemu_payload.o (the
+# EL1 payload lives inside vgic.c), PLUS vgic_qemu.o and flightrec.o (pulled
+# in by vgic.c's flightrec_log() on each injected LR; writes only DRAM at
+# 0x50012000 and needs no init, so it is portable as-is — same reason the
+# zephyr-qemu target links it).
+VGIC_QEMU_ELF  := microkernel-vgic-qemu.elf
+# VGST_BC_BASE override: vgic.c's default self-test breadcrumb window
+# (0x50001d00) is written BY THE GUEST but sits inside the hv-scratch window
+# stage2.c deliberately leaves INVALID in the guest's stage-2 map, so the
+# payload faults on its first store (see the long comment at vgic.c's
+# VGST_BC_BASE for the measured ESR/FAR). 0x50200000 is the first 2 MiB-aligned
+# DRAM address that satisfies all three constraints simultaneously: inside
+# stage2.h's identity-mapped DRAM range (0x40000000..0x80000000), OUTSIDE
+# hv-image (0x42000000 + 2 MiB), and OUTSIDE hv-scratch (0x50000000 + 2 MiB).
+# It is not taken on trust: main_vgic_qemu.c/el2_exc_vgic_qemu.c assert the
+# guest actually wrote the "VGST" magic and CurrentEL==1 there, so a bad or
+# colliding window fails the run loudly instead of passing quietly.
+VGIC_QEMU_DEFS := -DVGIC_GICD_BASE=0x08000000UL -DVGIC_GICC_BASE=0x08040000UL \
+                  -DVGIC_GICH_BASE=0x08030000UL -DVGIC_GICV_BASE=0x08040000UL \
+                  -DVGST_BC_BASE=0x50200000UL
+VGIC_QEMU_OBJS := start_qemu.o main_vgic_qemu.o exceptions.o guest.o stage2.o \
+                  timer.o gic_timer_qemu.o el2_exc_vgic_qemu.o vgic_qemu.o \
+                  flightrec.o pl011_qemu.o libmin.o
+
+vgic-qemu: $(VGIC_QEMU_ELF)
+
+# Explicit rule (not the generic %.o: %.c) so the QEMU GIC bases apply to THIS
+# object only: the board's own vgic.o must keep compiling with vgic.h's
+# unchanged A64 defaults. -MMD -MP writes vgic_qemu.d, so editing vgic.h/vgic.c
+# rebuilds it, same header-staleness protection every other object gets.
+vgic_qemu.o: vgic.c
+	$(CC) $(CFLAGS) $(VGIC_QEMU_DEFS) -MMD -MP -c -o $@ $<
+
+$(VGIC_QEMU_ELF): $(VGIC_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(VGIC_QEMU_OBJS)
 	$(SIZE) $@
 
 # --- holdtest: throwaway QEMU diagnostic for the "pause guest before its
@@ -353,4 +416,5 @@ clean: clean-qemu clean-holdtest
 	      $(FBSD_ELF) $(FBSD_BIN) $(DBG_ELF) $(DBG_BIN) \
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
-	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart
+	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart \
+	      test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq

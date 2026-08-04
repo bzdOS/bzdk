@@ -8,7 +8,18 @@
 #                     pure host-gcc, catch logic regressions with no board.
 #   2. ./qemu-ci.sh — the QEMU-virt second target boots end to end (EL2 vectors
 #                     + stage-2 + GICv2 timer + EL1 guest + timer preemption).
-#   3. ./zephyr-qemu-ci.sh
+#   3. ./vgic-qemu-ci.sh
+#                   — INTERRUPT VIRTUALIZATION: the real vgic.c, recompiled
+#                     for QEMU virt's GIC addresses and nothing else, driving
+#                     QEMU's real GICv2 virtualization extensions (GICH/GICV)
+#                     and delivering virtual IRQs to an EL1 guest that
+#                     acknowledges them via the virtual IAR and retires them
+#                     via the virtual EOIR. Added 2026-08-05 to close the
+#                     largest hole in this gate: neither of the other two QEMU
+#                     targets touched GIC virtualization at all (see that
+#                     script's header). No SKIP path — everything it needs is
+#                     in this repo.
+#   4. ./zephyr-qemu-ci.sh
 #                   — the ZEPHYR GUEST target boots end to end: a real Zephyr
 #                     RTOS image parsed/placed by kload.c, entered at EL1 under
 #                     stage-2, console served by the real vconsole.c 16550
@@ -40,6 +51,14 @@ if ./qemu-ci.sh; then
     echo "ci: qemu second target PASS"
 else
     echo "ci: qemu second target FAIL"
+    fail=1
+fi
+
+echo "════════ ci: vGIC interrupt virtualization on QEMU-virt (vgic-qemu-ci.sh) ════════"
+if ./vgic-qemu-ci.sh; then
+    echo "ci: vgic interrupt-virtualization target PASS"
+else
+    echo "ci: vgic interrupt-virtualization target FAIL"
     fail=1
 fi
 

@@ -687,7 +687,27 @@ int vgic_gicd_fault(struct el2_frame *frame)
  *   [5] spurious     count of spurious IARs (>=1020)
  *   [6] other_exc    non-IRQ EL1 exceptions (should stay 0)
  *   [7] vbar_set     VBAR_EL1 (lo) the payload installed */
+/* OVERRIDABLE, and this one has a REAL BUG behind it — found 2026-08-05 by
+ * actually running this self-test for the first time (under QEMU virt, see
+ * main_vgic_qemu.c): 0x50001d00 is inside the hv-scratch window
+ * (0x50000000 + 2 MiB) that stage2.c's stage2_build_dram_table() leaves
+ * INVALID in the GUEST's stage-2 map on purpose — that exclusion IS the A1
+ * guest/HV isolation. But THIS window is written by the guest, at EL1, so the
+ * payload's very first store takes a stage-2 translation fault (confirmed:
+ * ESR=0x93810046, DFSC=0x06 translation fault level 2, FAR=0x50001d00).
+ *
+ * The default is left at 0x50001d00 so no board target changes behaviour from
+ * this commit; it is now overridable so the QEMU vGIC CI target can put the
+ * window somewhere the guest can actually reach. NOTE for whoever revives this
+ * self-test ON HARDWARE: moving this window is necessary but NOT sufficient
+ * there. The payload's code and stack live in the HV's own .text/.bss, i.e.
+ * inside the hv-image window (0x42000000 + 2 MiB), which stage2.c excludes
+ * from the guest map for the same A1 reason — so on the board the guest cannot
+ * even fetch these instructions. Running this on real hardware needs the
+ * payload RELOCATED into guest-accessible DRAM, not just its breadcrumbs. */
+#ifndef VGST_BC_BASE
 #define VGST_BC_BASE   0x50001d00UL
+#endif
 #define VGST_BC_MAGIC  0x56475354u   /* "VGST" */
 
 static inline void vgst_bc(int i, uint32_t v)
