@@ -89,6 +89,8 @@ test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_klo
 	./test_gdbstub_hwop
 	./test_vgic_pendq
 	python3 test_automount.py
+	python3 coredump-recv.py selftest
+	python3 snapshot_net.py selftest
 
 test_vblk_stitch: test_vblk_stitch.c
 	gcc -Wall -Wextra -O2 -o $@ $<
