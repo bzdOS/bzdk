@@ -22,18 +22,34 @@ here. See "What's missing" below for the precise list.
 
 ## What IS covered end-to-end (confirmed from the tooling)
 
-0. **Board-free verification of the core HV (NEW, no hardware needed).**
-   `./ci.sh` = `make test` (five hosted unit suites: virtqueue ring, stage-2
-   table builder, vnet ring, kload modinfo, vconsole UART — pure host `gcc`)
-   plus `./qemu-ci.sh` (builds `make qemu` and boots it under
-   `qemu-system-aarch64 -M virt,gic-version=2,virtualization=on -cpu
-   cortex-a53`, asserting the end-to-end `QEMU-CI: PASS` the HV prints only
-   after EL2 vectors + stage-2 + GICv2 timer + EL1 guest + a timer preemption
-   all succeed). This is the one part a third party can reproduce today from a
-   clean clone with only the toolchain in `TOOLCHAIN.md`. See `docs/qemu-ci.md`.
+0. **Board-free verification of the core HV (no hardware needed).**
+   `./ci.sh` runs four stages; `make test` is the authoritative list of the
+   first one, so prefer reading it over any enumeration here (as of 2026-08-05:
+   nine hosted C suites — virtqueue ring and partial-sector stitching, stage-2
+   tables, vnet ring, kload modinfo, vconsole UART, two gdbstub suites, the
+   vGIC pending queue — plus three Python ones, `test_automount.py` and the
+   offline `selftest` modes of `coredump-recv.py` and `snapshot_net.py`).
+   Then three QEMU stages:
+   - `./qemu-ci.sh` — `make qemu` under `qemu-system-aarch64 -M
+     virt,gic-version=2,virtualization=on -cpu cortex-a53`, asserting the
+     `QEMU-CI: PASS` the HV prints only after EL2 vectors + stage-2 + GICv2
+     timer + EL1 guest + a timer preemption all succeed. See `docs/qemu-ci.md`.
+   - `./vgic-qemu-ci.sh` — interrupt virtualization end to end: GICH LR
+     injection → GICV → EL1 vIRQ → virtual EOI → LR reclaim.
+   - `./zephyr-qemu-ci.sh` — a real Zephyr RTOS image loaded by `kload.c`,
+     running at EL1 under stage-2, its console driven by the stock `ns16550`
+     driver against our own 16550 trap-emulation. **The same file that gets
+     TFTP'd to the board**, not a QEMU-shaped port. Skips visibly (does not
+     fail) when the Zephyr tree is absent.
+   This whole stage is what a third party can reproduce today from a clean
+   clone with only the toolchain in `TOOLCHAIN.md`.
 1. **Toolchain** — see `TOOLCHAIN.md`: exact verified `aarch64-linux-gnu-gcc`
-   / binutils / dtc / qemu versions. Build variants: `make dbg` (live-debug,
-   the one loaded below), `make gdb` (RSP-stub variant), `make qemu` (item 0).
+   / binutils / dtc / qemu versions, and `make toolchain-check` to compare what
+   you actually have against them (fails on a missing tool, warns on a
+   different version). Build variants: `make dbg` (live-debug, the one loaded
+   below), `make gdb` (RSP-stub variant), `make qemu` / `make zephyr-qemu`
+   (item 0), `make zephyr` / `make fbsd` / `make repl` (narrower guest-boot
+   variants — these DO link; a note claiming otherwise was stale for weeks).
 2. **Build** — `make dbg` (see `README.md` "Building"; `Makefile` has the
    authoritative flag/target list). Produces `microkernel-dbg.elf/.bin`.
 3. **Loading onto a board that already has U-Boot on it** —
@@ -58,6 +74,21 @@ here. See "What's missing" below for the precise list.
    `usb_debug` driver has hijacked the board's `1d6b:0010` CDC-ACM gadget —
    blacklist it (`/etc/modprobe.d/blacklist-usb_debug.conf`), it's not a board
    fault. See war-stories §11.
+
+   **Start here rather than with the individual scripts.** `python3 orient.py`
+   answers "what is going on right now?" from the live board in seconds
+   (read-only: is the tty free, are the cores moving, what state is the guest
+   in), and `python3 bzdctl.py` is one entry point for the whole board
+   lifecycle — `status`, `health`, `power reset|hold|release|uboot`, `console
+   [--follow] [--inject]`, `boot-watch`, `crash`, `ledger`, and `serve` for a
+   read-only web dashboard. `status` and `serve` deliberately never open the
+   tty, so they are safe to use while a reload is running; only `power uboot`
+   needs it. `ORIENTATION.md` in this directory is the short orientation doc.
+
+   **One process on `/dev/ttyACM0` at a time.** Two holders steal each other's
+   bytes and a perfectly healthy channel looks dead — check `fuser -v
+   /dev/ttyACM0` before blaming the board. This is the single most expensive
+   recurring mistake in this project's history.
 5. **Getting FreeBSD to boot from the loaded image** — automatic: the `dbg`
    build's `main_dbg.c` loads the FreeBSD kernel directly (no U-Boot stage
    for the guest) and enters it; `chimpd.py`'s monitor loop watches for the
