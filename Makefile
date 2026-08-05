@@ -78,7 +78,47 @@ all: $(STAGE0_BIN) $(MAIN_BIN)
 # test_automount.py is the exception to that mirror-don't-include rule and the
 # stronger kind of test: it drives the REAL reliable_load.auto_mount_root()
 # over a pty, so it CAN catch a transcription error. No board required.
-test: test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq
+# ── toolchain check (ROADMAP T5) ───────────────────────────────────────────
+# TOOLCHAIN.md documents the verified-working versions but nothing checked them,
+# and it said so itself: "The Makefile does not pin or version-check the
+# toolchain". This target closes that.
+#
+# It deliberately FAILS only when a tool is MISSING, and merely warns on a
+# version that differs from the verified one. Hard-failing on a version
+# mismatch would lock the project to one Fedora release for no measured reason
+# -- TOOLCHAIN.md's own stance is "check here first before assuming the source
+# regressed", which is advice, not a constraint. A warning delivers that advice
+# at the moment it is useful; an error would just make other distros patch the
+# Makefile out.
+TC_GCC_WANT := 15.2.1
+TC_LD_WANT  := 2.45
+
+.PHONY: toolchain-check
+toolchain-check:
+	@missing=0; \
+	for t in gcc ld objcopy size nm; do \
+	    command -v $(CROSS)$$t >/dev/null 2>&1 || { \
+	        echo "toolchain: MISSING $(CROSS)$$t"; missing=1; }; \
+	done; \
+	command -v gcc >/dev/null 2>&1 || { \
+	    echo "toolchain: MISSING host gcc (needed for the host-only tests)"; \
+	    missing=1; }; \
+	[ $$missing -eq 0 ] || { \
+	    echo "toolchain: FAIL -- see TOOLCHAIN.md for the install command"; \
+	    exit 1; }; \
+	g=$$($(CROSS)gcc -dumpfullversion 2>/dev/null \
+	     || $(CROSS)gcc -dumpversion 2>/dev/null); \
+	l=$$($(CROSS)ld --version 2>/dev/null | sed -n '1s/.* //p'); \
+	echo "toolchain: $(CROSS)gcc $$g (verified $(TC_GCC_WANT)), $(CROSS)ld $$l (verified $(TC_LD_WANT))"; \
+	case "$$g" in $(TC_GCC_WANT)*) ;; *) \
+	    echo "toolchain: WARNING gcc $$g is not the verified $(TC_GCC_WANT) -- if the build breaks, suspect this first (TOOLCHAIN.md)";; \
+	esac; \
+	case "$$l" in $(TC_LD_WANT)*) ;; *) \
+	    echo "toolchain: WARNING ld $$l is not the verified $(TC_LD_WANT) -- likewise";; \
+	esac; \
+	echo "toolchain: OK"
+
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
