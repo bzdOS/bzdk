@@ -31,6 +31,22 @@ LEDGER  = os.path.join(HERE, "boot-ledger.jsonl")
 SUMMARY = os.path.join(HERE, "boot-ledger.txt")
 
 
+# Entries older than this were scored by a supervisor with a KNOWN defect, so
+# the counts they contribute cannot be taken at face value. chimpd judged
+# liveness by console growth alone and declared "HANG" after 40 s of silence --
+# but a booting FreeBSD is quiet for far longer than that while working the
+# eMMC, and a guest that reached `login:` and went idle produces no console
+# output at all. It reset healthy boots and recorded them as failures; that was
+# proven on hardware and fixed 2026-08-05 (commit df611e3: liveness now counts
+# disk I/O too, and the guest is POKED before being condemned).
+#
+# Direction of the error matters: healthy boots scored as failures INFLATE the
+# failure count and TRUNCATE streaks, so the gate number is pessimistic rather
+# than flattering. That is the safe direction, but it is still wrong, and the
+# summary says so rather than leaving a reader to trust a clean-looking ✅.
+SUPERVISOR_FIX_TS = 1785886000.0   # 2026-08-05, commit df611e3
+
+
 def record(ok, isol_pass=None, sha=None, source="reliable_load", note=""):
     """Append one reload outcome and refresh the summary. Never raises — a
     ledger write must never be able to break the reload path that calls it."""
@@ -73,9 +89,11 @@ def stats():
             best = max(best, cur)
         else:
             cur = 0
+    pre_fix = sum(1 for r in recs if r.get("ts", 0) < SUPERVISOR_FIX_TS)
     return dict(total=total, passes=passes, fails=total - passes,
                 isol_ok=isol_ok, isol_seen=isol_seen,
                 current_streak=cur, best_streak=best,
+                pre_supervisor_fix=pre_fix,
                 first_ts=recs[0]["ts"] if recs else None,
                 last_ts=recs[-1]["ts"] if recs else None)
 
@@ -104,6 +122,17 @@ def _rewrite_summary():
         f"first entry       : {when(s['first_ts'])}",
         f"last entry        : {when(s['last_ts'])}",
     ]
+    if s["pre_supervisor_fix"]:
+        lines += [
+            "",
+            f"⚠ {s['pre_supervisor_fix']} of {s['total']} entries predate the "
+            f"supervisor fix of 2026-08-05 (df611e3) and were scored by a chimpd",
+            "  that condemned healthy boots after 40 s of console silence. Those",
+            "  entries UNDERSTATE reliability (healthy boots recorded as failures,",
+            "  streaks truncated), so treat this gate number as pessimistic but",
+            "  not trustworthy. Re-run the streak with the fixed supervisor before",
+            "  citing it in a release claim.",
+        ]
     with open(SUMMARY, "w") as f:
         f.write("\n".join(lines) + "\n")
 
