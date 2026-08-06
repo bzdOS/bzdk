@@ -60,7 +60,21 @@ struct el2_frame;   /* exceptions.h */
  * optional caller-supplied array of (addr,len) pairs (2*nregions uint64_t
  * words) added as additional PT_LOAD segments; pass NULL / 0 for none.
  * Out-of-DRAM or oversized regions are clamped/skipped. Bounded and
- * non-blocking. */
+ * non-blocking.
+ *
+ * ADDRESS SPACE OF `addr`/`regions` (fixed 2026-08-06): every address here —
+ * the automatic stack window and every (addr,len) pair in `regions` — is the
+ * guest's VIRTUAL address, exactly like SP_EL1/PC/x0-x30 already are in
+ * NT_PRSTATUS. It is what gets published in each PT_LOAD's p_vaddr, and it
+ * is what a debugger matches SP/frame-pointer values against to find a
+ * segment's bytes. Physical translation (gva_to_pa(), per page) happens
+ * internally, only to decide which bytes to stream, and never changes what
+ * gets published as the segment's address. Passing an already-physical
+ * address here (as this function itself did before the fix) produces a
+ * core.elf that parses fine but that a debugger cannot read the stack out
+ * of whenever the guest's MMU is on — confirmed live against a real
+ * kernel.debug: "Cannot access memory at address 0x...". See
+ * test_coredump_elf.c's va_pa_gdb_readable case for the reproduction. */
 void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions);
 
 #endif /* BZDOS_COREDUMP_H */
