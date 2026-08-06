@@ -8,11 +8,48 @@
 | A Zephyr guest image **builds** | ✅ | `zephyr-guest/build.sh bpi_m64_hv` → `zephyr.elf`, EXEC, one `PT_LOAD` @ `0x51000000`, entry `0x5100100c` |
 | The hypervisor **loads** it | ✅ | `kload_parse_elf` + `kload_place_segments` on the real image, board-free under QEMU |
 | It **boots** to its own `main()` | ✅ | `./zephyr-qemu-ci.sh` — banner, `hello from EL1`, heartbeats 0 and 1 |
-| It boots **on the board** | ❓ **not yet** | needs hardware; the image is staged at `/opt/bzdos/tftpboot/zephyr.elf`, procedure in `../zephyr-guest/LOADING.md` |
+| It boots **on the board** | ❌ **tried 2026-08-06, does not come up** | see "Result on real hardware" below |
 
 Those five rows are deliberately separate. "Links" is not "loads" and
 "loads" is not "boots"; this project has burned time before on a report that
 blurred them.
+
+## Result on real hardware (2026-08-06)
+
+Loaded via a reversible swap of `tftpboot/kernel` for `tftpboot/zephyr.elf`
+(SHA256-verified before and after, chimpd's own `HYP_ELF`/`KERNEL` constants
+monkeypatched at the Python object level rather than edited on disk — no
+file in the git tree changed for this test, and the guest-image TFTP name is
+a hardcoded string literal inside `chimpd.py`'s closures, not sourced from
+its `KERNEL` global, so that half had to be a real file swap regardless of
+any patch). `loady`+`bootelf` completed normally ("go sent"). EMAC never
+answered — not a patience problem: polled continuously for ~80s across two
+separate attempts, zero responses both times. After the first attempt the
+board had already dropped back to U-Boot's own USB gadget (`1f3a:efe8`),
+consistent with the project's own watchdog-auto-recovery design firing
+because nothing pets it — i.e. the HV hung or crashed early enough that it
+never reached its own EMAC/dbgmon service loop, or `bootelf` never actually
+jumped for a reason that has no analogue under QEMU.
+
+Not chased further live on hardware without a plan — this is a first
+finding, not a diagnosed bug. The board-free gate above stays a valid,
+narrower claim (loads and boots *under QEMU*); the gap between that and real
+hardware is itself the useful signal. Candidates worth checking before the
+next hardware attempt, none confirmed: `main_zephyr.c` initialises real A64
+peripherals `main_zephyr_qemu.c` never touches (nothing under QEMU exercises
+that code at all), and the GIC/vGIC path is a known black hole under QEMU
+specifically — a divergence there would be invisible to every board-free
+run to date.
+
+The board was restored to its normal `dbg`/FreeBSD configuration after this
+test (`tftpboot/kernel` restored from a SHA256-verified backup, reloaded via
+plain `chimpd.py`). The reload landed with root read-only (expected: the
+running guest was hard-reset via `bzdctl.py power reset` to force it back to
+U-Boot, not a cooperative `shutdown -p`, so the mid-session A2 guarantee
+does not apply here) — cleared with the documented `fsck_ffs -y` +
+`mount -u -o reload` path, then `service netif restart` + a manual default
+route, since `/etc/rc` had stopped before reaching network configuration too.
+Confirmed recovered: ssh answers, root `rw`, filesystem intact at 15% used.
 
 ## The two halves
 
