@@ -47,7 +47,7 @@
  * Printed via the early/boot-console replay mechanism the moment earlycon
  * registers, so it is expected to be the first (or one of the first) lines
  * this target's console ever shows — see main_linux_qemu.c's banner. */
-static const char PASS_MARKER[] = "THIS_STRING_SHOULD_NEVER_APPEAR_xyzzy";
+static const char PASS_MARKER[] = "Linux version";
 
 static void qemu_poweroff(void) __attribute__((noreturn));
 
