@@ -26,6 +26,19 @@
 #                     trap-emulator. SKIPs (does not fail) if no Zephyr tree is
 #                     available to build a guest image from — see that script's
 #                     header for why that is a missing input, not a regression.
+#   5. ./linux-qemu-ci.sh
+#                   — the LINUX GUEST target (ROADMAP D2) boots end to end: a
+#                     real, unmodified mainline Linux/arm64 Image loaded by
+#                     main_linux_qemu.c's own Image-header handoff (a
+#                     different entry contract than kload.c's ELF path — see
+#                     docs/linux-guest.md), entered at EL1 under stage-2,
+#                     console served by the same vconsole.c 16550
+#                     trap-emulator, asserted via its own "Linux version"
+#                     banner. SKIPs (does not fail) if no Linux Image+DTB are
+#                     available and none can be built — see that script's
+#                     header for why that is a missing input, not a
+#                     regression. Wired in 2026-08-07 after a 10/10 clean
+#                     reliability run (see docs/linux-guest.md "Gate status").
 #
 # One command, one exit code — the gate to run on every commit. Hardware-only
 # checks (100-boot streak, soak, break-glass) live in the cumulative boot
@@ -76,6 +89,21 @@ elif echo "$zout" | grep -q "zephyr-qemu-ci: SKIP"; then
     echo "ci: zephyr guest target SKIPPED (no Zephyr tree — not a regression)"
 else
     echo "ci: zephyr guest target PASS"
+fi
+
+echo "════════ ci: Linux guest on QEMU-virt (linux-qemu-ci.sh) ════════"
+# Same SKIP-vs-FAIL distinction as the Zephyr stage above: a missing ~1.6 GB
+# Linux source checkout must not be able to turn this gate red.
+lout=$(./linux-qemu-ci.sh 2>&1)
+lrc=$?
+echo "$lout"
+if [ "$lrc" -ne 0 ]; then
+    echo "ci: linux guest target FAIL"
+    fail=1
+elif echo "$lout" | grep -q "linux-qemu-ci: SKIP"; then
+    echo "ci: linux guest target SKIPPED (no Linux tree — not a regression)"
+else
+    echo "ci: linux guest target PASS"
 fi
 
 echo "════════════════════════════════════════════════════"

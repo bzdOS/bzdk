@@ -300,18 +300,39 @@ leaning on a FAIL run's captured tail as evidence of anything again.
 
 ## Gate status
 
-`linux-qemu-ci.sh` is **not yet wired into `ci.sh`**. Per this project's own
-rule ("a flaky addition to a green gate is worse than none — 5+ consecutive
-runs before wiring anything in"), it needs that reliability run first — 1
-clean PASS is on record (see "Result"), not yet 5. The reliability run
-itself could not be completed in this pass: a severe, host-wide disk-full
-event (unrelated to this target — see the session report) forced deleting
-the built `Image`/DTB partway through verification, and rebuilding a second
-copy was not attempted while the host was still critical. `linux-qemu-ci.sh`
-already SKIPs (not FAILs) when no guest artifacts are available, so this is
-a safe, honest state to leave it in — whoever runs the 5x trial next just
-needs `./linux-guest/build.sh` (or `LINUX_SRC=`) once the host has headroom
-again.
+`linux-qemu-ci.sh` **is now wired into `ci.sh`** (fifth stage, added
+2026-08-07), following the exact SKIP-vs-FAIL pattern the Zephyr stage
+established. This closes the loop the previous revision of this section
+left open: the guest artifacts lost in the earlier host-wide disk-full event
+were rebuilt from scratch this pass (`linux-6.12` re-fetched — the checkout
+itself had been deleted too, not just `build/` — via the same
+proxy-bypassing direct `curl` `build.sh`'s header documents, ~148 MB in 28s),
+and `./linux-qemu-ci.sh` was then run **10 consecutive times**, not just the
+5 this project's own rule requires ("a flaky addition to a green gate is
+worse than none — 5+ consecutive runs before wiring anything in"). All 10
+produced byte-identical `PASS` output (101 guest console bytes each,
+`LINUX-QEMU-CI: PASS` marker matched every time). Host disk stayed at
+84–86 GB free throughout the rebuild and all 10 CI runs — no pressure, no
+repeat of the earlier disk-full incident.
+
+One real bug was found and fixed en route: `linux-guest/build.sh` did not
+actually implement the config trimming this doc's own "Why the config is
+trimmed" section describes — it ran a plain, untrimmed `defconfig` at
+`-j$(nproc)` (8 on this host), which is exactly the wide-parallelism
+full-defconfig shape that caused the earlier disk emergency. Fixed by adding
+the documented `scripts/config --disable` pass (every `CONFIG_ARCH_*`
+vendor-SoC platform select, plus `NET`/`ACPI`/`PCI`/`SCSI`/`ATA`/`WLAN`/
+`INPUT`/`FB`/`SOUND`/`USB_SUPPORT`/`MMC`/`VIRTIO_MENU`/`CRYPTO_HW`) followed
+by `olddefconfig` before `make Image`, and capping the build's `-j` at 4
+rather than a bare `nproc`. The resulting build compiled in ~18 minutes
+wall-clock and produced a 13.7 MB `Image` — still noticeably larger than a
+maximally-tight config (a handful of generic subsystems not gated by the
+disabled list — e.g. `HID`, `PLATFORM_CHROME`, `firmware/arm_scmi` —
+survived `olddefconfig`'s dependency resolution and got built anyway), but
+nowhere near the ~180-vendor-platform full `defconfig` this doc warns
+against, and disk headroom never dropped below 84 GB during the build. A
+tighter config is a possible future refinement, not required for this
+milestone.
 
 ## Next step
 
