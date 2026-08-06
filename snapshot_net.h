@@ -64,8 +64,13 @@
  * ============================================================================
  * ZERO-SKIP
  * ============================================================================
- * The store (snapshot.h's SNAP_STORE_BASE region: header + SNAP_DRAM_SIZE)
- * is scanned in fixed SNAPNET_CHUNK-byte pieces. An all-zero chunk is never
+ * The store (logically: the SNAP_META_SIZE-byte header followed by the
+ * SNAP_DRAM_SIZE-byte DRAM mirror — snapshot.h's SNAPNET_STORE_LEN bytes in
+ * total; see snapshot.h's "Snapshot STORE region" for why these are, since
+ * 2026-08, two DISJOINT physical regions rather than one contiguous window —
+ * store_read()/store_write() in snapshot_net.c are what stitch them back into
+ * one logical byte stream for everything below) is scanned in fixed
+ * SNAPNET_CHUNK-byte pieces. An all-zero chunk is never
  * transmitted at all (no frame, seq number simply absent from the manifest);
  * the receiver pre-zeroes its destination before receiving, so an
  * intentionally-skipped chunk reconstructs correctly as zero with no wire

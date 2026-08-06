@@ -180,13 +180,19 @@
 /* ==================================================================== *
  * Constants mirrored from snapshot.h:72-100 / :188.
  * ==================================================================== */
+/* FIXED 2026-08 (see snapshot.h's "Snapshot STORE region"): the header no
+ * longer lives at the front of the high GiB. SNAP_DRAM_STORE == SNAP_STORE_BASE
+ * now (the mirror is the WHOLE window, zero header overhead, ending exactly
+ * at 0xC0000000 -- real DRAM top); the header moved to SNAP_META_BASE, a
+ * low-memory hv-scratch PA (== hv_addrmap.h's HVMAP_SNAP_HDR_BASE). */
 #define SNAP_DRAM_BASE   0x40000000UL            /* snapshot.h:72  */
 #define SNAP_DRAM_SIZE   0x40000000UL            /* snapshot.h:73  */
-#define SNAP_STORE_BASE  0x80000000UL            /* snapshot.h:95  */
-#define SNAP_META_SIZE   0x00010000UL            /* snapshot.h:96  */
-#define SNAP_DRAM_STORE  (SNAP_STORE_BASE + SNAP_META_SIZE)  /* snapshot.h:97 */
-#define SNAP_MAGIC       0x534E5031u             /* snapshot.h:100 ("SNP1") */
-#define SNAPSHOT_VERSION 1u                      /* snapshot.h:188 */
+#define SNAP_STORE_BASE  0x80000000UL            /* snapshot.h:136 */
+#define SNAP_META_SIZE   0x00010000UL            /* snapshot.h:140 */
+#define SNAP_META_BASE   0x50060000UL            /* snapshot.h:142, == hv_addrmap.h HVMAP_SNAP_HDR_BASE */
+#define SNAP_DRAM_STORE  SNAP_STORE_BASE         /* snapshot.h:144 */
+#define SNAP_MAGIC       0x534E5031u             /* snapshot.h ("SNP1") */
+#define SNAPSHOT_VERSION 1u                      /* snapshot.h */
 
 /* snapshot.h:104-108 — enum snapshot_store_kind. */
 #define SNAP_STORE_DRAM  0
@@ -368,11 +374,27 @@ _Static_assert(offsetof(struct snapshot_hdr, reserved)     == 580, "hdr.reserved
 _Static_assert(sizeof(struct snapshot_hdr)                 == 584, "sizeof snapshot_hdr");
 
 /* The header must fit inside the 64 KiB metadata reservation, otherwise
- * snapshot_save() would scribble into the DRAM copy region that starts at
- * SNAP_DRAM_STORE (snapshot.h:88-89). Huge margin today (584 of 65536), but
- * an unpinned invariant is an invariant waiting to break. */
+ * snapshot_save() would scribble past its own reservation in hv-scratch
+ * (SNAP_META_BASE, snapshot.h's "Snapshot STORE region"). Huge margin today
+ * (584 of 65536), but an unpinned invariant is an invariant waiting to
+ * break. */
 _Static_assert(sizeof(struct snapshot_hdr) <= SNAP_META_SIZE,
                "snapshot_hdr must fit in SNAP_META_SIZE");
+
+/* FIXED 2026-08 pins: the header and the mirror are now two DISJOINT
+ * physical regions (see snapshot.h). The mirror is the FULL window, zero
+ * slack, ending exactly at the real 2 GiB board's top of DRAM; the header
+ * sits entirely inside [SNAP_DRAM_BASE, SNAP_DRAM_BASE+SNAP_DRAM_SIZE), i.e.
+ * inside the swept "guest DRAM" range, not inside the mirror window. */
+_Static_assert(SNAP_DRAM_STORE == SNAP_STORE_BASE,
+               "mirror must start exactly at the window base (zero header overhead)");
+_Static_assert(SNAP_DRAM_STORE + SNAP_DRAM_SIZE == 0xC0000000UL,
+               "mirror must end exactly at the top of real 2 GiB DRAM, no slack");
+_Static_assert(SNAP_META_BASE >= SNAP_DRAM_BASE &&
+               SNAP_META_BASE + SNAP_META_SIZE <= SNAP_DRAM_BASE + SNAP_DRAM_SIZE,
+               "header window must sit inside the swept guest-DRAM range");
+_Static_assert(SNAP_META_BASE + SNAP_META_SIZE <= SNAP_STORE_BASE,
+               "header window must not spill into the high-GiB mirror");
 
 /* Chunk geometry (snapshot_net.h:126-135), pinned as literals. These exact
  * numbers appear in snapshot_net.h's own comment ("767,006 chunks / ~93.6
@@ -863,10 +885,11 @@ static void test_header_magic_and_version_constants(void)
 	assert(SNAP_DRAM_BASE == 0x40000000UL);
 	assert(SNAP_DRAM_SIZE == 0x40000000UL);
 	assert(SNAP_STORE_BASE == 0x80000000UL);
-	assert(SNAP_DRAM_STORE == 0x80010000UL);
-	/* The store must be able to hold header + a full DRAM image, and must
-	 * start exactly where the guest's stage-2 identity range ends
-	 * (snapshot.h:78-83). */
+	assert(SNAP_DRAM_STORE == 0x80000000UL);   /* fixed 2026-08: == SNAP_STORE_BASE */
+	assert(SNAP_META_BASE  == 0x50060000UL);   /* header lives here now, not here-adjacent */
+	/* The mirror must be able to hold a full DRAM image with zero slack, and
+	 * must start exactly where the guest's stage-2 identity range ends
+	 * (snapshot.h's "Snapshot STORE region"). */
 	assert(SNAP_DRAM_BASE + SNAP_DRAM_SIZE == SNAP_STORE_BASE);
 }
 
@@ -907,7 +930,7 @@ static void test_header_byte_image_round_trip(void)
 	assert(rd32(img + 12) == (uint32_t)SNAP_STORE_DRAM);
 	assert(rd32(img + 16) == 0x40000000u && rd32(img + 20) == 0u);      /* dram_base */
 	assert(rd32(img + 24) == 0x40000000u && rd32(img + 28) == 0u);      /* dram_size */
-	assert(rd32(img + 32) == 0x80010000u && rd32(img + 36) == 0u);      /* dram_store */
+	assert(rd32(img + 32) == 0x80000000u && rd32(img + 36) == 0u);      /* dram_store */
 	assert(rd32(img + 40) == 0x89ABCDEFu && rd32(img + 44) == 0x01234567u);
 	/* frame.x[0] at 48, x[1] at 56, ... x[30] at 48+240=288 */
 	assert(rd32(img + 48) == 0x1000u);
@@ -1552,18 +1575,31 @@ static void test_open_issue_present_accepts_absurd_geometry(void)
 	h.dram_size = SNAP_DRAM_SIZE + 0x1000UL;
 	assert(snapshot_present_at(&h) == 1);
 
-	store_end = SNAP_STORE_BASE + SNAP_META_SIZE + SNAP_DRAM_SIZE;
+	/* FIXED 2026-08: store_end is now literally the top of real, installed
+	 * DRAM (SNAP_DRAM_STORE == SNAP_STORE_BASE, mirror == the whole window,
+	 * zero header overhead — see snapshot.h). Before the fix this expression
+	 * was SNAP_STORE_BASE + SNAP_META_SIZE + SNAP_DRAM_SIZE, i.e. it INCLUDED
+	 * the very overrun that was this task's actual bug; today it is simply
+	 * "the mirror's own end", which is a cleaner and more honest thing for
+	 * this open-issue test to measure an overrun against. */
+	store_end = SNAP_DRAM_STORE + SNAP_DRAM_SIZE;
+	assert(store_end == 0xC0000000UL);   /* the real 2 GiB board's DRAM top */
 	src_end   = SNAP_DRAM_STORE + h.dram_size;
 	dst_end   = SNAP_DRAM_BASE  + h.dram_size;
 
-	/* The SOURCE read runs 0x1000 bytes past the end of the store. */
+	/* The SOURCE read runs 0x1000 bytes past the end of real DRAM. */
 	assert(src_end > store_end);
 	assert(src_end - store_end == 0x1000UL);
 
 	/* Worse, the DESTINATION write runs past the end of guest DRAM — and
-	 * guest DRAM ends exactly AT SNAP_STORE_BASE (snapshot.h:78-83), so the
-	 * overrun lands on the store header itself, destroying the very record
-	 * being restored from, mid-restore. */
+	 * guest DRAM ends exactly AT SNAP_STORE_BASE (snapshot.h's "Snapshot
+	 * STORE region"), so the overrun lands on the very FRONT of the DRAM
+	 * mirror itself, corrupting the record being restored from, mid-restore.
+	 * (Before the 2026-08 fix this landed on the store HEADER instead, which
+	 * lived at that same front-of-window address; the header has since moved
+	 * to SNAP_META_BASE, but the destination overrun described here is
+	 * unaffected by that move — it is still the first bytes of whatever now
+	 * occupies SNAP_STORE_BASE.) */
 	assert(dst_end > SNAP_STORE_BASE);
 	assert(SNAP_DRAM_BASE + SNAP_DRAM_SIZE == SNAP_STORE_BASE);
 	assert(dst_end - SNAP_STORE_BASE == 0x1000UL);
@@ -1754,16 +1790,31 @@ static void test_open_issue_snapshot_range_contains_hv_image(void)
 	assert(hv_base + hv_protected_len <= snap_hi);
 	assert(hv_base + hv_region_len <= snap_hi);
 
-	/* So are the HV's breadcrumb windows. */
+	/* So are the HV's breadcrumb windows -- including, since the 2026-08 fix,
+	 * this feature's OWN store header (SNAP_META_BASE moved into hv-scratch
+	 * to get out of the high-GiB mirror's way; see snapshot.h). It is now
+	 * one more thing this same pre-existing containment issue applies to:
+	 * snapshot_restore()'s dram_copy() overwrites it too, mid-restore, for
+	 * exactly the reason snapshot.h's own "CAVEAT" paragraph documents
+	 * (snapshot_restore() reads it into locals BEFORE that copy runs so the
+	 * FUNCTION stays correct regardless -- but the byte-for-byte confirmed
+	 * live symptom of this whole open issue is that dram_copy() also
+	 * clobbers its own C call stack, which is a HW-observed consequence, not
+	 * merely a static containment fact -- see the report this shipped with). */
 	assert(hv_bc >= snap_lo && hv_bc < snap_hi);
+	assert(SNAP_META_BASE >= snap_lo && SNAP_META_BASE + SNAP_META_SIZE <= snap_hi);
 
-	/* And the store itself is safely OUTSIDE that range — the one part the
-	 * design did get right (snapshot.h:78-83). */
+	/* And the store's DRAM MIRROR itself is safely OUTSIDE that range — the
+	 * one part the design did get right (snapshot.h's "Snapshot STORE
+	 * region"). */
 	assert(SNAP_STORE_BASE >= snap_hi);
 
 	/* Offset of the HV image within the store's DRAM copy, i.e. where these
-	 * bytes actually land — useful for anyone inspecting a pulled image. */
-	assert(SNAP_DRAM_STORE + (hv_base - SNAP_DRAM_BASE) == 0x82010000UL);
+	 * bytes actually land — useful for anyone inspecting a pulled image.
+	 * FIXED 2026-08: SNAP_DRAM_STORE no longer carries a +SNAP_META_SIZE
+	 * offset (it IS SNAP_STORE_BASE now), so this lands 0x10000 earlier than
+	 * before the fix. */
+	assert(SNAP_DRAM_STORE + (hv_base - SNAP_DRAM_BASE) == 0x82000000UL);
 }
 
 /* ==================================================================== *

@@ -192,8 +192,80 @@ static inline void store_cache_clean(uintptr_t addr, uint32_t size)
 }
 
 /* ------------------------------------------------------------------ *
- * Zero-skip check: is this (8-byte-aligned, since SNAP_STORE_BASE and
- * SNAPNET_CHUNK are both multiples of 8) chunk entirely zero?
+ * Store-relative addressing. FIXED 2026-08 (see snapshot.h's "Snapshot
+ * STORE region"): the store used to be one contiguous window starting at
+ * SNAP_STORE_BASE (header at offset 0, DRAM mirror at offset SNAP_META_SIZE),
+ * so every caller below could just compute `SNAP_STORE_BASE + off`. That is
+ * exactly the same overrun snapshot.c's dram_copy() had (the window is sized
+ * for the DRAM mirror ALONE, with zero slack for a header on top), so it
+ * moved too: the header now lives at SNAP_META_BASE (low hv-scratch), and
+ * the mirror is SNAP_DRAM_STORE (== SNAP_STORE_BASE now, the WHOLE high
+ * GiB) — two DISJOINT physical regions. A store-relative offset `off` in
+ * [0, SNAPNET_STORE_LEN) addresses the header for off < SNAP_META_SIZE and
+ * the mirror otherwise.
+ *
+ * SNAP_META_SIZE (64 KiB) is NOT a multiple of SNAPNET_CHUNK (1400 B) — on
+ * the current constants chunk index 46 (bytes [64400,65800)) straddles the
+ * seam at off=65536 — so a single chunk CAN need bytes from both physical
+ * regions. store_read()/store_write() split at the seam so every caller
+ * above them can keep treating the store as one logical byte stream, the
+ * same way it always could before this fix. */
+static void store_read(uint64_t off, uint8_t *buf, uint32_t len)
+{
+	while (len) {
+		uint64_t pa;
+		uint32_t n, i;
+		const uint8_t *s;
+
+		if (off < SNAP_META_SIZE) {
+			uint64_t room = SNAP_META_SIZE - off;
+			pa = SNAP_META_BASE + off;
+			n  = (room < (uint64_t)len) ? (uint32_t)room : len;
+		} else {
+			pa = SNAP_DRAM_STORE + (off - SNAP_META_SIZE);
+			n  = len;
+		}
+		s = (const uint8_t *)(uintptr_t)pa;
+		for (i = 0; i < n; i++)
+			buf[i] = s[i];
+
+		off += n; buf += n; len -= n;
+	}
+}
+
+/* Same split as store_read(), opposite direction, with the same coherent-
+ * store cache clean the old single-region code issued once per whole chunk
+ * (now issued once per sub-range instead — at most twice for the one
+ * straddling chunk, once for every other chunk, same as before). */
+static void store_write(uint64_t off, const uint8_t *buf, uint32_t len)
+{
+	while (len) {
+		uint64_t pa;
+		uint32_t n, i;
+		uint8_t *d;
+
+		if (off < SNAP_META_SIZE) {
+			uint64_t room = SNAP_META_SIZE - off;
+			pa = SNAP_META_BASE + off;
+			n  = (room < (uint64_t)len) ? (uint32_t)room : len;
+		} else {
+			pa = SNAP_DRAM_STORE + (off - SNAP_META_SIZE);
+			n  = len;
+		}
+		d = (uint8_t *)(uintptr_t)pa;
+		for (i = 0; i < n; i++)
+			d[i] = buf[i];
+		store_cache_clean((uintptr_t)d, n);
+
+		off += n; buf += n; len -= n;
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * Zero-skip check: is this (8-byte-aligned -- callers pass either an
+ * explicitly-aligned local buffer or a raw store pointer, and the store's
+ * two physical regions plus SNAPNET_CHUNK are all multiples of 8) chunk
+ * entirely zero?
  * ------------------------------------------------------------------ */
 static int chunk_is_zero(const uint8_t *p, uint32_t n)
 {
@@ -208,14 +280,13 @@ static int chunk_is_zero(const uint8_t *p, uint32_t n)
 	return 1;
 }
 
-/* Bulk-zero the whole store (header + DRAM copy) before receiving, so any
- * chunk the sender legitimately never transmits (all-zero, zero-skipped)
- * reconstructs correctly at zero cost. Same wdt_pet()/dc-cvac discipline as
- * snapshot.c's dram_copy(). */
-static void store_zero(void)
+/* Zero one contiguous physical run, same wdt_pet()/dc-cvac discipline as
+ * snapshot.c's dram_copy(). `bytes` must be a multiple of 8 (both callers'
+ * regions are: SNAP_META_SIZE and SNAP_DRAM_SIZE are each 8-byte multiples). */
+static void zero_region(uint64_t pa, uint64_t bytes)
 {
-	volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)SNAP_STORE_BASE;
-	uint64_t n = SNAPNET_STORE_LEN / 8u, i;
+	volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)pa;
+	uint64_t n = bytes / 8u, i;
 
 	for (i = 0; i < n; i++) {
 		d[i] = 0;
@@ -227,9 +298,23 @@ static void store_zero(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* Bulk-zero the whole store (header + DRAM copy) before receiving, so any
+ * chunk the sender legitimately never transmits (all-zero, zero-skipped)
+ * reconstructs correctly at zero cost. Two disjoint physical regions now
+ * (see store_read()/store_write()'s comment) instead of one contiguous
+ * range, but the logical effect -- "every store-relative byte is zero" --
+ * is unchanged. */
+static void store_zero(void)
+{
+	zero_region(SNAP_META_BASE, SNAP_META_SIZE);
+	zero_region(SNAP_DRAM_STORE, SNAP_DRAM_SIZE);
+}
+
 static volatile struct snapshot_hdr *snapnet_hdr(void)
 {
-	return (volatile struct snapshot_hdr *)(uintptr_t)SNAP_STORE_BASE;
+	/* SNAP_META_BASE, not SNAP_STORE_BASE -- see snapshot.h's "Snapshot
+	 * STORE region" and snapshot.c's own snap_hdr(), which this mirrors. */
+	return (volatile struct snapshot_hdr *)(uintptr_t)SNAP_META_BASE;
 }
 
 /* ------------------------------------------------------------------ *
@@ -244,12 +329,10 @@ static void snapnet_send_one(uint32_t seq)
 	uint64_t off = (uint64_t)seq * SNAPNET_CHUNK;
 	uint32_t remain = (uint32_t)(SNAPNET_STORE_LEN - off);
 	uint16_t len = (remain < SNAPNET_CHUNK) ? (uint16_t)remain : (uint16_t)SNAPNET_CHUNK;
-	const uint8_t *src = (const uint8_t *)(uintptr_t)(SNAP_STORE_BASE + off);
 	uint32_t crc;
 	int i;
 
-	for (i = 0; i < (int)len; i++)
-		frame[SNAPNET_HDR_LEN + i] = src[i];
+	store_read(off, frame + SNAPNET_HDR_LEN, len);
 	crc = crc32_calc(frame + SNAPNET_HDR_LEN, len);
 
 	wr32(frame + 0, SNAPNET_MAGIC);
@@ -274,12 +357,11 @@ static void snapnet_send_one(uint32_t seq)
  * ------------------------------------------------------------------ */
 void snapshot_net_rx_frame(const uint8_t *payload, uint16_t len)
 {
-	uint32_t magic, seq, crc, i;
+	uint32_t magic, seq, crc;
 	uint16_t plen, expect_len;
 	uint64_t off;
 	uint32_t remain;
 	const uint8_t *data;
-	uint8_t *dst;
 
 	if (len < SNAPNET_HDR_LEN)
 		return;
@@ -311,10 +393,7 @@ void snapshot_net_rx_frame(const uint8_t *payload, uint16_t len)
 	                                          * diff round, same recovery path
 	                                          * as an outright-lost frame */
 
-	dst = (uint8_t *)(uintptr_t)(SNAP_STORE_BASE + off);
-	for (i = 0; i < plen; i++)
-		dst[i] = data[i];
-	store_cache_clean((uintptr_t)dst, plen);
+	store_write(off, data, plen);
 
 	if (!bit_test(s_received, seq)) {
 		bit_set(s_received, seq);
@@ -362,9 +441,14 @@ int snapshot_net_send(const struct el2_frame *frame)
 		uint64_t off = (uint64_t)seq * SNAPNET_CHUNK;
 		uint32_t remain = (uint32_t)(SNAPNET_STORE_LEN - off);
 		uint16_t len = (remain < SNAPNET_CHUNK) ? (uint16_t)remain : (uint16_t)SNAPNET_CHUNK;
-		const uint8_t *src = (const uint8_t *)(uintptr_t)(SNAP_STORE_BASE + off);
+		/* 8-byte aligned (chunk_is_zero()'s uint64_t scan requires it --
+		 * see its own comment): true of a raw store pointer because
+		 * SNAP_STORE_BASE/SNAP_META_BASE and SNAPNET_CHUNK are all
+		 * multiples of 8, and true of this local copy because we say so. */
+		uint8_t buf[SNAPNET_CHUNK] __attribute__((aligned(8)));
 
-		if (chunk_is_zero(src, len)) {
+		store_read(off, buf, len);
+		if (chunk_is_zero(buf, len)) {
 			if ((seq & 0xFFFu) == 0xFFFu)
 				wdt_pet();
 			continue;
