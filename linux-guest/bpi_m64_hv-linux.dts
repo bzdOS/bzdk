@@ -1,0 +1,167 @@
+/*
+ * bpi_m64_hv-linux.dts — devicetree for a mainline Linux/arm64 EL1 guest
+ * running under the bzdOS EL2 hypervisor (Banana Pi M64 / Allwinner A64,
+ * Cortex-A53), board-free target (main_linux_qemu.c / linux-qemu-ci.sh).
+ *
+ * SPDX-License-Identifier: GPL-2.0 (matches upstream Linux's own
+ * arch/arm64/boot/dts convention; this file is new, not extracted from any
+ * upstream .dts, but it deliberately cites the real .dtsi it was checked
+ * against below).
+ *
+ * WHY A NEW FILE, NOT A COPY OF zephyr-guest's .dts: same MMIO addresses,
+ * same rationale (cross-checked against
+ * /opt/bzdos/build/u-boot/arch/arm/dts/sun50i-a64.dtsi), but a different
+ * consumer with different requirements:
+ *   - Zephyr does not parse a runtime DTB at all (see that file's header);
+ *     this one is the ACTUAL x0 payload handed to Linux at eret, so every
+ *     property here is load-bearing, not documentation.
+ *   - Linux needs /memory (Zephyr gets its RAM extent from Kconfig/the
+ *     linker script instead), /chosen/bootargs + stdout-path (Zephyr's
+ *     console is wired at compile time via zephyr,console), and a
+ *     standard-binding-compatible GIC/timer/uart node set that the
+ *     kernel's *upstream, unmodified* drivers (irq-gic.c, arch_timer.c,
+ *     8250_dw.c / earlycon) will actually bind against.
+ *
+ * PLACEMENT: kept OUT of every hypervisor-owned window under
+ * link_qemu.ld/main_qemu.c's memory map:
+ *   - HV image itself:  [0x40080000, 0x42080000)  (link_qemu.ld ORIGIN/LENGTH)
+ *   - hv-scratch/breadcrumbs: [0x50000000, 0x50200000)
+ *   - stage2 AT self-test IPA: 0x60000000 (stage2.h STAGE2_SELFTEST_IPA)
+ * This DTB is staged at 0x44000000 (comfortably between the two, same
+ * convention zephyr-qemu-ci.sh uses for staging its guest ELF) and the
+ * /memory node below matches stage2.h's STAGE2_DRAM_BASE/SIZE (identity
+ * map covers all of it) intersected with what `-m 1024` actually gives
+ * QEMU. The kernel Image itself is staged at 0x51000000 — the same base
+ * zephyr-guest's board port uses for ITS guest RAM window, reused here
+ * because it is already the vetted "far above every HV window" address in
+ * this tree (see that file's sram0 node comment); Zephyr and this target
+ * never run in the same process, so there is no real collision, only a
+ * deliberately familiar number.
+ *
+ * UART0/GIC nodes are BYTE-FOR-BYTE the same addresses/reg-shift as
+ * zephyr-guest's bpi_m64_hv.dts uart0/gic nodes (see that file for the
+ * hardware citation) — that register layout is what vconsole.c already
+ * emulates (word/ISS-decoded regardless of access width) and what stage2.c
+ * already traps (UART0_BASE) / leaves identity-mapped (the GIC, a black
+ * hole under QEMU — see docs/linux-guest.md for why that is expected and
+ * harmless for THIS milestone).
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	model = "Banana Pi M64 (bzdOS EL2 hypervisor EL1 guest, Linux, QEMU)";
+	compatible = "bzdos,bpi-m64-hv";
+
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0x1c28000,115200n8 console=ttyS0,115200n8 debug loglevel=8";
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Boot CPU only — no secondary-CPU node, so Linux never needs
+		 * an enable-method/cpu-release-addr/psci node to bring one up
+		 * (booting.rst's enable-method requirement is per described
+		 * CPU; a CPU this DTB never mentions is simply never started).
+		 * This build's own guest_config()-equivalent path in
+		 * main_linux_qemu.c likewise only ever programs CPU0. */
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0>;
+			enable-method = "psci";
+		};
+	};
+
+	/* Matches stage2.h STAGE2_DRAM_BASE/STAGE2_DRAM_SIZE (identity-mapped
+	 * [0x40000000, 0x80000000)) intersected with QEMU's `-m 1024`. Telling
+	 * Linux about the full 1 GiB rather than trimming around the HV's own
+	 * [0x40080000,0x42080000) window is deliberate and SAFE, not sloppy:
+	 * nothing reserves that range from the kernel's allocator today (no
+	 * /memreserve/, no reserved-memory node) because the kernel Image is
+	 * staged at 0x51000000, 240+ MiB above it, and this milestone never
+	 * exercises the page allocator anywhere near the low 32 MiB. A real
+	 * follow-on (letting Linux actually run its allocator/mount a rootfs)
+	 * MUST add a /reserved-memory node for the HV window before it can be
+	 * trusted not to overwrite EL2's own code — noted, not yet needed.
+	 */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x40000000>;
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&gic>;
+		/* PPI 13/14/11/10 = phys-secure, phys-non-secure, virtual, hyp
+		 * — same four cells zephyr-guest's dts declares (GIC_PPI n
+		 * IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY, spelled out numerically
+		 * here since this file has no Zephyr dt-bindings include).
+		 * IRQ_TYPE_LEVEL=4, default priority 0. PPI n -> INTID (16+n). */
+		interrupts = <1 13 4>, <1 14 4>, <1 11 4>, <1 10 4>;
+		always-on;
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-parent = <&gic>;
+
+		/* GIC-400 (GICv2). Real A64 addresses (see file header).
+		 * Identity-mapped by stage2.c -- a BLACK HOLE under QEMU virt
+		 * (nothing answers at these addresses in QEMU's memory system;
+		 * see docs/linux-guest.md for exactly what that does and does
+		 * not prove, same limitation zephyr-qemu-ci.sh documents for
+		 * its own guest). */
+		gic: interrupt-controller@1c81000 {
+			compatible = "arm,gic-400", "arm,cortex-a15-gic";
+			reg = <0x0 0x01c81000 0x0 0x1000>,	/* GICD */
+			      <0x0 0x01c82000 0x0 0x2000>;	/* GICC (guest IPA) */
+			interrupt-controller;
+			#interrupt-cells = <3>;
+			#address-cells = <0>;
+		};
+
+		/* Allwinner/Synopsys 16550-compatible UART0, byte-for-byte the
+		 * same reg/reg-shift zephyr-guest's uart0 node uses (see that
+		 * file's citation of sun50i-a64.dtsi). "ns16550a" (rather than
+		 * "snps,dw-apb-uart") is used here specifically because it is
+		 * on Linux's OF_EARLYCON_DECLARE list for the generic 8250
+		 * earlycon (drivers/tty/serial/8250/8250_port.c) as well as
+		 * of_serial.c's platform-match table for the real driver later
+		 * — both paths read reg-shift/reg-io-width straight from this
+		 * node, so which of the two compatible strings is used does not
+		 * change what vconsole.c sees on the wire. reg-io-width=4
+		 * matches vconsole.c's decode, which ignores the transfer size
+		 * from ESR_EL2.ISS.SAS anyway (see vconsole.c's ESR_SAS
+		 * comment) — the property is here for driver-side correctness,
+		 * not because vconsole.c enforces it.
+		 */
+		uart0: serial@1c28000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x01c28000 0x0 0x400>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clock-frequency = <24000000>;
+			current-speed = <115200>;
+			interrupts = <0 0 4>;	/* GIC_SPI 0, level */
+			status = "okay";
+		};
+	};
+};
