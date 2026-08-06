@@ -39,13 +39,16 @@ Usage:
     bzdctl.py serve [--port 8088]    # read-only web dashboard, EMAC only
 """
 import argparse
+import contextlib
 import datetime
 import html
 import importlib.util
+import io
 import json
 import os
 import sys
 import time
+import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -491,6 +494,309 @@ def cmd_serve(args):
     return 0
 
 
+# ── selftest — pure, offline. No sockets, no board. ─────────────────────
+#
+# bzdctl.py had no tests at all before this pass, despite carrying the exact
+# bug its own docstrings warn about: collect_status()'s first version diffed
+# two reads of the BMC1 breadcrumb -- which is a LATCH, rewritten only when
+# the `bmc health` verb runs -- and duly reported cpu0/cpu1/cpu2 FROZEN on a
+# board whose CPU1 heartbeat was demonstrably advancing (see collect_status's
+# sample() docstring). This suite pins that down as an explicit regression,
+# plus render()'s degraded-data paths and cmd_status's idle-vs-frozen
+# classification. bmc_client.py's own `selftest` covers _avail()/health_raw()/
+# print_health(); this one stays one layer up, at the fresh/stale-latch and
+# HTML-rendering logic that lives in THIS file.
+#
+# `python3 bzdctl.py selftest` (see main()); wired into `make test`.
+
+
+class _FakeBMC:
+    """Scripted (health_raw, health_text) replies, consumed one call at a
+    time. collect_status()'s sample() calls health_text() THEN health_raw()
+    per sample, and samples twice per collect_status() call -- so a normal
+    test scripts two of each. Entries in `text_seq` may be an Exception
+    instance/class to simulate "the health verb itself is unreachable"
+    (the exact "could not poke" case collect_status()'s docstring calls
+    out), independently of whether health_raw() (a plain memory read)
+    still succeeds."""
+
+    def __init__(self, raw_seq, text_seq):
+        self._raw = list(raw_seq)
+        self._text = list(text_seq)
+
+    def health_text(self):
+        if not self._text:
+            raise AssertionError("fake BMC: health_text() called more than scripted")
+        v = self._text.pop(0)
+        if isinstance(v, Exception):
+            raise v
+        if isinstance(v, type) and issubclass(v, Exception):
+            raise v("scripted failure")
+        return v
+
+    def health_raw(self):
+        if not self._raw:
+            raise AssertionError("fake BMC: health_raw() called more than scripted")
+        return self._raw.pop(0)
+
+
+def _mkhealth(**overrides):
+    """A fully-decoded health dict -- what health_raw() actually returns, not
+    a hand-rolled parallel shape that could quietly drift from it. Built via
+    bmc_client's OWN wire-decode path (_mkwords()/_FakeWordsBMC, the same
+    helpers its selftest uses) so cmd_status()'s real call to
+    bmc_client.print_health() gets every key it expects (version, ticks,
+    exc_count, hb_cpuN, ...), not just the subset render() happens to read.
+    `overrides` are HEALTH_WORDS field names, exactly as bmc_client._mkwords()
+    takes them."""
+    words = bmc_client._mkwords(**overrides)
+    return bmc_client._FakeWordsBMC(words).health_raw()
+
+
+def _mkstatus(**overrides):
+    """A plausible collect_status()-shaped dict, for testing render()/
+    cmd_status() in isolation from collect_status() itself."""
+    base = dict(when="2026-08-06T00:00:00", reachable=True, error=None,
+                health=_mkhealth(), moving={"cpu0": True, "cpu1": True},
+                console_advancing=True)
+    base.update(overrides)
+    return base
+
+
+@contextlib.contextmanager
+def _patched(obj, name, value):
+    """Swap one attribute on `obj` (a module or object) for the duration of
+    the `with` block. Used to inject a fake BMC / fake collect_status /
+    fake boot_ledger without ever touching a socket or a file that isn't
+    this test's own."""
+    orig = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, orig)
+
+
+def _captured(fn, *a, **kw):
+    """Run fn(*a, **kw) with stdout captured; return (result, printed text)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = fn(*a, **kw)
+    return result, buf.getvalue()
+
+
+_THIS = sys.modules[__name__]
+
+
+# ---- collect_status(): fresh-sample vs stale-latch ------------------------
+def case_collect_status_moving_from_two_fresh_reads():
+    h1 = _mkhealth(hb_cpu0=1, hb_cpu1=10, hb_cpu2=5, cons_bytes=100)
+    h2 = _mkhealth(hb_cpu0=2, hb_cpu1=10, hb_cpu2=5, cons_bytes=150)
+    fake = _FakeBMC(raw_seq=[h1, h2], text_seq=["dbg> BMC health v1.1", "dbg> BMC health v1.1"])
+    with _patched(_THIS, "_bmc", lambda iface="br0": fake), \
+         _patched(time, "sleep", lambda *_a, **_k: None):
+        out = collect_status()
+    assert out["reachable"] is True
+    assert out["moving"] == {"cpu0": True, "cpu1": False, "cpu2": False}
+    assert "cpu3" not in out["moving"]          # no-heartbeat sentinel excluded
+    assert out["console_advancing"] is True
+
+
+def case_collect_status_stale_latch_is_unknown_not_frozen():
+    """THE regression: two reads of an UN-refreshed latch (identical values,
+    health verb unreachable both times) must report liveness as unknown,
+    never as every core FROZEN. This is the exact bug collect_status()'s
+    docstring documents having shipped once already."""
+    h = _mkhealth(hb_cpu0=1, hb_cpu1=1, hb_cpu2=1, cons_bytes=100)
+    fake = _FakeBMC(raw_seq=[h, dict(h)], text_seq=["", ""])   # not fresh
+    with _patched(_THIS, "_bmc", lambda iface="br0": fake), \
+         _patched(time, "sleep", lambda *_a, **_k: None):
+        out = collect_status()
+    assert out["reachable"] is True             # the memory read itself worked
+    assert out["moving"] is None                # NOT {"cpu0": False, ...}
+    assert out["console_advancing"] is None
+
+
+def case_collect_status_health_verb_exception_is_unknown_not_frozen():
+    """Same regression, via the other route into "not fresh": health_text()
+    itself raising (e.g. a transient console timeout), not just returning an
+    empty string."""
+    h = _mkhealth(hb_cpu0=7, hb_cpu1=7, hb_cpu2=7)
+    fake = _FakeBMC(raw_seq=[h, dict(h)], text_seq=[TimeoutError, TimeoutError])
+    with _patched(_THIS, "_bmc", lambda iface="br0": fake), \
+         _patched(time, "sleep", lambda *_a, **_k: None):
+        out = collect_status()
+    assert out["moving"] is None
+    assert out["reachable"] is True
+
+
+def case_collect_status_never_raises_on_construction_failure():
+    def _boom(iface="br0"):
+        raise OSError("no such device br0")
+    with _patched(_THIS, "_bmc", _boom):
+        out = collect_status()
+    assert out["reachable"] is False
+    assert "OSError" in out["error"]
+
+
+def case_collect_status_never_raises_on_missing_record():
+    fake = _FakeBMC(raw_seq=[None, None], text_seq=["", ""])
+    with _patched(_THIS, "_bmc", lambda iface="br0": fake), \
+         _patched(time, "sleep", lambda *_a, **_k: None):
+        out = collect_status()
+    assert out["reachable"] is False
+    assert "no BMC1 record" in out["error"]
+
+
+def case_collect_status_never_raises_on_arbitrary_exception():
+    class _Boom(_FakeBMC):
+        def health_raw(self):
+            raise RuntimeError("boom")
+    with _patched(_THIS, "_bmc", lambda iface="br0": _Boom([], [])), \
+         _patched(time, "sleep", lambda *_a, **_k: None):
+        out = collect_status()
+    assert out["reachable"] is False
+    assert "RuntimeError" in out["error"]
+
+
+# ---- cmd_status(): idle-vs-frozen classification --------------------------
+def case_cmd_status_cpu2_idle_not_reported_frozen():
+    s = _mkstatus(moving={"cpu0": True, "cpu1": True, "cpu2": False})
+    with _patched(_THIS, "collect_status", lambda iface="br0": s), \
+         _patched(boot_ledger, "stats", lambda: {}):
+        _rc, text = _captured(cmd_status, argparse.Namespace(iface="br0"))
+    assert "idle=cpu2" in text
+    assert "FROZEN" not in text
+
+
+def case_cmd_status_cpu0_frozen_is_flagged():
+    s = _mkstatus(moving={"cpu0": False, "cpu1": True, "cpu2": True})
+    with _patched(_THIS, "collect_status", lambda iface="br0": s), \
+         _patched(boot_ledger, "stats", lambda: {}):
+        _rc, text = _captured(cmd_status, argparse.Namespace(iface="br0"))
+    assert "FROZEN=cpu0" in text
+
+
+def case_cmd_status_stale_latch_prints_unknown_not_a_verdict():
+    s = _mkstatus(moving=None)
+    with _patched(_THIS, "collect_status", lambda iface="br0": s), \
+         _patched(boot_ledger, "stats", lambda: {}):
+        _rc, text = _captured(cmd_status, argparse.Namespace(iface="br0"))
+    assert "unknown" in text
+    assert "FROZEN" not in text
+
+
+def case_cmd_status_unreachable_hints_at_uboot():
+    s = _mkstatus(reachable=False, error="OSError: no such device", health=None,
+                   moving=None)
+    with _patched(_THIS, "collect_status", lambda iface="br0": s):
+        rc, text = _captured(cmd_status, argparse.Namespace(iface="br0"))
+    assert rc == 1
+    assert "UNREACHABLE" in text
+
+
+# ---- render(): degraded-data HTML paths -----------------------------------
+def case_render_unreachable_shows_error_not_crash():
+    s = _mkstatus(reachable=False, error="OSError: no such device", health=None,
+                   moving=None)
+    out = render(s)
+    assert "unreachable" in out
+    assert "OSError" in out
+
+
+def case_render_stale_latch_does_not_paint_cores_green_or_red():
+    out = render(_mkstatus(moving=None))
+    assert "stale latch" in out
+    assert 'pill ok"' not in out
+    assert 'pill bad"' not in out
+
+
+def case_render_no_heartbeats_dict_shows_pill():
+    out = render(_mkstatus(moving={}))
+    assert "no heartbeats" in out
+
+
+def case_render_core_pills_match_idle_vs_frozen_convention():
+    out = render(_mkstatus(moving={"cpu0": True, "cpu1": False, "cpu2": False}))
+    assert 'pill ok">cpu0' in out
+    assert 'pill bad">cpu1' in out       # not cpu2 -> genuinely frozen
+    assert 'pill warn">cpu2' in out      # cpu2 idle is expected, not alarming
+
+
+def case_render_battery_present_no_readings_not_shown_as_zero_mv():
+    out = render(_mkstatus(health=_mkhealth(axp_ok=1, vbat_mv=0, ichg_ma=0,
+                                             idischg_ma=0, batt_ts_mv=0)))
+    assert "no readings" in out
+    assert "0 mV" not in out
+
+
+def case_render_battery_real_readings_shown():
+    out = render(_mkstatus(health=_mkhealth(axp_ok=1, vbat_mv=3950, ichg_ma=250,
+                                             idischg_ma=0, batt_ts_mv=1480)))
+    assert "3950" in out
+
+
+def case_render_console_state_labels():
+    for val, want in ((None, "unknown"), (True, "advancing"), (False, "quiet")):
+        out = render(_mkstatus(console_advancing=val))
+        assert want in out, f"console_advancing={val!r} -> missing {want!r}"
+
+
+_ST_CASES = [
+    ("collect_status_moving_from_two_fresh_reads",
+     case_collect_status_moving_from_two_fresh_reads),
+    ("collect_status_stale_latch_is_unknown_not_frozen",
+     case_collect_status_stale_latch_is_unknown_not_frozen),
+    ("collect_status_health_verb_exception_is_unknown_not_frozen",
+     case_collect_status_health_verb_exception_is_unknown_not_frozen),
+    ("collect_status_never_raises_on_construction_failure",
+     case_collect_status_never_raises_on_construction_failure),
+    ("collect_status_never_raises_on_missing_record",
+     case_collect_status_never_raises_on_missing_record),
+    ("collect_status_never_raises_on_arbitrary_exception",
+     case_collect_status_never_raises_on_arbitrary_exception),
+    ("cmd_status_cpu2_idle_not_reported_frozen",
+     case_cmd_status_cpu2_idle_not_reported_frozen),
+    ("cmd_status_cpu0_frozen_is_flagged",
+     case_cmd_status_cpu0_frozen_is_flagged),
+    ("cmd_status_stale_latch_prints_unknown_not_a_verdict",
+     case_cmd_status_stale_latch_prints_unknown_not_a_verdict),
+    ("cmd_status_unreachable_hints_at_uboot",
+     case_cmd_status_unreachable_hints_at_uboot),
+    ("render_unreachable_shows_error_not_crash",
+     case_render_unreachable_shows_error_not_crash),
+    ("render_stale_latch_does_not_paint_cores_green_or_red",
+     case_render_stale_latch_does_not_paint_cores_green_or_red),
+    ("render_no_heartbeats_dict_shows_pill",
+     case_render_no_heartbeats_dict_shows_pill),
+    ("render_core_pills_match_idle_vs_frozen_convention",
+     case_render_core_pills_match_idle_vs_frozen_convention),
+    ("render_battery_present_no_readings_not_shown_as_zero_mv",
+     case_render_battery_present_no_readings_not_shown_as_zero_mv),
+    ("render_battery_real_readings_shown",
+     case_render_battery_real_readings_shown),
+    ("render_console_state_labels", case_render_console_state_labels),
+]
+
+
+def cmd_selftest(_args):
+    passed = failed = 0
+    for name, fn in _ST_CASES:
+        print(f"[ RUN ] {name}")
+        try:
+            fn()
+        except Exception:
+            failed += 1
+            print(f"[FAIL ] {name}")
+            traceback.print_exc()
+            continue
+        passed += 1
+        print(f"[ OK  ] {name}")
+    n = passed + failed
+    print(f"---- bzdctl selftest: {passed}/{n} passed ----")
+    return 0 if failed == 0 else 1
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -530,11 +836,15 @@ def main(argv=None):
     sv.add_argument("--port", type=int, default=8088)
     sv.add_argument("--bind", default="127.0.0.1")
 
+    sub.add_parser("selftest", help="offline unit tests for bzdctl's own "
+                   "logic -- no board, no network")
+
     args = ap.parse_args(argv)
     fn = {
         "status": cmd_status, "health": cmd_health, "power": cmd_power,
         "console": cmd_console, "boot-watch": cmd_boot_watch,
         "crash": cmd_crash, "ledger": cmd_ledger, "serve": cmd_serve,
+        "selftest": cmd_selftest,
     }[args.cmd]
     return fn(args)
 

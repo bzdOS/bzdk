@@ -78,7 +78,39 @@ extern void axp803_read_health(struct axp803_health *out);
  * addresses per the tree convention; we do not include their headers, we just
  * know the layout — same discipline dbgmon.c's cmd_t()/cmd_ff() use.
  * ------------------------------------------------------------------ */
-#define BMC_GICT_BASE   0x50000800UL   /* gic_timer.c "GICT": [1/2]=ticks lo/hi */
+/* BMC_GICT_BASE (0x50000800) is RETIRED -- do not read it, do not resurrect a
+ * tick_lo/tick_hi/tick_delta read from it. Two independent, already-landed
+ * findings elsewhere in this tree prove it cannot give a trustworthy tick
+ * count over this channel:
+ *   1. gic_timer.c no longer writes "GICT" there at all -- it moved to
+ *      0x00018200 (gic_timer.c's own breadcrumb-window comment, "distinct
+ *      from ... jitter/TIMR"). hv_addrmap.h's map comment still lists
+ *      "GICT 0x800..." because migrating that legacy annotation is explicitly
+ *      called out there as unfinished ("only the 0x50020000 I/O block ... is
+ *      centralised so far") -- it is stale documentation, not current fact.
+ *   2. hv_addrmap.h's own collision audit (2026-07-26) records that this
+ *      address is ALIASED: "gic_timer.c's GICT (0x50000800) overlaps BTR1's
+ *      tail (BTR1 runs to 0x50000820)" -- backtrace.c's BT_BC_BASE is
+ *      0x50000700, size 0x120, i.e. words [64..71] of the *backtrace* ring
+ *      physically occupy 0x50000800..0x5000081c. So the old code here
+ *      (`gict[1]`, `gict[2]`) was not reading a stale-but-harmless sentinel
+ *      like the other fields below -- it was reading LIVE backtrace-ring
+ *      data and presenting it as a tick counter, which made `tick_delta`
+ *      nonzero (and printed "(timer LIVE)") essentially any time the
+ *      backtrace ring churned, regardless of whether the guest timer was
+ *      healthy. That is a confidently WRONG reading, worse than the
+ *      all-ones "n/a" sentinels this file already guards against below.
+ *   3. Even the *correct* current address (0x00018200) is independently
+ *      documented as unusable for a debug-channel read: gic_timer.c's own
+ *      vtimer_mask_watchdog() comment (2026-07-29) says it "sits ... in
+ *      GUEST-WRITABLE SRAM and read back as random bytes (magic not GICT)".
+ * So there is currently no trustworthy tick source to point this at without
+ * an address-map fix that is out of this file's scope (and needs board
+ * verification this session cannot do). bmc_health_snapshot() below reports
+ * the honest "no data" sentinel for tick_lo/tick_hi/tick_delta instead of
+ * silently forwarding someone else's memory. Use hb_cpu0/hb_cpu1 (SMP1,
+ * 0x50000900 -- unaffected by any of the above) for liveness; bzdctl.py
+ * already prefers those over ticks for exactly this reason. */
 #define BMC_EXC_BASE    0x50000400UL   /* el2_exc.c  "EXC1": [1]=count [2]=kind [3]=esr */
 #define BMC_SMP_BASE    0x50000900UL   /* smp.c      "SMP1": [1]=online [6..9]=heartbeats */
 #define BMC_UART_BASE   0x50000f00UL   /* vconsole.h "UART": [1]=total_bytes [2]=faults */
@@ -243,29 +275,42 @@ static uint32_t bmc_read_temp_mc(void)
 	}
 }
 
-/* Previous tick counter, to compute the liveness delta between snapshots. */
-static uint32_t bmc_prev_tick_lo;
-
 struct bmc_health *bmc_health_snapshot(struct bmc_health *out)
 {
-	volatile uint32_t *gict = (volatile uint32_t *)BMC_GICT_BASE;
 	volatile uint32_t *exc  = (volatile uint32_t *)BMC_EXC_BASE;
 	volatile uint32_t *smp  = (volatile uint32_t *)BMC_SMP_BASE;
 	volatile uint32_t *uart = (volatile uint32_t *)BMC_UART_BASE;
 	volatile uint32_t *ffv  = (volatile uint32_t *)BMC_FFV_BASE;
+	/* EXC1's magic (word[0]) is written lazily -- only inside the fault
+	 * path (el2_exc.c), never proactively at init -- so on a board that
+	 * has taken zero EL2 exceptions since cold boot, this window has
+	 * simply never been touched. Gate on the magic exactly like ffv_count
+	 * already does below, rather than trusting that untouched DRAM happens
+	 * to read as all-ones. Unlike ffv_count/hb_cpuN, a bare 0 is the
+	 * correct, unambiguous value here (EL2_KIND_SYNC == 0, so a defaulted
+	 * last_exc_kind must never be forwarded as if it were a real SYNC
+	 * event) -- callers show last_exc_kind/last_exc_esr only when
+	 * exc_count != 0, so both "never written" and "genuinely zero
+	 * exceptions" collapse to the same correct display: no last-fault
+	 * detail, because there isn't one. */
+	int exc_ok = (exc[0] == 0x45584331u);   /* "EXC1" */
 	uint64_t up = rd_cntpct();
 
 	out->magic        = BMC_HEALTH_MAGIC;
 	out->version      = (BMC_PROTO_MAJOR << 16) | BMC_PROTO_MINOR;
 	out->uptime_lo    = (uint32_t)up;
 	out->uptime_hi    = (uint32_t)(up >> 32);
-	out->tick_lo      = gict[1];
-	out->tick_hi      = gict[2];
-	out->tick_delta   = gict[1] - bmc_prev_tick_lo;
-	bmc_prev_tick_lo  = gict[1];
-	out->exc_count    = exc[1];
-	out->last_exc_kind= exc[2];
-	out->last_exc_esr = exc[3];
+	/* tick_lo/tick_hi/tick_delta: RETIRED, see the BMC_GICT_BASE comment
+	 * above -- the address this used to read is aliased with backtrace.c's
+	 * live BTR1 ring, not a tick counter. Report the tree's standard
+	 * "never written" sentinel rather than someone else's memory; the host
+	 * side already renders this sentinel as "n/a" (bmc_client.py _avail). */
+	out->tick_lo      = 0xffffffffu;
+	out->tick_hi      = 0xffffffffu;
+	out->tick_delta   = 0xffffffffu;
+	out->exc_count    = exc_ok ? exc[1] : 0u;
+	out->last_exc_kind= exc_ok ? exc[2] : 0u;
+	out->last_exc_esr = exc_ok ? exc[3] : 0u;
 	{
 		struct el2_frame snap;
 		el2_snapshot_guest_frame(&snap);       /* consistent copy (H8) */
@@ -308,6 +353,16 @@ struct bmc_health *bmc_health_snapshot(struct bmc_health *out)
 	return out;
 }
 
+/* Print one heartbeat: "idle/never" for the tree's all-ones "no data" sentinel
+ * (a core with no heartbeat is not necessarily faulty -- CPU3 parks in WFI by
+ * design and never posts one) rather than a 4294967295-looking fake count.
+ * Mirrors bmc_client.py's hb_s formatting exactly, so the on-board text and
+ * the host-decoded text never disagree about what a given value means. */
+static void print_hb(uint32_t v)
+{
+	if (v == 0xffffffffu) cputs("idle"); else pdec(v);
+}
+
 static void bmc_print_health(void)
 {
 	struct bmc_health h;
@@ -315,16 +370,27 @@ static void bmc_print_health(void)
 
 	cputs("BMC health v"); pdec(BMC_PROTO_MAJOR); console_putc('.'); pdec(BMC_PROTO_MINOR); nl();
 	cputs("  uptime_cnt=0x"); ph64(((uint64_t)h.uptime_hi << 32) | h.uptime_lo); nl();
-	cputs("  ticks=0x");   ph64(((uint64_t)h.tick_hi << 32) | h.tick_lo);
-	cputs(" delta=");      pdec(h.tick_delta);
-	cputs(h.tick_delta ? "  (timer LIVE)\r\n" : "  (timer STALLED)\r\n");
+	/* tick_lo/tick_hi/tick_delta are always the retired sentinel now (see
+	 * bmc_health_snapshot()) -- say so plainly instead of computing a
+	 * LIVE/STALLED verdict from a field that carries no real data. */
+	cputs("  timer      n/a (tick breadcrumb retired -- see bmc.c BMC_GICT_BASE comment)\r\n");
 	cputs("  guest_pc=0x"); ph64(((uint64_t)h.guest_pc_hi << 32) | h.guest_pc_lo); nl();
-	cputs("  exc_count="); pdec(h.exc_count);
-	cputs(" last_kind=0x");ph32(h.last_exc_kind);
-	cputs(" last_esr=0x"); ph32(h.last_exc_esr); nl();
+	/* exc_count == 0 means "no exceptions recorded" whether that is because
+	 * none have happened or because the EXC1 breadcrumb was never written
+	 * (bmc_health_snapshot() collapses both to 0) -- either way there is no
+	 * last-fault detail to show, and last_exc_kind==0 is itself a real
+	 * vector index (EL2_KIND_SYNC), so printing it here would look like a
+	 * genuine SYNC fault that never occurred. */
+	if (h.exc_count == 0u) {
+		cputs("  exceptions none recorded\r\n");
+	} else {
+		cputs("  exc_count="); pdec(h.exc_count);
+		cputs(" last_kind=0x");ph32(h.last_exc_kind);
+		cputs(" last_esr=0x"); ph32(h.last_exc_esr); nl();
+	}
 	cputs("  online=0x");  ph32(h.online_map);
-	cputs(" hb=[");        pdec(h.hb_cpu0); console_putc(' '); pdec(h.hb_cpu1);
-	console_putc(' ');     pdec(h.hb_cpu2); console_putc(' '); pdec(h.hb_cpu3); cputs("]\r\n");
+	cputs(" hb=[");        print_hb(h.hb_cpu0); console_putc(' '); print_hb(h.hb_cpu1);
+	console_putc(' ');     print_hb(h.hb_cpu2); console_putc(' '); print_hb(h.hb_cpu3); cputs("]\r\n");
 	cputs("  console_bytes="); pdec(h.cons_bytes);
 	cputs(" faults=");         pdec(h.cons_faults);
 	cputs(" ffv=");            pdec(h.ffv_count); nl();
@@ -332,15 +398,24 @@ static void bmc_print_health(void)
 	cputs(" flags=0x");    ph32(h.flags);
 	cputs(" wdt_hold=");   pdec(h.wdt_hold); nl();
 	if (h.axp_ok) {
-		cputs("  battery: vbat_mV="); pdec(h.vbat_mv);
-		cputs(" ichg_mA=");           pdec(h.ichg_ma);
-		cputs(" idischg_mA=");        pdec(h.idischg_ma);
-		cputs(" ts_mV=");             pdec(h.batt_ts_mv);
-		cputs(" ["); if (h.batt_status & BMC_BATT_PRESENT)  cputs("present ");
-		if (h.batt_status & BMC_BATT_CHARGING) cputs("charging ");
-		if (h.batt_status & BMC_BATT_VBUS)     cputs("vbus ");
-		if (h.batt_status & BMC_BATT_DIE_HOT)  cputs("DIE_HOT ");
-		cputs("]\r\n");
+		/* chip_ok with every reading at zero means the PMIC answered but no
+		 * battery telemetry came back (typically: no pack on the
+		 * connector). Printing "vbat_mV=0" as a measurement invites a hunt
+		 * for a flat battery that was never plugged in -- same distinction
+		 * bmc_client.py's print_health() already makes. */
+		if (!h.vbat_mv && !h.ichg_ma && !h.idischg_ma && !h.batt_ts_mv) {
+			cputs("  battery: AXP803 present, no readings (no pack attached?)\r\n");
+		} else {
+			cputs("  battery: vbat_mV="); pdec(h.vbat_mv);
+			cputs(" ichg_mA=");           pdec(h.ichg_ma);
+			cputs(" idischg_mA=");        pdec(h.idischg_ma);
+			cputs(" ts_mV=");             pdec(h.batt_ts_mv);
+			cputs(" ["); if (h.batt_status & BMC_BATT_PRESENT)  cputs("present ");
+			if (h.batt_status & BMC_BATT_CHARGING) cputs("charging ");
+			if (h.batt_status & BMC_BATT_VBUS)     cputs("vbus ");
+			if (h.batt_status & BMC_BATT_DIE_HOT)  cputs("DIE_HOT ");
+			cputs("]\r\n");
+		}
 	} else {
 		cputs("  battery: no AXP803 detected (RSB probe failed or absent)\r\n");
 	}
@@ -357,6 +432,13 @@ static void bmc_print_battery(void)
 
 	if (!bh.chip_ok) {
 		cputs("no AXP803 detected (RSB probe failed or absent)\r\n");
+		return;
+	}
+	if (!bh.vbat_mv && !bh.ichg_ma && !bh.idischg_ma && !bh.ts_mv) {
+		/* Same "present but no readings" case bmc_print_health() guards --
+		 * see there for why a bare 0 must not be shown as a measurement. */
+		cputs("AXP803 present, no readings (no pack attached?) status=0x");
+		ph32(bh.status); cputs("\r\n");
 		return;
 	}
 	cputs("vbat_mV=");    pdec(bh.vbat_mv);
@@ -586,7 +668,6 @@ void bmc_init(void)
 {
 	struct bmc_health h;
 	bmc_arm_nonce = 0u;                 /* start disarmed */
-	bmc_prev_tick_lo = rd32(BMC_GICT_BASE + 4u);
 	axp803_init();                     /* probe the AXP803 over RSB (bounded; */
 	                                    /* leaves chip_ok=0 on any failure)    */
 	bmc_health_snapshot(&h);           /* lay down BMC1 magic + first record */

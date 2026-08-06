@@ -82,12 +82,19 @@ struct bmc_health {
 	uint32_t version;        /* [1]  (MAJOR<<16)|MINOR                      */
 	uint32_t uptime_lo;      /* [2]  CNTPCT_EL0 low  (÷CNTFRQ = seconds)    */
 	uint32_t uptime_hi;      /* [3]  CNTPCT_EL0 high                        */
-	uint32_t tick_lo;        /* [4]  GICT ticks low  (guest-tick counter)   */
-	uint32_t tick_hi;        /* [5]  GICT ticks high                        */
-	uint32_t tick_delta;     /* [6]  ticks since previous snapshot (liveness)*/
-	uint32_t exc_count;      /* [7]  EXC1 total EL2 exceptions seen         */
-	uint32_t last_exc_kind;  /* [8]  EXC1 last vector index                 */
-	uint32_t last_exc_esr;   /* [9]  EXC1 last ESR (low 32)                 */
+	uint32_t tick_lo;        /* [4]  RETIRED: always 0xffffffff (see bmc.c  */
+	uint32_t tick_hi;        /* [5]  BMC_GICT_BASE comment -- the address   */
+	uint32_t tick_delta;     /* [6]  this used to read is aliased with a    */
+	                         /*      live backtrace.c ring, not tick data). */
+	                         /*      Use hb_cpu0/hb_cpu1 for liveness.      */
+	uint32_t exc_count;      /* [7]  EXC1 total EL2 exceptions seen; 0 means*/
+	                         /*      "none recorded" (genuinely zero, or    */
+	                         /*      EXC1 never written -- both are safe to */
+	                         /*      collapse: see bmc.c bmc_health_snapshot)*/
+	uint32_t last_exc_kind;  /* [8]  EXC1 last vector index; meaningless    */
+	                         /*      when exc_count==0 (0 is EL2_KIND_SYNC, */
+	                         /*      a real value -- don't display it then)*/
+	uint32_t last_exc_esr;   /* [9]  EXC1 last ESR (low 32); ditto          */
 	uint32_t guest_pc_lo;    /* [10] g_last_guest_frame ELR low (guest PC)  */
 	uint32_t guest_pc_hi;    /* [11] g_last_guest_frame ELR high            */
 	uint32_t online_map;     /* [12] SMP1 per-core online bitmap            */

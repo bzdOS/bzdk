@@ -28,7 +28,7 @@ automatically right before the destructive send, so the human types one
 command — the on-board window (~10 s, one-shot) still protects against a
 stray/replayed frame firing a reset on its own.
 """
-import sys, time, struct, argparse
+import contextlib, io, sys, time, struct, argparse, traceback
 
 # Reuse the whole EMAC transport + reset machinery from hvdbg.py.
 from hvdbg import HV
@@ -171,6 +171,15 @@ def print_health(d):
     exc = _avail(d["exc_count"])
     if exc is None:
         print("  exceptions  n/a (EXC breadcrumb not written by this build)")
+    elif exc == 0:
+        # A genuine, healthy zero (bmc.c's bmc_health_snapshot() reports 0
+        # both for "never written" and for "written, zero recorded" -- either
+        # way there IS no last fault). last_exc_kind==0 is itself the real
+        # vector index for EL2_KIND_SYNC, so printing it here would read as
+        # a SYNC exception that never happened -- same trap as the all-ones
+        # sentinel this branch already guards against, just at value 0
+        # instead of 0xffffffff.
+        print("  exceptions  none recorded")
     else:
         print(f"  exceptions  count={exc}  last_kind=0x{d['last_exc_kind']:x}"
               f"  last_esr=0x{d['last_exc_esr']:08x}")
@@ -201,8 +210,247 @@ def print_health(d):
         print("  battery     no AXP803 detected (RSB probe failed or absent)")
 
 
+# ── selftest — pure, offline. No sockets, no board. ─────────────────────
+#
+# There were no tests at all for this file before this pass, despite three
+# real bugs having already shipped and been fixed here (see the module and
+# _avail() docstrings): read_words() silently breaking on any decimal count
+# not a multiple of 4 (so `health --raw`'s 29-word ask never once worked),
+# all-ones "never written" sentinels printed as measurements (STALLED timer,
+# exc_count=4294967295, a "dead" CPU3 that parks in WFI by design, vbat=0mV
+# for an absent battery), and (in bzdctl.py) a stale LATCH read twice being
+# mistaken for a live sample. This suite pins down the parts of THIS file
+# that are pure functions over plain data -- _avail()'s sentinel handling,
+# health_raw()'s decode/reject logic, and print_health()'s degraded-data
+# text -- with the three historical bugs as explicit regression cases so
+# they cannot come back silently. `bzdctl.py selftest` covers the
+# latch/freshness logic that lives in bzdctl.py itself.
+#
+# `python3 bmc_client.py selftest` (see main()); wired into `make test`.
+
+
+class _FakeWordsBMC(BMC):
+    """A BMC that answers read_words() from a canned list instead of a
+    socket -- overriding __init__ means HV.__init__ (which opens a real
+    AF_PACKET socket bound to an interface) never runs. Exercises the REAL
+    health_raw() decode logic against synthetic DRAM content; no network, no
+    hardware, matches the "no board" discipline the rest of this project's
+    selftests already follow (coredump-recv.py, snapshot_net.py)."""
+
+    def __init__(self, words):
+        self._words = list(words)          # deliberately skip HV.__init__
+
+    def read_words(self, pa, n):
+        return list(self._words[:n]) if len(self._words) >= n else []
+
+
+def _mkwords(**overrides):
+    """One full, self-consistent HEALTH_WORDS-ordered word list for a
+    plausible healthy board, with any field overridden by name. Defaults
+    reflect the POST-firmware-fix contract (see bmc.c bmc_health_snapshot()):
+    tick_* is always the retired all-ones sentinel, exc_count/last_exc_kind/
+    last_exc_esr default to a genuine 0 (no exceptions recorded), hb_cpu3 is
+    the "no such heartbeat" sentinel (parks in WFI by design)."""
+    base = dict(
+        magic=BMC_HEALTH_MAGIC, version=(1 << 16) | 1,
+        uptime_lo=24000000 * 3600, uptime_hi=0,     # ~1h uptime
+        tick_lo=0xffffffff, tick_hi=0xffffffff, tick_delta=0xffffffff,
+        exc_count=0, last_exc_kind=0, last_exc_esr=0,
+        guest_pc_lo=0x00001234, guest_pc_hi=0,
+        online_map=0xf,
+        hb_cpu0=10, hb_cpu1=20, hb_cpu2=5, hb_cpu3=0xffffffff,
+        cons_bytes=500, cons_faults=0, temp_mc=35000,
+        flags=0, wdt_hold=0, ffv_count=0,
+        vbat_mv=4000, ichg_ma=100, idischg_ma=0, batt_ts_mv=1500,
+        batt_status=0x1, axp_ok=1,
+    )
+    base.update(overrides)
+    return [base[name] for name in HEALTH_WORDS]
+
+
+def _captured(fn, *a, **kw):
+    """Run fn(*a, **kw), return (result, everything it printed to stdout)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = fn(*a, **kw)
+    return result, buf.getvalue()
+
+
+# ---- _avail(): sentinel-vs-measurement ----------------------------------
+def case_avail_32bit_sentinel_is_none():
+    assert _avail(0xffffffff) is None
+
+
+def case_avail_64bit_sentinel_is_none():
+    assert _avail((1 << 64) - 1, 64) is None
+
+
+def case_avail_passthrough_for_real_values():
+    assert _avail(0) == 0
+    assert _avail(42) == 42
+    assert _avail(0xfffffffe) == 0xfffffffe        # one below the sentinel
+
+
+def case_avail_boundary_64bit_not_sentinel():
+    # One below the 64-bit all-ones sentinel must NOT be treated as "no data"
+    # -- a regression here would mean a real near-max tick count gets
+    # silently hidden as "n/a".
+    assert _avail((1 << 64) - 2, 64) == (1 << 64) - 2
+
+
+# ---- health_raw(): decode / reject ---------------------------------------
+def case_health_raw_rejects_bad_magic():
+    bmc = _FakeWordsBMC(_mkwords(magic=0xdeadbeef))
+    assert bmc.health_raw() is None
+
+
+def case_health_raw_rejects_short_read():
+    bmc = _FakeWordsBMC(_mkwords()[:-1])           # one word short
+    assert bmc.health_raw() is None
+
+
+def case_health_raw_decodes_wide_fields_and_flags():
+    words = _mkwords(uptime_lo=0x11111111, uptime_hi=0x2,
+                      guest_pc_lo=0x33333333, guest_pc_hi=0x4,
+                      flags=(1 << 1) | (1 << 4),          # core_enable, no_guest
+                      batt_status=(1 << 0) | (1 << 1))    # present, charging
+    d = _FakeWordsBMC(words).health_raw()
+    assert d is not None
+    assert d["uptime"] == (0x2 << 32) | 0x11111111
+    assert d["guest_pc"] == (0x4 << 32) | 0x33333333
+    assert sorted(d["flag_names"]) == ["core_enable", "no_guest"]
+    assert sorted(d["batt_status_names"]) == ["charging", "present"]
+
+
+# ---- print_health(): the three historical "crying wolf" bugs -------------
+def case_print_health_no_record_does_not_crash():
+    _out, text = _captured(print_health, None)
+    assert "no BMC1 record" in text
+
+
+def case_print_health_exc_sentinel_hidden_as_na():
+    """Regression for bug #2: a pre-fix board (or any board whose EXC1
+    breadcrumb genuinely never got magic-gated firmware-side) that reports
+    the raw all-ones sentinel must show "n/a", never the literal number."""
+    d = _FakeWordsBMC(_mkwords(exc_count=0xffffffff)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "4294967295" not in text
+    assert "exceptions" in text and "n/a" in text
+
+
+def case_print_health_exc_zero_is_none_recorded_not_sync():
+    """Post firmware-fix, exc_count==0 is a genuine measurement (no
+    exceptions since boot) -- must not be confused with the sentinel path,
+    and must not print last_kind=0x0 as if a real SYNC fault happened."""
+    d = _FakeWordsBMC(_mkwords(exc_count=0, last_exc_kind=0,
+                                last_exc_esr=0)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "exceptions" in text
+    assert "last_kind" not in text            # nothing to show for "no fault"
+
+
+def case_print_health_exc_nonzero_shows_last_fault():
+    d = _FakeWordsBMC(_mkwords(exc_count=3, last_exc_kind=1,
+                                last_exc_esr=0x96000010)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "count=3" in text
+    assert "96000010" in text.lower()
+
+
+def case_print_health_cpu3_idle_not_dead():
+    """Regression for bug #2: CPU3 parks in WFI by design and never posts a
+    heartbeat -- the all-ones sentinel must render as "idle", never as the
+    literal 4294967295 that trained this project to distrust its own BMC."""
+    d = _FakeWordsBMC(_mkwords(hb_cpu3=0xffffffff)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "4294967295" not in text
+    assert "idle" in text
+
+
+def case_print_health_tick_sentinel_is_na_not_stalled():
+    """Regression for bug #2 (and the later firmware finding that the tick
+    field was retired outright): the sentinel must read "n/a", never a
+    confident-but-wrong "STALLED" (or, worse, "LIVE")."""
+    d = _FakeWordsBMC(_mkwords(tick_lo=0xffffffff, tick_hi=0xffffffff,
+                                tick_delta=0xffffffff)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "STALLED" not in text and "LIVE" not in text
+    assert "n/a" in text
+
+
+def case_print_health_battery_present_no_readings():
+    """Regression for bug #2: chip_ok with every reading at zero is "present,
+    no pack attached", never a measured "vbat=0mV"."""
+    d = _FakeWordsBMC(_mkwords(axp_ok=1, vbat_mv=0, ichg_ma=0,
+                                idischg_ma=0, batt_ts_mv=0)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "0mV" not in text and "0 mV" not in text
+    assert "no readings" in text
+
+
+def case_print_health_battery_real_readings_shown():
+    d = _FakeWordsBMC(_mkwords(axp_ok=1, vbat_mv=3950, ichg_ma=250,
+                                idischg_ma=0, batt_ts_mv=1480)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "3950" in text and "250" in text
+
+
+def case_print_health_no_axp_detected():
+    d = _FakeWordsBMC(_mkwords(axp_ok=0)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "no AXP803 detected" in text
+
+
+_ST_CASES = [
+    ("avail_32bit_sentinel_is_none",         case_avail_32bit_sentinel_is_none),
+    ("avail_64bit_sentinel_is_none",         case_avail_64bit_sentinel_is_none),
+    ("avail_passthrough_for_real_values",    case_avail_passthrough_for_real_values),
+    ("avail_boundary_64bit_not_sentinel",    case_avail_boundary_64bit_not_sentinel),
+    ("health_raw_rejects_bad_magic",         case_health_raw_rejects_bad_magic),
+    ("health_raw_rejects_short_read",        case_health_raw_rejects_short_read),
+    ("health_raw_decodes_wide_fields_and_flags",
+     case_health_raw_decodes_wide_fields_and_flags),
+    ("print_health_no_record_does_not_crash",
+     case_print_health_no_record_does_not_crash),
+    ("print_health_exc_sentinel_hidden_as_na",
+     case_print_health_exc_sentinel_hidden_as_na),
+    ("print_health_exc_zero_is_none_recorded_not_sync",
+     case_print_health_exc_zero_is_none_recorded_not_sync),
+    ("print_health_exc_nonzero_shows_last_fault",
+     case_print_health_exc_nonzero_shows_last_fault),
+    ("print_health_cpu3_idle_not_dead",      case_print_health_cpu3_idle_not_dead),
+    ("print_health_tick_sentinel_is_na_not_stalled",
+     case_print_health_tick_sentinel_is_na_not_stalled),
+    ("print_health_battery_present_no_readings",
+     case_print_health_battery_present_no_readings),
+    ("print_health_battery_real_readings_shown",
+     case_print_health_battery_real_readings_shown),
+    ("print_health_no_axp_detected",         case_print_health_no_axp_detected),
+]
+
+
+def _cli_selftest(_args):
+    passed = failed = 0
+    for name, fn in _ST_CASES:
+        print(f"[ RUN ] {name}")
+        try:
+            fn()
+        except Exception:
+            failed += 1
+            print(f"[FAIL ] {name}")
+            traceback.print_exc()
+            continue
+        passed += 1
+        print(f"[ OK  ] {name}")
+    n = passed + failed
+    print(f"---- bmc_client selftest: {passed}/{n} passed ----")
+    return 0 if failed == 0 else 1
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────
 def main(argv):
+    if argv and argv[0] == "selftest":
+        return _cli_selftest(argv[1:])
     ap = argparse.ArgumentParser(description="bzdOS software-BMC client")
     ap.add_argument("--iface", default="br0")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -276,4 +524,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))
