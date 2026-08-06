@@ -272,17 +272,19 @@ v1 = **зрелый, стабильный, изолированный**. Гей�
 - **Почему:** проект перестаёт быть «FreeBSD-специфичным хаком». Множитель доверия ко всему остальному.
 - **DoD:** Linux грузится до shell на том же HV без изменений в изоляции/virtio-контрактах.
 - 🟡 **Первый заход 2026-08-06 (board-free, QEMU): реальный mainline Linux/arm64
-  v6.12 грузится глубоко в init** (RCU, GIC, arch_timer, scheduler, cacheinfo) —
-  `make linux-qemu` + `linux-guest/build.sh`, разрыв входного контракта (ELF vs
-  raw `Image`-заголовок) описан в `docs/linux-guest.md`. `linux-qemu-ci.sh`
-  сообщает FAIL: маркер успеха в харнессе — заглушка
-  (`THIS_STRING_SHOULD_NEVER_APPEAR_xyzzy`), не соответствующая своему же
-  комментарию («Linux version» баннер), а сам баннер в захваченном выводе
-  вообще не встречается — не проверено, теряет ли `vconsole.c` самые первые
-  байты консоли гостя или баннер не печатается по другой причине. GIC-вопрос
-  снят: `irq-gic.c` не паникует на identity-mapped «чёрной дыре», просто
+  v6.12 грузится глубоко в init** (banner, PSCI, RCU, GIC, arch_timer,
+  scheduler_clock) и стопорится сразу после `cacheinfo` — `make linux-qemu` +
+  `linux-guest/build.sh`, разрыв входного контракта (ELF vs raw
+  `Image`-заголовок) описан в `docs/linux-guest.md`. `linux-qemu-ci.sh`
+  сообщает **PASS** (маркер `"Linux version"` — баннер подтверждён 4 раза
+  подряд живым запуском, включая прогон самого харнесса; предыдущая ревизия
+  этой записи ошибочно репортила FAIL из-за сломанного маркера-заглушки —
+  исправлено, см. `docs/linux-guest.md`'s «Corrected»). GIC-вопрос снят:
+  `irq-gic.c` не паникует на identity-mapped «чёрной дыре», просто
   предупреждает («PPI11 is secure or misconfigured») и продолжает — как и у
-  Zephyr. Не в гейте. Подробности и точный следующий шаг — в
+  Zephyr. PSCI SMC passthrough работает (новый код в `el2_exc_linux_qemu.c`).
+  Не в гейте — нужен прогон 5x, заблокирован в этом заходе аварийной нехваткой
+  диска на хосте (не связано с этой целью). Подробности — в
   `docs/linux-guest.md`'s «Result».
 
 ---
