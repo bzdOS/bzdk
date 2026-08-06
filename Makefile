@@ -56,7 +56,7 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu vgic-qemu qemu holdtest clean clean-qemu clean-holdtest test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu holdtest clean clean-qemu clean-linux-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -118,7 +118,7 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -130,9 +130,14 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_vgic_pendq
 	./test_sd_bio_addr
 	./test_snapshot_fmt
+	./test_bmc_arm_gate
+	./test_coredump_elf
 	python3 test_automount.py
 	python3 coredump-recv.py selftest
 	python3 snapshot_net.py selftest
+	python3 bmc_client.py selftest
+	python3 bzdctl.py selftest
+	python3 crash_report.py selftest
 
 test_vblk_stitch: test_vblk_stitch.c
 	gcc -Wall -Wextra -O2 -o $@ $<
@@ -164,7 +169,13 @@ test_sd_bio_addr: test_sd_bio_addr.c
 test_snapshot_fmt: test_snapshot_fmt.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
+test_bmc_arm_gate: test_bmc_arm_gate.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
 test_vgic_pendq: test_vgic_pendq.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_coredump_elf: test_coredump_elf.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 stage0: $(STAGE0_BIN)
@@ -305,10 +316,42 @@ $(QEMU_ELF): $(QEMU_OBJS) link_qemu.ld
 	$(CC) $(LDFLAGS_QEMU) -o $@ $(QEMU_OBJS)
 	$(SIZE) $@
 
+# --- Snapshot/restore exercise on QEMU virt (ROADMAP D1: "freeze the guest,
+# dump RAM, restore it") — see main_snapshot_qemu.c / el2_exc_snapshot_qemu.c
+# for the full tick schedule and what the printed verdict means.
+#
+# Object list = the `qemu` target's skeleton (start_qemu.o, exceptions.o,
+# guest.o, stage2.o, timer.o, gic_timer_qemu.o, pl011_qemu.o, libmin.o) with
+# el2_exc_snapshot_qemu.o in place of el2_exc_qemu.o and
+# guest_snapshot_payload.o in place of guest_qemu_payload.o, PLUS:
+#   snapshot.o        -- the REAL, unmodified snapshot_save()/
+#                         snapshot_restore()/snapshot_present() this exercise
+#                         is actually testing.
+#   wdt_qemu_stub.o    -- inert wdt_pet() (see that file's header): the real
+#                         wdt.o pokes A64-only MMIO that doesn't exist under
+#                         QEMU virt, and snapshot.c calls wdt_pet()
+#                         unconditionally during its DRAM copy.
+# snapshot_net.o is deliberately NOT linked here: this exercise drives the
+# LOCAL DRAM-store path (snapshot_save/snapshot_restore) directly, not the
+# EMAC bulk transport (which needs emac.o and a real NIC this target has
+# none of).
+SNAPSHOT_QEMU_ELF  := microkernel-snapshot-qemu.elf
+SNAPSHOT_QEMU_OBJS := start_qemu.o main_snapshot_qemu.o exceptions.o guest.o stage2.o timer.o \
+             gic_timer_qemu.o pl011_qemu.o el2_exc_snapshot_qemu.o guest_snapshot_payload.o \
+             snapshot.o wdt_qemu_stub.o libmin.o
+
+snapshot-qemu: $(SNAPSHOT_QEMU_ELF)
+
+$(SNAPSHOT_QEMU_ELF): $(SNAPSHOT_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(SNAPSHOT_QEMU_OBJS)
+	$(SIZE) $@
+
 clean-qemu:
 	rm -f start_qemu.o main_qemu.o gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o \
 	      $(QEMU_ELF) main_zephyr_qemu.o el2_exc_zephyr_qemu.o $(ZEPHYR_QEMU_ELF) \
-	      main_vgic_qemu.o el2_exc_vgic_qemu.o vgic_qemu.o vgic_qemu.d $(VGIC_QEMU_ELF)
+	      main_vgic_qemu.o el2_exc_vgic_qemu.o vgic_qemu.o vgic_qemu.d $(VGIC_QEMU_ELF) \
+	      main_snapshot_qemu.o el2_exc_snapshot_qemu.o guest_snapshot_payload.o \
+	      wdt_qemu_stub.o $(SNAPSHOT_QEMU_ELF)
 
 # --- Zephyr guest on QEMU virt: the board-free half of the `zephyr` target
 # (see main_zephyr_qemu.c's banner for the full argument). Runs the SAME
@@ -344,6 +387,38 @@ zephyr-qemu: $(ZEPHYR_QEMU_ELF)
 $(ZEPHYR_QEMU_ELF): $(ZEPHYR_QEMU_OBJS) link_qemu.ld
 	$(CC) $(LDFLAGS_QEMU) -o $@ $(ZEPHYR_QEMU_OBJS)
 	$(SIZE) $@
+
+# --- Linux/arm64 guest on QEMU virt: ROADMAP D2, first pass (see
+# main_linux_qemu.c's banner for the full argument, and linux-qemu-ci.sh).
+#
+# Runs the SAME board-free skeleton zephyr-qemu uses -- start_qemu.o entry,
+# exceptions.o vectors, pl011_qemu.o HV console, stage2.o, guest.o, kload.o
+# (for kload_enter() ONLY -- this guest's Image format is not an ELF, so
+# kload_parse_elf()/kload_place_segments() are linked in but never called;
+# see main_linux_qemu.c), vconsole.o + wdt.o + flightrec.o (the real 16550
+# trap-emulator, unmodified, same as the board/Zephyr targets) -- with
+# el2_exc_linux_qemu.o in place of el2_exc_zephyr_qemu.o (PSCI SMC
+# passthrough is the one thing this target's trap dispatch needs that
+# Zephyr's never did; see that file's header).
+#
+# Object list is therefore IDENTICAL to ZEPHYR_QEMU_OBJS except for the two
+# guest-specific files (main_*.o, el2_exc_*.o) -- deliberately, since the
+# whole point of this pass is that the guest-loading INFRASTRUCTURE (stage-2,
+# console trap-emulation, EL2->EL1 handoff) is guest-OS-agnostic and Linux is
+# the second, independent proof of that, not a reason to invent a new one.
+LINUX_QEMU_ELF  := microkernel-linux-qemu.elf
+LINUX_QEMU_OBJS := start_qemu.o main_linux_qemu.o exceptions.o guest.o stage2.o \
+                   kload.o vconsole.o wdt.o flightrec.o \
+                   el2_exc_linux_qemu.o pl011_qemu.o libmin.o
+
+linux-qemu: $(LINUX_QEMU_ELF)
+
+$(LINUX_QEMU_ELF): $(LINUX_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(LINUX_QEMU_OBJS)
+	$(SIZE) $@
+
+clean-linux-qemu:
+	rm -f main_linux_qemu.o main_linux_qemu.d el2_exc_linux_qemu.o el2_exc_linux_qemu.d $(LINUX_QEMU_ELF)
 
 # --- vGIC on QEMU virt: the board-free gate for INTERRUPT VIRTUALIZATION
 # (see main_vgic_qemu.c's banner for the full argument, and vgic-qemu-ci.sh).
