@@ -73,9 +73,43 @@ mkdir -p "$BUILD_DIR"
 if [ ! -f "$BUILD_DIR/.config" ]; then
     make -C "$LINUX_SRC" O="$BUILD_DIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
         defconfig >&2
+
+    # Trim: disable every CONFIG_ARCH_* vendor SoC platform select (this
+    # synthetic DTB names none of their compatible strings, so building
+    # their clk/pinctrl/gpio/soc driver trees is pure disk/CPU waste on a
+    # disk-constrained host) plus subsystems this milestone's DTB gives the
+    # kernel no way to use. See docs/linux-guest.md "Why the config is
+    # trimmed" for the full rationale — this list must match that doc.
+    DISABLE_CONFIGS="
+        ARCH_ACTIONS ARCH_AIROHA ARCH_ALPINE ARCH_APPLE ARCH_BCM2835
+        ARCH_BCMBCA ARCH_BCM_IPROC ARCH_BERLIN ARCH_BITMAIN ARCH_BRCMSTB
+        ARCH_EXYNOS ARCH_HISI ARCH_INTEL_SOCFPGA ARCH_K3 ARCH_KEEMBAY
+        ARCH_LAYERSCAPE ARCH_LG1K ARCH_MA35 ARCH_MEDIATEK ARCH_MESON
+        ARCH_MVEBU ARCH_MXC ARCH_NPCM ARCH_PENSANDO ARCH_QCOM ARCH_REALTEK
+        ARCH_RENESAS ARCH_ROCKCHIP ARCH_S32 ARCH_SEATTLE ARCH_SPARX5
+        ARCH_SPRD ARCH_STM32 ARCH_SUNXI ARCH_SYNQUACER ARCH_TEGRA
+        ARCH_TESLA_FSD ARCH_THUNDER ARCH_THUNDER2 ARCH_UNIPHIER
+        ARCH_VEXPRESS ARCH_VISCONTI ARCH_XGENE ARCH_ZYNQMP
+        NET ACPI PCI SCSI ATA WLAN INPUT FB SOUND USB_SUPPORT MMC
+        VIRTIO_MENU CRYPTO_HW
+    "
+    DISABLE_ARGS=""
+    for c in $DISABLE_CONFIGS; do
+        DISABLE_ARGS="$DISABLE_ARGS --disable $c"
+    done
+    # shellcheck disable=SC2086
+    "$LINUX_SRC/scripts/config" --file "$BUILD_DIR/.config" $DISABLE_ARGS >&2
+
+    make -C "$LINUX_SRC" O="$BUILD_DIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
+        olddefconfig >&2
 fi
 
+# Deliberately capped, not a bare nproc: this host has run near-zero free
+# disk/memory from wide-parallelism full kernel builds before (see the
+# ROADMAP D2 session brief) — even a trimmed Image-only build stays modest
+# here rather than assuming every core is free to spend.
 NPROC=$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)
+[ "$NPROC" -gt 4 ] && NPROC=4
 make -C "$LINUX_SRC" O="$BUILD_DIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
     -j"$NPROC" Image >&2
 
