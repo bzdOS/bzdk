@@ -20,21 +20,23 @@ extern void emac_poll(void);
 #define DRAM_LO 0x40000000ULL
 #define DRAM_HI 0x80000000ULL
 
-/* ROADMAP B3 fix: translate a guest EL1 virtual address to a physical one
- * before it is handed to region_clamp()/stream_mem() below (which only ever
- * understand flat physical addresses in [DRAM_LO, DRAM_HI)). Exactly the
- * same AT S1E1R / PAR_EL1 idiom backtrace.c's bt_read64() already uses for
- * the guest frame-pointer walk, with the identical MMU-off fallback
- * (treat the VA as already-physical if translation faults — correct for an
- * early-boot guest with SCTLR_EL1.M==0, where VA==PA by construction).
- * `at`/`isb`/`mrs` never themselves fault, so this is safe to call
- * unconditionally from the fault path. See coredump_send()'s use below: the
- * automatic "stack window" region used to be built from frame->sp_at_entry,
- * which is EL2's OWN exception stack pointer (see exceptions.S's frame
- * layout comment: "sp_at_entry: SP before we pushed the frame" — that's
- * SP_EL2, never anything the guest owns) — i.e. every coredump ever sent
- * streamed a window of the HYPERVISOR's stack, not the panicking GUEST's,
- * and stamped that same wrong value into NT_PRSTATUS's sp register too. */
+/* ROADMAP B3: translate a guest EL1 virtual address to a physical one, used
+ * by region_clamp()/stream_mem() below ONLY to decide which physical bytes
+ * to read — never to decide what address gets published in the ELF PT_LOAD
+ * header (see the 2026-08-06 fix note on struct region below for why that
+ * distinction is now load-bearing). Exactly the same AT S1E1R / PAR_EL1
+ * idiom backtrace.c's bt_read64() already uses for the guest frame-pointer
+ * walk, with the identical MMU-off fallback (treat the VA as already-
+ * physical if translation faults — correct for an early-boot guest with
+ * SCTLR_EL1.M==0, where VA==PA by construction). `at`/`isb`/`mrs` never
+ * themselves fault, so this is safe to call unconditionally from the fault
+ * path. See coredump_send()'s use below: the automatic "stack window"
+ * region used to be built from frame->sp_at_entry, which is EL2's OWN
+ * exception stack pointer (see exceptions.S's frame layout comment:
+ * "sp_at_entry: SP before we pushed the frame" — that's SP_EL2, never
+ * anything the guest owns) — i.e. every coredump ever sent streamed a
+ * window of the HYPERVISOR's stack, not the panicking GUEST's, and stamped
+ * that same wrong value into NT_PRSTATUS's sp register too. */
 static uint64_t gva_to_pa(uint64_t va)
 {
 	uint64_t par, pa;
@@ -150,42 +152,99 @@ static void stream_buf(struct stream *s, const uint8_t *p, uint32_t n)
 		stream_byte(s, p[i]);
 }
 
-/* Read `n` bytes from guest/kernel memory into the stream, defensively: only
- * DRAM-range addresses are dereferenced; anything else streams as zero so the
- * segment stays the declared size and the fault path never faults on a read. */
-static void stream_mem(struct stream *s, uint64_t addr, uint32_t n)
+/* Read `n` bytes starting at guest VIRTUAL address `va` into the stream,
+ * defensively: only DRAM-range PHYSICAL addresses are ever dereferenced;
+ * anything else streams as zero so the segment stays the declared size and
+ * the fault path never faults on a read.
+ *
+ * 2026-08-06 FIX: this used to be called `stream_mem()` and take an address
+ * ALREADY translated to physical once, up front, then read `addr+i` for the
+ * whole span as flat physical bytes. That is wrong in two independent ways
+ * whenever the guest's MMU is on (i.e. every panic past early boot — the
+ * common case, not the exception): (1) a multi-page VA window is NOT
+ * guaranteed to be PA-contiguous even though the VA is, so translating only
+ * the first byte/page and then walking flat physical addresses for the rest
+ * silently reads the WRONG PHYSICAL PAGE past the first one; (2) the same
+ * (by-then-already-physical) address was also stamped into the ELF PT_LOAD
+ * header as p_vaddr (see struct region / region_clamp() below) — telling
+ * the debugger the segment lives at a physical address that has nothing to
+ * do with the virtual addresses (SP, frame-pointer chain) recorded
+ * elsewhere in the very same core. A debugger locates stack memory by
+ * matching the SP register (a VA) against PT_LOAD p_vaddr ranges; a PA
+ * there means "cannot access memory at <sp>" for any guest whose MMU is on,
+ * i.e. the vmcore looked fine (readelf parses it — the bytes are real) but
+ * gdb could not read the panicking guest's own stack from it. Confirmed
+ * live: a hand-built ET_CORE with p_vaddr=PA on the SP's page gave gdb
+ * "Cannot access memory at address 0xffff...", loaded against
+ * kernel.debug's real stack-relative CFI; the identical core with
+ * p_vaddr=VA read the same bytes back cleanly against the same $sp. See
+ * test_coredump_elf.c's va_pa_gdb_readable case for the reproduction that
+ * pins this fix (a fabricated core, opened with a real scripted gdb batch
+ * run, not just eyeballed hex).
+ *
+ * The fix: translate PER PAGE, at read time, exactly like backtrace.c's
+ * bt_read64() and coredump.h's own multi-page comment already describe for
+ * the guest frame-pointer walk — never assume one translation covers more
+ * than the one page it was computed for. */
+static void stream_mem(struct stream *s, uint64_t va, uint32_t n)
 {
-	uint32_t i;
+	uint32_t done = 0;
 
-	for (i = 0; i < n; i++) {
-		uint64_t a = addr + i;
-		uint8_t  b = 0;
+	while (done < n) {
+		uint64_t cur       = va + done;
+		uint64_t page_va   = cur & ~0xfffULL;
+		uint64_t page_pa   = gva_to_pa(page_va);   /* whole-page translate */
+		uint32_t in_page   = (uint32_t)(0x1000ULL - (cur & 0xfffULL));
+		uint32_t chunk     = n - done;
+		uint32_t i;
 
-		if (a >= DRAM_LO && a < DRAM_HI)
-			b = *(volatile uint8_t *)(uintptr_t)a;
-		stream_byte(s, b);
+		if (chunk > in_page)
+			chunk = in_page;
+
+		for (i = 0; i < chunk; i++) {
+			uint64_t a = page_pa + ((cur + i) & 0xfffULL);
+			uint8_t  b = 0;
+
+			if (a >= DRAM_LO && a < DRAM_HI)
+				b = *(volatile uint8_t *)(uintptr_t)a;
+			stream_byte(s, b);
+		}
+		done += chunk;
 	}
 }
 
-/* ---- region set: [addr,len] pairs, clamped into DRAM and to a size cap ---- */
-struct region { uint64_t addr; uint32_t len; };
+/* ---- region set: [va,len] pairs, clamped to a size cap ---- */
+/* `va` is the address published in the ELF PT_LOAD header (p_vaddr/p_paddr)
+ * AND the address stream_mem() above translates per-page at read time —
+ * NOT a physical address, even though the DRAM-range gate below still
+ * checks it via gva_to_pa() (see the 2026-08-06 fix note on stream_mem()
+ * for why these must not be conflated: a region's virtual span and its
+ * backing physical bytes are two different address spaces once the guest
+ * MMU is on). */
+struct region { uint64_t va; uint32_t len; };
 
-/* Clamp a requested region to DRAM and to a per-region size cap. Returns 0 if
- * nothing usable remains. */
-static int region_clamp(uint64_t addr, uint64_t len, struct region *out)
+/* Clamp a requested VIRTUAL region to a per-region size cap, gating on
+ * whether its FIRST page even translates into DRAM (a plausibility check,
+ * same intent the old flat-PA bounds check had — a per-page re-check happens
+ * at actual read time in stream_mem(), since a multi-page VA span is not
+ * guaranteed to stay within DRAM, or PA-contiguous, past that first page).
+ * Returns 0 if nothing usable remains. */
+static int region_clamp(uint64_t va, uint64_t len, struct region *out)
 {
-	uint64_t end;
+	uint64_t pa0;
 
-	if (len == 0 || addr >= DRAM_HI || addr < DRAM_LO)
+	if (len == 0)
 		return 0;
 	if (len > (COREDUMP_MAX_TOTAL / 2u))
 		len = COREDUMP_MAX_TOTAL / 2u;
-	end = addr + len;
-	if (end > DRAM_HI)
-		end = DRAM_HI;
-	out->addr = addr;
-	out->len  = (uint32_t)(end - addr);
-	return out->len ? 1 : 0;
+
+	pa0 = gva_to_pa(va & ~0xfffULL);
+	if (pa0 < DRAM_LO || pa0 >= DRAM_HI)
+		return 0;
+
+	out->va  = va;
+	out->len = (uint32_t)len;
+	return 1;
 }
 
 void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
@@ -195,7 +254,7 @@ void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
 	uint8_t  prstatus[PRSTATUS_SZ];
 	uint32_t nreg = 0, hlen, note_off, data_off, seg_off;
 	uint32_t total_bytes, i, j;
-	uint64_t sp1, sp_pa, sbase;
+	uint64_t sp1, sbase;
 
 	if (!frame)
 		return;
@@ -210,13 +269,17 @@ void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
 	 * live stack pointer, same register el2_ss_handle() already treats as
 	 * "the guest's SP" elsewhere in this tree. sp1 (the VA) is what's
 	 * recorded into NT_PRSTATUS below, matching every other captured
-	 * register (x0-x30/elr/spsr are also raw, untranslated guest values);
-	 * sp_pa (translated via gva_to_pa()) is only for the actual memory
-	 * region, since region_clamp()/stream_mem() work in flat physical
-	 * addresses. */
+	 * register (x0-x30/elr/spsr are also raw, untranslated guest values).
+	 *
+	 * 2026-08-06 FIX: `sbase` is now built by page-aligning sp1 ITSELF (the
+	 * VA) — it used to page-align gva_to_pa(sp1) (the PA) instead, and that
+	 * same PA-derived value then got published as the region's address, See
+	 * region_clamp()/stream_mem()'s own fix note for why publishing a PA
+	 * where a debugger expects the VA that SP itself holds breaks stack
+	 * access for any guest whose MMU is on. Translation to physical now
+	 * happens ONLY inside stream_mem(), per page, at actual read time. */
 	__asm__ volatile("mrs %0, sp_el1" : "=r"(sp1));
-	sp_pa = gva_to_pa(sp1);
-	sbase = (sp_pa > 0x1000ULL) ? ((sp_pa - 0x1000ULL) & ~0xFFFULL) : sp_pa;
+	sbase = (sp1 > 0x1000ULL) ? ((sp1 - 0x1000ULL) & ~0xFFFULL) : sp1;
 	if (region_clamp(sbase, 0x2000ULL, &reg[nreg]))
 		nreg++;
 
@@ -280,8 +343,17 @@ void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
 		put32(hdrbuf, p + 0, PT_LOAD);
 		put32(hdrbuf, p + 4, PF_R | PF_W | PF_X);
 		put64(hdrbuf, p + 8,  seg_off);           /* p_offset */
-		put64(hdrbuf, p + 16, reg[j].addr);       /* p_vaddr */
-		put64(hdrbuf, p + 24, reg[j].addr);       /* p_paddr */
+		put64(hdrbuf, p + 16, reg[j].va);         /* p_vaddr -- the VA a
+		                                            * debugger's SP/FP-chain
+		                                            * lookups key off, NOT a
+		                                            * translated PA (fixed
+		                                            * 2026-08-06) */
+		put64(hdrbuf, p + 24, reg[j].va);         /* p_paddr (advisory only;
+		                                            * gdb does not use this
+		                                            * for a core's memory
+		                                            * map, same convention
+		                                            * as Linux/FreeBSD user
+		                                            * process cores) */
 		put64(hdrbuf, p + 32, reg[j].len);        /* p_filesz */
 		put64(hdrbuf, p + 40, reg[j].len);        /* p_memsz */
 		put64(hdrbuf, p + 48, 8);                 /* p_align */
@@ -318,7 +390,7 @@ void coredump_send(struct el2_frame *frame, uint64_t *regions, int nregions)
 	/* ---- stream: header block (Ehdr+phdrs+note), then each segment ---- */
 	stream_buf(&s, hdrbuf, data_off);            /* through end of note */
 	for (j = 0; j < nreg; j++)
-		stream_mem(&s, reg[j].addr, reg[j].len);
+		stream_mem(&s, reg[j].va, reg[j].len);
 
 	frame_flush(&s, 1);                          /* final frame, last flag */
 }
