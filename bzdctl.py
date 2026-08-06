@@ -280,6 +280,55 @@ def cmd_boot_watch(args):
 
 
 # ── crash collection ─────────────────────────────────────────────────────
+def _build_crash_report(iface, tail=64):
+    """ROADMAP B3 integration point: turn crash_report.py's own
+    gather_capture_from_hv()/build_report() into bundle text.
+
+    crash_report.py has NO file-based input path -- its live gather always
+    reads the EXC1/BTR1/BTS1/FLTR breadcrumb windows straight off the board
+    (see its gather_exc()/gather_btr()/gather_bts()/gather_fltr(), all of
+    which take an `hv`-shaped connection, not a path). Those windows are
+    disjoint from what collect_status()/status.json capture (BMC1 health
+    words) and from triage.txt (its own separate live read) -- there is
+    nothing to "wire from files" here, only a connection to open.
+
+    That connection does not need to be a second, independent socket: this
+    file's own `_bmc()` already returns a `bmc_client.BMC`, and BMC IS an
+    `hvdbg.HV` subclass (bmc_client.py:63) -- it has the exact
+    read_words()/read_words_stable() methods crash_report.py's gatherers
+    call. So this reuses `_bmc()` instead of crash_report.py's standalone
+    CLI opening its own hvdbg.HV().
+
+    Never raises. "The guest never panicked this boot" is NOT an error --
+    build_report() already renders that cleanly (all-None capture -> "no
+    EXC1 breadcrumb" / "no BTR1 backtrace breadcrumb" / "no FLTR ring", see
+    crash_report.py's own case_missing_windows_render_without_crashing
+    selftest) since `bzdctl.py crash` is normally run diagnostically, not
+    only post-mortem. What IS caught here is a CONNECTION problem (board
+    unreachable, mid-reload, no br0 on this host) -- crash_report.py's live
+    path has no try/except of its own around opening the socket, so a
+    crash bundle collected while the board is down would otherwise lose
+    status.json/triage.txt too, by raising before either gets written."""
+    import crash_report
+    b = None
+    try:
+        b = _bmc(iface)
+        capture = crash_report.gather_capture_from_hv(b, tail=tail)
+        return crash_report.build_report(capture, elf_path=crash_report.DEFAULT_ELF)
+    except Exception as e:                                       # noqa: BLE001
+        return ("bzdOS crash report (ROADMAP B3)\n\n"
+                f"could not gather breadcrumbs over EMAC: {type(e).__name__}: {e}\n"
+                "(board unreachable, mid-reload, or no EMAC interface on this "
+                "host -- status.json/triage.txt in this bundle still capture "
+                "whatever else was reachable)\n")
+    finally:
+        if b is not None:
+            try:
+                b.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
 def cmd_crash(args):
     """Collect one self-contained crash bundle.
 
@@ -326,6 +375,17 @@ def cmd_crash(args):
                     wrote.append(p)
             except Exception as e:
                 print(f"  coredump capture failed: {e}")
+
+    # ROADMAP B3: the symbolic report -- see _build_crash_report()'s
+    # docstring for why this is a fresh live gather, not a re-read of
+    # status.json/triage.txt above.
+    report_text = _build_crash_report(args.iface)
+    p = os.path.join(outdir, "report.txt")
+    with open(p, "w") as f:
+        f.write(report_text)
+    wrote.append(p)
+    if "could not gather breadcrumbs" in report_text:
+        print("  report: could not gather breadcrumbs this pass (see report.txt)")
 
     print(f"crash bundle -> {outdir}")
     for p in wrote:
@@ -742,6 +802,101 @@ def case_render_console_state_labels():
         assert want in out, f"console_advancing={val!r} -> missing {want!r}"
 
 
+# ---- ROADMAP B3: _build_crash_report() / cmd_crash() report.txt wiring ---
+#
+# crash_report.py is a separate, already-tested module (its own `selftest`
+# covers build_report()'s formatting in depth, including the exact
+# all-None-windows and fabricated-fault shapes reused below). These cases
+# stay one layer up, at the INTEGRATION: does bzdctl reuse its existing BMC
+# connection correctly (bmc_client.BMC IS an hvdbg.HV subclass), does a
+# connection failure degrade to a message instead of losing the whole
+# bundle, and does cmd_crash() actually land report.txt next to
+# status.json/triage.txt. Fabrication technique (hand-built capture dicts,
+# a nonexistent elf_path so no addr2line/kernel.debug dependency) mirrors
+# crash_report.py's own case_unresolved_pc_does_not_crash /
+# case_fltr_dabt_names_the_device -- kept toolchain-free so `make test`
+# never needs aarch64-linux-gnu-addr2line just to run THIS file's cases
+# (crash_report.py's own selftest already covers the real-DWARF path).
+def case_build_crash_report_no_fault_renders_cleanly():
+    """The common case: `bzdctl.py crash` run diagnostically against a
+    guest that never panicked. gather_capture_from_hv() is patched to
+    return exactly what a healthy, fault-free board yields (all four
+    windows None) -- build_report() must render text, not raise, and say
+    so plainly rather than looking like a failure."""
+    import crash_report
+    with _patched(_THIS, "_bmc", lambda iface="br0": object()), \
+         _patched(crash_report, "gather_capture_from_hv",
+                  lambda hv, tail=64: {"exc": None, "btr": None,
+                                        "bts": None, "fltr": None}):
+        text = _build_crash_report("br0")
+    assert "no EXC1 breadcrumb" in text
+    assert "no BTR1 backtrace breadcrumb" in text
+    assert "no FLTR ring" in text
+    assert "could not gather breadcrumbs" not in text
+
+
+def case_build_crash_report_fabricated_fault_produces_report():
+    """A fabricated fault (same shape as crash_report.py's own
+    case_unresolved_pc_does_not_crash) must show up in the text bzdctl
+    writes to report.txt: the fault PC and the decoded IPA device name."""
+    import crash_report
+    cap = {"exc": {"count": 1, "kind": 10, "esr": 0x96000010, "elr": 0x1234,
+                  "far": 0x5678, "ipa": 0x0A000050, "hvviol_count": 0},
+          "btr": None, "bts": None, "fltr": None}
+    with _patched(_THIS, "_bmc", lambda iface="br0": object()), \
+         _patched(crash_report, "gather_capture_from_hv",
+                  lambda hv, tail=64: cap):
+        text = _build_crash_report("br0")
+    assert "0x0000000000001234" in text          # ELR (fault PC)
+    assert "vblk" in text, "IPA 0x0A000050 must be named via triage.describe_ipa()"
+    assert "could not gather breadcrumbs" not in text
+
+
+def case_build_crash_report_handles_unreachable_board():
+    """Board unreachable / no EMAC interface on this host must degrade to
+    a plain message, not an unhandled exception -- an uncaught exception
+    here would abort cmd_crash() before status.json/triage.txt even get
+    written (see _build_crash_report()'s docstring)."""
+    def _boom(iface="br0"):
+        raise OSError("no such device br0")
+    with _patched(_THIS, "_bmc", _boom):
+        text = _build_crash_report("br0")
+    assert "could not gather breadcrumbs" in text
+    assert "OSError" in text
+
+
+def case_cmd_crash_bundle_contains_report_txt():
+    """End-to-end cmd_crash() wiring: report.txt must land next to
+    status.json/triage.txt in the bundle directory, holding the text
+    _build_crash_report() produced. status.json/triage.txt's own content is
+    exercised by the collect_status()/render() cases above and by
+    triage.py/crash_report.py's own selftests -- this stays scoped to
+    "did cmd_crash() actually call the new step and write its output.\""""
+    import subprocess
+    import tempfile
+    fake_status = _mkstatus()
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = "fake triage output\n"
+        stderr = ""
+
+    with tempfile.TemporaryDirectory() as td:
+        outdir = os.path.join(td, "bundle")
+        args = argparse.Namespace(iface="br0", out=outdir, coredump=0)
+        with _patched(_THIS, "collect_status", lambda iface="br0": fake_status), \
+             _patched(subprocess, "run", lambda *a, **k: _FakeCompleted()), \
+             _patched(_THIS, "_build_crash_report",
+                      lambda iface, tail=64: "FAKE REPORT BODY\n"):
+            rc, _text = _captured(cmd_crash, args)
+        assert rc == 0
+        for name in ("status.json", "triage.txt", "report.txt"):
+            p = os.path.join(outdir, name)
+            assert os.path.isfile(p), f"missing {name} in bundle"
+        with open(os.path.join(outdir, "report.txt")) as f:
+            assert f.read() == "FAKE REPORT BODY\n"
+
+
 _ST_CASES = [
     ("collect_status_moving_from_two_fresh_reads",
      case_collect_status_moving_from_two_fresh_reads),
@@ -776,6 +931,14 @@ _ST_CASES = [
     ("render_battery_real_readings_shown",
      case_render_battery_real_readings_shown),
     ("render_console_state_labels", case_render_console_state_labels),
+    ("build_crash_report_no_fault_renders_cleanly",
+     case_build_crash_report_no_fault_renders_cleanly),
+    ("build_crash_report_fabricated_fault_produces_report",
+     case_build_crash_report_fabricated_fault_produces_report),
+    ("build_crash_report_handles_unreachable_board",
+     case_build_crash_report_handles_unreachable_board),
+    ("cmd_crash_bundle_contains_report_txt",
+     case_cmd_crash_bundle_contains_report_txt),
 ]
 
 
