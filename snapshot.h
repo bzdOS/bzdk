@@ -61,6 +61,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"   /* struct el2_frame */
+#include "hv_addrmap.h"   /* HVMAP_SNAP_HDR_BASE/_SIZE -- see SNAP_META_BASE */
 
 /* ------------------------------------------------------------------ *
  * Guest DRAM range to snapshot — MUST match stage2.h's
@@ -79,22 +80,74 @@
  * guest's stage-2 map only exposes the LOW 1 GiB (0x40000000..0x80000000 —
  * see coredump.c's DRAM_HI=0x80000000). The HIGH 1 GiB (0x80000000..
  * 0xC0000000) is invisible to the guest and unused by the hypervisor, so it is
- * the natural in-DRAM store: a full-DRAM checkpoint fits exactly once, with the
- * guest unable to observe or clobber it.
+ * the natural in-DRAM store for a full-DRAM checkpoint.
  *
- * Layout inside the store:
- *   SNAP_STORE_BASE + 0x0000            : struct snapshot_hdr (metadata,
+ * FIXED 2026-08 — REAL OVERRUN, found by actually running this feature for
+ * the first time (the `snapshot-qemu` exercise): the header used to live at
+ * the FRONT of this same high GiB (SNAP_STORE_BASE + 0), with the mirror
+ * starting SNAP_META_SIZE bytes later (SNAP_STORE_BASE + SNAP_META_SIZE).
+ * That is not a paper bug: the window is exactly SNAP_DRAM_SIZE (1 GiB),
+ * sized for the mirror ALONE with zero slack for a header on top, so
+ * pushing the mirror's start forward by SNAP_META_SIZE pushed its END the
+ * same amount past 0xC0000000 — the last byte of real, installed DRAM.
+ * dram_copy() faulted at FAR=0xC0000000 (exactly the top of QEMU's `-m 2048`
+ * backed RAM, which mirrors the real board's 2 GiB total 1:1 — not a QEMU
+ * artifact).
+ *
+ * FIX: the header moves OUT of the high GiB entirely, into the existing
+ * hv-scratch DRAM window (hv_addrmap.h's HVMAP_SNAP_HDR_BASE, inside the
+ * DTB-reserved, guest-invisible 0x50000000..0x501fffff block stage2.c
+ * already excludes from the guest's stage-2 map — see stage2.c's
+ * HVSCR_BASE). The high GiB is then a pure, full-SNAP_DRAM_SIZE 1:1 mirror
+ * with ZERO header overhead, matching the guest's own 1 GiB window byte for
+ * byte as originally intended:
+ *   SNAP_DRAM_STORE == SNAP_STORE_BASE, ending exactly at
+ *   SNAP_STORE_BASE + SNAP_DRAM_SIZE == 0xC0000000 (real DRAM top, no slack).
+ *   SNAP_META_BASE (a DIFFERENT, low-memory PA) holds struct snapshot_hdr.
+ *
+ * This does NOT change the on-wire/on-disk SIZE either piece occupies —
+ * SNAP_META_SIZE and SNAP_DRAM_SIZE are both unchanged, so
+ * snapshot_net.h's SNAPNET_STORE_LEN / chunk geometry / manifest size are
+ * unchanged too. Only WHERE physically the header lives changed.
+ *
+ * CAVEAT this fix introduces, and snapshot_restore() must (and does) account
+ * for: hv-scratch is ordinary physical DRAM inside [SNAP_DRAM_BASE,
+ * SNAP_DRAM_BASE+SNAP_DRAM_SIZE) — on a 2 GiB board EVERY physical address is
+ * either part of that guest-DRAM sweep or part of the high-GiB mirror, there
+ * is no third place. So SNAP_META_BASE, like every other hv-scratch window
+ * (vconsole ring, flightrec, ...), is itself swept by snapshot_save()'s /
+ * snapshot_restore()'s whole-guest-DRAM dram_copy() — a pre-existing,
+ * already-documented property of this design (see test_snapshot_fmt.c's
+ * open_issue_snapshot_range_contains_hv_image), now also true of the header.
+ * snapshot_restore() reads every header field it needs into locals BEFORE
+ * calling dram_copy() for exactly this reason — see its own comment.
+ *
+ * Layout:
+ *   SNAP_META_BASE                      : struct snapshot_hdr (metadata,
  *                                         magic "SNP1", cache-coherent stores)
- *   SNAP_STORE_BASE + SNAP_META_SIZE    : verbatim copy of guest DRAM
- *                                         (SNAP_DRAM_SIZE bytes)
+ *   SNAP_DRAM_STORE (== SNAP_STORE_BASE) : verbatim copy of guest DRAM
+ *                                         (SNAP_DRAM_SIZE bytes, the WHOLE
+ *                                         high GiB, no offset)
  *
  * On a 1 GiB board (no high DRAM) this store does not exist — fall back to the
  * eMMC store (emmc_bio_write, see design doc) or stream-over-EMAC. Selected at
  * build time by SNAP_STORE_KIND.
  * ------------------------------------------------------------------ */
-#define SNAP_STORE_BASE   0x80000000UL          /* high (guest-invisible) GiB */
-#define SNAP_META_SIZE    0x00010000UL          /* 64 KiB reserved for header */
-#define SNAP_DRAM_STORE   (SNAP_STORE_BASE + SNAP_META_SIZE)
+#define SNAP_STORE_BASE   0x80000000UL          /* high (guest-invisible) GiB;
+                                                  * the FULL SNAP_DRAM_SIZE
+                                                  * mirror starts exactly here */
+#define SNAP_META_SIZE    0x00010000UL          /* 64 KiB header; lives at
+                                                  * SNAP_META_BASE, NOT carved
+                                                  * out of the mirror above */
+#define SNAP_META_BASE    HVMAP_SNAP_HDR_BASE   /* header PA -- low-memory
+                                                  * hv-scratch (see above) */
+#define SNAP_DRAM_STORE   SNAP_STORE_BASE       /* mirror == the whole window,
+                                                  * verbatim; ends exactly at
+                                                  * SNAP_STORE_BASE+SNAP_DRAM_SIZE
+                                                  * == 0xC0000000 (real DRAM top) */
+
+_Static_assert(HVMAP_SNAP_HDR_SIZE >= SNAP_META_SIZE,
+               "hv_addrmap.h's snapshot header lane is smaller than SNAP_META_SIZE");
 
 /* Metadata magic ("SNP1"), placed at word[0] of the store header. */
 #define SNAP_MAGIC        0x534E5031u
@@ -161,11 +214,11 @@ struct snapshot_sysregs {
 };
 
 /* ------------------------------------------------------------------ *
- * Store header. Written to SNAP_STORE_BASE by snapshot_save(), read back by
+ * Store header. Written to SNAP_META_BASE by snapshot_save(), read back by
  * snapshot_restore(). All multi-word fields are little-endian; the whole
  * header is written with the dc-civac + dsb-sy coherent-store convention so a
  * warm WDT reset (DRAM survives) does not lose it and a host `bc`/`d` dump of
- * 0x80000000 shows a valid record.
+ * SNAP_META_BASE shows a valid record.
  * ------------------------------------------------------------------ */
 struct snapshot_hdr {
 	uint32_t magic;        /* SNAP_MAGIC ("SNP1")                          */
@@ -184,6 +237,12 @@ struct snapshot_hdr {
 	uint32_t crc32;        /* optional integrity check over DRAM copy      */
 	uint32_t reserved;
 };
+
+/* The header must fit inside SNAP_META_SIZE (and, per the assert above,
+ * SNAP_META_SIZE must fit inside HVMAP_SNAP_HDR_SIZE) -- otherwise
+ * snapshot_save() would scribble past its own reservation in hv-scratch. */
+_Static_assert(sizeof(struct snapshot_hdr) <= SNAP_META_SIZE,
+               "snapshot_hdr must fit in SNAP_META_SIZE");
 
 #define SNAPSHOT_VERSION  1u
 

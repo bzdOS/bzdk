@@ -276,7 +276,10 @@ static void dram_copy(uint64_t dst_pa, uint64_t src_pa, uint64_t bytes, uint32_t
 
 static volatile struct snapshot_hdr *snap_hdr(void)
 {
-	return (volatile struct snapshot_hdr *)SNAP_STORE_BASE;
+	/* SNAP_META_BASE, not SNAP_STORE_BASE: the header lives in low-memory
+	 * hv-scratch now, disjoint from the high-GiB DRAM mirror -- see
+	 * snapshot.h's "Snapshot STORE region" comment for why. */
+	return (volatile struct snapshot_hdr *)SNAP_META_BASE;
 }
 
 int snapshot_present(void)
@@ -355,7 +358,9 @@ int snapshot_save(const struct el2_frame *frame)
 int snapshot_restore(struct el2_frame *frame)
 {
 	volatile struct snapshot_hdr *h = snap_hdr();
-	uint64_t now_cntpct, delta;
+	struct snapshot_sysregs sr;
+	struct el2_frame saved_frame;
+	uint64_t dram_size, taken_cntpct, now_cntpct, delta;
 
 	if (!frame)
 		return -1;
@@ -365,6 +370,25 @@ int snapshot_restore(struct el2_frame *frame)
 	/* PRECONDITION (caller-enforced): secondary cores parked (design "SMP"),
 	 * guest quiesced at this trap boundary. */
 
+	/* 0. Read EVERY header field this function still needs into locals
+	 *    BEFORE step 1's DRAM copy, and NOT after. This ordering is not
+	 *    cosmetic: `h` (snap_hdr(), SNAP_META_BASE) now lives in low-memory
+	 *    hv-scratch, which -- unlike the old high-GiB header location -- sits
+	 *    INSIDE [SNAP_DRAM_BASE, SNAP_DRAM_BASE+dram_size), i.e. inside step
+	 *    1's own COPY DESTINATION (see snapshot.h's "Snapshot STORE region"
+	 *    CAVEAT). Reading `h->sysregs`/`h->frame`/`h->taken_cntpct` AFTER that
+	 *    copy would read back whatever byte-for-byte shadow of the header
+	 *    snapshot_save() happened to embed in the mirror at save time, not
+	 *    necessarily this call's own values -- harmless today (nothing
+	 *    changes the header's own storage between a save and its restore, so
+	 *    the shadow and the live header agree), but fragile and not a sound
+	 *    argument to build "restore is correct" on. Capturing these first
+	 *    makes the function correct independent of that coincidence. */
+	dram_size    = h->dram_size;
+	taken_cntpct = h->taken_cntpct;
+	sr           = h->sysregs;
+	saved_frame  = h->frame;
+
 	/* 1. Reload guest DRAM from the store. Do this BEFORE sysregs so that when
 	 *    the MMU regime comes back the memory it translates already holds the
 	 *    snapshot contents. NULL crc: restore never recomputes/verifies CRC32
@@ -372,12 +396,10 @@ int snapshot_restore(struct el2_frame *frame)
 	 *    goal (design doc "Performance"). The stored crc32 is a save-time
 	 *    integrity aid for out-of-band inspection (e.g. a host memory dump),
 	 *    not an on-path restore check. */
-	dram_copy(SNAP_DRAM_BASE, SNAP_DRAM_STORE, h->dram_size, (uint32_t *)0);
+	dram_copy(SNAP_DRAM_BASE, SNAP_DRAM_STORE, dram_size, (uint32_t *)0);
 
 	/* 2. Reload the EL1 + per-guest EL2 sysreg set. */
 	{
-		struct snapshot_sysregs sr = h->sysregs;   /* copy out of volatile store */
-
 		/* 3. TIMER RE-BASE (see design "timer skew"): the physical counter has
 		 *    advanced by (now - taken) since the snapshot. The saved compare
 		 *    values (CNTP_CVAL/CNTV_CVAL) are ABSOLUTE counts and would now be
@@ -398,7 +420,7 @@ int snapshot_restore(struct el2_frame *frame)
 		 *    gic_timer.c), but the guest-visible rebase this comment is about
 		 *    is correctly CNTVOFF_EL2, not CNTP_CVAL_EL0. */
 		now_cntpct = RD("cntpct_el0");
-		delta      = now_cntpct - h->taken_cntpct;
+		delta      = now_cntpct - taken_cntpct;
 		sr.cntvoff_el2 = sr.cntvoff_el2 - delta;
 
 		sysregs_reload(&sr);
@@ -413,7 +435,7 @@ int snapshot_restore(struct el2_frame *frame)
 	 *    frame->elr (-> ELR_EL2) and frame->spsr (-> SPSR_EL2). Overwriting
 	 *    them here is exactly how we "jump into" the restored guest: the CPU
 	 *    lands at the snapshot PC/PSTATE with the snapshot GP registers. */
-	*frame = h->frame;
+	*frame = saved_frame;
 
 	/* NB: SP_EL1/SP_EL0 were already reloaded in sysregs_reload(); they are
 	 * banked and NOT part of the eret-restored frame, so they must be (and

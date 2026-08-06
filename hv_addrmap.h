@@ -36,6 +36,7 @@
  *   0x50001d00              vgic self-test guest ("VGST")
  *   0x50006000              software-BMC block
  *   0x50020000..0x50020fff  virtio-blk / eMMC / SD I/O storage — MAPPED BELOW
+ *   0x50060000..0x5006ffff  snapshot/restore metadata header — MAPPED BELOW
  *
  * If you need a new fixed word, add it to the block below (or a new documented
  * lane) so the _Static_assert chain proves it doesn't alias anything. Never
@@ -232,5 +233,39 @@ _Static_assert(HVMAP_LOW_VCONSOLE_BUF + HVMAP_LOW_VCONSOLE_BUF_SZ
                <= 0x50200000UL,
                "vconsole capture buffer runs past the DTB hv-scratch reserve");
 
+/* ---- Snapshot/restore (ROADMAP D1) metadata header ----------------------
+ * Added 2026-08 fixing a real overrun found by actually running the feature
+ * for the first time (snapshot-qemu exercise): snapshot.h's high-GiB DRAM
+ * store window ([0x80000000,0xC0000000), SNAP_DRAM_SIZE == exactly 1 GiB,
+ * matching the guest's own stage-2 window byte for byte) has ZERO slack for
+ * a header on top of a full 1:1 mirror. The original layout placed the 64
+ * KiB struct snapshot_hdr at the FRONT of that window and started the mirror
+ * SNAP_META_SIZE bytes later — which pushed the mirror's END the same amount
+ * past 0xC0000000, the last byte of real, installed DRAM (confirmed live:
+ * dram_copy() faulted with FAR=0xC0000000, exactly the top of QEMU's
+ * `-m 2048` backed RAM, which mirrors the real board's 2 GiB total 1:1).
+ *
+ * FIX: the header moves out of the high GiB entirely, into this lane, so the
+ * high GiB becomes a pure, full-SNAP_DRAM_SIZE mirror with zero header
+ * overhead (SNAP_DRAM_STORE == SNAP_STORE_BASE now — see snapshot.h). Placed
+ * here (just past the already-centralised 0x50020000 I/O block and the
+ * dbgtools lane, well below the 0x50100000 non-cacheable EMAC-DMA-scratch
+ * boundary — see el2_ncmap.c's idx0..255/idx256..511 split comment, which is
+ * why this needs to be a Normal-WB address, not Normal-NC) rather than
+ * packed any tighter against HVMAP_LOW_VCONSOLE_BUF, to leave that buffer
+ * (grep'd, not assumed, per this file's own house rule) unambiguous room to
+ * grow without another audit. HVMAP_SNAP_HDR_SIZE must stay >= snapshot.h's
+ * SNAP_META_SIZE (checked in snapshot.h, which includes this file). */
+#define HVMAP_SNAP_HDR_BASE   0x50060000UL
+#define HVMAP_SNAP_HDR_SIZE   0x00010000UL   /* == snapshot.h SNAP_META_SIZE */
+#define HVMAP_SNAP_HDR_END    (HVMAP_SNAP_HDR_BASE + HVMAP_SNAP_HDR_SIZE)
+
+_Static_assert(HVMAP_SNAP_HDR_BASE >= HVMAP_LOW_VCONSOLE_BUF + HVMAP_LOW_VCONSOLE_BUF_SZ,
+               "snapshot header lane overlaps the vconsole capture buffer");
+_Static_assert(HVMAP_SNAP_HDR_END <= 0x50100000UL,
+               "snapshot header lane runs into emac.c's non-cacheable DMA "
+               "scratch window (SCRATCH_BASE 0x50100000) -- see el2_ncmap.c");
+_Static_assert(HVMAP_SNAP_HDR_END <= 0x50200000UL,
+               "snapshot header lane runs past the DTB hv-scratch reserve");
 
 #endif /* HV_ADDRMAP_H */
