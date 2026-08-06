@@ -198,7 +198,8 @@ class _BulkReader:
                 continue
             self.parse_frame(frame)
 
-    def parse_frame(self, frame: bytes) -> bool:
+    def parse_frame(self, frame: bytes, store_len: int = STORE_LEN,
+                     total_chunks: int = TOTAL_CHUNKS) -> bool:
         """Validate ONE raw Ethernet frame and, if it is good, record its
         chunk in self.received. Returns True if accepted, False if dropped.
 
@@ -206,18 +207,47 @@ class _BulkReader:
         so the offline selftest can drive every accept/drop path with no
         socket at all. The checks, their order, and the wire format are
         byte-for-byte what _run() did before: nothing here knows about the
-        socket, and _run() now does nothing but read bytes and call this."""
+        socket, and _run() now does nothing but read bytes and call this.
+
+        `store_len`/`total_chunks` exist ONLY so the offline selftest can
+        drive this over the tiny synthetic store instead of the real 1 GiB
+        one (same reasoning/pattern as chunk_range()/build_manifest()); every
+        production call site (_run(), via the bare `self.parse_frame(frame)`
+        in the socket-reading loop) uses the real STORE_LEN/TOTAL_CHUNKS
+        defaults unchanged.
+
+        FIXED (was the open issue `open_issue_host_trusts_frame_length`):
+        this now cross-checks the frame's declared `length` against the
+        length its `seq` implies -- mirroring snapshot_net.c's own
+        `if (plen != expect_len) return;` (snapshot_net.c:304) -- and drops
+        any mismatch before it can reach _cli_pull's
+            out[off:end] = data
+        reassembly step, where a length that disagrees with `end - off`
+        does not partially write, it RESIZES the bytearray (shifting every
+        later byte and silently corrupting the whole pulled image). The
+        order mirrors the board's own validation ladder: bounds/truncation
+        check first (so an out-of-range seq is never used to index
+        chunk_range()), then the seq-range check, then the length-vs-seq
+        check, then the payload CRC last."""
         if len(frame) < 14 + HDR_LEN:
             return False
         if struct.unpack("!H", frame[12:14])[0] != SNAPNET_ETHERTYPE:
             return False
         payload = frame[14:]
         magic, seq, length, crc = unpack_hdr(payload)
-        if magic != MAGIC or seq >= TOTAL_CHUNKS:
+        if magic != MAGIC:
             return False
-        data = payload[HDR_LEN:HDR_LEN + length]
-        if len(data) < length:
+        available = len(payload) - HDR_LEN
+        if length > available:
             return False          # truncated: drop, will show up as missing
+        if seq >= total_chunks:
+            return False          # bogus chunk index: drop
+        off, end = chunk_range(seq, store_len)
+        expect_len = end - off
+        if length != expect_len:
+            return False          # wrong length for this index: drop (mirrors
+                                   # snapshot_net.c's own expect_len check)
+        data = payload[HDR_LEN:HDR_LEN + length]
         if _crc32(data) != crc:
             return False          # corrupt: drop, will show up as missing
         self.received[seq] = bytes(data)
@@ -756,7 +786,12 @@ def _st_offline_round_trip():
     def send(seq):
         data = chunks[seq]
         hdr = pack_hdr(seq, len(data), _crc32(data))     # same as _cli_push
-        return reader.parse_frame(_eth_frame(src, BOARD_MAC, hdr + data))
+        # Synthetic geometry, explicitly: parse_frame()'s length-vs-seq check
+        # (see its own docstring) needs to know THIS store's shape, not the
+        # real 1 GiB one, or it would reject chunk 4 (the real 360-B tail
+        # length only matches seq TOTAL_CHUNKS-1 under the real geometry).
+        return reader.parse_frame(_eth_frame(src, BOARD_MAC, hdr + data),
+                                   SYN_STORE_LEN, SYN_CHUNKS)
 
     # Bulk pass with chunk 2 "lost" on the wire.
     assert send(0) is True
@@ -799,44 +834,46 @@ def _st_offline_round_trip():
             "byte-identical")
 
 
-def _st_open_issue_host_trusts_frame_length():
-    """NEW, OPEN ISSUE — PINNED, NOT FIXED.
+def _st_frame_length_mismatch_is_rejected():
+    """FIXED (was `open_issue_host_trusts_frame_length`, PINNED-NOT-FIXED).
 
     The board's RX path checks that a frame's `len` equals the length its
     `seq` implies (snapshot_net.c:301-305: expect_len = min(CHUNK,
-    STORE_LEN-off), then `if (plen != expect_len) return;`). _BulkReader has
-    NO such check: it accepts any length whose CRC happens to match. That
-    matters because _cli_pull then reassembles with
+    STORE_LEN-off), then `if (plen != expect_len) return;`). _BulkReader had
+    NO such check: it accepted any length whose CRC happened to match. That
+    mattered because _cli_pull then reassembles with
 
         out[off:end] = data
 
     on a bytearray. If len(data) != end-off, that is not a partial write — it
     RESIZES the bytearray, shifting every byte after `off` and changing the
-    output file's length, so one wrong-length frame silently corrupts the
-    entire pulled image (and the resulting file is then rejected by `push`
-    only because its total length no longer equals STORE_LEN).
+    output file's length, so one wrong-length frame used to silently corrupt
+    the entire pulled image.
 
-    This test measures the current behaviour rather than changing it: adding
-    the missing length check is a behaviour change for the reviewer to make,
-    not something to slip into a test pass."""
+    parse_frame() now cross-checks length-vs-seq (see its docstring) and
+    rejects the mismatch outright, before self.received is ever touched —
+    this test pins the FIXED behaviour: the short frame is dropped, never
+    reaches reassembly, and a correctly-sized frame for the same chunk still
+    works normally right after."""
     reader = _BulkReader(None)
     src = b"\x02\xbd\x05\x00\x00\x02"
-    short = bytes(100)[:100] or b""
     short = bytes((i % 13) + 1 for i in range(100))
     hdr = pack_hdr(0, len(short), _crc32(short))
-    # Accepted, even though chunk 0 must be exactly CHUNK bytes:
-    assert reader.parse_frame(_eth_frame(src, BOARD_MAC, hdr + short)) is True
-    assert len(reader.received[0]) == 100 != CHUNK
+    # Chunk 0 must be exactly CHUNK bytes; a 100-byte frame for it is now
+    # rejected outright -- never reaches self.received, so the reassembly
+    # bytearray-resize hazard is never reached either.
+    assert reader.parse_frame(_eth_frame(src, BOARD_MAC, hdr + short)) is False
+    assert 0 not in reader.received
 
-    # ...and the reassembly step silently resizes the output.
-    out = bytearray(SYN_STORE_LEN)
-    off, end = chunk_range(0, SYN_STORE_LEN)
-    out[off:end] = reader.received[0]
-    assert len(out) == SYN_STORE_LEN - CHUNK + 100
-    assert len(out) != SYN_STORE_LEN
-    return (f"host accepts a {len(short)}-B frame for a {CHUNK}-B chunk; "
-            f"reassembly shrinks the image by {SYN_STORE_LEN - len(out)} B "
-            f"(board would have dropped the frame)")
+    # A correctly-sized frame for the SAME chunk is still accepted normally.
+    good = bytes((i * 3) % 256 for i in range(CHUNK))
+    hdr2 = pack_hdr(0, len(good), _crc32(good))
+    assert reader.parse_frame(_eth_frame(src, BOARD_MAC, hdr2 + good)) is True
+    assert reader.received[0] == good
+
+    return (f"a {len(short)}-B frame for a {CHUNK}-B chunk is now rejected "
+            f"before reassembly (previously silently accepted and would "
+            f"have shrunk the pulled image)")
 
 
 _SELFTEST_CASES = [
@@ -849,7 +886,7 @@ _SELFTEST_CASES = [
     ("bulk_reader_parse_paths",            _st_bulk_reader_parse_paths),
     ("missing_list_message_shape",         _st_missing_list_message_shape),
     ("offline_round_trip",                 _st_offline_round_trip),
-    ("open_issue_host_trusts_frame_length", _st_open_issue_host_trusts_frame_length),
+    ("frame_length_mismatch_is_rejected",   _st_frame_length_mismatch_is_rejected),
 ]
 
 
