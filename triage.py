@@ -432,7 +432,7 @@ def dump_fltr(hv, out, tail=40):
         flag = ""
         if k == 6 and ago > 50:
             flag = "  <-- TIMER events STOPPED. Suspect a permanently masked"
-        out.append(f"    {FLTR_KINDS.get(k, k):<10s} {hist[k]:>6d}   "
+        out.append(f"    {str(FLTR_KINDS.get(k, k)):<10s} {hist[k]:>6d}   "
                    f"{ago:>5d} events ago{flag}")
         if flag:
             out.append("        CNTV (EL2 set IMASK, vGIC never delivered the")
