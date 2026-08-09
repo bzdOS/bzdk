@@ -465,6 +465,23 @@ __attribute__((weak)) void vblk_async_cpu2_run(void)
 }
 
 /* ------------------------------------------------------------------ *
+ * CPU3 Zephyr-guest hook (dual-guest milestone — see zguest_cpu3.h for the
+ * full design). WEAK default: a plain WFI park, byte-for-byte the old
+ * "unused secondary" behaviour this replaces — EXACT same pattern as
+ * vblk_async_cpu2_run() above. zguest_cpu3.c (linked ONLY into the `dual`
+ * target's DUAL_OBJS) provides a STRONG override that actually parks in a
+ * wfe-poll loop waiting for a host-issued `zboot` (dbgmon.c) before ever
+ * touching a Zephyr image; every other Makefile target (stage0/net/repl/
+ * fbsd/dbg/gdb/hdmi/zephyr/every QEMU target) does not link zguest_cpu3.o
+ * and keeps this weak park unchanged — the dispatch in smp_secondary_main()
+ * below therefore never changes behaviour for those targets. */
+__attribute__((weak)) void zephyr_cpu3_run(void)
+{
+	for (;;)
+		__asm__ volatile("wfi" ::: "memory");
+}
+
+/* ------------------------------------------------------------------ *
  * Secondary C entry — MMU already ON and coherent (set up in start.S).
  * ------------------------------------------------------------------ */
 void smp_secondary_main(uint64_t cpuid)
@@ -678,10 +695,19 @@ void smp_secondary_main(uint64_t cpuid)
 		 * that invariant is ever broken by a future change. */
 	}
 
-	/* CPU3 (and CPU2 defensively, see above): unused for now — park in WFI,
-	 * out of the way. (The per-core preemptive-tick/sched path is
-	 * intentionally NOT started; it's untested and only adds risk to the
-	 * guest bring-up.) */
+	/* ---- CPU3 = dual-guest Zephyr core (weak/strong, see above) ---------
+	 * Every existing target links only the weak zephyr_cpu3_run() (a plain
+	 * WFI park, identical to the old inline loop this replaces); the `dual`
+	 * target's zguest_cpu3.o overrides it with the real wfe-poll-for-
+	 * `zboot` implementation. */
+	if (cpu == 3) {
+		zephyr_cpu3_run();
+		/* NOTREACHED — see the CPU2 comment above for the same defensive
+		 * fallthrough reasoning. */
+	}
+
+	/* Defensive shared park (unreachable for cpu==2/3 today; kept for any
+	 * future core / as a last-resort catch-all). */
 	for (;;)
 		__asm__ volatile("wfi" ::: "memory");
 }

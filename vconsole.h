@@ -152,10 +152,21 @@
  * time earlier the same day. Readers should take base/size FROM THE HEADER. */
 #define VCONSOLE_LAYOUT_VER  2u
 
-/* Lay down the ring's magic + zero its counters/buffer. Call once before
- * the guest can fault on UART0 (i.e. before stage2_enable() in
- * main_fbsd.c). Idempotent. */
+/* Lay down channel 0's (FreeBSD) ring magic + zero its counters/buffer.
+ * Call once before the guest can fault on UART0 (i.e. before
+ * stage2_enable() in main_fbsd.c). Idempotent. UNCHANGED signature and
+ * behavior (see vconsole.c's header comment for the dual-guest channel
+ * refactor -- this call addresses exactly the same ring it always did). */
 void vconsole_init(void);
+
+/* NEW (dual-guest milestone): lay down channel 1's (Zephyr, CPU3) ring
+ * magic + zero its counters/buffer, at a second, smaller, fixed DRAM lane
+ * (HVMAP_VCONSOLE_CHAN1_HDR/_BUF, see hv_addrmap.h). Call once before
+ * Zephyr can fault on UART0 (i.e. before stage2_zephyr_enable() in
+ * zguest_cpu3.c). Idempotent. Channel 1 has no RX ring / TX-tee ring to
+ * zero -- it is TX-only by design (see vconsole_handle_fault()'s `channel`
+ * parameter below). */
+void vconsole_init_chan1(void);
 
 /* Called from el2_trap (see the wiring contract in the file banner above)
  * on a guest (lower-EL) synchronous data abort. Inspects frame->esr/far
@@ -163,6 +174,17 @@ void vconsole_init(void);
  * LSR/USR read synthesis, ignoring init-time writes to IER/LCR/FCR/MCR),
  * advancing frame->elr past the faulting instruction, or determines the
  * fault isn't a UART0 access at all.
+ *
+ * `channel` selects which guest's ring/state this fault is emulated
+ * against: 0 = FreeBSD (CPU0) -- the original, verbatim behavior (RX
+ * injection, USB-ACM TX tee, feeds wdt_note_progress()); 1 = Zephyr (CPU3,
+ * dual-guest milestone) -- the same 16550 emulation shape against the NEW
+ * channel-1 ring, but TX-ONLY: Zephyr's app only prints, never reads UART
+ * input in this design, so there is no RX ring, no USB-ACM tee, and
+ * (the one correctness requirement that is NOT optional) NO path to
+ * wdt_note_progress() -- Zephyr's heartbeat output must never be able to
+ * feed the FreeBSD-guest-progress watchdog gate. Every existing call site
+ * (el2_exc.c) passes channel 0; only the new CPU3 dispatch path passes 1.
  *
  * Returns 1 if the fault was handled here (el2_trap should return
  * immediately, without recording a generic fault) or 0 if it was not ours
@@ -173,7 +195,7 @@ void vconsole_init(void);
  * advanced -- see vconsole.c -- and this still returns 1, since giving up
  * and re-recording a "real" fault for an address we know is UART0 is not
  * useful and would just spin the same fault forever.) */
-int vconsole_handle_fault(struct el2_frame *frame);
+int vconsole_handle_fault(struct el2_frame *frame, unsigned channel);
 
 /* ------------------------------------------------------------------ *
  * USB-ACM bridge API (see the "INTERACTIVE CONSOLE" section above).
