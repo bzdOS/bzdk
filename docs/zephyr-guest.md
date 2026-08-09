@@ -8,7 +8,7 @@
 | A Zephyr guest image **builds** | ✅ | `zephyr-guest/build.sh bpi_m64_hv` → `zephyr.elf`, EXEC, one `PT_LOAD` @ `0x51000000`, entry `0x5100100c` |
 | The hypervisor **loads** it | ✅ | `kload_parse_elf` + `kload_place_segments` on the real image, board-free under QEMU |
 | It **boots** to its own `main()` | ✅ | `./zephyr-qemu-ci.sh` — banner, `hello from EL1`, heartbeats 0 and 1 |
-| It boots **on the board** | ❌ **tried 2026-08-06, does not come up** | see "Result on real hardware" below |
+| It boots **on the board** | ✅ **confirmed 2026-08-09, after the Finding-1 fix** | see "Confirmed on real hardware" below |
 
 Those five rows are deliberately separate. "Links" is not "loads" and
 "loads" is not "boots"; this project has burned time before on a report that
@@ -408,3 +408,54 @@ answer, that's new information (points squarely at Finding 2 or something
 else entirely); if it does answer, use it to read the exact stage where any
 remaining hang occurs, same breadcrumb addresses as the "next live check"
 above.
+
+## Confirmed on real hardware (2026-08-09)
+
+The Finding-1 fix was flashed to the real board the same day it landed,
+using the same reversible `tftpboot/kernel` swap (SHA256-verified before
+and after, restored afterward) and `chimpd.HYP_ELF` monkeypatch as the
+2026-08-06 attempt.
+
+**Result: EMAC answered immediately** ("EMAC живой" within 7s of `loady`+
+`bootelf`'s "go sent") — the exact channel that never produced a single
+response on 2026-08-06. `chimpd`'s monitor loop then read real, growing
+`vconsole` byte counts every poll for over 100s (137→985→1210 bytes across
+this session's checks) and `hvdbg.vconsole_text()` read back the guest's
+actual console output verbatim:
+
+```
+*** Booting Zephyr OS build v4.4.1 ***
+bzdOS/Zephyr: hello from EL1 (board: bpi_m64_hv)
+heartbeat 0
+heartbeat 1
+...
+heartbeat 59
+```
+
+Sustained past heartbeat 59 with `bzdctl.py status` showing `exceptions
+none recorded`, `guest_pc` moving and staying inside the Zephyr image's own
+load range (`0x51000000`+), and `console advancing` on every check across
+more than two minutes of continuous operation before the board was
+deliberately reset back to FreeBSD. `chimpd`'s monitor loop did emit one
+`timer=FROZEN` heuristic warning and one spurious "guest exception" line
+during this run — both are the hang-detector reading a tick/EXC breadcrumb
+this build's tickless Zephyr config never touches (see the file header's
+own "KNOWN GAP" note: `CONFIG_SYS_CLOCK_EXISTS=n` / `CONFIG_ARM_ARCH_TIMER=n`),
+not evidence of a real problem; a fresh `bzdctl.py status` moments later
+showed `exceptions none recorded` and the console still climbing.
+
+**This resolves Finding 2 in practice, if not in theory**: the un-paired
+GICC→GICV redirect / missing `vgic_init()`+IMO=1 (still genuinely absent
+from `main_zephyr.c`, still a real latent gap on paper) evidently never
+gets exercised by this exact Zephyr build, because it never touches GIC
+CPU-interface registers at all in a tickless, no-arch-timer configuration.
+The moment this guest's Kconfig grows a real timer tick or any interrupt
+source, that gap stops being theoretical — revisit before then, not after.
+
+Restored to the normal FreeBSD/`dbg` configuration immediately afterward
+(`tftpboot/kernel` restored from a SHA256-verified backup, reloaded via
+plain `chimpd.py`, `fsck_ffs -y` + `netif restart` + `sshd start` — the
+same read-only-root-after-hard-reset recovery this project has needed every
+time a running guest gets a hard `power reset` rather than a cooperative
+shutdown). Confirmed recovered: `ssh` answers, root mounted `rw`, `fsck`
+found nothing to repair.
