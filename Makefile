@@ -56,7 +56,7 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu holdtest clean clean-qemu clean-linux-qemu clean-holdtest test
+.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu dual-qemu holdtest clean clean-qemu clean-linux-qemu clean-dual-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -353,6 +353,43 @@ clean-qemu:
 	      main_snapshot_qemu.o el2_exc_snapshot_qemu.o guest_snapshot_payload.o \
 	      wdt_qemu_stub.o $(SNAPSHOT_QEMU_ELF)
 
+# --- SMP/PSCI CPU_ON proof on QEMU virt (dual-guest Step 0 — see
+# main_dual_qemu.c's banner for the full argument, and smp-qemu-ci.sh).
+#
+# Proves the REAL, UNMODIFIED smp.c (smp_init()/smp_secondary_main()) brings
+# up all 3 secondary vCPUs via PSCI CPU_ON under QEMU's `-smp 4`, with NO
+# board attached and NO guest entered. This is a NARROWER skeleton than every
+# other QEMU target: no stage2.o/guest.o/gic_timer_qemu.o (no guest, no
+# timer — see main_dual_qemu.c for why this proof doesn't need either).
+#
+# start_secondary_qemu.o provides `_start_secondary` — a byte-for-byte copy of
+# start.S's own routine in its own translation unit, needed only to avoid a
+# duplicate `_start` symbol clash with start_qemu.o (see that file's header
+# for why the routine itself needed no logic changes to work under QEMU).
+#
+# smp_qemu_stub.o provides inert stand-ins for the handful of real-hardware
+# symbols smp.o references UNCONDITIONALLY (musb_*/emac_link_watchdog/
+# dbgmon_service/wdt_debug_kick/g_last_guest_frame/el2_snapshot_guest_frame/
+# dbg_core_active) so the real smp.o links without also pulling in musb.o/
+# emac.o/dbgmon.o/usbacm.o/el2_exc.o and their own hardware-only dependency
+# chains — see that file's header for exactly why each is needed at link time
+# despite never executing at runtime on this target (main_dual_qemu.c sets
+# smp.c's own `dbg_core_enable=0` before calling smp_init()).
+DUAL_QEMU_ELF  := microkernel-dual-qemu.elf
+DUAL_QEMU_OBJS := start_qemu.o start_secondary_qemu.o main_dual_qemu.o exceptions.o \
+                  el2_exc_dual_qemu.o pl011_qemu.o timer.o smp.o smp_qemu_stub.o libmin.o
+
+dual-qemu: $(DUAL_QEMU_ELF)
+
+$(DUAL_QEMU_ELF): $(DUAL_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(DUAL_QEMU_OBJS)
+	$(SIZE) $@
+
+clean-dual-qemu:
+	rm -f start_secondary_qemu.o main_dual_qemu.o el2_exc_dual_qemu.o smp_qemu_stub.o \
+	      start_secondary_qemu.d main_dual_qemu.d el2_exc_dual_qemu.d smp_qemu_stub.d \
+	      $(DUAL_QEMU_ELF)
+
 # --- Zephyr guest on QEMU virt: the board-free half of the `zephyr` target
 # (see main_zephyr_qemu.c's banner for the full argument). Runs the SAME
 # guest-loading sequence `make zephyr` runs on real hardware -- kload_parse_elf
@@ -534,7 +571,7 @@ dbgtools.o: FORCE
 # per-object .d dependency files, and the hosted test binaries. A blanket
 # *.o/*.d avoids the old hand-maintained list silently going stale as files
 # are added (dbgmon.o, emmc_bio.o, vblk_*.o, … were all missing before).
-clean: clean-qemu clean-holdtest
+clean: clean-qemu clean-dual-qemu clean-holdtest
 	rm -f *.o *.d \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
