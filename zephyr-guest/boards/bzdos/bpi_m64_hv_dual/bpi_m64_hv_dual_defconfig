@@ -1,0 +1,24 @@
+# Byte-for-byte the same as bpi_m64_hv_defconfig (this board's sibling) --
+# the CPU/cache/console configuration is unaffected by WHERE in physical
+# memory the image is linked, only the devicetree's sram0 base/size differs
+# (see bpi_m64_hv_dual.dts). See that file for the per-option rationale.
+
+# Non-secure EL1 guest (bzdOS's guest_config() sets HCR_EL2.RW=1 for an
+# AArch64 EL1, no secure world involved).
+CONFIG_ARMV8_A_NS=y
+
+# Cache management: the guest runs with its own SCTLR_EL1 MMU (Zephyr's own
+# static MMU tables via CONFIG_ARM_MMU below). THIS is exactly the config
+# option whose page tables broke under a naive HV-side relocation of the
+# bpi_m64_hv (0x51000000) image to 0xBE000000 -- see board.cmake's header
+# comment. Rebuilding for the correct address (this board) fixes it at the
+# source instead of working around it.
+CONFIG_CACHE_MANAGEMENT=y
+CONFIG_ARM_MMU=y
+
+# UART0 (ns16550-compatible, bzdOS's vconsole.c channel 1 trap-and-emulates
+# it -- see el2_exc_dual_zephyr_qemu.c): polling only, same as bpi_m64_hv.
+CONFIG_SERIAL=y
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y
+CONFIG_UART_INTERRUPT_DRIVEN=n

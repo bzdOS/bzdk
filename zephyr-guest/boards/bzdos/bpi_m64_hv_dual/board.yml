@@ -1,0 +1,6 @@
+board:
+  name: bpi_m64_hv_dual
+  full_name: Banana Pi M64 (Allwinner A64) -- bzdOS EL2 hypervisor EL1 guest, dual-guest CPU3 slice
+  vendor: bzdos
+  socs:
+  - name: qemu_virt_arm64

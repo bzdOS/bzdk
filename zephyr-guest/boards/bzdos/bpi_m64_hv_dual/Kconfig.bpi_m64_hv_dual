@@ -1,0 +1,8 @@
+# Copyright (c) 2026 bzdOS project
+# SPDX-License-Identifier: Apache-2.0
+#
+# See bpi_m64_hv/Kconfig.bpi_m64_hv for the full SOC_QEMU_VIRT_ARM64
+# rationale (unchanged, reused verbatim here).
+
+config BOARD_BPI_M64_HV_DUAL
+	select SOC_QEMU_VIRT_ARM64

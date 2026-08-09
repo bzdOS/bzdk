@@ -56,7 +56,7 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg dual gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu dual-qemu dual2-qemu holdtest clean clean-qemu clean-linux-qemu clean-dual-qemu clean-dual2-qemu clean-holdtest test
+.PHONY: all stage0 net repl fbsd dbg dual gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu dual-qemu dual2-qemu dual-zephyr-qemu holdtest clean clean-qemu clean-linux-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -473,6 +473,39 @@ clean-dual2-qemu:
 	      main_dual2_qemu.d el2_exc_dual2_qemu.d dual2_qemu_stub.d \
 	      $(DUAL2_QEMU_ELF)
 
+# --- Dual-guest Step 2 on QEMU virt (see main_dual_zephyr_qemu.c's banner
+# and el2_exc_dual_zephyr_qemu.c's for the full argument): Step 1's hand-
+# built trivial ELF on CPU3 (fc20b63) swapped for a REAL Zephyr RTOS image,
+# still genuinely concurrent with CPU0's guest_demo_el1(). See
+# dual-zephyr-qemu-ci.sh for the SKIP-if-no-Zephyr-tree convention.
+#
+# Object list = Step 1's DUAL2_QEMU_OBJS skeleton (start_qemu.o,
+# start_secondary_qemu.o, exceptions.o, pl011_qemu.o, timer.o,
+# gic_timer_qemu.o, smp.o, dual2_qemu_stub.o, guest.o, kload.o, vconsole.o,
+# wdt.o, flightrec.o, zguest_cpu3.o, zload2.o, stage2_zephyr.o, libmin.o),
+# with main_dual_zephyr_qemu.o/el2_exc_dual_zephyr_qemu.o in place of Step
+# 1's main_dual2_qemu.o/el2_exc_dual2_qemu.o, PLUS mmio_absorb.o -- real
+# Zephyr's GIC probe (unlike Step 1's trivial payload) genuinely reaches
+# CPU3's stage-2 fault path (see stage2_zephyr.h: CPU3 has NO real MMIO
+# passthrough at all) and needs the same catch-all absorber the real
+# board's el2_exc.c already relies on for exactly this.
+DUAL_ZEPHYR_QEMU_ELF  := microkernel-dual-zephyr-qemu.elf
+DUAL_ZEPHYR_QEMU_OBJS := start_qemu.o start_secondary_qemu.o main_dual_zephyr_qemu.o exceptions.o \
+                         el2_exc_dual_zephyr_qemu.o pl011_qemu.o timer.o gic_timer_qemu.o \
+                         smp.o dual2_qemu_stub.o guest.o kload.o vconsole.o wdt.o flightrec.o \
+                         zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o libmin.o
+
+dual-zephyr-qemu: $(DUAL_ZEPHYR_QEMU_ELF)
+
+$(DUAL_ZEPHYR_QEMU_ELF): $(DUAL_ZEPHYR_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(DUAL_ZEPHYR_QEMU_OBJS)
+	$(SIZE) $@
+
+clean-dual-zephyr-qemu:
+	rm -f main_dual_zephyr_qemu.o el2_exc_dual_zephyr_qemu.o \
+	      main_dual_zephyr_qemu.d el2_exc_dual_zephyr_qemu.d \
+	      $(DUAL_ZEPHYR_QEMU_ELF)
+
 # --- Zephyr guest on QEMU virt: the board-free half of the `zephyr` target
 # (see main_zephyr_qemu.c's banner for the full argument). Runs the SAME
 # guest-loading sequence `make zephyr` runs on real hardware -- kload_parse_elf
@@ -654,7 +687,7 @@ dbgtools.o: FORCE
 # per-object .d dependency files, and the hosted test binaries. A blanket
 # *.o/*.d avoids the old hand-maintained list silently going stale as files
 # are added (dbgmon.o, emmc_bio.o, vblk_*.o, … were all missing before).
-clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-holdtest
+clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-holdtest
 	rm -f *.o *.d \
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
