@@ -280,7 +280,7 @@ $(FBSD_BIN): $(FBSD_ELF)
 zephyr: $(ZEPHYR_BIN)
 
 ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
-               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
+               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgmon.o bmc.o dbgtools.o rsb.o axp803.o
 $(ZEPHYR_ELF): $(ZEPHYR_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(ZEPHYR_OBJS)
 	$(SIZE) $@

@@ -70,6 +70,19 @@
 #include "vconsole.h"
 #include "gtrace.h"
 #include "reboot.h"
+#include "emac.h"
+#include "usbacm.h"
+#include "dbgmon.h"
+#include "smp.h"
+#include "dbgtools.h"
+#include "bmc.h"
+
+/* Debug console rides the EMAC network channel (raw 0x88B5) -- same hooks
+ * main_dbg.c/main_gdb.c define, dbgmon.c calls them as extern. */
+int  console_getc(void)   { return emac_getc(); }
+void console_putc(int c)  { emac_putc(c); }
+void console_poll(void)   { emac_poll(); }
+void console_flush(void)  { emac_flush(); }
 
 #define Z_ELF        0x44000000UL   /* raw Zephyr ELF (TFTP'd here) — same
                                       * staging address main_fbsd.c uses for
@@ -82,12 +95,10 @@
 #define SP_EL1_PLACEHOLDER 0x51000000UL   /* see file header point 3: never
                                             * actually used by Zephyr. */
 
-/* Stand-in for dbgmon.c's global of the same name -- identical to
- * main_fbsd.c's own copy right next to it (see main_gdb.c's file header for
- * the full rationale). el2_exc.c's cmd_call() fault-recovery path
- * references this `extern` unconditionally from every build; this build
- * never links dbgmon.o, so it's simply always false here -- a no-op. */
-volatile int dbgmon_call_active = 0;
+/* dbgmon_call_active itself now comes from dbgmon.o (this build links it,
+ * see dbgmon_init() below) -- do NOT redefine it here as main_gdb.c's
+ * stand-in does for builds that skip dbgmon.o; a second definition would be
+ * a multiple-definition link error. */
 
 /* Breadcrumb window: 0x50008000 ("ZEP1"). Distinct from every other window
  * already in this tree (see guest.c's header comment for the existing list
@@ -109,10 +120,49 @@ int main(void)
 
 	usb_gadget_disconnect();
 
+	/* Network debug console up first -- same reasoning and placement as
+	 * main_dbg.c/main_gdb.c: without this, there is no EMAC/dbgmon service
+	 * for the host's polling tooling to ever talk to, regardless of how
+	 * this guest boots. Missing here until 2026-08-09 -- the reason a real
+	 * hardware attempt could never have observed EMAC responding at all,
+	 * independent of whether Zephyr itself came up. See docs/zephyr-guest.md. */
+	emac_init();
+
 	el2_install();
 	vconsole_init();
+
+	/* CPU1 heartbeat / build-id / entry-hold breadcrumb lane -- must run
+	 * before smp_init() (near kload_enter() below) brings CPU1 up, same
+	 * constraint main_dbg.c documents at its own call site. Also a hard
+	 * dependency of dbgmon.o's own exec_line() (dbgtools_hold_set()/
+	 * dbgtools_release_set()), which is why dbgtools.o is now linked here. */
+	dbgtools_init();
+
+	/* USB-OTG CDC-ACM console bridge (brings up musb_init() internally) and
+	 * the EMAC debug-monitor service -- both missing until 2026-08-09 for
+	 * the same reason as emac_init() above. Must run before smp_init()
+	 * (near kload_enter() below), same ordering constraint main_dbg.c/
+	 * main_gdb.c document at their own call sites. */
+	usbacm_init();
 	gtrace_init();
+	dbgmon_init();
+	bmc_init();   /* lay down BMC1 breadcrumb + first health record -- dbgmon.o's
+	               * exec_line() calls bmc_dispatch(), a hard dependency. */
 	ZEP_BC(1, 2);
+
+	/* Arm the dead-man's-switch watchdog EARLY -- before any of the risky
+	 * setup (kload, stage2, guest entry) -- same placement and reasoning as
+	 * main_dbg.c/main_gdb.c. Replaces this file's own former raw WDOG_CFG/
+	 * MODE/CTRL pokes (removed 2026-08-09): those wrote the same three
+	 * registers wdt_arm() does, but never set wdt_window_ticks/
+	 * wdt_last_progress (wdt.c's static state, only wdt_arm() sets it) --
+	 * so wdt_pet() (called unconditionally from every el2_trap(), whether
+	 * or not this build cares) could never re-arm the hardware timer, and
+	 * the board was GUARANTEED to hard-reset back to U-Boot a few seconds
+	 * after kload_enter() regardless of whether Zephyr booted, hung, or
+	 * crashed. That alone fully explains the 2026-08-06 "board already back
+	 * in U-Boot" observation. See docs/zephyr-guest.md. */
+	wdt_arm();
 
 	if (!kload_parse_elf(Z_ELF)) {
 		ZEP_BC(1, 0xBAD1);   /* bad Zephyr ELF at Z_ELF */
@@ -142,11 +192,16 @@ int main(void)
 	stage2_enable();
 	ZEP_BC(1, 6);
 
-	/* Same ~6s bring-up watchdog as main_fbsd.c: on a hang/fault, U-Boot
-	 * gets control back to read this breadcrumb + gtrace's fault record. */
-	*(volatile uint32_t *)0x01c20cb4UL = 1u;
-	*(volatile uint32_t *)0x01c20cb8UL = 0x61u;
-	*(volatile uint32_t *)0x01c20cb0UL = 0x14AFu;
+	/* Bring up CPU1 (EMAC/debug core) LAST, right before entering the
+	 * guest -- same placement as main_dbg.c/main_gdb.c, for the same
+	 * reason: CPU1 immediately starts reading/mutating state (musb.c's
+	 * gadget state via usbacm_poll(), dbgmon's own state) that must
+	 * already be laid down by usbacm_init()/dbgmon_init() above. Missing
+	 * here until 2026-08-09 -- without it CPU1 was never brought online at
+	 * all, so even ignoring the watchdog/EMAC-init gaps above there was no
+	 * second core left running to answer anything after CPU0 (the guest)
+	 * entered Zephyr. */
+	smp_init();
 	ZEP_BC(1, 7);
 
 	kload_enter(entry, 0 /* x0: don't-care, see file header point 2 */,
