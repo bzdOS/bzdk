@@ -210,9 +210,12 @@ int snapshot_net_send(const struct el2_frame *frame);
  * timeout ends the collection window), reliably receive the host's manifest
  * over netcon, then up to SNAPNET_MAX_ROUNDS bounded rounds requesting (over
  * netcon) and collecting any still-missing chunks. If the manifest is fully
- * accounted for, recomputes CRC32 over the received DRAM region and checks
- * it against the received header's own crc32 field (the same field
- * snapshot_save() already computes/relies on) BEFORE calling
+ * accounted for, recomputes CRC32 over the received DRAM region (skipping the
+ * same exclusion windows snapshot_save() itself skipped when computing that
+ * field -- see snapshot.h's "EXCLUSION WINDOWS" and snapshot_net.c's
+ * crc32_region_excluding()) and checks it against the received header's own
+ * crc32 field (the same field snapshot_save() already computes/relies on)
+ * BEFORE calling
  * snapshot_restore() — a corrupt-but-"complete" image is refused rather than
  * silently restored into the live guest.
  *

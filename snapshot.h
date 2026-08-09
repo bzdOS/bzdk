@@ -32,7 +32,11 @@
  *   - EL2-side per-guest translation control: VTTBR_EL2 / VTCR_EL2 (the
  *     stage-2 tables the guest runs under) and HCR_EL2.
  *   - The guest's DRAM: PA [SNAP_DRAM_BASE, SNAP_DRAM_BASE+SNAP_DRAM_SIZE)
- *     (== stage-2 identity range 0x40000000..0x80000000, 1 GiB).
+ *     (== stage-2 identity range 0x40000000..0x80000000, 1 GiB), MINUS the
+ *     "exclusion windows" (see below) — the sub-ranges inside that same 1 GiB
+ *     that are actually the hypervisor's own image/scratch/framebuffer, never
+ *     guest-visible bytes to begin with. See "EXCLUSION WINDOWS" further down
+ *     for why skipping them is required for correctness, not an optimization.
  *
  * NOT CAPTURED (the correctness risk — see design doc "Risks"):
  *   - MMIO device state: EMAC, MMC/eMMC, USB-OTG(MUSB), UART, HDMI, PMIC,
@@ -110,17 +114,77 @@
  * snapshot_net.h's SNAPNET_STORE_LEN / chunk geometry / manifest size are
  * unchanged too. Only WHERE physically the header lives changed.
  *
- * CAVEAT this fix introduces, and snapshot_restore() must (and does) account
- * for: hv-scratch is ordinary physical DRAM inside [SNAP_DRAM_BASE,
+ * CAVEAT this fix introduced, ONCE TRUE, NOW FIXED (see "EXCLUSION WINDOWS"
+ * below): hv-scratch is ordinary physical DRAM inside [SNAP_DRAM_BASE,
  * SNAP_DRAM_BASE+SNAP_DRAM_SIZE) — on a 2 GiB board EVERY physical address is
  * either part of that guest-DRAM sweep or part of the high-GiB mirror, there
  * is no third place. So SNAP_META_BASE, like every other hv-scratch window
- * (vconsole ring, flightrec, ...), is itself swept by snapshot_save()'s /
- * snapshot_restore()'s whole-guest-DRAM dram_copy() — a pre-existing,
- * already-documented property of this design (see test_snapshot_fmt.c's
- * open_issue_snapshot_range_contains_hv_image), now also true of the header.
- * snapshot_restore() reads every header field it needs into locals BEFORE
- * calling dram_copy() for exactly this reason — see its own comment.
+ * (vconsole ring, flightrec, ...), USED TO be swept by snapshot_save()'s /
+ * snapshot_restore()'s whole-guest-DRAM dram_copy() the same as any other
+ * "guest" byte, harmlessly only by coincidence (nothing changes the header's
+ * own storage between a save and its matching restore). snapshot_restore()
+ * still reads every header field it needs into locals BEFORE calling
+ * dram_copy() (see its own comment) — that hoist stays, as cheap insurance,
+ * even though the exclusion windows below now also stop dram_copy() from
+ * touching SNAP_META_BASE at all.
+ *
+ * ============================================================================
+ * EXCLUSION WINDOWS (ROADMAP D1, second bug, fixed 2026-08)
+ * ============================================================================
+ * The naive version of this design swept the WHOLE [SNAP_DRAM_BASE,
+ * SNAP_DRAM_BASE+SNAP_DRAM_SIZE) range with one blind dram_copy() call, in
+ * both snapshot_save() and snapshot_restore(). That range is documented above
+ * as "guest DRAM", but it is NOT exclusively guest DRAM: it also physically
+ * contains the hypervisor's OWN running image (.text/.rodata/.data/.bss —
+ * which, per stage2.c's H2(a) comment, is where every CPU's EL2 stack lives
+ * too), the hv-scratch window (breadcrumbs, rings, BMC block, flightrec, and
+ * — see above — this very module's SNAP_META_BASE header), and, on HV_HDMI
+ * builds, the HDMI scanout framebuffer. All three are windows the HV itself
+ * reads and writes WHILE THE COPY RUNS — dram_copy() is EL2 code, stage-2
+ * translation does not apply to EL2, so nothing stops a naive sweep from:
+ *   - on save(): reading the HV's own live bytes as if they were "guest
+ *     content" (harmless to the HV itself, but wrong — the resulting
+ *     snapshot would misrepresent what the guest's memory actually held);
+ *   - on restore(): OVERWRITING the HV's own live .text/.data/.bss/stack —
+ *     including the C call stack the copy loop is executing on RIGHT NOW —
+ *     with year-old snapshot bytes, self-corrupting the running hypervisor
+ *     mid-restore. This is not a hypothetical: reproduced live via the
+ *     `snapshot-qemu` exercise (link_qemu.ld places that harness's own image,
+ *     including its only stack, at 0x40080000 — squarely inside the swept
+ *     range) as a garbled fault (ESR=0x02000000 ELR=0 FAR=0) partway through
+ *     snapshot_restore()'s copy.
+ *
+ * FIX: snapshot_save()/snapshot_restore() no longer call plain dram_copy()
+ * over the full range. They call dram_copy_excluding() (snapshot.c), which
+ * walks the range and skips any byte offset covered by an exclusion window
+ * from snapshot_excl_windows() (also snapshot.c) — so those bytes are simply
+ * never read as "guest content" and never written on restore. The window list
+ * itself is NOT hardcoded to one build's link address: the HV-image window is
+ * computed at runtime from the linker symbols _text_start/__bss_end that
+ * EVERY link script in this tree already provides (see snapshot.c's own
+ * comment for why a hardcoded literal — which is all stage2.c's HVIMG_BASE
+ * is, and which is correct ONLY for the real board's link.ld — would have
+ * fixed the real board and done nothing at all for the QEMU harness, whose
+ * link_qemu.ld places the identical source at a different address). The
+ * hv-scratch and (HV_HDMI) framebuffer windows ARE fixed absolute PAs (they
+ * don't move with the link address), so those two are still literal
+ * mirrors of stage2.c's own HVSCR_BASE/HVFB_BASE, same convention
+ * test_stage2_tables.c already uses for the same constants.
+ *
+ * CONSEQUENCE for the store's own bytes: the DRAM mirror simply never gets
+ * written at the excluded offsets (save skips reading+writing them; restore
+ * skips reading+writing them too) — those particular bytes of the 1 GiB
+ * mirror are "wasted" (whatever was there before, typically stale from a
+ * previous run), not shrunk out of the format. SNAP_META_SIZE, SNAP_DRAM_SIZE
+ * and every SNAPNET_* wire-geometry constant in snapshot_net.h are therefore
+ * UNCHANGED by this fix — deliberately the simpler of the two options this
+ * fix considered (uniform offset arithmetic beats a few tens of KiB of inert
+ * mirror bytes). See snapshot_net.c's crc32_region_excluding() for the one
+ * place that DOES need to know about the exclusion windows despite that:
+ * snapshot_save()'s own crc32 is now computed over the excluded-aware pass
+ * (folded into dram_copy_excluding()'s copy loop), so a whole-image recheck
+ * that didn't skip the same windows would disagree with it on every single
+ * transfer.
  *
  * Layout:
  *   SNAP_META_BASE                      : struct snapshot_hdr (metadata,
@@ -245,6 +309,38 @@ _Static_assert(sizeof(struct snapshot_hdr) <= SNAP_META_SIZE,
                "snapshot_hdr must fit in SNAP_META_SIZE");
 
 #define SNAPSHOT_VERSION  1u
+
+/* ------------------------------------------------------------------ *
+ * Exclusion windows — see this header's own "EXCLUSION WINDOWS" section
+ * above for why these exist. A window is a contiguous byte range, expressed
+ * as an OFFSET FROM SNAP_DRAM_BASE (not an absolute PA), because the same
+ * offset excludes the matching bytes on BOTH sides of every copy this module
+ * does: snapshot_save()'s destination (SNAP_DRAM_STORE + off) mirrors
+ * snapshot_restore()'s source at the identical off, and snapshot_net.c's
+ * crc32_region_excluding() walks the mirror at that same off too — one
+ * offset space, three consumers, so it is defined once, here.
+ *
+ * snapshot_excl_windows() (snapshot.c) is the SOLE producer of this list; it
+ * is exported (not `static`) specifically so snapshot_net.c's whole-image
+ * CRC recheck can reuse the exact same windows dram_copy_excluding() skips —
+ * two independent hand-rolled walks of the SAME list, not two independently
+ * *derived* lists, closing off exactly the kind of "two files' assumptions
+ * drift apart" bug this project's own history keeps finding (see e.g. the
+ * SNAP_META_SIZE/SNAPNET_CHUNK seam fixed alongside this same header's
+ * previous fix). ------------------------------------------------------- */
+struct snapshot_excl_window {
+	uint64_t off;   /* byte offset from SNAP_DRAM_BASE, start of window */
+	uint64_t len;   /* window length in bytes                           */
+};
+
+/* HV image (1, link-address-independent, computed at runtime) + hv-scratch
+ * (1, fixed PA) + HDMI framebuffer (1, fixed PA, HV_HDMI builds only) — see
+ * snapshot.c's snapshot_excl_windows() for the exact definition of each. */
+#define SNAPSHOT_EXCL_MAX 3u
+
+/* Fill out[0..N) with the current exclusion windows, sorted ascending by
+ * `off` and guaranteed non-overlapping. Returns N (<= SNAPSHOT_EXCL_MAX). */
+unsigned snapshot_excl_windows(struct snapshot_excl_window out[SNAPSHOT_EXCL_MAX]);
 
 /* ------------------------------------------------------------------ *
  * Public API. Both are meant to be invoked at a GUEST TRAP BOUNDARY, from the

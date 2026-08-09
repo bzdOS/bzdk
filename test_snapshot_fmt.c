@@ -91,10 +91,24 @@
  *     neither `off` nor `total` on the wire), plus the bit_test/bit_set
  *     helpers at the four indices where an off-by-one would hide (bit 0,
  *     bit 7, bit 8, and the very last valid bit).
- *  5. Three real robustness holes found while reading, each PINNED at its
- *     current (unfixed) behaviour rather than fixed — see "OPEN ISSUE" below
- *     and the individual tests. snapshot.c/snapshot_net.c are NOT modified by
- *     this file.
+ *  5. Three real robustness holes found while reading. Two remain PINNED at
+ *     their current (unfixed) behaviour rather than fixed — see "OPEN ISSUE"
+ *     below and the individual tests. The third (the snapshotted range
+ *     containing the hypervisor's own image) WAS fixed in snapshot.c/.h
+ *     since this file was first written (dram_copy_excluding(), snapshot.h's
+ *     "EXCLUSION WINDOWS") — see "OPEN ISSUES PINNED" item (c) below for
+ *     where its test now lives. snapshot.c/snapshot_net.c are otherwise NOT
+ *     modified by this file.
+ *  6. That the exclusion-window fix itself is correct, not just that it
+ *     compiles: the HV-image window really does track the link address
+ *     instead of a hardcoded literal (test_excl_windows_adapt_to_link_address,
+ *     the property whose absence caused the live QEMU-harness corruption),
+ *     the resulting copy provably never touches an excluded byte
+ *     (test_fixed_c_exclusion_windows_cover_hv_image_and_scratch), and the
+ *     two independent real-source walks of the same window list
+ *     (snapshot.c's dram_copy_excluding(), snapshot_net.c's
+ *     crc32_region_excluding()) can't have silently diverged
+ *     (test_two_excluding_walks_agree).
  *
  * ============================================================================
  * WHAT THIS FILE EXPLICITLY DOES *NOT* PROVE
@@ -160,17 +174,23 @@
  *  (b) snapshot_hdr.crc32 covers the DRAM image ONLY, never the header
  *      itself, so a garbled header passes every integrity check the feature
  *      has. test_open_issue_header_is_not_crc_covered() pins that.
- *  (c) The snapshotted "guest DRAM" range CONTAINS the hypervisor's own
- *      image and stack. test_open_issue_snapshot_range_contains_hv_image()
- *      pins the containment arithmetically. See that test for why it matters.
+ *  (c) FIXED 2026-08, no longer open — kept here only as a pointer to where
+ *      the fix lives now: the snapshotted "guest DRAM" range still CONTAINS
+ *      the hypervisor's own image/hv-scratch/(HV_HDMI) framebuffer (that
+ *      containment is a fact of the addresses, not something that can be
+ *      "fixed" away), but snapshot_save()/snapshot_restore() no longer sweep
+ *      those sub-ranges — see snapshot.c's dram_copy_excluding() and
+ *      snapshot.h's "EXCLUSION WINDOWS". What used to be
+ *      test_open_issue_snapshot_range_contains_hv_image() is now
+ *      test_fixed_c_exclusion_windows_cover_hv_image_and_scratch(), plus two
+ *      new tests (test_excl_windows_adapt_to_link_address(),
+ *      test_two_excluding_walks_agree()) proving the fix itself is correct,
+ *      not just that the old containment facts still hold.
  *
  * Build: gcc -Wall -Wextra -O2 -o test_snapshot_fmt test_snapshot_fmt.c &&
  *        ./test_snapshot_fmt
- * (NOT wired into `make test`: the Makefile is off-limits to this change. To
- *  wire it in, add `test_snapshot_fmt` to the `test:` prerequisite list and
- *  its `./test_snapshot_fmt` run line at Makefile:81-91, plus the two-line
- *  build rule pattern used at Makefile:93-120.)
- */
+ * Wired into `make test` (Makefile's `test:` target) since 2026-08; the
+ * build rule and run line both live there now, not just as a suggestion. */
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -218,6 +238,31 @@
 #define SNAPNET_HDR_LEN        16u                                 /* .h:168 */
 #define SNAPNET_MAGIC          0x42504E53u                         /* .h:169 ("SNPB" LE) */
 #define SNAPNET_SENTINEL       0xFFFFFFFFu                         /* snapshot_net.c:44 */
+
+/* snapshot.h's struct snapshot_excl_window / SNAPSHOT_EXCL_MAX, and the two
+ * fixed-PA windows snapshot.c's snapshot_excl_windows() mirrors from
+ * stage2.c (HVSCR_BASE/HVFB_BASE) — see "EXCLUSION WINDOWS MIRROR" below for
+ * the full transcription, including why the HV-image window becomes a
+ * PARAMETER here instead of the two extern linker symbols the real function
+ * reads. */
+struct snapshot_excl_window { uint64_t off; uint64_t len; };
+#define SNAPSHOT_EXCL_MAX 3u
+#define T_HVSCR_BASE 0x50000000UL   /* snapshot.c mirror of stage2.c:436 */
+#define T_HVSCR_SIZE 0x00200000UL
+#define T_HVFB_BASE  0x4D000000UL   /* snapshot.c mirror of stage2.c:450 */
+#define T_HVFB_SIZE  0x00800000UL
+
+/* The real board's link.ld and the QEMU harness's link_qemu.ld — the two
+ * (img_base, img_end) pairs snapshot_excl_windows() must handle correctly
+ * via _text_start/__bss_end on the real hardware/QEMU builds. img_end here
+ * is illustrative (a plausible .bss end for each target's actual image
+ * size), not read from either real ELF — the point of the tests below is
+ * that the WINDOW arithmetic adapts to whatever img_base it's given, not
+ * that these two numbers are exactly right down to the byte. */
+#define T_REALBOARD_IMG_BASE 0x42000000UL   /* link.ld:12 ORIGIN */
+#define T_REALBOARD_IMG_END  0x42045000UL   /* representative -- see above */
+#define T_QEMU_IMG_BASE      0x40080000UL   /* link_qemu.ld:25 ORIGIN */
+#define T_QEMU_IMG_END       0x40099000UL   /* representative -- see above */
 
 /* ==================================================================== *
  * struct el2_frame — VERBATIM from exceptions.h:22-30. The offsets in the
@@ -508,8 +553,9 @@ static uint32_t crc32_bitwise_bytes(const uint8_t *p, size_t len)
 /* ==================================================================== *
  * CRC32 IMPLEMENTATION B — VERBATIM mirror of snapshot_net.c:137-161
  * (table-driven; used on the RX validation path for every chunk, and for
- * the whole-image recheck at snapshot_net.c:486 via crc32_region(), which is
- * the same loop with a wdt_pet() in it).
+ * the whole-image recheck via crc32_region_excluding(), which folds this
+ * same table-driven loop into a run over each non-excluded segment — see
+ * "EXCLUSION WINDOWS" mirror further down for that part).
  * ==================================================================== */
 static uint32_t crc_table[256];
 static int      crc_table_ready;
@@ -535,6 +581,153 @@ static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 	for (i = 0; i < len; i++)
 		crc = crc_table[(crc ^ data[i]) & 0xffu] ^ (crc >> 8);
 	return crc ^ 0xFFFFFFFFu;
+}
+
+/* ==================================================================== *
+ * EXCLUSION WINDOWS MIRROR — snapshot.h's struct snapshot_excl_window and
+ * snapshot.c's snapshot_excl_windows()/dram_copy_excluding() (the 2026-08
+ * fix for the SECOND snapshot bug: a blind whole-1-GiB dram_copy() reads/
+ * overwrites the hypervisor's own live image, hv-scratch, and (HV_HDMI)
+ * framebuffer while it is executing — see snapshot.h's "EXCLUSION WINDOWS").
+ *
+ * DEVIATION FROM "hand-transcribe verbatim": the real snapshot_excl_windows()
+ * takes NO parameters — it reads two extern linker symbols, _text_start and
+ * __bss_end, that only exist once a link script (link.ld or link_qemu.ld)
+ * has run. This hosted, unlinked file has neither, so those two symbol reads
+ * become explicit (img_base, img_end) parameters below. This is a REQUIRED
+ * shim (same class as the file's other two documented "TEST SHIMS"), not a
+ * simplification of the logic: every line downstream of the parameter list
+ * is the same arithmetic/sort the real function does.
+ *
+ * ONE mirror stands in for BOTH snapshot.c's dram_copy_excluding() and
+ * snapshot_net.c's crc32_region_excluding(): the two real functions
+ * independently walk the identical (off,len) window list with the identical
+ * "skip a window / clip before the next one" logic (deliberately — see both
+ * functions' own comments on why they must never disagree), so copy_segments()
+ * below models that ONE walk, and test_two_excluding_walks_agree() cross-
+ * checks it against a second, independently-written version of the same
+ * walk (copy_segments_v2()) rather than trusting one hand transcription not
+ * to hide the exact class of bug ("two files' assumptions drift apart") this
+ * project's own history keeps finding. */
+static unsigned excl_windows(uint64_t img_base, uint64_t img_end, int hv_hdmi,
+                              struct snapshot_excl_window *out)
+{
+	unsigned n = 0;
+
+	/* 1. HV's own image -- see file banner deviation note above. */
+	out[n].off = img_base - SNAP_DRAM_BASE;
+	out[n].len = img_end - img_base;
+	n++;
+
+	/* 2. hv-scratch (fixed PA, every build target). */
+	out[n].off = T_HVSCR_BASE - SNAP_DRAM_BASE;
+	out[n].len = T_HVSCR_SIZE;
+	n++;
+
+	if (hv_hdmi) {
+		/* 3. HDMI framebuffer (fixed PA, HV_HDMI builds only). */
+		out[n].off = T_HVFB_BASE - SNAP_DRAM_BASE;
+		out[n].len = T_HVFB_SIZE;
+		n++;
+	}
+
+	/* Ascending insertion sort by `off`, same as the real function. */
+	{
+		unsigned i, j;
+		for (i = 1; i < n; i++) {
+			struct snapshot_excl_window key = out[i];
+			j = i;
+			while (j > 0 && out[j - 1].off > key.off) {
+				out[j] = out[j - 1];
+				j--;
+			}
+			out[j] = key;
+		}
+	}
+	return n;
+}
+
+/* One non-excluded (off,len) sub-range dram_copy_excluding()/
+ * crc32_region_excluding() would hand to their respective inner copy/CRC
+ * loop. */
+struct copy_seg { uint64_t off; uint64_t len; };
+
+/* Mirrors the walk both real functions implement: advance past elapsed
+ * windows, skip straight over the next one if `off` is already inside it,
+ * otherwise clip the current segment to stop at the next window's start. */
+static unsigned copy_segments(uint64_t total_len,
+                               const struct snapshot_excl_window *win, unsigned n,
+                               struct copy_seg *segs, unsigned max_segs)
+{
+	uint64_t off = 0;
+	unsigned wi = 0, ns = 0;
+
+	while (off < total_len) {
+		uint64_t seg_len = total_len - off;
+
+		while (wi < n && win[wi].off + win[wi].len <= off)
+			wi++;
+
+		if (wi < n && win[wi].off <= off) {
+			uint64_t skip_end = win[wi].off + win[wi].len;
+			off = (skip_end < total_len) ? skip_end : total_len;
+			continue;
+		}
+
+		if (wi < n && win[wi].off < off + seg_len)
+			seg_len = win[wi].off - off;
+
+		assert(ns < max_segs);
+		segs[ns].off = off;
+		segs[ns].len = seg_len;
+		ns++;
+		off += seg_len;
+	}
+	return ns;
+}
+
+/* A SECOND, independently-structured walk (linear scan of every window on
+ * every step, rather than the monotonic `wi` index copy_segments() uses) —
+ * deliberately a different implementation strategy computing the same
+ * answer, the same "two independent implementations must agree" shape as
+ * this file's own two CRC32 mirrors (test_crc32_two_implementations_agree).
+ * Only used by test_two_excluding_walks_agree() below. */
+static unsigned copy_segments_v2(uint64_t total_len,
+                                  const struct snapshot_excl_window *win, unsigned n,
+                                  struct copy_seg *segs, unsigned max_segs)
+{
+	uint64_t off = 0;
+	unsigned ns = 0;
+
+	while (off < total_len) {
+		uint64_t next_excl_start = total_len;
+		uint64_t next_excl_end   = total_len;
+		unsigned k;
+		int inside = 0;
+
+		for (k = 0; k < n; k++) {
+			uint64_t wb = win[k].off, we = win[k].off + win[k].len;
+			if (off >= wb && off < we) {
+				inside = 1;
+				if (we < next_excl_end)
+					next_excl_end = we;
+			} else if (wb > off && wb < next_excl_start) {
+				next_excl_start = wb;
+			}
+		}
+
+		if (inside) {
+			off = next_excl_end;
+			continue;
+		}
+
+		assert(ns < max_segs);
+		segs[ns].off = off;
+		segs[ns].len = next_excl_start - off;
+		ns++;
+		off = next_excl_start;
+	}
+	return ns;
 }
 
 /* ==================================================================== *
@@ -1744,77 +1937,182 @@ static void test_open_issue_only_first_cacheline_is_explicitly_cleaned(void)
 	assert(sizeof(struct snapshot_hdr) - line == 520);
 }
 
-/* OPEN ISSUE (c) — the snapshotted "guest DRAM" range contains the
- * hypervisor itself.
+/* FIXED (c) — the snapshotted "guest DRAM" range CONTAINS the hypervisor
+ * itself, but the copy no longer TOUCHES those sub-ranges.
  *
- * SNAP_DRAM_BASE..+SNAP_DRAM_SIZE is 0x40000000..0x80000000 (snapshot.h:72-73,
- * == stage2.h:87-88's STAGE2_DRAM_BASE/SIZE). link.ld:12 places the
- * hypervisor image at ORIGIN = 0x42000000, LENGTH = 8M, with a build-time
- * ASSERT (link.ld, tail) that text+rodata+data+bss stays inside the 2 MiB
- * stage-2-protected window at 0x42000000 — and the HV's own run-time stack is
- * smp_stacks[0], a .bss array (see start.S:30-39), i.e. inside that window.
- *
- * Consequences, none of which snapshot.h's "WHAT IS (AND IS NOT) CAPTURED"
- * inventory (snapshot.h:26-50) mentions:
- *   - snapshot_save() copies the hypervisor's own .text/.data/.bss/stack into
- *     the store (harmless in itself: it is only a read).
- *   - snapshot_restore() (snapshot.c:375) writes 1 GiB back over that range
- *     *while executing out of it*, overwriting its own code, data and live
- *     call stack with the save-time bytes. .text/.rodata would be identical
- *     for an identical build, but .bss/.data/stack are not: the dram_copy()
- *     frame's own return address is in the range being overwritten.
- *   - The HV's fixed breadcrumb/ring windows at 0x5000xxxx (vconsole ring,
- *     flightrec, stage-2 AT results, ...) are in the range too, so a restore
- *     also rolls those back.
- *
- * This test only pins the containment arithmetic — that is the mechanical,
- * host-checkable part. Whether a restore actually survives it is a board
- * question, and the answer is very likely "no". */
-static void test_open_issue_snapshot_range_contains_hv_image(void)
+ * This test used to be "OPEN ISSUE (c)": SNAP_DRAM_BASE..+SNAP_DRAM_SIZE is
+ * 0x40000000..0x80000000 (snapshot.h:72-73, == stage2.h:87-88's
+ * STAGE2_DRAM_BASE/SIZE), and that range genuinely contains the hypervisor's
+ * own image (link.ld ORIGIN=0x42000000), stack (smp_stacks[0], a .bss array
+ * per start.S), and hv-scratch (0x50000000, breadcrumbs/rings/BMC block,
+ * including this feature's OWN SNAP_META_BASE header). All of that
+ * CONTAINMENT is still true today (the assertions below pin the same
+ * addresses the old test did) — what changed is that snapshot_save()/
+ * snapshot_restore() no longer sweep those sub-ranges with dram_copy(): they
+ * call dram_copy_excluding(), which skips every offset covered by
+ * snapshot_excl_windows() (snapshot.c/snapshot.h's "EXCLUSION WINDOWS").
+ * That is what turned this from "restore corrupts its own call stack,
+ * reproduced live as ESR=0x02000000 ELR=0 FAR=0" into a real, reproducible
+ * end-to-end PASS (see the report this shipped with). */
+static void test_fixed_c_exclusion_windows_cover_hv_image_and_scratch(void)
 {
-	/* Mirrored from link.ld:12/17 and its tail ASSERT. */
+	/* Mirrored from link.ld:12/17 and its tail ASSERT -- same containment
+	 * facts the old open-issue test pinned. */
 	const uint64_t hv_base = 0x42000000UL;
 	const uint64_t hv_region_len = 8UL * 1024UL * 1024UL;   /* link.ld LENGTH */
 	const uint64_t hv_protected_len = 0x200000UL;           /* link.ld ASSERT */
-	/* One of the HV's fixed DRAM breadcrumb windows (main_qemu.c:33 cites
-	 * 0x50000c1c; vconsole's ring is at 0x50000f10 per CLAUDE.md). */
-	const uint64_t hv_bc = 0x50000000UL;
+	const uint64_t hv_bc = 0x50000000UL;   /* one of the HV's breadcrumb windows */
 
 	const uint64_t snap_lo = SNAP_DRAM_BASE;
 	const uint64_t snap_hi = SNAP_DRAM_BASE + SNAP_DRAM_SIZE;
 
-	/* The HV image — including the 2 MiB window holding its stack — is
-	 * wholly inside the region snapshot_save() copies and
-	 * snapshot_restore() overwrites. */
+	struct snapshot_excl_window win[SNAPSHOT_EXCL_MAX];
+	struct copy_seg segs[8];
+	unsigned n, ns, i;
+	uint64_t copied_total, excluded_total;
+	uint64_t hv_image_off, hv_scratch_off, meta_off;
+
+	/* --- Containment: still true, unchanged from before the fix. --- */
 	assert(hv_base >= snap_lo);
 	assert(hv_base + hv_protected_len <= snap_hi);
 	assert(hv_base + hv_region_len <= snap_hi);
-
-	/* So are the HV's breadcrumb windows -- including, since the 2026-08 fix,
-	 * this feature's OWN store header (SNAP_META_BASE moved into hv-scratch
-	 * to get out of the high-GiB mirror's way; see snapshot.h). It is now
-	 * one more thing this same pre-existing containment issue applies to:
-	 * snapshot_restore()'s dram_copy() overwrites it too, mid-restore, for
-	 * exactly the reason snapshot.h's own "CAVEAT" paragraph documents
-	 * (snapshot_restore() reads it into locals BEFORE that copy runs so the
-	 * FUNCTION stays correct regardless -- but the byte-for-byte confirmed
-	 * live symptom of this whole open issue is that dram_copy() also
-	 * clobbers its own C call stack, which is a HW-observed consequence, not
-	 * merely a static containment fact -- see the report this shipped with). */
 	assert(hv_bc >= snap_lo && hv_bc < snap_hi);
 	assert(SNAP_META_BASE >= snap_lo && SNAP_META_BASE + SNAP_META_SIZE <= snap_hi);
-
-	/* And the store's DRAM MIRROR itself is safely OUTSIDE that range — the
-	 * one part the design did get right (snapshot.h's "Snapshot STORE
+	/* The store's DRAM MIRROR itself is safely OUTSIDE that range -- the one
+	 * part the design got right from the start (snapshot.h's "Snapshot STORE
 	 * region"). */
 	assert(SNAP_STORE_BASE >= snap_hi);
 
-	/* Offset of the HV image within the store's DRAM copy, i.e. where these
-	 * bytes actually land — useful for anyone inspecting a pulled image.
-	 * FIXED 2026-08: SNAP_DRAM_STORE no longer carries a +SNAP_META_SIZE
-	 * offset (it IS SNAP_STORE_BASE now), so this lands 0x10000 earlier than
-	 * before the fix. */
-	assert(SNAP_DRAM_STORE + (hv_base - SNAP_DRAM_BASE) == 0x82000000UL);
+	/* --- NOW THE FIX: build the real-board exclusion windows (image at
+	 * hv_base, generously sized to cover hv_protected_len so this test does
+	 * not depend on the exact real .bss end) and walk the copy the same way
+	 * dram_copy_excluding() does. --- */
+	n = excl_windows(hv_base, hv_base + hv_protected_len, /*hv_hdmi=*/0, win);
+	assert(n == 2u);   /* image + hv-scratch, no HDMI fb in this scenario */
+	ns = copy_segments(SNAP_DRAM_SIZE, win, n, segs, 8u);
+
+	/* Nothing lost or double-counted: copied + excluded == the whole range. */
+	copied_total = 0;
+	for (i = 0; i < ns; i++)
+		copied_total += segs[i].len;
+	excluded_total = 0;
+	for (i = 0; i < n; i++)
+		excluded_total += win[i].len;
+	assert(copied_total + excluded_total == SNAP_DRAM_SIZE);
+
+	/* No copied segment overlaps any exclusion window. */
+	for (i = 0; i < ns; i++) {
+		uint64_t seg_end = segs[i].off + segs[i].len;
+		unsigned k;
+		for (k = 0; k < n; k++) {
+			uint64_t wend = win[k].off + win[k].len;
+			assert(seg_end <= win[k].off || segs[i].off >= wend);
+		}
+	}
+
+	/* The specific bytes that USED to be swept -- the HV image's own base
+	 * and the header's own storage inside hv-scratch -- now fall INSIDE a
+	 * gap between segments, i.e. no segment covers them. */
+	hv_image_off   = hv_base - SNAP_DRAM_BASE;
+	hv_scratch_off = hv_bc   - SNAP_DRAM_BASE;
+	meta_off       = SNAP_META_BASE - SNAP_DRAM_BASE;
+	for (i = 0; i < ns; i++) {
+		uint64_t seg_end = segs[i].off + segs[i].len;
+		assert(!(hv_image_off   >= segs[i].off && hv_image_off   < seg_end));
+		assert(!(hv_scratch_off >= segs[i].off && hv_scratch_off < seg_end));
+		assert(!(meta_off       >= segs[i].off && meta_off       < seg_end));
+	}
+}
+
+/* The whole point of computing the HV-image window from (img_base, img_end)
+ * instead of reusing stage2.c's hardcoded HVIMG_BASE=0x42000000: link.ld and
+ * link_qemu.ld link the IDENTICAL snapshot.c source at DIFFERENT addresses
+ * (0x42000000 vs 0x40080000 -- see both files' own headers), and this is
+ * exactly the gap that let the QEMU harness's own stack sit unexcluded and
+ * get corrupted by snapshot_restore() (reproduced live: ESR=0x02000000
+ * ELR=0 FAR=0 -- see snapshot.h's "EXCLUSION WINDOWS"). This test proves the
+ * fix actually clears that bar: the two real link targets produce two
+ * DIFFERENT image-window offsets, both of them correctly excluding their
+ * OWN respective image, and both windows lists stay sorted + non-overlapping
+ * either way. */
+static void test_excl_windows_adapt_to_link_address(void)
+{
+	struct snapshot_excl_window real_win[SNAPSHOT_EXCL_MAX];
+	struct snapshot_excl_window qemu_win[SNAPSHOT_EXCL_MAX];
+	unsigned real_n, qemu_n, i;
+
+	real_n = excl_windows(T_REALBOARD_IMG_BASE, T_REALBOARD_IMG_END, 0, real_win);
+	qemu_n = excl_windows(T_QEMU_IMG_BASE, T_QEMU_IMG_END, 0, qemu_win);
+
+	assert(real_n == 2u && qemu_n == 2u);
+
+	/* Each target's image window matches ITS OWN link address, not the
+	 * other's -- the exact property a hardcoded HVIMG_BASE=0x42000000
+	 * literal would have failed for the QEMU target. */
+	assert(real_win[0].off == T_REALBOARD_IMG_BASE - SNAP_DRAM_BASE);
+	assert(real_win[0].len == T_REALBOARD_IMG_END - T_REALBOARD_IMG_BASE);
+	assert(qemu_win[0].off == T_QEMU_IMG_BASE - SNAP_DRAM_BASE);
+	assert(qemu_win[0].len == T_QEMU_IMG_END - T_QEMU_IMG_BASE);
+	assert(real_win[0].off != qemu_win[0].off);   /* the whole point */
+
+	/* hv-scratch is the SAME fixed window on both -- it does not move with
+	 * the link address. */
+	assert(real_win[1].off == T_HVSCR_BASE - SNAP_DRAM_BASE);
+	assert(qemu_win[1].off == T_HVSCR_BASE - SNAP_DRAM_BASE);
+
+	/* Both lists stay sorted ascending and non-overlapping (the contract
+	 * dram_copy_excluding()/crc32_region_excluding() both rely on instead of
+	 * re-deriving it themselves). */
+	for (i = 1; i < real_n; i++)
+		assert(real_win[i - 1].off + real_win[i - 1].len <= real_win[i].off);
+	for (i = 1; i < qemu_n; i++)
+		assert(qemu_win[i - 1].off + qemu_win[i - 1].len <= qemu_win[i].off);
+
+	/* And with HV_HDMI, a third window appears, still sorted/non-overlapping,
+	 * on either target. */
+	{
+		struct snapshot_excl_window win3[SNAPSHOT_EXCL_MAX];
+		unsigned n3 = excl_windows(T_QEMU_IMG_BASE, T_QEMU_IMG_END, /*hv_hdmi=*/1, win3);
+		assert(n3 == 3u);
+		for (i = 1; i < n3; i++)
+			assert(win3[i - 1].off + win3[i - 1].len <= win3[i].off);
+	}
+}
+
+/* snapshot.c's dram_copy_excluding() and snapshot_net.c's
+ * crc32_region_excluding() are two SEPARATE hand-written walks of the same
+ * window list (kept separate deliberately -- see both functions' own
+ * comments on "keep each module link-independent"). copy_segments() above
+ * mirrors that shared walk once; this test cross-checks it against
+ * copy_segments_v2() (a structurally different implementation of the same
+ * "skip excluded, copy the rest" contract) so a mistake in the walk itself
+ * -- not just in the window list -- would be caught, the same shape of test
+ * as test_crc32_two_implementations_agree() already applies to the two
+ * CRC32 implementations. */
+static void test_two_excluding_walks_agree(void)
+{
+	static const struct { uint64_t base, end; int hdmi; } cases[] = {
+		{ T_REALBOARD_IMG_BASE, T_REALBOARD_IMG_END, 0 },
+		{ T_QEMU_IMG_BASE,      T_QEMU_IMG_END,      0 },
+		{ T_QEMU_IMG_BASE,      T_QEMU_IMG_END,      1 },
+	};
+	unsigned c;
+
+	for (c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+		struct snapshot_excl_window win[SNAPSHOT_EXCL_MAX];
+		struct copy_seg a[8], b[8];
+		unsigned n, na, nb, i;
+
+		n  = excl_windows(cases[c].base, cases[c].end, cases[c].hdmi, win);
+		na = copy_segments(SNAP_DRAM_SIZE, win, n, a, 8u);
+		nb = copy_segments_v2(SNAP_DRAM_SIZE, win, n, b, 8u);
+
+		assert(na == nb);
+		for (i = 0; i < na; i++) {
+			assert(a[i].off == b[i].off);
+			assert(a[i].len == b[i].len);
+		}
+	}
 }
 
 /* ==================================================================== *
@@ -1851,12 +2149,16 @@ static const struct test_case k_tests[] = {
 	{ "manifest_bitmap_helpers",                    test_manifest_bitmap_helpers },
 	{ "missing_list_message_shape",                 test_missing_list_message_shape },
 	{ "chunk_is_zero_predicate",                    test_chunk_is_zero_predicate },
-	/* 5. open issues, pinned not fixed */
+	/* 5. open issues, pinned not fixed -- (c) graduated to "fixed", see below */
 	{ "open_issue_present_accepts_absurd_geometry", test_open_issue_present_accepts_absurd_geometry },
 	{ "open_issue_header_is_not_crc_covered",       test_open_issue_header_is_not_crc_covered },
 	{ "open_issue_only_first_cacheline_is_explicitly_cleaned",
 	                                                test_open_issue_only_first_cacheline_is_explicitly_cleaned },
-	{ "open_issue_snapshot_range_contains_hv_image", test_open_issue_snapshot_range_contains_hv_image },
+	/* 6. exclusion windows (2026-08 fix for the second snapshot bug) */
+	{ "fixed_c_exclusion_windows_cover_hv_image_and_scratch",
+	                                                test_fixed_c_exclusion_windows_cover_hv_image_and_scratch },
+	{ "excl_windows_adapt_to_link_address",         test_excl_windows_adapt_to_link_address },
+	{ "two_excluding_walks_agree",                  test_two_excluding_walks_agree },
 };
 
 int main(void)

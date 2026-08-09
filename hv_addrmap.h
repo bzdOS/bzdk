@@ -255,7 +255,22 @@ _Static_assert(HVMAP_LOW_VCONSOLE_BUF + HVMAP_LOW_VCONSOLE_BUF_SZ
  * packed any tighter against HVMAP_LOW_VCONSOLE_BUF, to leave that buffer
  * (grep'd, not assumed, per this file's own house rule) unambiguous room to
  * grow without another audit. HVMAP_SNAP_HDR_SIZE must stay >= snapshot.h's
- * SNAP_META_SIZE (checked in snapshot.h, which includes this file). */
+ * SNAP_META_SIZE (checked in snapshot.h, which includes this file).
+ *
+ * FOLLOW-UP FIX (2026-08, same investigation): moving the header IN here
+ * exposed that the header's own storage (this lane) sits INSIDE
+ * [SNAP_DRAM_BASE, SNAP_DRAM_BASE+SNAP_DRAM_SIZE) — the very range
+ * snapshot_save()/snapshot_restore() sweep byte-for-byte — same as the whole
+ * 2 MiB hv-scratch block (HVSCR_BASE, stage2.c) it lives inside. A blind
+ * sweep would read this lane as if it were guest data (harmless) and, on
+ * restore, WRITE stale snapshot-time bytes back over it and every other
+ * hv-scratch window (breadcrumbs, rings, BMC block) while the hypervisor is
+ * actively using them — self-corruption of the running HV, not a
+ * guest-visible bug, and not hypothetical: the analogous window for the
+ * HV's own image produced a live, reproduced fault (see snapshot.h's
+ * "EXCLUSION WINDOWS"). Fixed the same way: snapshot.c's
+ * dram_copy_excluding() treats [HVSCR_BASE, HVSCR_BASE+0x200000) — which
+ * contains this whole lane — as an exclusion window and never touches it. */
 #define HVMAP_SNAP_HDR_BASE   0x50060000UL
 #define HVMAP_SNAP_HDR_SIZE   0x00010000UL   /* == snapshot.h SNAP_META_SIZE */
 #define HVMAP_SNAP_HDR_END    (HVMAP_SNAP_HDR_BASE + HVMAP_SNAP_HDR_SIZE)
