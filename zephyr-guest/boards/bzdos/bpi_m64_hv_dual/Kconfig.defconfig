@@ -1,0 +1,26 @@
+# Copyright (c) 2026 bzdOS project
+# SPDX-License-Identifier: Apache-2.0
+#
+# Byte-for-byte the same tickless-first-bring-up rationale as
+# bpi_m64_hv/Kconfig.defconfig (this board's sibling) -- CPU3's stage-2
+# table (stage2_zephyr.c) does not forward any interrupt to this guest
+# either, for the same reason (no GICC-IPA -> GICV redirect wired up).
+
+if BOARD_BPI_M64_HV_DUAL
+
+config BUILD_OUTPUT_BIN
+	default y
+
+config ARM_ARCH_TIMER
+	default n
+
+config SYS_CLOCK_EXISTS
+	default n
+
+# Same conservative placeholder as bpi_m64_hv (see that board's
+# Kconfig.defconfig) -- QEMU TCG timing is unrelated to any real hardware
+# clock anyway, so re-measuring this for a QEMU-only board buys nothing.
+config BUSYWAIT_CPU_LOOPS_PER_USEC
+	default 400
+
+endif # BOARD_BPI_M64_HV_DUAL

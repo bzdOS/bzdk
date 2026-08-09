@@ -1,0 +1,165 @@
+/*
+ * Copyright (c) 2026 bzdOS project
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Zephyr board devicetree for a Zephyr/AArch64 EL1 guest running
+ * CONCURRENTLY on CPU3 of the bzdOS EL2 hypervisor, alongside FreeBSD on
+ * CPU0 (the "dual-guest" milestone -- see ../../../../stage2_zephyr.h and
+ * ../../../../zguest_cpu3.c in the hypervisor tree).
+ *
+ * DERIVED FROM bpi_m64_hv.dts (this board's sibling, the one actually
+ * loaded onto the real Banana Pi M64) -- byte-for-byte identical except for
+ * one thing: the `sram0` node's base address and size. Every MMIO address
+ * below (GIC, UART0) is unchanged, because those are trap-emulated/absorbed
+ * by the hypervisor regardless of where in physical memory this image
+ * itself is linked (see mmio_absorb.c/vconsole.c in the hypervisor tree) --
+ * only the guest's OWN RAM placement needs to match reality.
+ *
+ * WHY THIS BOARD EXISTS, RATHER THAN JUST RUNNING bpi_m64_hv's OWN IMAGE ON
+ * CPU3: bpi_m64_hv is linked at 0x51000000 -- inside FreeBSD's low-DRAM
+ * gigabyte, which CPU3's own stage-2 table (stage2_zephyr.c) deliberately
+ * leaves ENTIRELY UNMAPPED (that unmapping IS the cross-guest isolation
+ * boundary the dual-guest milestone exists to prove). Loading that same
+ * image onto CPU3, then relocating its BYTES at HV load time
+ * (zload2_parse_and_place()'s pa_base parameter can do this mechanically)
+ * to CPU3's actual 0xBE000000-0xC0000000 slice, was tried and empirically
+ * found to NOT work: with CONFIG_ARM_MMU=y (see bpi_m64_hv_dual_defconfig),
+ * Zephyr's own arm64 SoC layer (zephyr/soc/arm/qemu_virt_arm64) builds
+ * static stage-1 page tables from THIS DEVICETREE's sram0/GIC addresses at
+ * BUILD time; those tables are baked-in absolute data, not the
+ * position-independent ADRP-relative code the rest of a typical AArch64
+ * build mostly consists of. A byte-for-byte positional shift after the
+ * fact moves the CODE and DATA but not what those tables SAY -- they still
+ * describe 0x51000000, which CPU3's stage-2 leaves invalid. Measured
+ * result: CPU3 genuinely reaches the relocated entry point (confirmed via
+ * zguest_cpu3.c/zload2.c's own breadcrumbs -- state reaches "about to enter
+ * the guest", zload2 reports a clean single-segment placement with the
+ * expected byte count) and then produces ZERO console output and never
+ * traps back to EL2 again for the rest of a multi-tick sampling window --
+ * consistent with Zephyr's own MMU-enable faulting against its
+ * now-mismatched tables and the guest's own fatal-error path spinning
+ * (see dual-zephyr-qemu-ci.sh's commit message for the exact reproduction).
+ *
+ * This board is the honest fix: rebuild for the address the image will
+ * ACTUALLY run at, so every absolute pointer Zephyr's own linker bakes in
+ * -- MMU tables included -- is correct from the start. Nothing about
+ * mmio_absorb.c/vconsole.c/zload2.c's general relocation MECHANISM needed
+ * to change; the bug was in assuming a positional-shift-only relocation is
+ * always sufficient for an arbitrary MMU-enabled RTOS image, which it is
+ * not.
+ */
+
+/dts-v1/;
+
+#include <mem.h>
+#include <arm64/armv8-a.dtsi>
+#include <zephyr/dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	model = "Banana Pi M64 (bzdOS EL2 hypervisor EL1 guest, dual-guest CPU3 slice)";
+	compatible = "bzdos,bpi-m64-hv-dual";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0>;
+			i-cache-line-size = <64>;
+			d-cache-line-size = <64>;
+		};
+	};
+
+	/* Tickless first bring-up -- unchanged from bpi_m64_hv.dts. See that
+	 * file's own comment; the same "not wired up yet" status applies to
+	 * CPU3's stage-2 table (stage2_zephyr.c has no GICC-IPA -> GICV
+	 * redirect either). */
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "disabled";
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-parent = <&gic>;
+
+		/*
+		 * THE ONE REAL CHANGE FROM bpi_m64_hv.dts. CPU3's private
+		 * stage-2 slice (stage2_zephyr.h: ZSTAGE2_DRAM_BASE=0xBE000000,
+		 * ZSTAGE2_DRAM_SIZE=32 MiB, ending at 0xC0000000) -- everything
+		 * else in CPU3's stage-2 table (all MMIO, all of FreeBSD's
+		 * low-DRAM gigabyte) is INVALID by design (the cross-guest
+		 * isolation boundary), so this is the ONLY address range this
+		 * image may use. Sized to exactly the 32 MiB slice, not
+		 * bpi_m64_hv's 256 MiB -- there is no more room, and
+		 * zload2_parse_and_place() enforces this same 32 MiB ceiling
+		 * independently at HV load time (ZLOAD2_MAX_IMAGE_SIZE), so an
+		 * image that outgrew this devicetree's own RAM node would be
+		 * rejected there too, atomically, before ever being entered.
+		 */
+		sram0: memory@be000000 {
+			compatible = "mmio-sram";
+			reg = <0x0 0xbe000000 0x0 DT_SIZE_M(32)>;
+		};
+
+		/*
+		 * GIC-400 (GICv2 + virtualization extensions) -- UNCHANGED
+		 * from bpi_m64_hv.dts. Real A64 addresses, absorbed by
+		 * mmio_absorb.c on CPU3 (stage2_zephyr.c maps NO real MMIO at
+		 * all -- see that file's header): every access here
+		 * unconditionally "succeeds" without modeling real GIC
+		 * register semantics. Harmless for this tickless build, same
+		 * as bpi_m64_hv.dts's own note about QEMU's black-hole GIC.
+		 */
+		gic: interrupt-controller@1c81000 {
+			compatible = "arm,gic-v2", "arm,gic";
+			reg = <0x0 0x01c81000 0x0 0x1000>,	/* GICD */
+			      <0x0 0x01c82000 0x0 0x2000>;	/* GICC (guest IPA) */
+			interrupt-controller;
+			#interrupt-cells = <4>;
+			#address-cells = <0>;
+			status = "okay";
+		};
+
+		/*
+		 * Allwinner/Synopsys 16550-compatible UART0 -- UNCHANGED from
+		 * bpi_m64_hv.dts. Trap-and-emulated by bzdOS's vconsole.c
+		 * CHANNEL 1 on CPU3 (see vconsole.h/vconsole.c's channel
+		 * refactor and el2_exc_dual_zephyr_qemu.c's CPU3 dispatch),
+		 * not channel 0 (FreeBSD's) -- the two never collide because
+		 * they run on different cores against different, disjoint
+		 * stage-2 tables.
+		 */
+		uart0: serial@1c28000 {
+			compatible = "ns16550";
+			reg = <0x0 0x01c28000 0x0 0x400>;
+			reg-shift = <2>;
+			clock-frequency = <24000000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+			status = "disabled";
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};
