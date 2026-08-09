@@ -220,6 +220,109 @@ static uint32_t crc32_update_word(uint32_t crc, uint64_t word)
 }
 
 /* ================================================================== *
+ * EXCLUSION WINDOWS — see snapshot.h's "EXCLUSION WINDOWS" section for the
+ * full rationale. This is the SOLE place that list is built; snapshot_net.c's
+ * crc32_region_excluding() calls snapshot_excl_windows() (declared in
+ * snapshot.h) rather than re-deriving its own copy.
+ * ================================================================== */
+
+/* Provided by EVERY link script in this tree (link.ld for the real board,
+ * link_qemu.ld for the QEMU snapshot-qemu harness) — the same two symbols
+ * start.S/start_qemu.S already rely on for their own .bss-zeroing loops, and
+ * the same one el2_ncmap.c already reads (__bss_end) to learn "how big is
+ * our image really" at runtime instead of trusting a hardcoded literal.
+ *
+ * WHY A LINKER-SYMBOL WINDOW, NOT A HARDCODED HVIMG_BASE: stage2.c already
+ * has a fixed #define HVIMG_BASE 0x42000000 for exactly this purpose (its
+ * OWN purpose: guest stage-2 exclusion). Reusing that literal here would be
+ * wrong on this module's SECOND build target: link.ld places the real-board
+ * image at 0x42000000 (HVIMG_BASE is correct there BY CONSTRUCTION), but
+ * link_qemu.ld links the IDENTICAL source at 0x40080000 (see that file's own
+ * header) — a hardcoded 0x42000000 exclusion window would protect the real
+ * board and do ABSOLUTELY NOTHING on the QEMU harness, which is exactly the
+ * bug this fix closes (confirmed live: the QEMU harness's own stack,
+ * qemu_boot_stack in start_qemu.S, sits at 0x40080000+something, inside the
+ * unexcluded range, and snapshot_restore()'s old blind dram_copy() corrupted
+ * it mid-restore — see snapshot.h). Computing the window from _text_start/
+ * __bss_end instead makes it correct on BOTH targets with one definition,
+ * and automatically tracks the image if it ever grows (no periodic re-audit
+ * needed, unlike a hand-picked size margin).
+ *
+ * __bss_end is the right upper bound, not _text_end: per stage2.c's H2(a)
+ * comment, every CPU's EL2 runtime stack (smp_stacks[], real-board build) or
+ * the QEMU harness's own qemu_boot_stack (start_qemu.S) is a plain .bss
+ * array, so it is covered only if the window runs to __bss_end. */
+extern char    _text_start[];
+extern uint8_t __bss_end[];
+
+/* hv-scratch: a FIXED absolute PA, unlike the image window above — this is
+ * ordinary DRAM the code dereferences directly by address, so the link
+ * address is irrelevant. Mirrors stage2.c's own HVSCR_BASE (stage2.c:436)
+ * exactly: one 2 MiB L2 block, matching the DTB's `hv-scratch@50000000`
+ * reg=<0x200000> on the real board (see hv_addrmap.h's map for everything
+ * that lives inside it, including this very module's SNAP_META_BASE at
+ * 0x50060000 — see snapshot.h's "EXCLUSION WINDOWS"). Re-declared here
+ * rather than shared via a header for the same reason test_stage2_tables.c
+ * re-declares it at its own :325-326: stage2.c's copy is a file-local
+ * #define with no exported header. If stage2.c's own value ever moves, this
+ * copy must move with it — there is deliberately no compile-time link
+ * between the two today (same known gap as the existing test-file mirror). */
+#define SNAP_EXCL_HVSCR_BASE  0x50000000UL
+#define SNAP_EXCL_HVSCR_SIZE  0x00200000UL
+
+#ifdef HV_HDMI
+/* HDMI framebuffer — only excluded in HV_HDMI builds, mirroring stage2.c's
+ * own #ifdef HV_HDMI gate exactly (stage2.c HVFB_BASE/HVFB_SIZE). Neither
+ * `dbg` nor `snapshot-qemu` currently defines HV_HDMI (grep the Makefile),
+ * so this arm is untested dead code today, same status quo as stage2.c's
+ * own HVFB carve-out. */
+#define SNAP_EXCL_HVFB_BASE   0x4D000000UL
+#define SNAP_EXCL_HVFB_SIZE   0x00800000UL
+#endif
+
+unsigned
+snapshot_excl_windows(struct snapshot_excl_window out[SNAPSHOT_EXCL_MAX])
+{
+	unsigned n = 0;
+	uint64_t img_base = (uint64_t)(uintptr_t)_text_start;
+	uint64_t img_end   = (uint64_t)(uintptr_t)__bss_end;
+
+	/* 1. Our own running image (see the extern declarations' comment). */
+	out[n].off = img_base - SNAP_DRAM_BASE;
+	out[n].len = img_end - img_base;
+	n++;
+
+	/* 2. hv-scratch (fixed PA, every build target). */
+	out[n].off = SNAP_EXCL_HVSCR_BASE - SNAP_DRAM_BASE;
+	out[n].len = SNAP_EXCL_HVSCR_SIZE;
+	n++;
+
+#ifdef HV_HDMI
+	/* 3. HDMI framebuffer (fixed PA, HV_HDMI builds only). */
+	out[n].off = SNAP_EXCL_HVFB_BASE - SNAP_DRAM_BASE;
+	out[n].len = SNAP_EXCL_HVFB_SIZE;
+	n++;
+#endif
+
+	/* Sort ascending by `off` -- n <= 3, a plain insertion sort costs nothing
+	 * and lets dram_copy_excluding()/crc32_region_excluding() assume
+	 * ascending, non-overlapping order instead of re-deriving it themselves. */
+	{
+		unsigned i, j;
+		for (i = 1; i < n; i++) {
+			struct snapshot_excl_window key = out[i];
+			j = i;
+			while (j > 0 && out[j - 1].off > key.off) {
+				out[j] = out[j - 1];
+				j--;
+			}
+			out[j] = key;
+		}
+	}
+	return n;
+}
+
+/* ================================================================== *
  * DRAM COPY
  * ================================================================== */
 
@@ -268,6 +371,54 @@ static void dram_copy(uint64_t dst_pa, uint64_t src_pa, uint64_t bytes, uint32_t
 	__asm__ volatile("dsb sy" ::: "memory");
 	if (crc_inout)
 		*crc_inout = crc;
+}
+
+/* dram_copy(), but skipping every exclusion window (snapshot_excl_windows())
+ * instead of sweeping [0, total_len) blindly -- see snapshot.h's "EXCLUSION
+ * WINDOWS" for why. `dst_base`/`src_base` must be addresses whose OFFSET FROM
+ * SNAP_DRAM_BASE is the SAME offset space the windows are expressed in --
+ * true of both current callers: snapshot_save() passes (SNAP_DRAM_STORE,
+ * SNAP_DRAM_BASE, ...) and snapshot_restore() passes (SNAP_DRAM_BASE,
+ * SNAP_DRAM_STORE, ...), and SNAP_DRAM_STORE's own mirror is laid out 1:1
+ * against SNAP_DRAM_BASE at offset 0 either way (snapshot.h's "Snapshot
+ * STORE region"), so "offset from SNAP_DRAM_BASE" and "offset from
+ * SNAP_DRAM_STORE into the mirror" are the identical number.
+ *
+ * Windows are sorted ascending + non-overlapping (snapshot_excl_windows()'s
+ * own contract), so a single forward pass with a monotonically-advancing
+ * window index `wi` is enough -- no rescans, no O(n*windows) blowup. */
+static void
+dram_copy_excluding(uint64_t dst_base, uint64_t src_base, uint64_t total_len,
+                     uint32_t *crc_inout)
+{
+	struct snapshot_excl_window win[SNAPSHOT_EXCL_MAX];
+	unsigned n = snapshot_excl_windows(win);
+	uint64_t off = 0;
+	unsigned wi = 0;
+
+	while (off < total_len) {
+		uint64_t seg_len = total_len - off;
+
+		/* Advance past any window that has already fully elapsed. */
+		while (wi < n && win[wi].off + win[wi].len <= off)
+			wi++;
+
+		if (wi < n && win[wi].off <= off) {
+			/* `off` is INSIDE the next window: skip straight to its end
+			 * (clamped to total_len) without copying anything. */
+			uint64_t skip_end = win[wi].off + win[wi].len;
+			off = (skip_end < total_len) ? skip_end : total_len;
+			continue;
+		}
+
+		if (wi < n && win[wi].off < off + seg_len)
+			/* The next window starts partway through this segment:
+			 * copy only up to its start. */
+			seg_len = win[wi].off - off;
+
+		dram_copy(dst_base + off, src_base + off, seg_len, crc_inout);
+		off += seg_len;
+	}
 }
 
 /* ================================================================== *
@@ -329,11 +480,20 @@ int snapshot_save(const struct el2_frame *frame)
 	 * so integrity-checking costs no extra memory bandwidth. RESOLVED: this
 	 * closes the former "CRC left 0 in skeleton" TODO with a real check --
 	 * software CRC32, not the optional HW CRC32 extension (see
-	 * crc32_update_word for why that dependency is deliberately avoided). */
+	 * crc32_update_word for why that dependency is deliberately avoided).
+	 *
+	 * dram_copy_excluding(), not plain dram_copy(): see snapshot.h's
+	 * "EXCLUSION WINDOWS" -- this range also physically contains the
+	 * hypervisor's own image/hv-scratch/(HV_HDMI) framebuffer, which must be
+	 * skipped rather than read as if it were guest content. The CRC therefore
+	 * covers exactly the bytes that end up in the mirror (the excluded-aware
+	 * pass), which is also exactly what snapshot_net.c's
+	 * crc32_region_excluding() recomputes on the receiving end -- see that
+	 * function's comment for why the two MUST agree. */
 	{
 		uint32_t crc = CRC32_INIT;
 
-		dram_copy(SNAP_DRAM_STORE, SNAP_DRAM_BASE, SNAP_DRAM_SIZE, &crc);
+		dram_copy_excluding(SNAP_DRAM_STORE, SNAP_DRAM_BASE, SNAP_DRAM_SIZE, &crc);
 		h->crc32 = crc ^ 0xFFFFFFFFu;
 	}
 
@@ -395,8 +555,17 @@ int snapshot_restore(struct el2_frame *frame)
 	 *    -- that would cost the same pass again and defeat the <1 s restore
 	 *    goal (design doc "Performance"). The stored crc32 is a save-time
 	 *    integrity aid for out-of-band inspection (e.g. a host memory dump),
-	 *    not an on-path restore check. */
-	dram_copy(SNAP_DRAM_BASE, SNAP_DRAM_STORE, dram_size, (uint32_t *)0);
+	 *    not an on-path restore check.
+	 *
+	 *    dram_copy_excluding(), not plain dram_copy(): THIS is the fix for
+	 *    the live-reproduced self-corruption bug (see snapshot.h's
+	 *    "EXCLUSION WINDOWS") -- a blind dram_copy() here overwrites the
+	 *    hypervisor's own running .text/.data/.bss AND ITS OWN LIVE CALL
+	 *    STACK with year-old snapshot bytes while this very function is
+	 *    still executing on that stack. Skipping the exclusion windows means
+	 *    those PAs are left holding whatever the HV currently has there
+	 *    (its own live, correct state) instead of being clobbered. */
+	dram_copy_excluding(SNAP_DRAM_BASE, SNAP_DRAM_STORE, dram_size, (uint32_t *)0);
 
 	/* 2. Reload the EL1 + per-guest EL2 sysreg set. */
 	{

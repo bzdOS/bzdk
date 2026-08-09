@@ -162,18 +162,71 @@ static uint32_t crc32_calc(const uint8_t *data, uint32_t len)
 
 /* Same as crc32_calc but over a raw physical-memory region rather than a
  * local buffer, petting the watchdog periodically — this is a whole-DRAM
- * (up to 1 GiB) pass, the same cost class as snapshot.c's dram_copy(). */
-static uint32_t crc32_region(uint64_t pa, uint64_t len)
+ * (up to 1 GiB) pass, the same cost class as snapshot.c's dram_copy(). Folds
+ * into a caller-supplied running crc (`*crc`, already inverted, i.e. the raw
+ * accumulator state -- see crc32_region_excluding() below) so it can be
+ * called once per non-excluded segment and still produce one CRC over the
+ * whole logical (excluded-aware) region. */
+static void crc32_region_into(uint64_t pa, uint64_t len, uint32_t *crc)
 {
 	const uint8_t *p = (const uint8_t *)(uintptr_t)pa;
-	uint32_t crc = 0xFFFFFFFFu;
 	uint64_t i;
 	if (!crc_table_ready)
 		crc32_init();
 	for (i = 0; i < len; i++) {
-		crc = crc_table[(crc ^ p[i]) & 0xffu] ^ (crc >> 8);
+		*crc = crc_table[(*crc ^ p[i]) & 0xffu] ^ (*crc >> 8);
 		if ((i & 0xFFFFFu) == 0xFFFFFu)
 			wdt_pet();
+	}
+}
+
+/* snapshot_net_recv()'s whole-image CRC recheck (step 6 below), walking the
+ * SAME exclusion windows snapshot_save()'s dram_copy_excluding() skipped when
+ * it computed the header's own crc32 field in the first place (snapshot.c,
+ * snapshot.h's "EXCLUSION WINDOWS") -- a naive whole-region CRC with no
+ * exclusion awareness (what this used to be, before this fix) would make
+ * this recheck disagree with the header's crc32 on EVERY transfer (comparing
+ * "CRC over the excluded-aware
+ * save pass" against "CRC over the whole 1 GiB including the sender's own
+ * live HV image/hv-scratch bytes"), which is exactly the class of cross-file
+ * drift this project's own history keeps finding (see e.g. the
+ * SNAP_META_SIZE/SNAPNET_CHUNK seam this file's header already documents).
+ * `pa`/`len` are the same (h->dram_store, h->dram_size) values snapshot.c's
+ * own snapshot_save()/dram_copy_excluding() call was given -- offsets from
+ * SNAP_DRAM_BASE are the same offset space on both ends (snapshot.h).
+ *
+ * Hand-walks the same window list via snapshot_excl_windows() (snapshot.h) --
+ * a SEPARATE walk from snapshot.c's dram_copy_excluding(), same as this
+ * file's crc32_calc() is a separate implementation from snapshot.c's
+ * crc32_update_word() (see this file's header comment on why: "keep each
+ * module link-independent"). What must NOT diverge between the two walks is
+ * the WINDOW LIST itself, which is why that part is shared (snapshot.h's
+ * snapshot_excl_windows(), not re-derived here). */
+static uint32_t crc32_region_excluding(uint64_t pa, uint64_t len)
+{
+	struct snapshot_excl_window win[SNAPSHOT_EXCL_MAX];
+	unsigned n = snapshot_excl_windows(win);
+	uint32_t crc = 0xFFFFFFFFu;
+	uint64_t off = 0;
+	unsigned wi = 0;
+
+	while (off < len) {
+		uint64_t seg_len = len - off;
+
+		while (wi < n && win[wi].off + win[wi].len <= off)
+			wi++;
+
+		if (wi < n && win[wi].off <= off) {
+			uint64_t skip_end = win[wi].off + win[wi].len;
+			off = (skip_end < len) ? skip_end : len;
+			continue;
+		}
+
+		if (wi < n && win[wi].off < off + seg_len)
+			seg_len = win[wi].off - off;
+
+		crc32_region_into(pa + off, seg_len, &crc);
+		off += seg_len;
 	}
 	return crc ^ 0xFFFFFFFFu;
 }
@@ -565,9 +618,12 @@ int snapshot_net_recv(struct el2_frame *frame)
 	 *    (computed by the ORIGINAL snapshot_save() on the sending board) --
 	 *    belt-and-suspenders against any reconstruction bug even though every
 	 *    individual chunk's own CRC already passed. Refuse to restore on
-	 *    mismatch. */
+	 *    mismatch. Exclusion-window-aware (crc32_region_excluding()) -- see
+	 *    that function's own comment: the header's crc32 was computed the
+	 *    same way by snapshot_save(), so a naive whole-region recheck here
+	 *    would disagree on every single transfer. */
 	h = snapnet_hdr();
-	if (crc32_region(h->dram_store, h->dram_size) != h->crc32)
+	if (crc32_region_excluding(h->dram_store, h->dram_size) != h->crc32)
 		return -4;
 
 	/* 7. Commit into the live guest via the EXISTING, unmodified restore

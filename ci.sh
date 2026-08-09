@@ -39,6 +39,21 @@
 #                     header for why that is a missing input, not a
 #                     regression. Wired in 2026-08-07 after a 10/10 clean
 #                     reliability run (see docs/linux-guest.md "Gate status").
+#   6. ./snapshot-qemu-ci.sh
+#                   — GUEST CHECKPOINT/RESTORE (ROADMAP D1) round-trips end to
+#                     end: the REAL, unmodified snapshot_save()/
+#                     snapshot_restore() run against a live EL1 guest, and the
+#                     guest's own loop-counter breadcrumb is asserted to
+#                     actually REWIND to its snapshot-time value and then
+#                     resume climbing — a genuine save+restore, not just "no
+#                     fault". No SKIP path (everything needed is in this
+#                     repo). Could NOT be wired in until the exclusion-window
+#                     fix (snapshot.c's dram_copy_excluding(), see snapshot.h's
+#                     "EXCLUSION WINDOWS"): before that, a blind whole-1-GiB
+#                     dram_copy() corrupted the harness's own running image
+#                     mid-restore on EVERY run, so this stage would have been
+#                     permanently red. Wired in 2026-08 after 6/6 clean runs
+#                     (see the report this shipped with).
 #
 # One command, one exit code — the gate to run on every commit. Hardware-only
 # checks (100-boot streak, soak, break-glass) live in the cumulative boot
@@ -104,6 +119,14 @@ elif echo "$lout" | grep -q "linux-qemu-ci: SKIP"; then
     echo "ci: linux guest target SKIPPED (no Linux tree — not a regression)"
 else
     echo "ci: linux guest target PASS"
+fi
+
+echo "════════ ci: snapshot/restore round trip on QEMU-virt (snapshot-qemu-ci.sh) ════════"
+if ./snapshot-qemu-ci.sh; then
+    echo "ci: snapshot/restore target PASS"
+else
+    echo "ci: snapshot/restore target FAIL"
+    fail=1
 fi
 
 echo "════════════════════════════════════════════════════"
