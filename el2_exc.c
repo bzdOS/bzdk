@@ -265,6 +265,19 @@ __attribute__((weak)) int vblk_mmio_fault(struct el2_frame *frame)
 	return 0;
 }
 
+/* Dual-guest catch-all MMIO absorber for CPU3/Zephyr (mmio_absorb.c). Same
+ * weak-fallback pattern as vnet_mmio_fault/vblk_mmio_fault right above: only
+ * the `dual` Makefile target links mmio_absorb.o; every other target keeps
+ * linking with this stub, which always reports "not handled" -- harmless,
+ * since the CPU3 dispatch branch that calls it (below) is itself dead code
+ * on every target where CPU3 never traps at lower-EL (it just sits in
+ * `wfi`, see smp.c). */
+__attribute__((weak)) int mmio_absorb_fault(struct el2_frame *frame)
+{
+	(void)frame;
+	return 0;
+}
+
 /* B3 crash-forensics ELF-over-EMAC stream (coredump.c, coredump_send()).
  * Weak fallback so the `repl`/`fbsd`/`zephyr` builds -- which never call
  * emac_init() and don't link coredump.o -- still link; a genuine guest
@@ -662,8 +675,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 #endif
 
 	/* Snapshot the guest frame for the SMP debug core (CPU1) — only when that
-	 * core is actually up (dbg_core_active). Inert/zero-overhead otherwise. */
-	if (dbg_core_active && (kind >> 2) == 2u) {
+	 * core is actually up (dbg_core_active), and (dual-guest milestone)
+	 * only for CPU0's FreeBSD guest: CPU3's Zephyr traps must never be able
+	 * to overwrite this snapshot, which dbgmon.c's gr/sr/bt commands and
+	 * gdbstub.c both read as "the" live guest frame. Every existing target
+	 * only ever traps from CPU0 here anyway (CPU3 sits in `wfi`, see
+	 * smp.c), so this added check is dead code for them -- smp_cpu_id() is
+	 * a cheap `mrs mpidr_el1` either way. */
+	if (dbg_core_active && smp_cpu_id() == 0u && (kind >> 2) == 2u) {
 		/* seqlock publish (review H8): odd seq marks the copy in progress so
 		 * a concurrent CPU1 reader retries instead of seeing a torn frame. */
 		g_last_guest_frame_seq++;                        /* -> odd */
@@ -928,44 +947,74 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			return;
 	}
 
-	/* Guest (lower-EL) synchronous DATA ABORT (ESR EC==0x24): first try the
-	 * virtual UART console — a stage-2 fault on the unmapped UART0 page means
-	 * the FreeBSD guest is doing console I/O. vconsole emulates it (captures
-	 * transmitted bytes, returns "ready" on status reads, advances ELR) and
-	 * returns 1 if handled — then this is normal guest progress, NOT a fault,
-	 * so we return without recording. Only genuinely unhandled aborts fall
-	 * through to the fault record below. */
+	/* Guest (lower-EL) synchronous DATA ABORT (ESR EC==0x24): route by which
+	 * core is trapping. Every existing target only ever reaches this with
+	 * cpu==0 (CPU3 sits in `wfi` in all of them, see smp.c), so the cpu==3
+	 * branch below is dead code for them; the cpu!=3 branch is the ORIGINAL
+	 * code, unchanged, just now inside an explicit else. */
 	if ((kind >> 2) == 2u && (kind & 3u) == EL2_KIND_SYNC &&
 	    (((uint32_t)(frame->esr >> 26)) & 0x3fu) == 0x24u) {
-		if (vconsole_handle_fault(frame)) {
-			if (!dbg_core_active)
-				dbgmon_service(frame);
-			return;
-		}
-		/* Next, the eMMC-backed virtio-blk device at 0x0A000000. Same
-		 * "handled -> return without recording" contract as vconsole.
-		 * vblk_mmio_fault() returns 0 for any abort outside its 0x200-byte
-		 * window, so calling it unconditionally on every guest data abort is
-		 * safe; disjoint from the UART0 page, so order vs vconsole is
-		 * arbitrary. A QueueNotify write here drains the ring straight to the
-		 * real eMMC and injects INTID 82. See docs/virtio-blk-design.md. */
-		if (vblk_mmio_fault(frame)) {
-			if (!dbg_core_active)
-				dbgmon_service(frame);
-			return;
-		}
-		/* Finally, the virtio-net-over-EMAC multiplexer at 0x0A001000
-		 * (ROADMAP C1 — see vnet_emac.h). Same "handled -> return without
-		 * recording" contract; vnet_mmio_fault() returns 0 for any abort
-		 * outside its own 0x200-byte window (disjoint from vconsole's UART0
-		 * page and vblk's 0x0A000000 window), so calling it unconditionally
-		 * here is safe. A QueueNotify(1) write here drains the transmitq
-		 * straight to the real EMAC (muxed with the debug-protocol traffic —
-		 * see vnet_emac.c's TX ethertype filter) and injects VNET_INTID. */
-		if (vnet_mmio_fault(frame)) {
-			if (!dbg_core_active)
-				dbgmon_service(frame);
-			return;
+		if (smp_cpu_id() == 3u) {
+			/* Dual-guest milestone: CPU3/Zephyr. Try the channel-1 virtual
+			 * UART0 first (the one real, meaningfully-emulated device
+			 * Zephyr's console needs — see vconsole.c/vconsole.h); anything
+			 * else CPU3 could fault on (its stage-2 table has NO other
+			 * carve-outs at all — see stage2_zephyr.c) falls to the
+			 * generic MMIO absorber. Deliberately NOT calling
+			 * dbgmon_service() here — that service point reads/writes
+			 * g_last_guest_frame, which this milestone reserves for CPU0
+			 * (see the snapshot guard above); CPU3 has no analogous live
+			 * debug-core service in this design. */
+			if (vconsole_handle_fault(frame, 1)) {
+				return;
+			}
+			if (mmio_absorb_fault(frame)) {
+				return;
+			}
+			/* Fell outside every known-safe range on CPU3 -- do NOT
+			 * silently swallow (a real Zephyr-side bug, e.g. wandered
+			 * outside its 32 MiB slice, must stay visible): fall through
+			 * to the generic unhandled-fault path below, same as any
+			 * other unclaimed abort. */
+		} else {
+			/* ORIGINAL code, unchanged: first try the virtual UART console
+			 * — a stage-2 fault on the unmapped UART0 page means the
+			 * FreeBSD guest is doing console I/O. vconsole emulates it
+			 * (captures transmitted bytes, returns "ready" on status
+			 * reads, advances ELR) and returns 1 if handled — then this is
+			 * normal guest progress, NOT a fault, so we return without
+			 * recording. Only genuinely unhandled aborts fall through to
+			 * the fault record below. */
+			if (vconsole_handle_fault(frame, 0)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
+			/* Next, the eMMC-backed virtio-blk device at 0x0A000000. Same
+			 * "handled -> return without recording" contract as vconsole.
+			 * vblk_mmio_fault() returns 0 for any abort outside its 0x200-byte
+			 * window, so calling it unconditionally on every guest data abort is
+			 * safe; disjoint from the UART0 page, so order vs vconsole is
+			 * arbitrary. A QueueNotify write here drains the ring straight to the
+			 * real eMMC and injects INTID 82. See docs/virtio-blk-design.md. */
+			if (vblk_mmio_fault(frame)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
+			/* Finally, the virtio-net-over-EMAC multiplexer at 0x0A001000
+			 * (ROADMAP C1 — see vnet_emac.h). Same "handled -> return without
+			 * recording" contract; vnet_mmio_fault() returns 0 for any abort
+			 * outside its own 0x200-byte window (disjoint from vconsole's UART0
+			 * page and vblk's 0x0A000000 window), so calling it unconditionally
+			 * here is safe. A QueueNotify(1) write here drains the transmitq
+			 * straight to the real EMAC (muxed with the debug-protocol traffic —
+			 * see vnet_emac.c's TX ethertype filter) and injects VNET_INTID. */
+			if (vnet_mmio_fault(frame)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
 		}
 	}
 

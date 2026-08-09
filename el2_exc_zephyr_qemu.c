@@ -205,7 +205,7 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 
 	if (group == 2u) {   /* from a lower EL: the guest */
 		if (ec == EC_DABT_LOWER) {
-			if (vconsole_handle_fault(frame)) {
+			if (vconsole_handle_fault(frame, 0)) {
 				drain_guest_console();
 				return;
 			}

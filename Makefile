@@ -56,7 +56,7 @@ HDMI_BIN   := microkernel-hdmi.bin
 ZEPHYR_ELF := microkernel-zephyr.elf
 ZEPHYR_BIN := microkernel-zephyr.bin
 
-.PHONY: all stage0 net repl fbsd dbg gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu dual-qemu holdtest clean clean-qemu clean-linux-qemu clean-dual-qemu clean-holdtest test
+.PHONY: all stage0 net repl fbsd dbg dual gdb hdmi zephyr zephyr-qemu linux-qemu vgic-qemu qemu snapshot-qemu dual-qemu holdtest clean clean-qemu clean-linux-qemu clean-dual-qemu clean-holdtest test
 all: $(STAGE0_BIN) $(MAIN_BIN)
 
 # --- Hosted unit tests (T2 "Хостовые тесты", ROADMAP.md) ----------------
@@ -118,12 +118,13 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
 	./test_vnet_ring
 	./test_kload_modinfo
+	./test_zload2_parsing
 	./test_vconsole_uart
 	./test_gdbstub_resolve
 	./test_gdbstub_hwop
@@ -152,6 +153,9 @@ test_vnet_ring: test_vnet_ring.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_kload_modinfo: test_kload_modinfo.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_zload2_parsing: test_zload2_parsing.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vconsole_uart: test_vconsole_uart.c
@@ -243,6 +247,45 @@ $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
 $(DBG_BIN): $(DBG_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+# --- Dual-guest build: FreeBSD on CPU0 (byte-for-byte the SAME as `dbg` —
+# main_dbg.c is reused UNCHANGED, see below) + a genuinely concurrent
+# Zephyr guest on CPU3, started/stopped independently over EMAC via
+# dbgmon.c's new `zboot` command (see zguest_cpu3.h for the full lifecycle).
+# NEW target — does not touch/replace `dbg`.
+#
+# DUAL_OBJS = DBG_OBJS, MINUS snapshot.o/snapshot_net.o (ROADMAP D1 snapshot/
+# restore is mutually exclusive with this milestone this pass — both claim
+# the same high-GiB DRAM window, see stage2_zephyr.h's "FUTURE
+# RECONCILIATION NOTE"), PLUS the four new dual-guest-only objects
+# (zguest_cpu3.o/zload2.o/stage2_zephyr.o/mmio_absorb.o).
+#
+# main_dbg.c NEEDS NO CHANGES / no separate main_dual.c: grepped before
+# writing this target -- main_dbg.c has no direct call to snapshot_save()/
+# snapshot_restore()/snapshot_init() anywhere (that D1 feature is reachable
+# ONLY via snapshot_net.c's own EMAC RX hook, registered exactly like
+# dbgtools_rx_frame -- see emac.c's snapshot_net_rx_frame() weak-fallback
+# pattern), so dropping snapshot.o/snapshot_net.o from the link is a clean,
+# self-contained removal: emac.c's own weak stub already covers their
+# absence, the same way it already covers every OTHER target that doesn't
+# link snapshot_net.o (fbsd/zephyr/gdb/etc).
+DUAL_ELF   := microkernel-dual.elf
+DUAL_BIN   := microkernel-dual.bin
+
+dual: $(DUAL_BIN)
+
+DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
+             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
+             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o flightrec.o coredump.o \
+             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o \
+             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o \
+             zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o
+$(DUAL_ELF): $(DUAL_OBJS) link.ld
+	$(CC) $(LDFLAGS) -o $@ $(DUAL_OBJS)
+	$(SIZE) $@
+$(DUAL_BIN): $(DUAL_ELF)
 	$(OBJCOPY) -O binary $< $@
 
 # --- GDB-stub build: same skeleton as `dbg`, but the tick-path debugger is
@@ -576,7 +619,8 @@ clean: clean-qemu clean-dual-qemu clean-holdtest
 	      $(STAGE0_ELF) $(STAGE0_BIN) $(MAIN_ELF) $(MAIN_BIN) \
 	      $(NET_ELF) $(NET_BIN) $(REPL_ELF) $(REPL_BIN) \
 	      $(FBSD_ELF) $(FBSD_BIN) $(DBG_ELF) $(DBG_BIN) \
+	      $(DUAL_ELF) $(DUAL_BIN) \
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
-	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_vconsole_uart \
+	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_vconsole_uart \
 	      test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq

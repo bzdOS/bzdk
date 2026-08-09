@@ -9,6 +9,7 @@ test_vblk_ring
 test_stage2_tables
 test_vnet_ring
 test_kload_modinfo
+test_zload2_parsing
 test_vconsole_uart
 test_vblk_stitch
 test_gdbstub_resolve

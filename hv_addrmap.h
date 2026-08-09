@@ -283,4 +283,60 @@ _Static_assert(HVMAP_SNAP_HDR_END <= 0x50100000UL,
 _Static_assert(HVMAP_SNAP_HDR_END <= 0x50200000UL,
                "snapshot header lane runs past the DTB hv-scratch reserve");
 
+/* ---- Dual-guest (Zephyr on CPU3, `dual` target only) lanes --------------
+ * Added for the Zephyr-on-CPU3 concurrent-guest milestone: zguest_cpu3.c,
+ * zload2.c, stage2_zephyr.c and vconsole.c's new second channel each need a
+ * small fixed DRAM breadcrumb/ring lane, same convention as every other
+ * window in this file. Placed right after the snapshot header lane
+ * (HVMAP_SNAP_HDR_END == 0x50070000) and well below el2_ncmap.c's
+ * non-cacheable DMA scratch boundary (0x50100000) — a full-tree grep for
+ * `0x5007[0-9a-f]{4}` / `0x5008[0-9a-f]{4}` found nothing else there. These
+ * lanes are only ever written/read by objects linked into the `dual`
+ * target (zguest_cpu3.o/zload2.o/stage2_zephyr.o/mmio_absorb.o) plus
+ * vconsole.c's new chan1 path (always compiled, but chan1 is only ever
+ * exercised on CPU3, which no existing target ever brings up) — inert for
+ * every other target. */
+#define HVMAP_ZGUEST3_BC        0x50070000UL   /* zguest_cpu3.c breadcrumbs ("ZG3\0") */
+#define HVMAP_ZGUEST3_BC_SIZE   0x40UL
+
+#define HVMAP_ZLOAD2_BC         0x50071000UL   /* zload2.c breadcrumbs ("ZLD2") */
+#define HVMAP_ZLOAD2_BC_SIZE    0x80UL
+
+#define HVMAP_STAGE2Z_BC        0x50072000UL   /* stage2_zephyr.c breadcrumbs ("STGZ") */
+#define HVMAP_STAGE2Z_BC_SIZE   0x80UL
+
+#define HVMAP_MMIOABS_BC        0x50073000UL   /* mmio_absorb.c breadcrumbs ("MABS") */
+#define HVMAP_MMIOABS_BC_SIZE   0x20UL
+
+/* vconsole.c channel-1 (Zephyr/CPU3) ring — smaller than channel 0's 64 KiB
+ * capture buffer (see vconsole.h): Zephyr's console output at v1 is a short
+ * banner + heartbeat lines, not a full verbose OS boot log. Header mirrors
+ * VCONSOLE_HDR_WORDS' 8-word shape (see vconsole.h); buffer is a separate,
+ * explicit absolute base (same "never derive the buffer from the header"
+ * discipline as HVMAP_LOW_VCONSOLE_BUF, for the same reason: growing the
+ * header must never be able to march the buffer into a neighbour). */
+#define HVMAP_VCONSOLE_CHAN1_HDR       0x50074000UL
+#define HVMAP_VCONSOLE_CHAN1_HDR_SIZE  0x20UL      /* 8 words, same as chan0 */
+#define HVMAP_VCONSOLE_CHAN1_BUF       0x50075000UL
+#define HVMAP_VCONSOLE_CHAN1_BUF_SIZE  0x4000UL    /* 16 KiB */
+#define HVMAP_VCONSOLE_CHAN1_END \
+	(HVMAP_VCONSOLE_CHAN1_BUF + HVMAP_VCONSOLE_CHAN1_BUF_SIZE)
+
+_Static_assert(HVMAP_ZGUEST3_BC >= HVMAP_SNAP_HDR_END,
+               "zguest_cpu3 breadcrumb lane overlaps the snapshot header lane");
+_Static_assert(HVMAP_ZGUEST3_BC + HVMAP_ZGUEST3_BC_SIZE <= HVMAP_ZLOAD2_BC,
+               "zguest_cpu3 breadcrumbs overlap the zload2 breadcrumbs");
+_Static_assert(HVMAP_ZLOAD2_BC + HVMAP_ZLOAD2_BC_SIZE <= HVMAP_STAGE2Z_BC,
+               "zload2 breadcrumbs overlap the stage2_zephyr breadcrumbs");
+_Static_assert(HVMAP_STAGE2Z_BC + HVMAP_STAGE2Z_BC_SIZE <= HVMAP_MMIOABS_BC,
+               "stage2_zephyr breadcrumbs overlap the mmio_absorb breadcrumbs");
+_Static_assert(HVMAP_MMIOABS_BC + HVMAP_MMIOABS_BC_SIZE <= HVMAP_VCONSOLE_CHAN1_HDR,
+               "mmio_absorb breadcrumbs overlap the vconsole chan1 header");
+_Static_assert(HVMAP_VCONSOLE_CHAN1_HDR + HVMAP_VCONSOLE_CHAN1_HDR_SIZE
+               <= HVMAP_VCONSOLE_CHAN1_BUF,
+               "vconsole chan1 header overlaps the vconsole chan1 buffer");
+_Static_assert(HVMAP_VCONSOLE_CHAN1_END <= 0x50100000UL,
+               "dual-guest lanes run into el2_ncmap.c's non-cacheable DMA "
+               "scratch window (SCRATCH_BASE 0x50100000)");
+
 #endif /* HV_ADDRMAP_H */

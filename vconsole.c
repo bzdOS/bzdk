@@ -1,8 +1,27 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 /* vconsole.c — trap-and-emulate virtual UART0 for the FreeBSD/arm64 EL1
- * guest. See vconsole.h for the full rationale, the el2_trap wiring
- * contract, and the capture-ring layout.
+ * guest (channel 0) AND, since the dual-guest milestone, the Zephyr EL1
+ * guest running concurrently on CPU3 (channel 1). See vconsole.h for the
+ * full rationale, the el2_trap wiring contract, and the capture-ring
+ * layout.
+ *
+ * CHANNEL REFACTOR (dual-guest milestone): the original implementation was
+ * a single, hard-coded set of static file-scope helpers/state addressing
+ * VCONSOLE_RING_BASE/VCONSOLE_BUF_BASE directly. This file now
+ * parameterizes that same logic over an explicit `struct vc_chan *`
+ * channel-state pointer (see below), with two static instances: vc_chan0
+ * (VCONSOLE_RING_BASE/VCONSOLE_BUF_BASE, unchanged addresses, `interactive`
+ * = 1 -- RX injection + TX-tee + the wdt_note_progress() feed, exactly the
+ * original behavior) and vc_chan1 (a NEW, smaller ring at
+ * HVMAP_VCONSOLE_CHAN1_HDR/_BUF, `interactive` = 0 -- TX-only: Zephyr's
+ * console never reads UART input in this design, so there is no RX ring, no
+ * USB-ACM tee, and — the one correctness requirement that is NOT optional —
+ * NO path to wdt_note_progress(), which must stay reachable ONLY from
+ * channel 0. Every gated ("if (cs->interactive)") check below evaluates
+ * exactly as the original UNCONDITIONAL code did when cs == &vc_chan0, so
+ * channel 0's behavior is unchanged; grep for "cs->interactive" to see
+ * every place this refactor touches, there are no others.
  *
  * Freestanding, no libc: only <stdint.h>. Every ring store is
  * cache-coherent (dc civac + dsb sy per store), the same pattern used by
@@ -17,6 +36,7 @@
 #include "exceptions.h" /* struct el2_frame */
 #include "wdt.h"        /* wdt_note_progress() — feed the dead-man's switch */
 #include "flightrec.h"  /* B4: flightrec_log(FLTR_K_CONSOLE, ...) per byte */
+#include "hv_addrmap.h" /* HVMAP_VCONSOLE_CHAN1_* (channel 1's ring lane) */
 
 /* ------------------------------------------------------------------ *
  * A64 UART0 (8250/16550-compatible) register byte offsets from
@@ -24,7 +44,16 @@
  * uart" compatible + reg-shift/reg-io-width in
  * /opt/bzdos/build/bananapi-min.dtb's serial@1c28000 node (a standard
  * ns16550 register set, byte-addressed here since we only ever see 32-bit
- * word accesses from the guest's ISS decode anyway).
+ * word accesses from the guest's ISS decode anyway). The Zephyr guest
+ * (channel 1) targets the SAME physical/IPA UART0_BASE with the SAME
+ * register spacing (zephyr-guest/boards/bzdos/bpi_m64_hv/bpi_m64_hv.dts's
+ * uart0 node: "ns16550", reg-shift=2, i.e. 4-byte register spacing,
+ * identical to the offsets below) — the two channels never collide because
+ * they run on different cores against different, disjoint stage-2 tables
+ * (CPU0's stage2.c identity-maps this page away for a UART trap; CPU3's
+ * stage2_zephyr.c leaves the ENTIRE MMIO gigabyte invalid, so a Zephyr
+ * UART0 access reaches el2_exc.c's CPU3 dispatch instead — see that file's
+ * header).
  * ------------------------------------------------------------------ */
 #define UART_REG_THR   0x00u   /* write: transmit holding register       */
 #define UART_REG_IER   0x04u   /* interrupt enable (ignored)             */
@@ -39,7 +68,8 @@
 #define UART_LSR_DR          0x01u   /* bit0: RX data ready              */
 
 /* ------------------------------------------------------------------ *
- * RX INJECTION ring: lets the HOST feed keystrokes to the guest's UART0
+ * RX INJECTION ring (CHANNEL 0 ONLY — see vconsole.h's channel-1 contract:
+ * TX-only, no RX). Lets the HOST feed keystrokes to the guest's UART0
  * console over EMAC (dbgmon writes the buffer + advances head; the guest,
  * polling LSR/reading RBR through this trap, drains it). Makes the guest
  * console INTERACTIVE (mountroot> prompt, single-user shell, login) instead
@@ -87,7 +117,9 @@ static inline uint8_t vc_rx_getc(void)
  * vc_rx_getc()'s tail-side convention so the guest never observes a head
  * advance before the byte it points at is visible (SMPEN cache coherency
  * handles cross-core visibility; no dc civac needed for this live,
- * non-persisted ring, unlike the vconsole capture ring below). */
+ * non-persisted ring, unlike the vconsole capture ring below). This
+ * remains channel-0-only: nothing ever calls it for channel 1 (Zephyr's
+ * console has no RX path — see vconsole.h). */
 void
 vconsole_rx_push(uint8_t c)
 {
@@ -110,16 +142,19 @@ vconsole_rx_push(uint8_t c)
 }
 
 /* ------------------------------------------------------------------ *
- * TX TEE ring: a second, small, ring that mirrors every byte the guest
- * writes to THR (see vconsole_capture_byte() below) so the USB-ACM bridge
- * (usbacm.c, polled on the CPU1 debug core) can drain it out the gadget's
- * bulk-IN endpoint without ever touching MUSB registers from CPU0's guest-
- * fault path (single-core-owns-the-hardware discipline -- see usbacm.c's
- * file banner for why). Deliberately NOT the same ring as the big 64 KiB
+ * TX TEE ring (CHANNEL 0 ONLY, same reasoning as the RX ring above): a
+ * second, small, ring that mirrors every byte the guest writes to THR (see
+ * vconsole_capture_byte() below) so the USB-ACM bridge (usbacm.c, polled on
+ * the CPU1 debug core) can drain it out the gadget's bulk-IN endpoint
+ * without ever touching MUSB registers from CPU0's guest-fault path
+ * (single-core-owns-the-hardware discipline -- see usbacm.c's file banner
+ * for why). Deliberately NOT the same ring as the big 64 KiB
  * capture-for-postmortem window at VCONSOLE_RING_BASE (0x50000f00): that one
  * is written-only/never drained and exists purely for a post-WDT memory
  * dump, whereas this one is actively consumed every poll and must never
- * silently grow unbounded.
+ * silently grow unbounded. Channel 1 (Zephyr, no USB-ACM bridge) never
+ * pushes to this ring — see vconsole_capture_byte()'s `cs->interactive`
+ * gate.
  *
  * Fixed DRAM window 0x50004000 -- distinct from every breadcrumb window
  * listed in smp.h's map (MUSB 0x50000000 .. HDMI 0x50003000); chosen as the
@@ -171,39 +206,11 @@ vconsole_tx_tee_getc(uint8_t *out)
 	__asm__ volatile("dsb sy" ::: "memory");
 	return 1;
 }
+
 #define UART_IIR_RXRDY       0x04u   /* received data available            */
 #define UART_IIR_TXRDY       0x02u   /* transmit holding register empty    */
 #define UART_IER_ERXRDY      0x01u   /* enable RX-ready interrupt          */
 #define UART_IER_ETXRDY      0x02u   /* enable TX-ready interrupt          */
-
-/* Latched guest IER value (one per emulated uart is overkill — the guest
- * only drives uart0's tty; uart1/2 never get IER!=0 programmed).
- *
- * WHY LATCH IT (found live 2026-07-20, "userland prints ONE byte then rc
- * hangs silently forever" hunt): FreeBSD's ns8250 TTY path transmits one
- * FIFO's worth, sets IER.ETXRDY and then waits for IIR to report TXRDY
- * before sending more (uart_intr -> bus_ipend reads IIR; in polled mode the
- * 50 Hz callout does the same read). Our old always-NOPEND IIR meant the
- * FIRST tty write stalled the output queue permanently: the KERNEL's own
- * printfs (low-level cnputc, LSR-polled) all worked, so the whole verbose
- * boot printed fine — and then userland/rc, whose /dev/console writes go
- * through the tty layer, emitted exactly one byte and went silent, with the
- * guest idling at a 6 Hz IIR poll (ELR pinned at one PC reading page offset
- * 0x008). RXRDY has the same shape: without it, userland tty reads never
- * notice injected input. NOTE ns8250_clrint() at PROBE time loops until IIR
- * reads no-pending — at probe IER==0, so the ier-gated logic below still
- * returns NOPEND there, exactly as the old stub did. */
-static uint32_t vc_uart_ier;
-
-/* THRE-interrupt EDGE latch. A real 16550 raises the TX interrupt when THR
- * becomes empty (for us: right after every THR write, and when ETXRDY gets
- * enabled while THR is already empty) and CLEARS it when IIR is read with
- * TXRDY as the reported source. The first version of this emulation returned
- * TXRDY on EVERY IIR read while ETXRDY was set — level, not edge — and
- * ns8250_clrint() (which loops reading IIR until NOPEND) then span forever,
- * hanging the guest at uart ATTACH, before mountroot, with the console mute.
- * One boot lost to that. */
-static uint32_t vc_txrdy_pend;
 
 #define UART_IIR_NOPEND      0x01u   /* bit0: 1 = no interrupt pending (ns16550.h
                                       * IIR_NOPEND) -- synthesizing 0 here made
@@ -231,66 +238,103 @@ static uint32_t vc_txrdy_pend;
 #define SRT_XZR   31u   /* SRT==31 means the zero register, not x[31] */
 
 /* ------------------------------------------------------------------ *
+ * Channel state -- see this file's header comment for the full refactor
+ * rationale. `ring_base`/`buf_base`/`buf_size` are fixed (set once, at
+ * static-init time, never written again); `uart_ier`/`txrdy_pend` are the
+ * per-channel mutable latches the original code kept as file-scope statics
+ * (vc_uart_ier/vc_txrdy_pend) -- now one copy per channel instead of one
+ * shared copy, which is actually a LATENT BUG FIX for channel 0 alone
+ * (there was only ever one channel before, so this changes nothing
+ * observable for it) but is load-bearing for channel 1: Zephyr's IER
+ * writes must never be visible to/from FreeBSD's channel and vice versa.
+ * `interactive` gates every RX-ring/TX-tee/wdt_note_progress() access —
+ * see the file header comment for the exact list.
+ * ------------------------------------------------------------------ */
+struct vc_chan {
+	uint64_t ring_base;
+	uint64_t buf_base;
+	uint32_t buf_size;
+	int      interactive;   /* 1 = chan0 (RX ring + TX tee + wdt feed) */
+	uint32_t uart_ier;
+	uint32_t txrdy_pend;
+};
+
+static struct vc_chan vc_chan0 = {
+	VCONSOLE_RING_BASE, VCONSOLE_BUF_BASE, VCONSOLE_BUF_SIZE, 1, 0, 0
+};
+static struct vc_chan vc_chan1 = {
+	HVMAP_VCONSOLE_CHAN1_HDR, HVMAP_VCONSOLE_CHAN1_BUF,
+	(uint32_t)HVMAP_VCONSOLE_CHAN1_BUF_SIZE, 0, 0, 0
+};
+
+/* ------------------------------------------------------------------ *
  * Capture-ring low-level accessors. Cache-coherent single-word/single-byte
- * stores, matching the rest of the tree's breadcrumb convention.
+ * stores, matching the rest of the tree's breadcrumb convention. Now
+ * parameterized over the explicit channel-state pointer -- for `cs ==
+ * &vc_chan0` these address EXACTLY VCONSOLE_RING_BASE/VCONSOLE_BUF_BASE,
+ * i.e. channel 0's behavior is unchanged.
  * ------------------------------------------------------------------ */
 static inline void
-vc_store32(uint32_t word_idx, uint32_t v)
+vc_store32(struct vc_chan *cs, uint32_t word_idx, uint32_t v)
 {
 	volatile uint32_t *p =
-	    (volatile uint32_t *)(VCONSOLE_RING_BASE + word_idx * 4u);
+	    (volatile uint32_t *)(cs->ring_base + word_idx * 4u);
 	*p = v;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 
 static inline uint32_t
-vc_load32(uint32_t word_idx)
+vc_load32(struct vc_chan *cs, uint32_t word_idx)
 {
 	volatile uint32_t *p =
-	    (volatile uint32_t *)(VCONSOLE_RING_BASE + word_idx * 4u);
+	    (volatile uint32_t *)(cs->ring_base + word_idx * 4u);
 	return *p;
 }
 
 static inline void
-vc_store_byte(uint32_t buf_off, uint8_t v)
+vc_store_byte(struct vc_chan *cs, uint32_t buf_off, uint8_t v)
 {
-	volatile uint8_t *p = (volatile uint8_t *)(VCONSOLE_BUF_BASE + buf_off);
+	volatile uint8_t *p = (volatile uint8_t *)(cs->buf_base + buf_off);
 	*p = v;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 
 static inline void
-vc_zero_byte(uint32_t buf_off)
+vc_zero_byte(struct vc_chan *cs, uint32_t buf_off)
 {
-	vc_store_byte(buf_off, 0);
+	vc_store_byte(cs, buf_off, 0);
 }
 
 /* ------------------------------------------------------------------ *
  * Public API (see vconsole.h for the full contract).
  * ------------------------------------------------------------------ */
 
-void
-vconsole_init(void)
+/* Shared init body: magic + counters + self-describing base/size tail +
+ * zeroed buffer. Identical sequence to the original vconsole_init(), just
+ * addressed through `cs`. */
+static void
+vconsole_init_chan(struct vc_chan *cs)
 {
-	vc_store32(0, VCONSOLE_MAGIC);   /* word[0]: magic "UART"        */
-	vc_store32(1, 0);                /* word[1]: total_bytes         */
-	vc_store32(2, 0);                /* word[2]: fault_count         */
-	/* Self-describing tail (layout v2): the buffer no longer follows the
-	 * header, so publish where it actually is and how big it is. A host that
-	 * assumed adjacency and a hardcoded size is precisely how the firmware
-	 * (64 KiB) and bzd_board.py (4 KiB) drifted apart unnoticed — see
-	 * vconsole.h's VCONSOLE_LAYOUT_VER comment. */
-	vc_store32(3, VCONSOLE_LAYOUT_VER);            /* word[3]: layout version */
-	vc_store32(4, (uint32_t)VCONSOLE_BUF_BASE);    /* word[4]: buffer base    */
-	vc_store32(5, (uint32_t)VCONSOLE_BUF_SIZE);    /* word[5]: buffer size    */
-	vc_store32(6, 0);                              /* word[6]: reserved       */
-	vc_store32(7, 0);                              /* word[7]: reserved       */
+	vc_store32(cs, 0, VCONSOLE_MAGIC);              /* word[0]: magic "UART" */
+	vc_store32(cs, 1, 0);                           /* word[1]: total_bytes  */
+	vc_store32(cs, 2, 0);                           /* word[2]: fault_count  */
+	vc_store32(cs, 3, VCONSOLE_LAYOUT_VER);         /* word[3]: layout version */
+	vc_store32(cs, 4, (uint32_t)cs->buf_base);      /* word[4]: buffer base    */
+	vc_store32(cs, 5, cs->buf_size);                /* word[5]: buffer size    */
+	vc_store32(cs, 6, 0);                           /* word[6]: reserved       */
+	vc_store32(cs, 7, 0);                           /* word[7]: reserved       */
 
 	/* Zero the byte buffer for deterministic state on a fresh boot.
 	 * Init-time only (never called from exception context), so a
 	 * straightforward bounded loop is fine here. */
-	for (uint32_t i = 0; i < VCONSOLE_BUF_SIZE; i++)
-		vc_zero_byte(i);
+	for (uint32_t i = 0; i < cs->buf_size; i++)
+		vc_zero_byte(cs, i);
+}
+
+void
+vconsole_init(void)
+{
+	vconsole_init_chan(&vc_chan0);
 
 	/* BUG FIX (found live on hardware): VC_RX_HEAD/TAIL (0x50000e40/
 	 * 0x50000e44) and VC_TXTEE_HEAD/TAIL (0x50004000/0x50004004) are fixed
@@ -309,7 +353,9 @@ vconsole_init(void)
 	 * draining/flushing). Zero all four here, with plain stores + a single
 	 * barrier (matching vc_rx_getc()/vc_txtee_push()'s no-dc-civac
 	 * convention for these live, non-persisted rings), BEFORE the guest can
-	 * possibly fault on UART0 or the USB-ACM bridge can start draining. */
+	 * possibly fault on UART0 or the USB-ACM bridge can start draining.
+	 * CHANNEL 0 ONLY -- channel 1 has no RX ring / TX-tee ring at all
+	 * (see vconsole_init_chan1() below). */
 	VC_RX_HEAD = 0;
 	VC_RX_TAIL = 0;
 	VC_TXTEE_HEAD = 0;
@@ -317,45 +363,58 @@ vconsole_init(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* Push one transmitted byte into the ring, wrapping at VCONSOLE_BUF_SIZE.
- * total_bytes (word[1]) counts every byte ever captured (unclamped); the
- * physical write offset is total_bytes % VCONSOLE_BUF_SIZE. */
-static void
-vconsole_capture_byte(uint8_t c)
+void
+vconsole_init_chan1(void)
 {
-	uint32_t total = vc_load32(1);
-	uint32_t off = total % VCONSOLE_BUF_SIZE;
-	vc_store_byte(off, c);
-	vc_store32(1, total + 1);
+	/* Same init body as channel 0, addressed at the channel-1 ring
+	 * instead. No RX ring / TX-tee ring to zero -- channel 1 (Zephyr) has
+	 * neither (see vconsole.h: TX-only by design, no RX injection, no
+	 * USB-ACM tee). */
+	vconsole_init_chan(&vc_chan1);
+}
+
+/* Push one transmitted byte into `cs`'s ring, wrapping at cs->buf_size.
+ * total_bytes (word[1]) counts every byte ever captured (unclamped); the
+ * physical write offset is total_bytes % cs->buf_size. */
+static void
+vconsole_capture_byte(struct vc_chan *cs, uint8_t c)
+{
+	uint32_t total = vc_load32(cs, 1);
+	uint32_t off = total % cs->buf_size;
+	vc_store_byte(cs, off, c);
+	vc_store32(cs, 1, total + 1);
 
 	/* B4 flight recorder: a captured console byte, direction TX (guest ->
-	 * host, i.e. the guest's own printf/tty output). a1=0 marks the
-	 * direction. NOTE deliberate tradeoff: during a verbose boot this is by
-	 * far the highest-frequency flightrec_log() caller and can dominate the
-	 * 2048-slot ring, but that's the intended behavior, not overflow: the
-	 * 64 KiB VCONSOLE_RING_BASE capture ring above already retains the full
-	 * text separately, so flightrec's unique value here is INTERLEAVING the
-	 * last console bytes with faults/IRQs/virtio ops in one time-ordered
-	 * ring -- if the last ~2048 events before a crash are all console
-	 * bytes, that itself is the finding (crashed mid-boot-spew, not
-	 * mid-virtio-op). */
+	 * host). Shared across both channels -- harmless/informational, lets a
+	 * post-mortem see cross-guest console interleaving on one timeline.
+	 * a1=0 marks the direction (same convention for both channels). See
+	 * vconsole_rx_push()'s comment above for why this stays far below the
+	 * 2048-slot ring's overflow point in practice. */
 	flightrec_log(FLTR_K_CONSOLE, c, 0);
 
-	/* Tee the same byte to the USB-ACM bridge's TX ring (see above) so the
-	 * CPU1 debug core can push it out the gadget's bulk-IN endpoint. This
-	 * runs on CPU0 inside the guest's fault-handling path, so it MUST stay
-	 * O(1)/non-blocking -- it is (a bounded ring push, drops on overflow). */
-	vc_txtee_push(c);
+	if (cs->interactive) {
+		/* Tee to the USB-ACM bridge's TX ring -- CHANNEL 0 ONLY. Channel 1
+		 * (Zephyr) has no USB-ACM bridge; its console is EMAC/vconsole-ring
+		 * only. This runs on the faulting core's own fault-handling path,
+		 * so it MUST stay O(1)/non-blocking -- it is (a bounded ring push,
+		 * drops on overflow). */
+		vc_txtee_push(c);
+	}
 }
 
 static void
-vconsole_count_fault(void)
+vconsole_count_fault(struct vc_chan *cs)
 {
-	vc_store32(2, vc_load32(2) + 1);
+	vc_store32(cs, 2, vc_load32(cs, 2) + 1);
 }
 
-int
-vconsole_handle_fault(struct el2_frame *frame)
+/* Shared fault-handling body -- see vconsole_handle_fault() below for the
+ * public, channel-selecting entry point. For `cs == &vc_chan0` every
+ * `cs->interactive`-gated branch below evaluates exactly as the ORIGINAL,
+ * unconditional code did (interactive == 1), so channel 0's behavior is
+ * byte-for-byte the same logic as before this refactor. */
+static int
+vconsole_handle_fault_impl(struct el2_frame *frame, struct vc_chan *cs)
 {
 	uint32_t esr = (uint32_t)frame->esr;
 	uint32_t ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
@@ -369,16 +428,10 @@ vconsole_handle_fault(struct el2_frame *frame)
 
 	/* frame->far is FAR_EL2 -- the faulting VIRTUAL address the guest
 	 * used, valid only for its low 12 bits (the page offset) once the
-	 * guest's stage-1 MMU is on. During early boot (stage-1 off) VA==IPA
-	 * so far alone happened to equal the physical UART0 address, but once
-	 * pmap_bootstrap_dmap() runs the guest reads UART0 via its DMAP VA
-	 * (e.g. 0xffff007ffffff008), which never matches UART0_BASE and made
-	 * every later console access fall through unhandled -- ELR is never
-	 * advanced for a guest-group fault (el2_exc.c), so the guest re-faults
-	 * on the same instruction forever (looks like a hang, isn't one of our
-	 * making... except that it is: this comparison was wrong). Reconstruct
-	 * the true IPA from HPFAR_EL2 (bits[39:4] = IPA[47:12]) OR'd with far's
-	 * page offset, same as virtio.c's ipa_of(frame). */
+	 * guest's stage-1 MMU is on. Reconstruct the true IPA from HPFAR_EL2
+	 * (bits[39:4] = IPA[47:12]) OR'd with far's page offset, same as
+	 * virtio.c's ipa_of(frame) -- see the original comment (preserved in
+	 * spirit, condensed here) for the DMAP-VA bug this fixed. */
 	uint64_t hpfar;
 	__asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
 	uint64_t addr = ((hpfar & 0xFFFFFFFFF0ULL) << 8) | (frame->far & 0xFFFull);
@@ -388,41 +441,29 @@ vconsole_handle_fault(struct el2_frame *frame)
 	if (addr < UART0_BASE || addr >= UART0_BASE + UART0_SIZE)
 		return 0;
 
-	vconsole_count_fault();
+	vconsole_count_fault(cs);
 
 	uint32_t isv = esr & ESR_ISV_BIT;
 	if (!isv) {
-		/* No valid instruction-syndrome info -- we cannot tell which
-		 * register/size/direction without decoding the faulting
-		 * instruction ourselves, which we don't do. Skip it (advance
-		 * past the faulting instruction) rather than spin forever
-		 * re-taking the same fault, and count it as a "best effort"
-		 * emulate above. */
+		/* No valid instruction-syndrome info -- skip past the faulting
+		 * instruction rather than spin forever re-taking the same fault. */
 		frame->elr += 4;
 		return 1;
 	}
 
 	uint32_t wnr = esr & ESR_WNR_BIT;
 	uint32_t srt = (esr >> ESR_SRT_SHIFT) & ESR_SRT_MASK;
-	/* SAS (access size) is decoded for completeness/documentation but
-	 * unused: every register we emulate is accessed as a byte or a
-	 * 32-bit word by real 16550 drivers, and we only ever care about the
-	 * low 8 bits of THR writes / synthesize a fixed LSR value, so the
-	 * transfer width doesn't change our behavior. */
+	/* SAS (access size) decoded for completeness/documentation but unused
+	 * -- see the original comment: every register here is byte/word-sized
+	 * and we never vary behavior on transfer width. */
 	uint32_t sas = (esr >> ESR_SAS_SHIFT) & ESR_SAS_MASK;
 	(void)sas;
 
 	uint32_t off = (uint32_t)(addr - UART0_BASE);
 
 	/* UART0/1/2 share this one 4 KiB page at page offsets 0x000/0x400/0x800
-	 * (DTB: snps,dw-apb-uart serial@1c28000 / @1c28400 / @1c28800), all
-	 * 16550-compatible with an identical register layout inside each 0x400
-	 * block. Fold the access onto a single register window so IIR/LSR/USR
-	 * emulation applies to whichever UART the guest is driving. Without this,
-	 * a read of UART1's IIR (page offset 0x408) misses the off==UART_REG_IIR
-	 * check, falls through to val=0 (== "interrupt pending"), and FreeBSD's
-	 * ns8250 interrupt-service path (clrint: read IIR, read MSR, re-read IIR)
-	 * spins forever on the secondary UART. */
+	 * -- fold onto a single register window (see original comment for the
+	 * secondary-UART IIR-spin bug this fixed). */
 	uint32_t reg = off & 0x3FFu;
 
 	if (wnr) {
@@ -430,86 +471,70 @@ vconsole_handle_fault(struct el2_frame *frame)
 		uint64_t val = (srt == SRT_XZR) ? 0 : frame->x[srt];
 
 		if (reg == UART_REG_THR) {
-			/* Transmit: capture the low byte -- this is a
-			 * character FreeBSD's console is printing. */
-			vconsole_capture_byte((uint8_t)(val & 0xffu));
+			/* Transmit: capture the low byte. */
+			vconsole_capture_byte(cs, (uint8_t)(val & 0xffu));
 			/* THR write -> THR "drains" instantly -> THRE edge. */
-			vc_txrdy_pend = 1;
+			cs->txrdy_pend = 1;
 			/* Console output = observable forward progress: feed the
-			 * dead-man's-switch watchdog's minutes-window (see wdt.c). */
-			wdt_note_progress();
+			 * dead-man's-switch watchdog's minutes-window (see wdt.c).
+			 * CHANNEL 0 ONLY -- this is the one correctness requirement
+			 * that is NOT optional (see this file's header comment):
+			 * Zephyr's channel-1 heartbeat output must never be able to
+			 * feed the FreeBSD-guest-progress watchdog gate. */
+			if (cs->interactive)
+				wdt_note_progress();
 		} else if (reg == UART_REG_IER) {
 			/* Latch: IIR reads below report TXRDY/RXRDY only for
-			 * sources the guest actually enabled (see vc_uart_ier's
-			 * comment for the userland-console-hang story). Enabling
-			 * ETXRDY while THR is (always, in our model) empty raises
-			 * the THRE edge immediately — that's what wakes a tty
-			 * that armed the interrupt AFTER its last THR write. */
+			 * sources the guest actually enabled. */
 			uint32_t newier = (uint32_t)(val & 0xffu);
-			if ((newier & UART_IER_ETXRDY) && !(vc_uart_ier & UART_IER_ETXRDY))
-				vc_txrdy_pend = 1;
-			vc_uart_ier = newier;
+			if ((newier & UART_IER_ETXRDY) && !(cs->uart_ier & UART_IER_ETXRDY))
+				cs->txrdy_pend = 1;
+			cs->uart_ier = newier;
 		}
-		/* Every other write (IIR-FCR/LCR/MCR init-time
-		 * programming) is silently accepted/ignored -- there's no
-		 * real UART behind this page to configure. */
+		/* Every other write (IIR-FCR/LCR/MCR init-time programming) is
+		 * silently accepted/ignored -- there's no real UART behind this
+		 * page to configure, for either channel. */
 	} else {
 		/* Guest is reading a UART register. */
 		uint64_t val = 0;
 
 		if (reg == UART_REG_THR) {
-			/* This offset is RBR (receive buffer register) on a
-			 * read -- THR/RBR share byte offset 0x00 on a real
-			 * 16550, per the standard register map. Dequeue one
-			 * host-injected byte from the RX ring (see the "RX
-			 * INJECTION ring" section above / vconsole_rx_push(),
-			 * fed by usbacm.c) if one is pending; otherwise 0
-			 * (matches every other unpopulated read here). This is
-			 * what makes the guest console INTERACTIVE: FreeBSD's
-			 * ns8250 RX path polls LSR.DR then reads RBR exactly
-			 * like this. */
-			val = vc_rx_pending() ? (uint64_t)vc_rx_getc() : 0;
+			/* RBR (receive buffer register) on a read. Channel 0 only:
+			 * dequeue a host-injected byte if one is pending. Channel 1
+			 * (Zephyr) has no RX ring at all -- `cs->interactive` is 0,
+			 * so this always synthesizes 0, matching "no RX support". */
+			val = (cs->interactive && vc_rx_pending())
+			      ? (uint64_t)vc_rx_getc() : 0;
 		} else if (reg == UART_REG_LSR) {
-			/* THRE|TEMT: transmitter always ready, so FreeBSD's
-			 * busy-wait-for-tx-ready loop never blocks. OR in DR
-			 * (bit0) whenever the RX ring has a host-injected byte
-			 * waiting, so the guest's poll loop knows to read RBR. */
+			/* THRE|TEMT: transmitter always ready. OR in DR (bit0) only
+			 * for channel 0 (channel 1 never has RX data waiting). */
 			val = UART_LSR_THRE_TEMT;
-			if (vc_rx_pending())
+			if (cs->interactive && vc_rx_pending())
 				val |= UART_LSR_DR;
 		} else if (reg == UART_REG_USR) {
 			/* Allwinner "busy" bit: always 0 (never busy). */
 			val = 0;
 		} else if (reg == UART_REG_IIR) {
-			/* Priority-encode pending sources the guest ENABLED via
-			 * IER (see vc_uart_ier's comment): RX data waiting beats
-			 * TX-ready; TX is "ready" permanently in our model, so
-			 * ETXRDY alone yields an endless TXRDY stream — exactly
-			 * what keeps the ns8250 tty output queue draining. With
-			 * IER==0 (probe-time ns8250_clrint() loop) this still
-			 * reads NOPEND, as the old stub always did. */
-			if ((vc_uart_ier & UART_IER_ERXRDY) && vc_rx_pending()) {
+			/* Priority-encode pending sources the guest ENABLED via IER.
+			 * RX-ready is gated on `cs->interactive` (always false for
+			 * channel 1, so this branch can never fire there — the
+			 * whole RXRDY path degrades to "never", exactly the TX-only
+			 * shape vconsole.h documents for channel 1, with no separate
+			 * code needed). */
+			if ((cs->uart_ier & UART_IER_ERXRDY) && cs->interactive &&
+			    vc_rx_pending()) {
 				val = UART_IIR_RXRDY;   /* level: clears as RBR drains */
-			} else if ((vc_uart_ier & UART_IER_ETXRDY) && vc_txrdy_pend) {
-				vc_txrdy_pend = 0;      /* EDGE: consumed by this read */
+			} else if ((cs->uart_ier & UART_IER_ETXRDY) && cs->txrdy_pend) {
+				cs->txrdy_pend = 0;      /* EDGE: consumed by this read */
 				val = UART_IIR_TXRDY;
 			} else {
 				val = UART_IIR_NOPEND;
 			}
 		} else if (reg == UART_REG_MSR) {
-			/* Modem status: report DCD|DSR|CTS permanently asserted,
-			 * like a board with the modem lines strapped. MSR==0 means
-			 * "no carrier", and a tty open() without CLOCAL then sleeps
-			 * in the carrier wait FOREVER -- observed live 2026-07-20:
-			 * kernel boots (kernel printf bypasses the tty), init execs,
-			 * then userland hangs silently before rc's first echo,
-			 * blocked opening /dev/console; zero output, zero disk I/O,
-			 * only the 50 Hz uart poll ticking. Bits: DCD=0x80 DSR=0x20
-			 * CTS=0x10. */
+			/* Modem status: DCD|DSR|CTS permanently asserted (see
+			 * original comment for the carrier-wait hang this fixed). */
 			val = 0xB0;
 		} else {
-			/* Any other read (e.g. RBR/IER probed during
-			 * init/detection) synthesizes 0. */
 			val = 0;
 		}
 
@@ -520,4 +545,11 @@ vconsole_handle_fault(struct el2_frame *frame)
 	/* Skip the faulting load/store -- we've fully emulated its effect. */
 	frame->elr += 4;
 	return 1;
+}
+
+int
+vconsole_handle_fault(struct el2_frame *frame, unsigned channel)
+{
+	return vconsole_handle_fault_impl(frame,
+	                                  (channel == 0) ? &vc_chan0 : &vc_chan1);
 }

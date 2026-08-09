@@ -980,6 +980,24 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cputs("release signaled (HVMAP_DBGTOOLS_RELEASE=1)\r\n");
 		return;
 	}
+	if (streq(cmd, "zboot")) {
+		/* Dual-guest milestone: wake CPU3's wfe-poll loop (zguest_cpu3.c)
+		 * and start the one-way Zephyr boot sequence -- see
+		 * zguest_cpu3.h's lifecycle comment for the full staging protocol
+		 * (an operator writes the raw Zephyr ELF into DRAM at
+		 * ZG3_ELF_STAGE_PA BEFORE issuing this command). Weak: no-op with
+		 * a clear message in a build that doesn't link zguest_cpu3.o
+		 * (every existing target today), same pattern as the `gdb`
+		 * command's gdbstub_init weak guard just above. */
+		extern void zguest_cpu3_start_set(void) __attribute__((weak));
+		if (zguest_cpu3_start_set) {
+			zguest_cpu3_start_set();
+			cputs("zboot: CPU3 start requested\r\n");
+		} else {
+			cputs("zboot: not built with dual-guest support\r\n");
+		}
+		return;
+	}
 	if (streq(cmd, "t")) {
 		cmd_t();
 		return;
