@@ -231,8 +231,8 @@ long run's boots are distinguishable from manual ones.
 ## 8. Dry run (no board) — and what that does and does not prove
 
 ```sh
-python3 soak72.py --dry-run              # 15 cases
-python3 breakglass_cycle.py --dry-run    # 8 cases
+python3 soak72.py --dry-run              # 36 cases
+python3 breakglass_cycle.py --dry-run    # 13 cases
 python3 soak72.py --dry-run --scenario watchdog-reset --hours 0.25   # watch one
 ```
 
@@ -300,20 +300,172 @@ tests are for):
    comes back later. A recorded failure now disqualifies the gate outright and
    says so; use `--restart` to deliberately re-measure.
 
+### Board-free coverage pass, 2026-08-10 — closing the dry-run gaps
+
+The hardware smoke runs above closed both gates at tiny scale, but left a
+specific hole: `early_rate` was `None` in both real runs, and — this is the
+part that actually mattered — it had *never* been `None` for a good reason: no
+dry-run case ran long enough to lock it either. A degradation check that has
+never fired, on hardware or in simulation, is not a tested criterion. This
+pass went through `classify_sample()` kind by kind, drove every reachable
+branch from `soaklib.FakeBoard`, and fixed what it found broken.
+
+**The degradation detector now actually fires, in simulation.** Two new
+dry-run cases in `soak72.py` (`_dry_degradation_case`, `_dry_fluctuation_case`)
+give `FakeBoard` a `rate_schedule` knob (`[(poll_threshold, gen_period), ...]`)
+that genuinely slows the load's generation counter from a given poll onward,
+long enough for the trailing rate window to lock in on it:
+
+- a **sustained** slowdown (1/4 rate, never recovers) reports **not closed**
+  with the `<-- DEGRADED` marker and `verdict.degraded == True`.
+- a **transient** dip that fully recovers before the run ends reports
+  **closed**, `degraded == False` — proving the check does not cry wolf on
+  ordinary variance, which would be exactly as damaging as never firing.
+
+Both reduce `--early-window-s` from the production 1800 s to 300 s so the dry
+run stays fast; the mechanism exercised (lock an early rate, compare the
+trailing window to it) is identical. **The real 1800 s / 50 % thresholds are
+still unmeasured against hardware** — this closes the "cannot fire at all"
+gap, not the "is 50 % the right number" question.
+
+**One real bug found and fixed in `soaklib.classify_sample()`: `timer-stalled`
+was dead code.** The old check computed `imo1 = (tick_delta == 0)` from the
+CURRENT sample and then, inside the `else` branch (i.e. only when
+`tick_delta != 0`), re-tested `if tick_delta == 0` — a condition that branch
+had already excluded. The FAIL could never fire, on hardware or in dry-run,
+regardless of what tick_delta did. Fixed by threading a sticky
+`ever_ticked` flag from `soak72.sample()` through to the classifier: a
+build's IMO-ness cannot change mid-run, so once a real (non-zero) tick has
+been seen, `tick_delta == 0` from then on can only mean the tick stopped, not
+"this is an IMO=1 build". Scenarios `imo0-build` (WARN path) and
+`imo0-timer-stalled` (the FAIL, now reachable) cover both sides.
+
+**Classifier coverage table** — every `classify_sample()` kind, and how it is
+now reached in `--dry-run`:
+
+| kind | severity | dry-run scenario |
+|---|---|---|
+| `board-off-usb` | FAIL | `usb-vanishes-live` (classifier's own check) + `dead-board` (do_reload's separate check of the same name) |
+| `board-in-uboot` | RESET | `watchdog-reset` |
+| `unexpected-usb-id` | WARN | `unexpected-usb-id` |
+| `emac-flap` | BENIGN | `wedge` (first dark sample) |
+| `wedge` | RESET | `wedge` (second dark sample, past the grace period) |
+| `liveness-unknown` | BENIGN | `liveness-unknown` |
+| `cpu2-idle` | BENIGN | any scenario's first poll (e.g. `happy`) |
+| `core-frozen` | FAIL | `core-frozen` (cpu0 only — the identical code path would fire the same way for cpu1; not separately exercised, deemed redundant) |
+| `isolation-breach` | FAIL | `isolation-breach` |
+| `imo1-build` | BENIGN | any scenario's first poll |
+| `timer-stalled` | FAIL | `imo0-timer-stalled` (was unreachable dead code before this pass, see above) |
+| `exception-count-increased` | WARN | `imo0-build`, `imo0-timer-stalled` |
+| `silent-reset` | RESET | `silent-reset` |
+| `high-temperature` | WARN | `high-temperature` |
+| `emmc-lock-stuck` | FAIL | `emmc-lock-stuck` |
+| `guest-io-error` | WARN | `guest-io-error` |
+| `emmc-retry-absorbed` | BENIGN | `emmc-retry-absorbed` |
+| `emmc-recovery-clk-timeout` | FAIL | `emmc-recovery-clk-timeout` |
+| `guest-network-down` | WARN | `guest-network-down` |
+| `guest-unreachable` | FAIL | `guest-down-board-up` |
+| `root-readonly` | RECOVER | `root-readonly-live` |
+| `data-verify-mismatch` | FAIL | `data-corruption` |
+| `load-not-running` | RECOVER | `load-crashed` |
+| `load-stalled` | FAIL | `load-stalled` |
+| `load-slow` | WARN | `load-stalled` (same scenario, earlier poll) |
+| `disk-filling` | WARN | `disk-filling` |
+| `guest-log-errors` | WARN | `log-warnings` |
+| `healthy` | BENIGN | `happy` |
+
+Plus the kinds emitted outside the classifier: `fsck-second-pass` (any
+reset/reload scenario), and do_reload's generic "reload failed twice" ending —
+previously reachable only via `dead-board`, which always resolves to
+"vanished" first; scenario `reload-always-fails` now reaches the *other*
+ending (board stays present in U-Boot, reload just never lands).
+`breakglass_cycle.py` got the matching treatment: `watchdog-never-fires`
+("sent" bytes, watchdog never actually resets the board — distinct from
+`dead-board`'s "vanished"), `baseline-in-uboot` / `baseline-guest-unhealthy`
+(`_dry_baseline_repair_case`, since this harness barely calls `status()` at
+all — once per attempt — so the usual poll-indexed scripting doesn't reach
+them), and `recover_and_verify()`'s "reload after the reset failed" branch
+(`_dry_reload_after_reset_fails_case`).
+
+**Every one of the above needed new `soaklib.FakeBoard` knobs** (`usb_override`,
+`moving_unknown`, `tick_delta`, `temp_mc`, `lock_giveups`, `g_ioerrs`,
+`ebio_fails`, `ebio_settle_clkfail`, `avail_kb`, `force_readonly`,
+`reload_always_fails`, `breakglass_ineffective`, `rate_schedule`), each
+defaulting to the value that was previously hard-coded inline, so no existing
+scenario's behaviour changed by adding them (`api-parity` and all 15+8
+original cases still pass unmodified).
+
+**`--size-mb 48` (the default)** — checked what can be checked without the
+board: `LOAD_SCRIPT` renders correctly at 48 (and 16/24, for comparison) and
+`sh -n` syntax-checks clean; the only difference from the already-hardware-run
+16-24 MB is the `SZ=` constant, no new shell syntax. No timeout in the harness
+scales with `--size-mb` — `guest_start_load()`'s 120 s and the load probe's
+60 s just start/sample the background process, and the load-stall
+thresholds (300 s warn / 900 s fail) are wall-clock, not size-aware. Real
+per-generation time is genuinely unmeasured at 48 MB: the hardware runs at
+16-24 MB averaged ~45-50 s/generation; a naive linear extrapolation to 48 MB
+lands around 90-150 s, comfortably under the 300 s warn threshold, but that is
+an extrapolation, not a measurement — eMMC throughput under 2-3x the sustained
+write volume could be non-linear (wear-leveling, garbage collection) in either
+direction.
+
+**Resume/idempotence under the new "a failure disqualifies the gate" rule** —
+now explicitly tested, not just inferred:
+- `_dry_resume_case` (soak72) now also asserts that an interrupted-then-resumed
+  run reaches the **same closed/not-closed verdict** as an equivalent
+  straight-through run, not just that the raw hour counter accumulates.
+- `_dry_resume_carries_failure_case` (soak72) proves the exact shape of the
+  hardware-found bug: a real failure recorded in leg 1 still disqualifies leg
+  2's verdict even though leg 2 itself did nothing wrong, and `--restart`
+  (leg 3) is what clears it.
+- `_dry_restart_case` (breakglass) proves `--restart` zeroes the streak and
+  attempt count instead of carrying the previous run's numbers forward.
+- `_dry_status_readonly_case` (both harnesses) proves `--status` leaves the
+  state file and event log byte-identical — snapshotted before and after,
+  not just assumed from reading the code.
+
+**Lose-work audit (72 h unattended, memory/log growth, non-atomic writes)** —
+reviewed, nothing needed fixing in the files this pass owns:
+- `RunState.save()` was already atomic (`tmp` + `os.replace()`); confirmed, not
+  changed.
+- `gen_window` was already capped at 120 entries (`del w[:-120]`); the
+  degradation cases above are the first thing to actually rely on that cap
+  doing its job (trimming the early-rate samples out of the trailing window).
+- `state.d["failures"]` cannot grow past one entry within a single process
+  lifetime: the very first FAIL raises `HarnessStop` and the run exits before
+  a second one could ever be appended. It only grows further across *manual*
+  restarts without `--restart` — bounded by an operator's actions, not by run
+  duration.
+- `EventLog` never holds events in memory; each `emit()` opens, writes,
+  fsyncs and closes the file, so the append-only log growing across 72 h (an
+  estimated few thousand lines at the default 60 s poll cadence) costs disk,
+  not RAM.
+- The one subprocess whose output *is* accumulated in a Python list —
+  `soak.run_reliable_load()`'s `lines` — is out of this pass's file scope
+  (`soak.py`) and, on inspection, is bounded per-call (one reload's runtime,
+  freed on return), not across the 72 h run, so it is not a "dies at hour 60"
+  risk. Noted, not touched.
+
 ### Still unverified (read this before quoting any number)
 
 - **Duration.** The longest real run so far is minutes, not hours. Nothing is
-  known about behaviour over 72 h, and the degradation check (early vs recent
-  load rate, 50 % fraction) has never had enough samples to fire — note
-  `early_rate` was still `None` in both runs.
+  known about hardware behaviour over 72 h.
+- **The degradation check's real thresholds.** The mechanism now fires (see
+  above), in simulation, with a shortened window. The production 1800 s
+  early-rate window and 50 % fraction remain reasoned, not measured against
+  real load-rate variance — `early_rate` still has never been non-`None` on
+  hardware.
 - **20 break-glass resets in a row.** One has been proven. The gate wants 20, and
   this project has a documented history of the *second* or *third* cycle being
   the one that misbehaves.
-- **The failure paths.** `--max-resets`, the wedge-detection grace, the
-  load-stall timeout and the dead-board path have only ever run against
-  `FakeBoard`. The classifier's thresholds (60 s wedge grace, 15 min load stall,
-  50 % degradation) remain reasoned, not measured.
-- `--size-mb 48` (the default) has not been run; both smoke runs used 16-24 MB.
+- **The failure paths' real-world timing.** `--max-resets`, the 60 s
+  wedge-detection grace and the 15 min load-stall timeout are now all reached
+  in dry-run (see the coverage table above), but only against `FakeBoard`'s
+  timing, not the real board's.
+- **`--size-mb 48`'s real throughput.** Script correctness and arithmetic are
+  checked (see above); actual generations/hour at 48 MB — and whether that
+  stays comfortably clear of the load-stall thresholds — is unmeasured. Both
+  hardware smoke runs used 16-24 MB.
 
 So the harnesses are no longer untested code — but "the gate closed" above means
 minutes of load and one reset, and must not be quoted as the v1 numbers.

@@ -376,6 +376,10 @@ DRY_CASES = [
     ("flaky-verify", False, ["reload-done", "attempt-done"],
      "one attempt whose sshd never came back fails that attempt (the gate is "
      "N in a row) and stops by default"),
+    ("watchdog-never-fires", False, ["breakglass-send"],
+     "the magic bytes are accepted but the watchdog never actually resets "
+     "the board -- 'sent' is not 'done', and this must fail loudly rather "
+     "than pretend the reset happened"),
 ]
 
 
@@ -416,6 +420,10 @@ def cmd_dry_run(args):
                 print(f"         stopped loudly: {stopped.splitlines()[0][:110]}")
     passed, failed = _dry_resume_case(passed, failed, args.attempts)
     passed, failed = _dry_keep_going_case(passed, failed)
+    passed, failed = _dry_restart_case(passed, failed)
+    passed, failed = _dry_status_readonly_case(passed, failed)
+    passed, failed = _dry_baseline_repair_case(passed, failed)
+    passed, failed = _dry_reload_after_reset_fails_case(passed, failed)
     # Every attempt records into the real boot ledger on a real run, so proving
     # a dry run does NOT is part of the harness's contract.
     if L.ledger_fingerprint() != ledger0:
@@ -507,6 +515,197 @@ def _dry_keep_going_case(passed, failed):
         return passed, failed + 1
     print(f"[ OK  ] {'stop-on-fail':18} default stopped after 1 failed attempt; "
           f"--keep-going made {st_k.get('attempts_done')}")
+    return passed + 1, failed
+
+
+def _dry_restart_case(passed, failed):
+    """--restart must be the ONLY way to zero the streak/attempts counters --
+    otherwise a deliberate re-measurement (e.g. after a bogus recorded
+    failure) would not actually start clean."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="bg-restart-")
+    statep = os.path.join(tmp, "state.json")
+    eventsp = os.path.join(tmp, "events.jsonl")
+
+    def one(target, restart=False):
+        clock = FakeClock()
+        ev = EventLog(eventsp, clock, run_id="restart", stdout=False)
+        state = RunState(statep, clock, "breakglass", new_state_defaults(),
+                         restart=restart)
+        cfg = make_cfg(argparse.Namespace(
+            attempts=target, settle_s=1, between_s=1, uboot_timeout_s=120,
+            guest_timeout_s=420, reload_timeout_s=1800, load_cycles=3,
+            fsck_passes=2, expect_vbk=False, keep_going=False,
+            max_extra_attempts=2, logdir=os.path.join(tmp, "logs")))
+        board = L.make_board(True, "happy", clock, ev)
+        _stop["flag"] = False
+        with L.patched(L, "ledger_record", lambda *a, **k: None):
+            ok = run(board, clock, ev, state, cfg)
+        return ok, state
+
+    ok1, st1 = one(2)
+    problems = []
+    if st1.d.get("streak") != 2 or not ok1:
+        problems.append(f"first run did not build a clean streak of 2 "
+                        f"(streak={st1.d.get('streak')})")
+    ok2, st2 = one(2, restart=True)
+    if st2.d.get("streak") != 2:
+        problems.append(f"--restart run did not reach its own fresh streak "
+                        f"(streak={st2.d.get('streak')})")
+    if st2.d.get("attempts_done") != 2:
+        problems.append(f"--restart did not zero attempts_done before this "
+                        f"run (got {st2.d.get('attempts_done')} for a fresh "
+                        f"2-attempt run)")
+    if problems:
+        print(f"[FAIL ] {'restart':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'restart':18} --restart zeroed streak/attempts_done "
+          f"instead of carrying the previous run's 2 forward")
+    return passed + 1, failed
+
+
+def _dry_status_readonly_case(passed, failed):
+    """--status is documented as safe from a second terminal while a real
+    run is live: it must never mutate the state file or the event log."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="bg-statusro-")
+    statep = os.path.join(tmp, "state.json")
+    eventsp = os.path.join(tmp, "events.jsonl")
+    clock = FakeClock()
+    ev = EventLog(eventsp, clock, run_id="statusro", stdout=False)
+    state = RunState(statep, clock, "breakglass", new_state_defaults())
+    cfg = make_cfg(argparse.Namespace(
+        attempts=1, settle_s=1, between_s=1, uboot_timeout_s=120,
+        guest_timeout_s=420, reload_timeout_s=1800, load_cycles=3,
+        fsck_passes=2, expect_vbk=False, keep_going=False,
+        max_extra_attempts=2, logdir=os.path.join(tmp, "logs")))
+    board = L.make_board(True, "happy", clock, ev)
+    with L.patched(L, "ledger_record", lambda *a, **k: None):
+        run(board, clock, ev, state, cfg)
+    before_state = open(statep, "rb").read()
+    before_events = open(eventsp, "rb").read()
+    cmd_status(argparse.Namespace(state=statep, events=eventsp, attempts=1))
+    after_state = open(statep, "rb").read()
+    after_events = open(eventsp, "rb").read()
+    problems = []
+    if before_state != after_state:
+        problems.append("--status rewrote the state file")
+    if before_events != after_events:
+        problems.append("--status appended to the event log")
+    if problems:
+        print(f"[FAIL ] {'status-readonly':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'status-readonly':18} --status left both files "
+          f"byte-identical")
+    return passed + 1, failed
+
+
+def _dry_baseline_repair_case(passed, failed):
+    """baseline() must REPAIR a board that starts unhealthy (sitting in
+    U-Boot, or with a read-only root) before counting an attempt, rather
+    than either treating that as a failure or skipping a reset the board was
+    never really ready for. Two starting states, one test -- neither is
+    reachable by any of the scripted DRY_CASES scenarios above, since
+    breakglass_cycle.py barely calls board.status() at all (once per
+    attempt, inside baseline() itself)."""
+    import tempfile
+
+    def one(setup):
+        tmp = tempfile.mkdtemp(prefix="bg-baseline-")
+        clock = FakeClock()
+        ev = EventLog(os.path.join(tmp, "events.jsonl"), clock,
+                      run_id="baseline", stdout=False)
+        state = RunState(os.path.join(tmp, "state.json"), clock, "breakglass",
+                         new_state_defaults())
+        cfg = make_cfg(argparse.Namespace(
+            attempts=1, settle_s=1, between_s=1, uboot_timeout_s=120,
+            guest_timeout_s=420, reload_timeout_s=1800, load_cycles=3,
+            fsck_passes=2, expect_vbk=False, keep_going=False,
+            max_extra_attempts=2, logdir=os.path.join(tmp, "logs")))
+        board = L.make_board(True, "happy", clock, ev)
+        setup(board)
+        _stop["flag"] = False
+        with L.patched(L, "ledger_record", lambda *a, **k: None):
+            ok = run(board, clock, ev, state, cfg)
+        return ok, state, ev
+
+    def needs_load(b):
+        b.phase = "uboot"
+        b.emac = False
+        b.guest = "down"
+
+    def needs_recovery(b):
+        b.guest = "ro_root"
+
+    ok1, st1, ev1 = one(needs_load)
+    kinds1 = [e["kind"] for e in L.read_events(ev1.path)]
+    ok2, st2, ev2 = one(needs_recovery)
+    kinds2 = [e["kind"] for e in L.read_events(ev2.path)]
+
+    problems = []
+    if "baseline-in-uboot" not in kinds1:
+        problems.append("needs-load: missing baseline-in-uboot")
+    if not ok1 or st1.d.get("streak") != 1:
+        problems.append(f"needs-load: attempt did not count as a clean pass "
+                        f"(ok={ok1}, streak={st1.d.get('streak')})")
+    if "baseline-guest-unhealthy" not in kinds2:
+        problems.append("needs-recovery: missing baseline-guest-unhealthy")
+    if not ok2 or st2.d.get("streak") != 1:
+        problems.append(f"needs-recovery: attempt did not count as a clean "
+                        f"pass (ok={ok2}, streak={st2.d.get('streak')})")
+    if problems:
+        print(f"[FAIL ] {'baseline-repair':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'baseline-repair':18} both needs-load and "
+          f"needs-recovery starting states were repaired before the "
+          f"attempt, then counted normally")
+    return passed + 1, failed
+
+
+def _dry_reload_after_reset_fails_case(passed, failed):
+    """recover_and_verify()'s OTHER failure branch: the break-glass reset
+    itself works (watchdog really fires, usb flips to uboot) but the reload
+    back to the HV never lands. Distinct from send_break_glass()'s own
+    failure modes ("dead-board", "watchdog-never-fires"), and not reachable
+    by scripting alone given how sparsely this harness polls (see
+    _dry_baseline_repair_case's note) -- set directly on the board instead."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="bg-reloadfail-")
+    clock = FakeClock()
+    ev = EventLog(os.path.join(tmp, "events.jsonl"), clock, run_id="reloadfail",
+                  stdout=False)
+    state = RunState(os.path.join(tmp, "state.json"), clock, "breakglass",
+                     new_state_defaults())
+    cfg = make_cfg(argparse.Namespace(
+        attempts=3, settle_s=1, between_s=1, uboot_timeout_s=120,
+        guest_timeout_s=420, reload_timeout_s=1800, load_cycles=3,
+        fsck_passes=2, expect_vbk=False, keep_going=False,
+        max_extra_attempts=2, logdir=os.path.join(tmp, "logs")))
+    board = L.make_board(True, "happy", clock, ev)
+    board.reload_always_fails = True
+    _stop["flag"] = False
+    stopped, ok = None, False
+    with L.patched(L, "ledger_record", lambda *a, **k: None):
+        try:
+            ok = run(board, clock, ev, state, cfg)
+        except HarnessStop as e:
+            stopped = str(e)
+    kinds = [e["kind"] for e in L.read_events(ev.path)]
+    problems = []
+    if ok:
+        problems.append("gate closed despite the post-reset reload never "
+                        "landing")
+    if stopped is None:
+        problems.append("did not stop loudly")
+    if "reload-done" not in kinds:
+        problems.append("missing reload-done event")
+    if state.d.get("fails", 0) < 1:
+        problems.append("attempt was not recorded as a failure")
+    if problems:
+        print(f"[FAIL ] {'reload-after-reset':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'reload-after-reset':18} break-glass reset worked, the "
+          f"reload back never landed -- attempt failed, run stopped")
     return passed + 1, failed
 
 
