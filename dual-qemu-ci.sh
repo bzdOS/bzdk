@@ -70,8 +70,8 @@
 # source, qemu-system-aarch64) is in this repo / already required by ci.sh.
 # Either PASS or FAIL.
 #
-# NOT wired into ci.sh yet, per the task that added this script -- run
-# standalone until proven reliable.
+# Wired into ci.sh as of 2026-08-11 (stage 7-10). Still runnable standalone,
+# which is the faster loop while iterating on this target specifically.
 #
 # Usage:   ./dual-qemu-ci.sh
 # Exit:    0 = PASS, 1 = build/run/assert failure.

@@ -80,9 +80,10 @@
 # Usage:   ZEPHYR_BASE=<zephyr-4.4.x> ./dual-zephyr-qemu-ci.sh
 # Exit:    0 = PASS or SKIP, 1 = build/run/assert failure.
 #
-# NOT wired into ci.sh yet, per the task that added this script -- run
-# standalone until proven reliable (see the task's own verification
-# requirement: 5+ standalone runs).
+# Wired into ci.sh as of 2026-08-11 (stage 10), with the same SKIP-vs-FAIL
+# handling the single-guest Zephyr and Linux stages already use: a missing Zephyr
+# tree must not be able to turn the gate red. Still runnable standalone, which is
+# the faster loop while iterating on this target specifically.
 #
 # Override the guest image with ZEPHYR_DUAL_GUEST_ELF=/path/to/zephyr.elf.
 set -u
