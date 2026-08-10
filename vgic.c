@@ -80,6 +80,12 @@
 #include "vgic.h"
 #include "guest.h"   /* guest_config(), guest_enter() for the self-test */
 #include "flightrec.h"  /* B4: flightrec_log(FLTR_K_IRQ, ...) on every injected LR */
+#include "smp.h"     /* SMP_MAX_CPUS, smp_cpu_id() — Phase 2 P1 per-core
+                      * state, see the inventory comment above struct
+                      * vg_percpu below. Header-only (smp_cpu_id() is
+                      * `static inline`): no new link dependency on smp.o,
+                      * so main_vgic_qemu.c's target (which links vgic_qemu.o
+                      * — this same source — but NOT smp.o) still links. */
 
 /* ================================================================
  *  GICH — hypervisor control interface register block (0x01c84000).
@@ -243,16 +249,134 @@ static inline void vg_bc(int i, uint32_t v)
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 
-/* ---- Module state (private). ---- */
-static uint32_t vg_nr_lr = 4;        /* refined from GICH_VTR in vgic_init */
-static uint32_t vg_inject_count;
-static uint32_t vg_inject_ok;
-static uint32_t vg_inject_drop;
-static uint32_t vg_maint_count;
-static uint32_t vg_active;           /* 1 once vgic_init() has completed */
-static uint32_t vg_cntv_inject;      /* CNTV ticks actually placed in an LR   */
-static uint32_t vg_cntv_gate;        /* CNTV ticks skipped: a live 27 LR held */
-static uint32_t vg_cntv_drop;        /* CNTV ticks dropped: no free LR         */
+/* VGIC_PENDQ_SIZE / struct vgic_pend moved up here (were originally just
+ * above vgic_pendq_push(), see the "LR-exhaustion pending-injection queue"
+ * comment further down for the design rationale) because struct vg_percpu
+ * below embeds a fixed-size array of them — the type and the size just need
+ * to exist before that point, textually. */
+#define VGIC_PENDQ_SIZE 32u
+
+struct vgic_pend {
+	uint32_t vintid;
+	uint32_t pintid;
+	int      priority;
+};
+
+/* ------------------------------------------------------------------ *
+ * Per-core module state (Phase 2 step P1, docs/phase2-all-cores.md §1.6).
+ *
+ * STATE INVENTORY. Every mutable module-level variable this file had before
+ * this change, cited against the pre-P1 tree, and the per-core/global
+ * verdict for each:
+ *
+ *   vg_nr_lr           (vgic.c:247) PER-CORE. Refined from THIS core's own
+ *                       GICH_VTR readback in vgic_init() — GICH is EL2-only,
+ *                       per-PE-banked hypervisor state (this file's own
+ *                       header, "DRIVES: GICH ... EL2-only state the guest
+ *                       can never see"; gic_timer.c:445-449 independently
+ *                       states "GICH_* and HCR_EL2 are banked per PE").
+ *                       Every core that calls vgic_init() programs and
+ *                       reads back ITS OWN GICH.
+ *   vg_inject_count,   (vgic.c:248-251) PER-CORE. Counters of events THIS
+ *   vg_inject_ok,          core's own IRQ handling produced — an injection
+ *   vg_inject_drop,        or a maintenance pass on CPU2 is not a fact about
+ *   vg_maint_count          CPU0's GICH.
+ *   vg_active          (vgic.c:252) PER-CORE. Gates whether THIS core's
+ *                       gic_timer_irq() should treat physical IRQs as
+ *                       vgic-forwarded. Must be per-core: a core that has
+ *                       never called its own vgic_init() must not inherit
+ *                       "true" from a different core that has.
+ *   vg_cntv_inject,    (vgic.c:253-255) PER-CORE. Counters of THIS core's
+ *   vg_cntv_gate,          own guest's CNTV injection attempts — CNTV_CTL_EL0
+ *   vg_cntv_drop            is itself banked per PE (gic_timer.c's own
+ *                       vtimer_mask_watchdog() rationale), so there is no
+ *                       single "the" CNTV state to begin with.
+ *   vg_pendq[],        (vgic.c:280-285) PER-CORE. The LR-exhaustion pending
+ *   vg_pendq_head/          queue exists to feed List Registers, and List
+ *   tail/count/hwm/         Registers are the same per-PE-banked GICH state
+ *   overflow                as vg_nr_lr above. A queue meant to feed only
+ *                       one core's LRs must not be shared: two cores
+ *                       injecting concurrently would interleave push/pop on
+ *                       one queue and could hand core A's pending interrupt
+ *                       to core B's List Register (exactly the corruption
+ *                       docs/phase2-all-cores.md §1.6 warns about).
+ *
+ * global-but-inert (deliberately NOT converted):
+ *   vgic_gicd_shadow[0x1000]  (vgic.c:606, further down this file) is a
+ *                       shadow of the (single, shared) physical distributor
+ *                       page for the GICD trap-and-emulate helpers. Left
+ *                       GLOBAL, and this is a considered decision, not an
+ *                       oversight, for two independent reasons: (1) GICD is
+ *                       real, mostly-shared hardware — SPI configuration
+ *                       (INTID >= 32) is genuinely system-wide, only the
+ *                       PPI/SGI range (0..31) is per-PE-banked in real
+ *                       GICv2 silicon, so "one struct per core" would be the
+ *                       WRONG model for most of this page, not merely an
+ *                       unnecessary one; a correct per-core split would need
+ *                       to model that mixed banking, which is real design
+ *                       work belonging to whoever actually wires this up.
+ *                       (2) it is currently 100% dead: vgic_gicd_read(),
+ *                       vgic_gicd_write() and vgic_gicd_fault() have ZERO
+ *                       callers anywhere in this tree (grepped before this
+ *                       change) — "v1: present but not wired" per this
+ *                       file's own header. Converting untested, unreachable
+ *                       code is speculative complexity this pass explicitly
+ *                       avoids (see ORIENTATION.md's task scope: "nothing else").
+ *                       Flagged here for whoever activates it later.
+ *
+ * All the PER-CORE state above moves into struct vg_percpu below, one
+ * instance per core, indexed by smp_cpu_id() via vg_self().
+ *
+ * On CPU0 alone — every board target today; vgic_init() is called only once,
+ * from main_dbg.c's single-core boot path, before smp_init() ever starts a
+ * secondary (grepped before this change) — the index is always 0, so this
+ * is a pure storage-layout change with byte-identical behaviour. Cache-line-
+ * padded (64 B) exactly like smp.c's own per-core pattern (struct
+ * smp_percpu, smp.c:183-188) and gic_timer.c's new struct gt_percpu (this
+ * same P1 change), so a future second core running vgic_init() never shares
+ * a cache line with CPU0's copy.
+ *
+ * BREADCRUMB NOTE (hv_addrmap.h / the breadcrumb-window-hygiene discipline).
+ * VGIC_BC_BASE (0x50001c00) stays a SINGLE, file-scope window — NOT split
+ * per core — for the same reason as gic_timer.c's GICT/IRQ_COUNTER windows:
+ * nothing in the current tree ever calls vgic_init()/vgic_inject_hw()/etc.
+ * from any core but CPU0, so there is exactly one writer today, and
+ * splitting the window now would be speculative complexity with no way to
+ * exercise it. Whichever later Phase-2 step actually runs the vGIC on a
+ * second core MUST give it its own breadcrumb lane first — allocated in
+ * hv_addrmap.h's _Static_assert chain, never squeezed into a neighbour's
+ * space. Flagged here, not fixed here.
+ * ------------------------------------------------------------------ */
+struct vg_percpu {
+	uint32_t nr_lr;               /* refined from GICH_VTR in vgic_init */
+	uint32_t inject_count;
+	uint32_t inject_ok;
+	uint32_t inject_drop;
+	uint32_t maint_count;
+	uint32_t active;              /* 1 once vgic_init() has completed */
+	uint32_t cntv_inject;         /* CNTV ticks actually placed in an LR   */
+	uint32_t cntv_gate;           /* CNTV ticks skipped: a live 27 LR held */
+	uint32_t cntv_drop;           /* CNTV ticks dropped: no free LR         */
+	struct vgic_pend pendq[VGIC_PENDQ_SIZE];
+	uint32_t pendq_head;          /* next slot to push into */
+	uint32_t pendq_tail;          /* next slot to pop from   */
+	uint32_t pendq_count;
+	uint32_t pendq_hwm;           /* high-water mark, diagnostic only */
+	uint32_t pendq_overflow;      /* queue itself was full: TRUE loss  */
+} __attribute__((aligned(64)));
+
+static struct vg_percpu g_vg[SMP_MAX_CPUS];
+
+/* Defensive clamp only — same posture as gic_timer.c's gt_self() (see that
+ * file's comment): MPIDR affinity0 on this SoC is architecturally 0..3
+ * (SMP_MAX_CPUS==4, smp.h:42), so the out-of-range arm can never be hit on
+ * real hardware or under QEMU virt (single CPU => index 0). */
+static inline struct vg_percpu *vg_self(void)
+{
+	uint32_t cpu = smp_cpu_id();
+
+	return &g_vg[(cpu < SMP_MAX_CPUS) ? cpu : 0u];
+}
 
 /* ================================================================
  *  LR-exhaustion pending-injection queue (v2, interrupt-virtualization
@@ -268,73 +392,70 @@ static uint32_t vg_cntv_drop;        /* CNTV ticks dropped: no free LR         *
  *  queue into List Registers as they free up. Only if THIS ring is also
  *  full (VGIC_PENDQ_SIZE simultaneously-backlogged interrupts on top of 4
  *  already-occupied LRs) is an injection ever actually lost — see
- *  vg_pendq_overflow. No allocation, fixed array, bounded loops only. */
-#define VGIC_PENDQ_SIZE 32u
+ *  vg_pendq_overflow. No allocation, fixed array, bounded loops only.
+ *  (VGIC_PENDQ_SIZE / struct vgic_pend themselves now live just above the
+ *  struct vg_percpu state-inventory comment — see there for why.) */
 
-struct vgic_pend {
-	uint32_t vintid;
-	uint32_t pintid;
-	int      priority;
-};
-
-static struct vgic_pend vg_pendq[VGIC_PENDQ_SIZE];
-static uint32_t vg_pendq_head;       /* next slot to push into */
-static uint32_t vg_pendq_tail;       /* next slot to pop from   */
-static uint32_t vg_pendq_count;
-static uint32_t vg_pendq_hwm;        /* high-water mark, diagnostic only */
-static uint32_t vg_pendq_overflow;   /* queue itself was full: TRUE loss  */
-
-/* Push one (vintid,pintid,priority) onto the pending queue. Returns 1 if
- * queued, 0 if the queue itself was full (counted in vg_pendq_overflow —
+/* Push one (vintid,pintid,priority) onto `vg`'s pending queue. Returns 1 if
+ * queued, 0 if the queue itself was full (counted in vg->pendq_overflow —
  * the only case where an interrupt is actually lost in v2). Enables
  * GICH_HCR.UIE the moment the queue transitions from empty to non-empty, so
  * the underflow maintenance IRQ starts firing to drive draining — see the
- * file-header rationale for why UIE is never left on unconditionally. */
-static int vgic_pendq_push(uint32_t vintid, uint32_t pintid, int priority)
+ * file-header rationale for why UIE is never left on unconditionally.
+ * `vg` is always the CALLING core's own slot (see struct vg_percpu's
+ * inventory comment for why this queue is per-core): passed in rather than
+ * re-derived so a single logical push/pop/drain sequence never risks
+ * mixing two different lookups of "the current core" together. */
+static int vgic_pendq_push(struct vg_percpu *vg, uint32_t vintid,
+                            uint32_t pintid, int priority)
 {
-	if (vg_pendq_count >= VGIC_PENDQ_SIZE) {
-		vg_pendq_overflow++;
-		vg_bc(17, vg_pendq_overflow);
+	if (vg->pendq_count >= VGIC_PENDQ_SIZE) {
+		vg->pendq_overflow++;
+		vg_bc(17, vg->pendq_overflow);
 		return 0;
 	}
 
-	if (vg_pendq_count == 0)
+	if (vg->pendq_count == 0)
 		GICH(GICH_HCR) |= GICH_HCR_UIE;   /* start driving drains */
 
-	vg_pendq[vg_pendq_head].vintid   = vintid;
-	vg_pendq[vg_pendq_head].pintid   = pintid;
-	vg_pendq[vg_pendq_head].priority = priority;
-	vg_pendq_head = (vg_pendq_head + 1u) % VGIC_PENDQ_SIZE;
-	vg_pendq_count++;
-	if (vg_pendq_count > vg_pendq_hwm)
-		vg_pendq_hwm = vg_pendq_count;
+	vg->pendq[vg->pendq_head].vintid   = vintid;
+	vg->pendq[vg->pendq_head].pintid   = pintid;
+	vg->pendq[vg->pendq_head].priority = priority;
+	vg->pendq_head = (vg->pendq_head + 1u) % VGIC_PENDQ_SIZE;
+	vg->pendq_count++;
+	if (vg->pendq_count > vg->pendq_hwm)
+		vg->pendq_hwm = vg->pendq_count;
 
-	vg_bc(15, vg_pendq_count);
-	vg_bc(16, vg_pendq_hwm);
+	vg_bc(15, vg->pendq_count);
+	vg_bc(16, vg->pendq_hwm);
 	return 1;
 }
 
-/* Pop the oldest queued entry. Returns 0 if the queue is empty. */
-static int vgic_pendq_pop(uint32_t *vintid, uint32_t *pintid, int *priority)
+/* Pop the oldest queued entry from `vg`'s queue. Returns 0 if empty. */
+static int vgic_pendq_pop(struct vg_percpu *vg, uint32_t *vintid,
+                           uint32_t *pintid, int *priority)
 {
-	if (vg_pendq_count == 0)
+	if (vg->pendq_count == 0)
 		return 0;
 
-	*vintid   = vg_pendq[vg_pendq_tail].vintid;
-	*pintid   = vg_pendq[vg_pendq_tail].pintid;
-	*priority = vg_pendq[vg_pendq_tail].priority;
-	vg_pendq_tail = (vg_pendq_tail + 1u) % VGIC_PENDQ_SIZE;
-	vg_pendq_count--;
-	vg_bc(15, vg_pendq_count);
+	*vintid   = vg->pendq[vg->pendq_tail].vintid;
+	*pintid   = vg->pendq[vg->pendq_tail].pintid;
+	*priority = vg->pendq[vg->pendq_tail].priority;
+	vg->pendq_tail = (vg->pendq_tail + 1u) % VGIC_PENDQ_SIZE;
+	vg->pendq_count--;
+	vg_bc(15, vg->pendq_count);
 	return 1;
 }
 
 /* Write one List Register in HW mode (tied to physical INTID `pintid`) —
  * the single LR-programming step shared by vgic_inject_hw()'s fast path and
  * vgic_maintenance()'s drain path, so the field layout is defined exactly
- * once. Caller has already confirmed LR `n` is free (GICH_ELRSR0 bit set). */
-static void vgic_lr_write_hw(uint32_t n, uint32_t vintid, uint32_t pintid,
-                              int priority)
+ * once. Caller has already confirmed LR `n` is free (GICH_ELRSR0 bit set),
+ * on `vg`'s (the calling core's) own GICH — see the vg_nr_lr inventory note:
+ * List Registers are per-PE-banked hardware, so "LR n" only means the same
+ * physical register if `vg` is genuinely the executing core's slot. */
+static void vgic_lr_write_hw(struct vg_percpu *vg, uint32_t n, uint32_t vintid,
+                              uint32_t pintid, int priority)
 {
 	uint32_t prio5 = ((uint32_t)priority >> 3) & 0x1fu;
 	uint32_t lr = (vintid & GICH_LR_VID_MASK) |
@@ -346,9 +467,9 @@ static void vgic_lr_write_hw(uint32_t n, uint32_t vintid, uint32_t pintid,
 
 	GICH(GICH_LR(n)) = lr;
 
-	vg_inject_ok++;
-	vg_bc(4, vg_inject_count);
-	vg_bc(5, vg_inject_ok);
+	vg->inject_ok++;
+	vg_bc(4, vg->inject_count);
+	vg_bc(5, vg->inject_ok);
 	vg_bc(7, lr);
 	/* B4 flight recorder: a0=vintid(==pintid for HW mode), a1=LR word. */
 	flightrec_log(FLTR_K_IRQ, vintid, lr);
@@ -359,17 +480,18 @@ static void vgic_lr_write_hw(uint32_t n, uint32_t vintid, uint32_t pintid,
  * ================================================================ */
 void vgic_init(void)
 {
+	struct vg_percpu *vg = vg_self();
 	uint32_t vtr, i, vmcr;
 
 	vg_bc(0, VGIC_BC_MAGIC);
 
 	vtr = GICH(GICH_VTR);
-	vg_nr_lr = (vtr & 0x3fu) + 1u;   /* VTR[5:0] = ListRegs - 1 */
-	if (vg_nr_lr > 16u)
-		vg_nr_lr = 16u;
+	vg->nr_lr = (vtr & 0x3fu) + 1u;   /* VTR[5:0] = ListRegs - 1 */
+	if (vg->nr_lr > 16u)
+		vg->nr_lr = 16u;
 
 	/* Start from a clean slate: every LR invalid (state 00). */
-	for (i = 0; i < vg_nr_lr; i++)
+	for (i = 0; i < vg->nr_lr; i++)
 		GICH(GICH_LR(i)) = 0u;
 
 	/* Preset the virtual GICC control the guest sees: Group 1 enabled,
@@ -408,7 +530,7 @@ void vgic_init(void)
 	VGIC_GICD(VGIC_GICD_ISENABLER0) |= (1u << VGIC_MAINT_INTID);
 
 	vg_bc(1, vtr);
-	vg_bc(2, vg_nr_lr);
+	vg_bc(2, vg->nr_lr);
 	vg_bc(3, GICH(GICH_HCR));
 	vg_bc(12, 1u);
 	vg_bc(13, GICH(GICH_VMCR));
@@ -416,26 +538,30 @@ void vgic_init(void)
 	vg_bc(18, GICH(GICH_HCR));                  /* UIE (bit1) expected 0 here */
 	vg_bc(19, VGIC_GICD(VGIC_GICD_ISENABLER0)); /* readback: bit25 must be 1 */
 
-	vg_active = 1;
+	vg->active = 1;
 }
 
 uint32_t vgic_active(void)
 {
-	return vg_active;
+	/* THIS core's own flag — see struct vg_percpu's inventory comment for
+	 * why a core that has never called its own vgic_init() must not read
+	 * "true" from a different core's slot. */
+	return vg_self()->active;
 }
 
 void vgic_inject(uint32_t vintid, int priority)
 {
+	struct vg_percpu *vg = vg_self();
 	uint32_t elrsr, n, prio5, lr;
 
-	vg_inject_count++;
+	vg->inject_count++;
 
 	/* GICH_ELRSR0 bit n == 1 means LR n is empty (invalid) and reusable.
 	 * A guest EOI drops its LR to invalid, so this naturally reclaims LRs
 	 * without any maintenance interrupt. */
 	elrsr = GICH(GICH_ELRSR0);
 
-	for (n = 0; n < vg_nr_lr; n++) {
+	for (n = 0; n < vg->nr_lr; n++) {
 		if (elrsr & (1u << n)) {
 			prio5 = ((uint32_t)priority >> 3) & 0x1fu;
 			lr = (vintid & GICH_LR_VID_MASK) |
@@ -444,9 +570,9 @@ void vgic_inject(uint32_t vintid, int priority)
 			     (prio5 << GICH_LR_PRIO_SHIFT);
 			GICH(GICH_LR(n)) = lr;
 
-			vg_inject_ok++;
-			vg_bc(4, vg_inject_count);
-			vg_bc(5, vg_inject_ok);
+			vg->inject_ok++;
+			vg_bc(4, vg->inject_count);
+			vg_bc(5, vg->inject_ok);
 			vg_bc(7, lr);
 			vg_bc(8, elrsr);
 			/* B4 flight recorder: one event per IRQ actually landed in a
@@ -459,9 +585,9 @@ void vgic_inject(uint32_t vintid, int priority)
 
 	/* All LRs busy — the guest hasn't drained the previous ticks. Drop and
 	 * count (a periodic tick is idempotent; losing one is harmless). */
-	vg_inject_drop++;
-	vg_bc(4, vg_inject_count);
-	vg_bc(6, vg_inject_drop);
+	vg->inject_drop++;
+	vg_bc(4, vg->inject_count);
+	vg_bc(6, vg->inject_drop);
 	vg_bc(8, elrsr);
 }
 
@@ -473,9 +599,10 @@ void vgic_inject(uint32_t vintid, int priority)
  * ================================================================ */
 int vgic_inject_cntv(void)
 {
+	struct vg_percpu *vg = vg_self();
 	uint32_t elrsr, n, lr, free_lr = 0xffffffffu;
 
-	vg_inject_count++;
+	vg->inject_count++;
 
 	/* ONE-SHOT GATE (fix C): if any List Register already holds a live
 	 * (pending and/or active, i.e. NOT invalid) vINTID 27, do NOT inject a
@@ -485,7 +612,7 @@ int vgic_inject_cntv(void)
 	 * occupied ones we read the LR and compare the VirtualID field. In the
 	 * same pass we remember the first free LR so we don't scan twice. */
 	elrsr = GICH(GICH_ELRSR0);
-	for (n = 0; n < vg_nr_lr; n++) {
+	for (n = 0; n < vg->nr_lr; n++) {
 		if (elrsr & (1u << n)) {
 			if (free_lr == 0xffffffffu)
 				free_lr = n;
@@ -495,8 +622,8 @@ int vgic_inject_cntv(void)
 		if ((lr & GICH_LR_VID_MASK) == VGIC_VTIMER_INTID) {
 			/* A live 27 is still in flight — the guest hasn't EOIed the
 			 * previous tick yet. Gate this one. */
-			vg_cntv_gate++;
-			vg_bc(21, vg_cntv_gate);
+			vg->cntv_gate++;
+			vg_bc(21, vg->cntv_gate);
 			vg_bc(8, elrsr);
 			return 0;
 		}
@@ -504,8 +631,8 @@ int vgic_inject_cntv(void)
 
 	if (free_lr == 0xffffffffu) {
 		/* All LRs busy with OTHER vINTIDs — drop this tick (idempotent). */
-		vg_cntv_drop++;
-		vg_bc(23, vg_cntv_drop);
+		vg->cntv_drop++;
+		vg_bc(23, vg->cntv_drop);
 		vg_bc(8, elrsr);
 		return 0;
 	}
@@ -532,13 +659,13 @@ int vgic_inject_cntv(void)
 
 	GICH(GICH_LR(n)) = lr;
 
-	vg_cntv_inject++;
-	vg_inject_ok++;
-	vg_bc(4, vg_inject_count);
-	vg_bc(5, vg_inject_ok);
+	vg->cntv_inject++;
+	vg->inject_ok++;
+	vg_bc(4, vg->inject_count);
+	vg_bc(5, vg->inject_ok);
 	vg_bc(7, lr);
 	vg_bc(8, elrsr);
-	vg_bc(20, vg_cntv_inject);
+	vg_bc(20, vg->cntv_inject);
 	vg_bc(22, lr);
 	flightrec_log(FLTR_K_IRQ, VGIC_VTIMER_INTID, lr);
 	return 1;
@@ -546,9 +673,10 @@ int vgic_inject_cntv(void)
 
 void vgic_maintenance(void)
 {
+	struct vg_percpu *vg = vg_self();
 	uint32_t misr, eisr, elrsr, n;
 
-	vg_maint_count++;
+	vg->maint_count++;
 	misr = GICH(GICH_MISR);
 	eisr = GICH(GICH_EISR0);
 
@@ -558,7 +686,7 @@ void vgic_maintenance(void)
 	 * done by hardware directly, no maintenance IRQ needed for THAT — so
 	 * this loop is normally a no-op in v2 too; kept for completeness/safety
 	 * against any future LR that does set the EOI-maintenance bit. */
-	for (n = 0; n < vg_nr_lr; n++)
+	for (n = 0; n < vg->nr_lr; n++)
 		if (eisr & (1u << n))
 			GICH(GICH_LR(n)) = 0u;
 
@@ -566,31 +694,31 @@ void vgic_maintenance(void)
 	 * whichever LRs GICH_ELRSR0 shows free RIGHT NOW — this is what the
 	 * underflow condition (MISR.U, the reason UIE fired this INTID 25 in
 	 * the first place) is telling us: at least one LR just freed up. Bounded
-	 * to vg_nr_lr iterations regardless of queue depth — never loops on the
+	 * to vg->nr_lr iterations regardless of queue depth — never loops on the
 	 * queue itself, only on the fixed LR count. */
 	elrsr = GICH(GICH_ELRSR0);
-	for (n = 0; n < vg_nr_lr && vg_pendq_count > 0; n++) {
+	for (n = 0; n < vg->nr_lr && vg->pendq_count > 0; n++) {
 		uint32_t vintid, pintid;
 		int priority;
 
 		if (!(elrsr & (1u << n)))
 			continue;
-		if (!vgic_pendq_pop(&vintid, &pintid, &priority))
+		if (!vgic_pendq_pop(vg, &vintid, &pintid, &priority))
 			break;
-		vgic_lr_write_hw(n, vintid, pintid, priority);
+		vgic_lr_write_hw(vg, n, vintid, pintid, priority);
 	}
 
 	/* Once the queue is empty again, stop asking for underflow maintenance —
 	 * see the file-header rationale (UIE left on unconditionally would make
 	 * INTID 25 itself storm at idle, since <2-valid-LRs is the normal idle
 	 * state of a 4-LR GIC-400). */
-	if (vg_pendq_count == 0)
+	if (vg->pendq_count == 0)
 		GICH(GICH_HCR) &= ~GICH_HCR_UIE;
 
-	vg_bc(9, vg_maint_count);
+	vg_bc(9, vg->maint_count);
 	vg_bc(10, misr);
 	vg_bc(11, eisr);
-	vg_bc(15, vg_pendq_count);
+	vg_bc(15, vg->pendq_count);
 	vg_bc(18, GICH(GICH_HCR));
 }
 
@@ -858,9 +986,10 @@ void vgic_selftest_start(void)
 
 void vgic_inject_hw(uint32_t vintid, uint32_t pintid, int priority)
 {
+	struct vg_percpu *vg = vg_self();
 	uint32_t elrsr, n;
 
-	vg_inject_count++;
+	vg->inject_count++;
 
 	/* Fast path only when the pending queue is already empty: if it isn't,
 	 * something is draining (or about to be, via the maintenance IRQ) and
@@ -869,11 +998,11 @@ void vgic_inject_hw(uint32_t vintid, uint32_t pintid, int priority)
 	 * require strict inter-device ordering) but needlessly surprising to
 	 * reason about, so we keep FIFO order across the queue+LR combination
 	 * by always queuing behind an existing backlog. */
-	if (vg_pendq_count == 0) {
+	if (vg->pendq_count == 0) {
 		elrsr = GICH(GICH_ELRSR0);
-		for (n = 0; n < vg_nr_lr; n++) {
+		for (n = 0; n < vg->nr_lr; n++) {
 			if (elrsr & (1u << n)) {
-				vgic_lr_write_hw(n, vintid, pintid, priority);
+				vgic_lr_write_hw(vg, n, vintid, pintid, priority);
 				vg_bc(8, elrsr);
 				return;
 			}
@@ -883,11 +1012,12 @@ void vgic_inject_hw(uint32_t vintid, uint32_t pintid, int priority)
 	/* No free LR right now (or the queue is already draining) — queue it.
 	 * vgic_maintenance() (driven by the GICH_HCR.UIE underflow maintenance
 	 * IRQ this push enables) drains it the moment an LR frees up. Only the
-	 * queue itself being full actually loses the interrupt (vg_pendq_overflow,
-	 * counted separately from vg_inject_drop's legacy meaning below). */
-	if (!vgic_pendq_push(vintid, pintid, priority))
-		vg_inject_drop++;   /* true loss: even the pending queue was full */
+	 * queue itself being full actually loses the interrupt
+	 * (vg->pendq_overflow, counted separately from vg->inject_drop's legacy
+	 * meaning below). */
+	if (!vgic_pendq_push(vg, vintid, pintid, priority))
+		vg->inject_drop++;   /* true loss: even the pending queue was full */
 
-	vg_bc(4, vg_inject_count);
-	vg_bc(6, vg_inject_drop);
+	vg_bc(4, vg->inject_count);
+	vg_bc(6, vg->inject_drop);
 }
