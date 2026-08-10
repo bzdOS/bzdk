@@ -40,7 +40,7 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
 | `PROGRESS.md` / `ROADMAP.md` | Where the project is and what v1 requires. |
 | `WOW_FEATURES.md` §0 | Hard prohibitions — read rule 7 before "just patching" anything on disk. |
 
-## The four rules that bite hardest
+## The five rules that bite hardest
 
 1. **Never ask the user to press reset or re-plug power** (R0). Fix it live over
    EMAC, or let the agent do a network reload itself. Silently.
@@ -53,6 +53,14 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
    state — a read over the debug channel is serviced by **CPU1** and tells you
    nothing about the guest's core. This has produced at least four confidently
    wrong diagnoses in this project.
+5. **A guest-written DRAM word read from another core is not a liveness
+   probe on real hardware.** A guest running with its stage-1 MMU off makes
+   its own stores Device-typed; a Device write does not invalidate another
+   core's cached copy, so the reader can return a stale value forever. QEMU
+   models no caches and will not catch this — it made exactly this probe lie
+   about a working retry path on 2026-08-10 (see `docs/dual-guest.md`'s
+   RETRACTED section). Trust progress observed *through a stage-2 fault*
+   (console bytes, an EL2 breadcrumb with explicit `dc civac`) instead.
 
 ## Core layout
 
@@ -60,7 +68,10 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
 - **CPU1** — EMAC/debug core; survives guest wedges, hosts `dbgmon` and the
   GDB stub, owns the hardware watchdog.
 - **CPU2** — async eMMC I/O offload.
-- **CPU3** — idle (WFI).
+- **CPU3** — idle (WFI) in the default `dbg`/`gdb`/`fbsd` builds. In the
+  `dual` build it runs a genuine second guest (Zephyr) concurrently with
+  FreeBSD on CPU0, under its own disjoint stage-2 table — see
+  `docs/dual-guest.md`.
 
 ## Talking to the guest
 
