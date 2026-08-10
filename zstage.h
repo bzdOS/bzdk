@@ -106,6 +106,31 @@ int zstage_span(const void *elf, uint64_t avail, uint64_t *span_out);
  * Breadcrumbs land in HVMAP_ZSTAGE_BC (see hv_addrmap.h). */
 uint64_t zstage_copy_to(uint64_t dest_pa, uint64_t dest_limit);
 
+/* dbgmon.c's `zstage` command: re-run the copy-in on demand, at any time, from
+ * whichever core is servicing the debug channel.
+ *
+ * WHY THIS EXISTS. `zunhalt` returns a failed CPU3 to its parked state, but on
+ * its own that is not enough to be useful: the operator also needs a way to get
+ * a corrected image to where zload2 will read it, and the boot-time copy-in has
+ * long since run. Without this command the only route left is writing straight
+ * to ZG3_ELF_STAGE_PA over the debug channel -- which is precisely the
+ * destination-only route that zstage_invalidate_dest() made unsupported. So the
+ * supported retry workflow is: put the image in the LANDING window (debug-channel
+ * writes to ZSTAGE_LOW_PA, or it may still be there from this boot's TFTP),
+ * `zstage`, `zunhalt`, `zboot`.
+ *
+ * Returns the number of bytes copied, 0 if nothing usable was staged (in which
+ * case the destination is wiped, exactly as at boot -- so a `zstage` that finds
+ * garbage leaves nothing bootable behind rather than half-updating).
+ *
+ * SAFE BUT NOT ALWAYS USEFUL LATE IN A BOOT: the landing window lives inside the
+ * FreeBSD guest's own gigabyte, so once FreeBSD is running it may have allocated
+ * over it. Reading it can therefore return garbage -- which is refused and
+ * reported (breadcrumb state 2), not acted on. The destination it writes is
+ * inside the second guest's private slice, so the write itself can never disturb
+ * FreeBSD. */
+uint64_t zstage_restage(void);
+
 /* main_dbg.c's call site. Weakly defined there as a no-op, strongly overridden
  * by zstage.c, which is linked only into the `dual` target — the same
  * weak/strong linkage pattern smp.c already uses for zephyr_cpu3_run() and

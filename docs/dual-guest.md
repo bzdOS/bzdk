@@ -11,11 +11,17 @@
 | CPU3 runs **genuinely concurrently with FreeBSD on the real board** | ✅ **confirmed 2026-08-10** | see below |
 | **Real Zephyr** on CPU3 on the real board | ✅ **confirmed 2026-08-10** | see "Real Zephyr on the real board" below |
 | A real guest image can be **loaded** onto the board at all (bulk loader) | ✅ **confirmed 2026-08-10** | `zstage.c` + `chimpd --zguest`, see below |
-| A failed `zboot` can be **retried** without a board reload (`zunhalt`) | ⚠️ **partly** — re-arm works, re-arm→successful-boot does NOT | see "zunhalt: what is and isn't proven" |
+| A failed `zboot` can be **retried** without a board reload (`zstage` + `zunhalt`) | ✅ **confirmed 2026-08-10** | see "Retrying a failed zboot" below |
 
-None of these rows are interchangeable — "the mechanism exists" is not "it boots," and "boots under QEMU" is not "boots on the board." This project has burned time before on reports that blurred exactly this kind of distinction (see `zephyr-guest.md`'s own header note). The `⚠️` row is deliberately not rounded up to ✅.
+None of these rows are interchangeable — "the mechanism exists" is not "it boots," and "boots under QEMU" is not "boots on the board." This project has burned time before on reports that blurred exactly this kind of distinction (see `zephyr-guest.md`'s own header note). Every ✅ here names the evidence, and the section on retrying documents a case where the *measurement*, not the firmware, was what was broken.
 
 ## Confirmed on real hardware (2026-08-10)
+
+> **Historical.** This section is the narrative of the FIRST hardware milestone,
+> when there was no bulk loader and no retry path. Both of its "unresolved gap"
+> notes were closed later the same day — see "The bulk loader" and "Retrying a
+> failed zboot" below. Kept because the reasoning that got there is still worth
+> reading; do not take its open items as current.
 
 Flashed `make dual` (FreeBSD/CPU0 path reuses `main_dbg.c` verbatim — zero changes) to the real board via the same reversible `chimpd.HYP_ELF` monkeypatch technique used for every prior real-hardware test this session. **FreeBSD booted and ran completely normally first** — `ssh` answered, root mounted `rw`, `kldstat`/`uptime` all ordinary — proving the safety property the plan itself insisted on checking before ever touching CPU3.
 
@@ -121,58 +127,101 @@ pass now asserts that a destination-only image is **refused** rather than that i
 works. Hand-staging over EMAC after boot is unaffected: the copy-in runs during
 HV init, long before `dbgmon` exists to write anything.
 
-## zunhalt: what is and isn't proven
+## Retrying a failed zboot (`zstage` + `zunhalt`) — and a probe that lied
 
-**Proven on hardware.** `zboot` while CPU3 is halted is fully inert; `zunhalt`
-returns CPU3 to an *observable* parked state with `attempts` unchanged,
-`rearms` incremented, and `last_fail` sticky:
+**The workflow, hardware-verified end to end.** A failed `zboot` no longer needs
+a board reload:
+
+1. put a corrected image in the **landing window** (`ZSTAGE_LOW_PA`) — over the
+   debug channel, or it may still be there from this boot's TFTP;
+2. `zstage` — re-runs the copy-in on demand (`zstage_restage()`);
+3. `zunhalt` — returns CPU3 to parked;
+4. `zboot` — try again.
+
+`zstage` exists because `zunhalt` alone is not enough to be useful: after a
+failure the boot-time copy-in has long since run, and the only other route to the
+destination is writing straight to `ZG3_ELF_STAGE_PA` — precisely what
+`zstage_invalidate_dest()` made unsupported. Confirmed live with the real Zephyr
+image:
 
 ```
+ZSTAGE at boot   state=4  span=36924 copied=36924
+(destination header deliberately zeroed over the debug channel to force a failure)
 after zboot #1   state=0xbad1  attempts=1  last_fail=0xbad1  rearms=0
-after zboot #2   state=0xbad1  attempts=1  last_fail=0xbad1  rearms=0   (inert)
+zstage           copied 0x903c bytes;  state=4 span=36924 copied=36924
 after zunhalt    state=0x1     attempts=1  last_fail=0xbad1  rearms=1   (parked)
+after zboot #2   state=0x3     attempts=2  last_fail=0xbad1  rearms=1
+chan1 bytes      0 -> 142 -> 184     *** Booting Zephyr OS build v4.4.1 ***
+                                     hello from EL1 ... heartbeat 0..5
 ```
 
-Two real bugs were found getting there, both only visible on hardware:
+FreeBSD stayed healthy throughout the retry (16 MB `dd` at 4.2 MB/s, root rw).
 
-1. The halt loop originally waited on `wfi`. CPU3 takes **no interrupts at all**
-   in this design, and `sev` (which `zguest_cpu3_rearm_set()` sends) wakes only
-   `wfe` — so it was a permanent sleep. `zunhalt` was acknowledged over EMAC and
-   CPU3 slept through it, `rearms` stuck at 0 across repeated attempts.
+Two real bugs were found getting `zunhalt` to work, both invisible under QEMU:
+
+1. The halt loop waited on `wfi`. CPU3 takes **no interrupts at all** in this
+   design, and `sev` (which `zguest_cpu3_rearm_set()` sends) wakes only `wfe` —
+   so it was a permanent sleep. The command was acknowledged over EMAC and CPU3
+   slept through it, `rearms` stuck at 0 across repeated attempts. My own comment
+   had asserted "any interrupt does"; there are none.
 2. A `zboot` issued *while* halted stayed latched and fired the instant the
    re-arm released the core, so `zunhalt` alone silently started an attempt and
-   the parked state could never be observed at all. The request is now discarded
-   on re-arm.
+   the parked state could never be observed at all. Discarded on re-arm now.
 
-**NOT proven.** After a re-arm, a `zboot` with a freshly hand-staged trivial
-payload reached `kload_enter` — `state=3`, `attempts=2`, `entry_pa=0xBE000000`,
-`zload2` breadcrumb clean (`elf_valid=1`, `bytes_copied=24`, `fail_reason=0`),
-isolation self-check passed, and the placed bytes at `0xBE000000` verified
-byte-for-byte against `objdump` — and **the payload never executed**: its counter
-at `0xBE000100` was static across repeated samples, with zero absorbed MMIO
-faults, zero channel-1 faults and no exception recorded. Note that `state=3` is
-written *before* `kload_enter()`, so it means "about to enter", never "running".
+### RETRACTED: "the retry reaches kload_enter and nothing runs"
 
-The same firmware boots the real Zephyr image correctly on a **first** attempt
-(verified immediately afterwards), so the suspicion is narrowed to the
-second-trip-through-the-loop path specifically. Cause not identified; not chased
-further this pass. So: **`zunhalt` gets you back to parked, but a retry is not
-yet known to produce a working guest.** A failed `zboot` should still be treated
-as needing a reload until this is understood.
+An earlier revision of this file reported the retry as broken — CPU3 reaching
+`kload_enter` with `state=3`, `zload2` clean, isolation passed, placed bytes
+verified against `objdump`, and the guest apparently dead. **That conclusion was
+wrong, and the reason is worth more than the conclusion was.**
+
+The liveness probe was `zg3_trivial_payload`'s counter word at `0xBE000100`, read
+from CPU1 over the debug channel. It stayed static — on two separate boots, via
+both the hand-staging route and the fully supported `zstage` route. But the real
+Zephyr image, retried through exactly the same code path, demonstrably **runs**:
+banner and heartbeats, as above. So the retry path works and the probe was the
+broken part.
+
+Why the probe is unsound on real hardware and fine under QEMU: CPU1 reads that
+word at EL2 through a Normal-cacheable mapping, while the guest runs with its
+stage-1 MMU disabled, which makes its own data accesses Device-typed. A Device
+write does not invalidate another core's cached copy, so CPU1 can keep returning
+a stale line indefinitely. QEMU models no caches, so the same probe is perfectly
+reliable there — which is exactly why `dual-rearm-qemu-ci.sh` passes on the same
+counter that lies on the board.
+
+**The lesson, which generalises beyond this feature:** a guest-written DRAM word
+read from another core is not a valid liveness probe on this hardware. Progress
+that is observed *through stage-2 faults* — console output, breadcrumbs written
+by EL2 itself — is. The previous milestone's counter-based proof (`317175671 ->
+330845384`, 2026-08-10) did climb and is not being retracted, but it was luckier
+than it was sound, and should not be the pattern anything new copies.
+
+Board-free regression guard for the retry path: `dual-rearm-qemu-ci.sh`. No
+pre-existing dual-guest QEMU target exercised a *second* attempt at all, so none
+of them could have caught a retry defect; that one does nothing else.
 
 ## What's still open
 
 1. ~~A real bulk loader~~ — **done**, see above.
 2. ~~Real Zephyr, on the real board, concurrently with FreeBSD~~ — **done**, see
    above.
-3. **`zunhalt` re-arm → successful boot.** The re-arm itself works; the retry
-   reaching a running guest does not. Precise evidence above — this is the one
-   concrete, reproducible-looking defect left in this feature.
+3. ~~`zunhalt` re-arm → successful boot~~ — **done** via `zstage` + `zunhalt`,
+   see above. The apparent defect was a bad liveness probe, not the firmware.
 4. **Whether the second guest can destabilise FreeBSD.** One boot this session
    showed FreeBSD wedged spinning on its console while Zephyr stayed healthy. Not
-   attributable from the evidence, not reproduced on the healthy boots. Needs a
-   soak run rather than more single-shot tests.
-5. **Phase 2** (repurposing CPU1/CPU2 for further guests) remains out of scope
+   attributable from the evidence, not reproduced on any of the healthy boots
+   (of which there were several, including two under real disk load). Needs a
+   soak run rather than more single-shot tests — `soak72.py` now exists for
+   exactly this, see `docs/soak-and-breakglass.md`.
+5. **`zg3_trivial_payload`'s counter is not a sound liveness probe on hardware**
+   (see the retraction above). It is still useful under QEMU, where it is the
+   basis of three CI scripts, but nothing on the board should rely on reading a
+   guest-written DRAM word from another core. Giving the payload a
+   fault-observable heartbeat instead — a write to an address the HV traps, the
+   way real Zephyr's console already is — would make the board and QEMU paths
+   equally trustworthy. Not done.
+6. **Phase 2** (repurposing CPU1/CPU2 for further guests) remains out of scope
    here — CPU1's unconditional watchdog-kick is still this project's only
    automatic crash-recovery path. It now has its own design document,
    `docs/phase2-all-cores.md`, which also corrects an assumption in this file:

@@ -304,4 +304,10 @@ zguest_stage_copyin(void)
 	(void)zstage_copy_to(ZG3_ELF_STAGE_PA, ZG3_ELF_STAGE_SIZE);
 }
 
+uint64_t
+zstage_restage(void)
+{
+	return zstage_copy_to(ZG3_ELF_STAGE_PA, ZG3_ELF_STAGE_SIZE);
+}
+
 #endif /* !ZSTAGE_HOSTED_TEST */
