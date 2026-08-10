@@ -96,6 +96,15 @@ def sample(board, prev, state, cfg):
     s["temp_c"] = (h.get("temp_mc") / 1000.0) if h.get("temp_mc") else None
     s["exc_count"] = h.get("exc_count")
 
+    # Sticky, run-lifetime fact: has this run EVER seen a real (non-zero) EL2
+    # tick? classify_sample() needs this to tell "tick_delta==0 by design on
+    # an IMO=1 build" apart from "tick_delta==0 because an IMO=0 build's
+    # timer just stalled" — a single sample cannot distinguish the two.
+    tick_delta = h.get("tick_delta")
+    if tick_delta not in (None, 0):
+        state.d["ever_ticked"] = True
+    s["ever_ticked"] = bool(state.d.get("ever_ticked"))
+
     if not st.get("reachable"):
         # Re-read the USB identity AFTER the (slow, ~2 s) health sample: the
         # board can flip to U-Boot between the two reads, and classifying that
@@ -485,6 +494,64 @@ DRY_CASES = [
     ("log-warnings", True, ["guest-log-errors"],
      "a WARN is recorded, does not stop the run, and still counts as healthy "
      "time (FreeBSD's ordinary chatter must not kill a 72 h run)"),
+    # Board-free coverage pass, 2026-08-10: the cases below reach
+    # classify_sample() branches the matrix above never touched (see the
+    # coverage audit in docs/soak-and-breakglass.md).
+    ("usb-vanishes-live", False, ["board-off-usb"],
+     "the board disappears from the USB bus during an ORDINARY poll -- "
+     "classify_sample()'s own board-off-usb branch, distinct from "
+     "do_reload()'s separate check of the same name"),
+    ("unexpected-usb-id", True, ["unexpected-usb-id"],
+     "a USB id that's neither U-Boot's nor the HV gadget's, EMAC still up -- "
+     "a WARN, not a failure"),
+    ("liveness-unknown", True, ["liveness-unknown"],
+     "the health verb couldn't be polled this round -- UNKNOWN motion, "
+     "never FROZEN, still counts as healthy time"),
+    ("imo0-build", True, ["exception-count-increased"],
+     "a real (non-IMO1) tick with exc_count climbing is an ordinary WARN, "
+     "not the IMO=1 once-per-boot note"),
+    ("imo0-timer-stalled", False,
+     ["exception-count-increased", "timer-stalled"],
+     "an IMO=0 build's tick actually stops after ticking for real -- the "
+     "FAIL this check exists for (previously unreachable dead code: see "
+     "soaklib.classify_sample()'s history comment on tick_delta/ever_ticked)"),
+    ("high-temperature", True, ["high-temperature"],
+     "a thermal excursion over --high-temp-c is a WARN, still counts as "
+     "healthy time"),
+    ("emmc-lock-stuck", False, ["emmc-lock-stuck"],
+     "lock_giveups>0 is a leaked unlock, not contention -- hard failure"),
+    ("guest-io-error", True, ["guest-io-error"],
+     "g_ioerrs>0 is a WARN (the FAIL conditions are measured directly, "
+     "elsewhere)"),
+    ("emmc-retry-absorbed", True, ["emmc-retry-absorbed"],
+     "ebio_fails>0 with g_ioerrs==0 -- the retry covered it, benign but "
+     "shown (VBK1 alone reports it as silence)"),
+    ("emmc-recovery-clk-timeout", False, ["emmc-recovery-clk-timeout"],
+     "the eMMC controller reset not completing is unrecoverable -- hard "
+     "failure"),
+    ("guest-network-down", True, ["guest-network-down"],
+     "ssh is down but the load's own generation counter is still readable "
+     "over the console -- soak.py's rule: writing-but-unreachable is a "
+     "networking problem, not a dead guest -- a WARN"),
+    ("guest-down-board-up", False, ["guest-unreachable"],
+     "the guest itself is dead (no ssh, no console, no load progress) while "
+     "the board/EMAC stays healthy -- distinct from a board-level wedge"),
+    ("root-readonly-live", True, ["root-readonly", "guest-recovery-done"],
+     "root remounts read-only on its own (ssh stays up, no reboot observed) "
+     "-- caught and repaired by the live poll, not a reset path"),
+    ("load-crashed", True, ["load-not-running", "load-restarted"],
+     "the load PROCESS dies while the guest stays up and reachable -- a "
+     "lighter recovery than a full guest_recover()"),
+    ("disk-filling", True, ["disk-filling"],
+     "free space drops under --min-avail-kb -- a WARN, not a failure (the "
+     "FAIL conditions are measured directly, elsewhere)"),
+    ("silent-reset", True, ["silent-reset", "reset-recorded", "reload-done"],
+     "uptime goes backwards without the harness ever seeing usb flip to "
+     "uboot or EMAC go dark -- still caught and recovered"),
+    ("reload-always-fails", False, ["breakglass-escalation", "reload-done"],
+     "the board stays present and reachable in U-Boot but the reload itself "
+     "never lands twice in a row -- do_reload()'s OTHER failure ending, "
+     "distinct from board-off-usb"),
 ]
 
 
@@ -525,6 +592,15 @@ def cmd_dry_run(args):
     # their own cases rather than being inferred from the scenarios above.
     passed, failed = _dry_resume_case(passed, failed)
     passed, failed = _dry_idempotent_load_case(passed, failed)
+    passed, failed = _dry_resume_carries_failure_case(passed, failed)
+    passed, failed = _dry_status_readonly_case(passed, failed)
+    # The degradation detector (early vs recent load rate, --degrade-frac)
+    # had NEVER fired anywhere: not on hardware (early_rate was None in both
+    # real runs) and not in the dry-run matrix either (0.5h of virtual time
+    # never spans the 1800s early-rate window). A gate criterion that cannot
+    # fire is not a criterion.
+    passed, failed = _dry_degradation_case(passed, failed)
+    passed, failed = _dry_fluctuation_case(passed, failed)
     # A dry run only means something if the fake answers the same calls the
     # real board does. Class-level check: nothing is instantiated, nothing is
     # touched.
@@ -607,10 +683,10 @@ def _dry_resume_case(passed, failed):
         board = L.make_board(True, "happy", clock, ev)
         _stop["flag"] = False
         ok = run(board, clock, ev, state, cfg)
-        return ok, state, ev
+        return ok, state, ev, cfg
 
-    ok1, st1, ev1 = one(0.25)
-    ok2, st2, ev2 = one(0.50)
+    ok1, st1, ev1, cfg1 = one(0.25)
+    ok2, st2, ev2, cfg2 = one(0.50)
     problems = []
     if not st2.resumed:
         problems.append("second run did not resume the state file")
@@ -620,12 +696,243 @@ def _dry_resume_case(passed, failed):
         problems.append("event log did not keep growing across the restart")
     if len(L.read_events(eventsp, kinds=["run-start"])) != 2:
         problems.append("expected exactly two run-start events")
+
+    # Equality check: an interrupted-then-resumed run must land on the SAME
+    # closed/not-closed verdict as a straight-through run to the same total
+    # target -- being resumable must be invisible in the RESULT, not just in
+    # the raw counters.
+    tmp2 = tempfile.mkdtemp(prefix="soak72-resume-straight-")
+    clock_s = FakeClock()
+    ev_s = EventLog(os.path.join(tmp2, "events.jsonl"), clock_s,
+                    run_id="straight", stdout=False)
+    cfg_s = make_cfg(argparse.Namespace(
+        hours=0.50, poll_s=60.0, size_mb=8, idle_s=1, max_resets=3,
+        fsck_passes=2, reload_timeout_s=1800, load_cycles=3,
+        expect_vbk=False, logdir=os.path.join(tmp2, "logs"),
+        progress_every=50))
+    state_s = RunState(os.path.join(tmp2, "state.json"), clock_s, "soak72",
+                       new_state_defaults())
+    board_s = L.make_board(True, "happy", clock_s, ev_s)
+    _stop["flag"] = False
+    ok_s = run(board_s, clock_s, ev_s, state_s, cfg_s)
+    closed_straight = verdict(state_s, cfg_s, ev_s, ok_s, None, show=False)
+    closed_resumed = verdict(st2, cfg2, ev2, ok2, None, show=False)
+    if closed_straight != closed_resumed:
+        problems.append(f"straight-through closed={closed_straight} but "
+                        f"interrupted-then-resumed closed={closed_resumed}")
+
     if problems:
         print(f"[FAIL ] {'resume':18} {'; '.join(problems)}")
         return passed, failed + 1
     print(f"[ OK  ] {'resume':18} "
           f"{st1.d['load_s'] / 3600.0:.2f}h then resumed to "
-          f"{st2.d['load_s'] / 3600.0:.2f}h in the same state file")
+          f"{st2.d['load_s'] / 3600.0:.2f}h in the same state file, same "
+          f"verdict ({closed_resumed}) as a straight-through run")
+    return passed + 1, failed
+
+
+def _dry_resume_carries_failure_case(passed, failed):
+    """A recorded failure disqualifies the gate even on a LATER, clean run --
+    state persists across restarts by design, so an old failure must not be
+    forgotten just because this invocation did nothing wrong. This is the
+    exact "GATE CLOSED" + "failures recorded: 1" bug found on the first
+    hardware run (see verdict()'s comment); --restart is the only sanctioned
+    way to clear it."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="soak72-carryfail-")
+    statep = os.path.join(tmp, "state.json")
+    eventsp = os.path.join(tmp, "events.jsonl")
+
+    def leg(hours, scen, restart=False):
+        clock = FakeClock()
+        ev = EventLog(eventsp, clock, run_id="carryfail", stdout=False)
+        cfg = make_cfg(argparse.Namespace(
+            hours=hours, poll_s=60.0, size_mb=8, idle_s=1, max_resets=3,
+            fsck_passes=2, reload_timeout_s=1800, load_cycles=3,
+            expect_vbk=False, logdir=os.path.join(tmp, "logs"),
+            progress_every=1000))
+        state = RunState(statep, clock, "soak72", new_state_defaults(),
+                         restart=restart)
+        board = L.make_board(True, scen, clock, ev)
+        _stop["flag"] = False
+        stopped, ok = None, False
+        with L.patched(L, "ledger_record", lambda *a, **k: None):
+            try:
+                ok = run(board, clock, ev, state, cfg)
+            except HarnessStop as e:
+                stopped = str(e)
+        closed = verdict(state, cfg, ev, ok, stopped, show=False)
+        return closed, state, stopped
+
+    # Leg 1: a real failure (data-verify-mismatch) stops the run and records it.
+    closed1, st1, stopped1 = leg(0.25, "data-corruption")
+    # Leg 2: resume WITHOUT --restart, on a scenario that is itself perfectly
+    # healthy. The old failure must still disqualify the gate.
+    closed2, st2, stopped2 = leg(0.5, "happy")
+    # Leg 3: --restart. The failure must be gone and the gate must be able to
+    # close again on its own merits.
+    closed3, st3, stopped3 = leg(0.5, "happy", restart=True)
+
+    problems = []
+    if closed1:
+        problems.append("leg1: gate closed despite a real data-verify-mismatch")
+    if not st1.d.get("failures"):
+        problems.append("leg1: failure was not recorded in state")
+    if closed2:
+        problems.append("leg2: a clean resumed run closed the gate despite "
+                        "the earlier recorded failure (the 'GATE CLOSED' + "
+                        "'failures recorded: 1' bug)")
+    if not st2.d.get("failures"):
+        problems.append("leg2: resuming without --restart lost the recorded "
+                        "failure")
+    if st3.d.get("failures"):
+        problems.append("leg3: --restart did not clear the recorded failure")
+    if not closed3:
+        problems.append(f"leg3: a genuinely clean --restart run still did "
+                        f"not close (stopped={stopped3!r})")
+    if problems:
+        print(f"[FAIL ] {'resume-vs-failure':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'resume-vs-failure':18} a recorded failure survives a "
+          f"clean resume and disqualifies the gate; --restart clears it")
+    return passed + 1, failed
+
+
+def _dry_status_readonly_case(passed, failed):
+    """--status is documented as safe to run from a second terminal while a
+    real run is live: it must never mutate the state file or the event log."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="soak72-statusro-")
+    statep = os.path.join(tmp, "state.json")
+    eventsp = os.path.join(tmp, "events.jsonl")
+    clock = FakeClock()
+    ev = EventLog(eventsp, clock, run_id="statusro", stdout=False)
+    cfg = make_cfg(argparse.Namespace(
+        hours=0.05, poll_s=60.0, size_mb=8, idle_s=1, max_resets=3,
+        fsck_passes=2, reload_timeout_s=1800, load_cycles=3, expect_vbk=False,
+        logdir=os.path.join(tmp, "logs"), progress_every=50))
+    state = RunState(statep, clock, "soak72", new_state_defaults())
+    board = L.make_board(True, "happy", clock, ev)
+    with L.patched(L, "ledger_record", lambda *a, **k: None):
+        run(board, clock, ev, state, cfg)
+    before_state = open(statep, "rb").read()
+    before_events = open(eventsp, "rb").read()
+    cmd_status(argparse.Namespace(state=statep, events=eventsp, hours=0.05))
+    after_state = open(statep, "rb").read()
+    after_events = open(eventsp, "rb").read()
+    problems = []
+    if before_state != after_state:
+        problems.append("--status rewrote the state file")
+    if before_events != after_events:
+        problems.append("--status appended to the event log")
+    if problems:
+        print(f"[FAIL ] {'status-readonly':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'status-readonly':18} --status left both the state and "
+          f"event files byte-identical")
+    return passed + 1, failed
+
+
+def _dry_degradation_case(passed, failed):
+    """Drive the degradation detector for real: a run whose load rate
+    genuinely and durably drops below --degrade-frac of its early rate must
+    report not-closed with the <-- DEGRADED marker. This branch had never
+    fired anywhere before (see the note above where this is called)."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="soak72-degrade-")
+    clock = FakeClock()
+    ev = EventLog(os.path.join(tmp, "events.jsonl"), clock, run_id="degrade",
+                  stdout=False)
+    poll_s = 20.0
+    cfg = make_cfg(argparse.Namespace(
+        hours=1.2, poll_s=poll_s, size_mb=8, idle_s=1, max_resets=3,
+        fsck_passes=2, reload_timeout_s=1800, load_cycles=3, expect_vbk=False,
+        logdir=os.path.join(tmp, "logs"), progress_every=1000))
+    # The production early-rate window is 1800s; shortened here so the dry
+    # run stays quick. The MECHANISM under test -- lock an early rate, then
+    # compare the trailing window to it -- is identical either way.
+    cfg["early_window_s"] = 300.0
+    state = RunState(os.path.join(tmp, "state.json"), clock, "soak72",
+                     new_state_defaults())
+    board = L.make_board(True, "happy", clock, ev)
+    board.load_running = True
+    board.rate_schedule = [(40, 4)]      # from poll 40 on: 1/4 the generation
+                                         # rate, sustained to the end -- a
+                                         # real, durable slowdown
+    _stop["flag"] = False
+    with L.patched(L, "ledger_record", lambda *a, **k: None):
+        ok = run(board, clock, ev, state, cfg)
+    closed = verdict(state, cfg, ev, ok, None, show=False)
+    early, recent = state.d.get("early_rate"), state.d.get("recent_rate")
+    verdict_evs = L.read_events(ev.path, kinds=["verdict"])
+    problems = []
+    if early is None:
+        problems.append("early_rate never locked in (test setup too short)")
+    if recent is None:
+        problems.append("recent_rate never computed")
+    if early and recent and recent >= early * cfg["degrade_frac"]:
+        problems.append(f"recent_rate {recent:.1f} did not drop below "
+                        f"{cfg['degrade_frac']} of early_rate {early:.1f} -- "
+                        f"the scenario did not degrade enough to test anything")
+    if closed:
+        problems.append("gate closed despite a genuine, sustained rate drop")
+    if not verdict_evs or not verdict_evs[-1].get("degraded"):
+        problems.append("verdict event did not record degraded=True")
+    if problems:
+        print(f"[FAIL ] {'degradation':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'degradation':18} early={early:.1f} recent={recent:.1f} "
+          f"gens/h -> not closed, <-- DEGRADED")
+    return passed + 1, failed
+
+
+def _dry_fluctuation_case(passed, failed):
+    """The flip side, same run shape: a load rate that dips and then
+    RECOVERS must NOT be called degraded -- proving the detector does not
+    cry wolf on ordinary variance, which would be just as damaging as never
+    firing at all."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="soak72-fluctuate-")
+    clock = FakeClock()
+    ev = EventLog(os.path.join(tmp, "events.jsonl"), clock, run_id="fluctuate",
+                  stdout=False)
+    poll_s = 20.0
+    cfg = make_cfg(argparse.Namespace(
+        hours=1.2, poll_s=poll_s, size_mb=8, idle_s=1, max_resets=3,
+        fsck_passes=2, reload_timeout_s=1800, load_cycles=3, expect_vbk=False,
+        logdir=os.path.join(tmp, "logs"), progress_every=1000))
+    cfg["early_window_s"] = 300.0
+    state = RunState(os.path.join(tmp, "state.json"), clock, "soak72",
+                     new_state_defaults())
+    board = L.make_board(True, "happy", clock, ev)
+    board.load_running = True
+    # A transient dip (polls 40-79) that fully recovers (poll 80 on) well
+    # before the run ends -- by the time the trailing rate window is sampled,
+    # it sits entirely inside the recovered stretch.
+    board.rate_schedule = [(40, 4), (80, 1)]
+    _stop["flag"] = False
+    with L.patched(L, "ledger_record", lambda *a, **k: None):
+        ok = run(board, clock, ev, state, cfg)
+    closed = verdict(state, cfg, ev, ok, None, show=False)
+    early, recent = state.d.get("early_rate"), state.d.get("recent_rate")
+    verdict_evs = L.read_events(ev.path, kinds=["verdict"])
+    problems = []
+    if early is None or recent is None:
+        problems.append("early_rate/recent_rate never computed")
+    elif recent < early * cfg["degrade_frac"]:
+        problems.append(f"recent_rate {recent:.1f} still looked degraded "
+                        f"against early_rate {early:.1f} after the dip fully "
+                        f"recovered")
+    if not closed:
+        problems.append(f"gate did not close despite the rate recovering "
+                        f"(ok={ok})")
+    if verdict_evs and verdict_evs[-1].get("degraded"):
+        problems.append("verdict event wrongly recorded degraded=True")
+    if problems:
+        print(f"[FAIL ] {'rate-fluctuates':18} {'; '.join(problems)}")
+        return passed, failed + 1
+    print(f"[ OK  ] {'rate-fluctuates':18} early={early:.1f} "
+          f"recent={recent:.1f} gens/h -> closed, NOT flagged degraded")
     return passed + 1, failed
 
 

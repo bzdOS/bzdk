@@ -638,8 +638,20 @@ def classify_sample(s, prev, cfg):
     # DESIGN) and exc_count counts EVERY physical IRQ EL2 takes, millions per
     # second — it is not a fault counter there. soak.py calibrated this; if it
     # is not respected the run flags every poll of every cycle.
-    imo1 = (h.get("tick_delta") == 0)
-    if imo1:
+    #
+    # tick_delta==0 ALONE cannot tell "IMO=1 build, always 0, benign" apart
+    # from "IMO=0 build whose tick just stalled, FAIL" — both look identical
+    # in a single sample. `s["ever_ticked"]` (threaded through by
+    # soak72.sample()) is whether THIS run has ever seen a non-zero
+    # tick_delta at all. A build's IMO-ness cannot change mid-run, so once a
+    # real tick has been seen, tick_delta==0 from then on can only mean the
+    # tick stopped. (An earlier version of this check computed `imo1` from
+    # the CURRENT sample's tick_delta alone and then re-tested the same value
+    # inside the branch that condition had already excluded — "timer-stalled"
+    # was unreachable dead code as a result; fixed here, 2026-08-10.)
+    td = h.get("tick_delta")
+    ever_ticked = s.get("ever_ticked", False)
+    if td == 0 and not ever_ticked:
         if prev is None:
             # Emitted ONCE per run/boot rather than every poll: a fact about the
             # build does not change between samples, and a 72 h run that repeats
@@ -648,6 +660,11 @@ def classify_sample(s, prev, cfg):
                        "tick_delta=0 and a climbing exc_count are by design on "
                        "the IMO=1 vGIC build (no EL2 tick; exc_count counts "
                        "all IRQs) — this note is emitted once per boot"))
+    elif td == 0 and ever_ticked:
+        ev.append((FAIL, "timer-stalled",
+                   "EL2 GIC-timer tick_delta=0 after this run already "
+                   "observed a real (non-zero) tick — an IMO=0 build's timer "
+                   "has stalled; this is not the IMO=1 by-design case"))
     else:
         pe = (prev or {}).get("exc_count")
         ce = h.get("exc_count")
@@ -656,9 +673,6 @@ def classify_sample(s, prev, cfg):
                        f"exc_count {pe} -> {ce} last_kind="
                        f"0x{h.get('last_exc_kind', 0):x} "
                        f"esr=0x{h.get('last_exc_esr', 0):08x}"))
-        if h.get("tick_delta") == 0:
-            ev.append((FAIL, "timer-stalled",
-                       "EL2 GIC-timer tick_delta=0 on an IMO=0 build"))
 
     # --- uptime regression = something reset underneath us --------------
     pu, cu = (prev or {}).get("uptime_s"), s.get("uptime_s")
@@ -793,6 +807,28 @@ class FakeBoard:
         self.reloads = 0
         self.break_glasses = 0
         self.recoveries = 0
+        # Extra knobs added for a board-free coverage pass (2026-08-10): every
+        # one of these defaults to the value that was PREVIOUSLY HARD-CODED
+        # inline below, so no existing scenario's behaviour changes just from
+        # adding them. A scenario (or a dry-run test that pokes the board
+        # directly, the way the resume/idempotent-load cases already do)
+        # sets one to reach a classify_sample() branch that a dry run could
+        # not otherwise exercise — see soak72.py's / breakglass_cycle.py's
+        # DRY_CASES for which ones now use each.
+        self.usb_override = None          # usb() returns this verbatim if set
+        self.moving_unknown = False       # status(): moving=None (BMC1 latch)
+        self.cpu1_frozen = False
+        self.tick_delta = 0               # 0 == IMO=1 build, by design
+        self.temp_mc = 52000
+        self.lock_giveups = 0
+        self.g_ioerrs = 0
+        self.ebio_fails = 0
+        self.ebio_settle_clkfail = 0
+        self.avail_kb = 4_600_000
+        self.force_readonly = False       # root goes ro WITHOUT a reboot
+        self.reload_always_fails = False  # board stays put, reload never lands
+        self.breakglass_ineffective = False  # bytes "sent", watchdog never fires
+        self.rate_schedule = []           # [(poll_threshold, gen_period), ...]
         self.never_returns = (scenario == "dead-board")
         self.script = {}                  # poll index -> callable(self)
         self._build_scenario()
@@ -863,6 +899,128 @@ class FakeBoard:
             def freeze(b):
                 b.cpu0_frozen = True
             self.script[3] = freeze
+        elif s == "usb-vanishes-live":
+            # Distinct from "dead-board": here the board disappears from the
+            # USB bus DURING an ordinary health poll, not as the outcome of a
+            # failed reload/break-glass retry. Exercises classify_sample()'s
+            # OWN top-of-function board-off-usb branch, which do_reload()'s
+            # separate (already-covered) board-off-usb check never reaches.
+            def vanish(b):
+                b.phase = "gone"
+                b.emac = False
+                b.guest = "down"
+            self.script[3] = vanish
+        elif s == "unexpected-usb-id":
+            # A USB identity that is neither U-Boot's nor the HV gadget's --
+            # some other device on the port -- while EMAC still answers.
+            def other_id(b):
+                b.usb_override = "other:1234:5678"
+            self.script[3] = other_id
+        elif s == "liveness-unknown":
+            # The BMC1 health verb could not be polled this round even though
+            # the board is otherwise reachable -- the record is a stale
+            # LATCH, so classify_sample() must say "unknown", never "frozen".
+            def unknown(b):
+                b.moving_unknown = True
+            self.script[3] = unknown
+        elif s == "imo0-build":
+            # A non-IMO1 build: the EL2 tick is real (tick_delta != 0) for the
+            # whole run, so a climbing exc_count is an ordinary WARN, never
+            # the IMO=1 build's once-per-boot benign note.
+            self.tick_delta = 137
+        elif s == "imo0-timer-stalled":
+            # The tick was real (proving this is NOT an IMO=1 build) and then
+            # stops: tick_delta==0 from here on means the timer actually
+            # stalled, a hard failure, not the "by design" IMO=1 case.
+            self.tick_delta = 137
+
+            def stall_timer(b):
+                b.tick_delta = 0
+            self.script[4] = stall_timer
+        elif s == "high-temperature":
+            def hot(b):
+                b.temp_mc = 90000
+            self.script[3] = hot
+        elif s == "emmc-lock-stuck":
+            def stuck(b):
+                b.lock_giveups = 3
+            self.script[3] = stuck
+        elif s == "guest-io-error":
+            def ioerr(b):
+                b.g_ioerrs = 2
+            self.script[3] = ioerr
+        elif s == "emmc-retry-absorbed":
+            def absorbed(b):
+                b.ebio_fails = 12      # g_ioerrs stays 0: the retry covered it
+            self.script[3] = absorbed
+        elif s == "emmc-recovery-clk-timeout":
+            def clkfail(b):
+                b.ebio_settle_clkfail = 1
+            self.script[3] = clkfail
+        elif s == "guest-network-down":
+            # ssh is down (guest_alive() False) but the load's own generation
+            # counter is still readable over the OTHER channel (the console)
+            # -- soak.py's rule: writing-but-unreachable is a networking
+            # problem, not a dead guest, so this is a WARN, not the FAIL
+            # "guest-down-board-up" reaches.
+            def net_down(b):
+                b.guest = "ro_root"
+            self.script[3] = net_down
+        elif s == "guest-down-board-up":
+            # The GUEST stops answering (neither ssh nor console, no load
+            # progress) while the board/EMAC itself stays perfectly healthy
+            # -- a real dead-guest failure, distinct from a board-level wedge.
+            def guest_down(b):
+                b.guest = "down"
+            self.script[3] = guest_down
+        elif s == "root-readonly-live":
+            # Root remounts read-only on its own -- ssh stays reachable, no
+            # reboot ever observed -- caught and repaired by the ordinary
+            # poll loop, not a reset path.
+            def ro(b):
+                b.force_readonly = True
+            self.script[3] = ro
+        elif s == "load-crashed":
+            # The LOAD PROCESS dies while the guest stays up, reachable and
+            # rw -- a lighter recovery than a full guest_recover().
+            def crash(b):
+                b.load_running = False
+            self.script[3] = crash
+        elif s == "disk-filling":
+            def filling(b):
+                b.avail_kb = 30_000       # well under --min-avail-kb
+            self.script[3] = filling
+        elif s == "silent-reset":
+            # Uptime goes backwards without the harness ever seeing usb flip
+            # to uboot or EMAC go dark -- a reboot fast enough that neither
+            # check caught it directly. (Backdated by 1s, not to exactly
+            # clock.now(): sample()'s `if h.get("uptime") else None` guard
+            # treats an exact 0 as "no reading", same as a missing key. Poll
+            # 4, not 3: run()'s pre-loop load-progress check costs one status()
+            # call before the main loop's own first sample, so poll 3 is only
+            # the SECOND real sample and its prev's uptime is itself still the
+            # falsy-zero "no reading" case -- poll 4 is the first with a
+            # genuinely non-None previous uptime to regress against.)
+            def silent(b):
+                b.boot_epoch = b.clock.now() - 1.0
+            self.script[4] = silent
+        elif s == "reload-always-fails":
+            # The board stays PRESENT and reachable in U-Boot (never "gone"),
+            # but the reload itself never lands twice in a row -- exercises
+            # do_reload()'s generic "reload failed twice" ending, which
+            # "dead-board" never reaches (it always ends up "gone" first).
+            def stuck_in_uboot(b):
+                b.phase = "uboot"
+                b.emac = False
+                b.guest = "down"
+                b.reload_always_fails = True
+            self.script[3] = stuck_in_uboot
+        elif s == "watchdog-never-fires":
+            # break_glass() "sends" the bytes but the watchdog never actually
+            # resets the board -- "sent" is not "done". Only meaningful to
+            # breakglass_cycle.py's send_break_glass(), which waits for the
+            # USB identity to flip and must fail loudly when it never does.
+            self.breakglass_ineffective = True
         else:
             raise HarnessStop(f"unknown dry-run scenario {s!r}")
 
@@ -873,7 +1031,18 @@ class FakeBoard:
             fn(self)
         if self.phase == "hv" and self.load_running and \
                 not getattr(self, "gen_frozen", False):
-            self.gen += 1
+            # rate_schedule lets a test slow (or restore) the generation rate
+            # from a given poll onward -- e.g. [(40, 4)] means "from poll 40,
+            # only 1 poll in 4 advances gen", a real and durable slowdown for
+            # the degradation detector to catch. Defaults to period 1 (every
+            # poll advances gen), i.e. unchanged behaviour for every scenario
+            # that never sets it.
+            period = 1
+            for threshold, p in self.rate_schedule:
+                if self.polls >= threshold:
+                    period = p
+            if self.polls % period == 0:
+                self.gen += 1
 
     def _count(self, name):
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -881,6 +1050,8 @@ class FakeBoard:
     # -- facade ----------------------------------------------------------
     def usb(self):
         self._count("usb")
+        if self.usb_override is not None:
+            return self.usb_override
         return {"hv": "hv", "uboot": "uboot", "gone": "gone"}[self.phase]
 
     def emac_alive(self):
@@ -896,14 +1067,18 @@ class FakeBoard:
         up = int((self.clock.now() - self.boot_epoch) * 24_000_000)
         hb = self.polls * 10
         cpu0 = 0 if getattr(self, "cpu0_frozen", False) else hb
+        cpu1 = 0 if self.cpu1_frozen else hb
         h = (self._mkhealth(uptime_lo=up & 0xffffffff, uptime_hi=up >> 32,
                             hb_cpu0=cpu0, hb_cpu1=hb, hb_cpu2=hb,
-                            hb_cpu3=0xffffffff, tick_delta=0, exc_count=self.polls,
-                            temp_mc=52000)
+                            hb_cpu3=0xffffffff, tick_delta=self.tick_delta,
+                            exc_count=self.polls, temp_mc=self.temp_mc)
              if self._mkhealth else
-             {"tick_delta": 0, "exc_count": self.polls, "temp_mc": 52000,
-              "uptime": up})
-        moving = {"cpu0": cpu0 != 0, "cpu1": True, "cpu2": False}
+             {"tick_delta": self.tick_delta, "exc_count": self.polls,
+              "temp_mc": self.temp_mc, "uptime": up})
+        if self.moving_unknown:
+            moving = None
+        else:
+            moving = {"cpu0": cpu0 != 0, "cpu1": cpu1 != 0, "cpu2": False}
         return {"reachable": True, "fresh": True, "health": h, "moving": moving,
                 "console_advancing": True, "error": None}
 
@@ -912,7 +1087,10 @@ class FakeBoard:
         if self.phase != "hv":
             return {"channel": "down"}
         return {"g_reads": 1000 * self.polls, "g_writes": 500 * self.polls,
-                "g_ioerrs": 0, "write_retries": 1, "lock_giveups": 0}
+                "g_ioerrs": self.g_ioerrs, "write_retries": 1,
+                "lock_giveups": self.lock_giveups,
+                "ebio_fails": self.ebio_fails,
+                "ebio_settle_clkfail": self.ebio_settle_clkfail}
 
     def isolation(self):
         self._count("isolation")
@@ -930,7 +1108,12 @@ class FakeBoard:
         self._count("guest_fs_state")
         if self.phase != "hv" or self.guest == "down":
             return None
-        ro = (self.guest == "ro_root")
+        # `guest == "ro_root"` is the post-reset shape (ssh not up yet either,
+        # so guest_alive() is False and this is never even called). scenario
+        # "root-readonly-live" needs the OTHER shape -- ssh stays reachable
+        # (guest_alive() True) while root has spontaneously gone read-only --
+        # which is `force_readonly`, independent of the `guest` phase.
+        ro = (self.guest == "ro_root") or getattr(self, "force_readonly", False)
         return {"mount": ("/dev/vtbd0p3 on / (ufs, local, read-only)" if ro else
                           "/dev/vtbd0p3 on / (ufs, local, soft-updates)"),
                 "df": "/dev/vtbd0p3 5900000 900000 4600000 16% /",
@@ -955,7 +1138,7 @@ class FakeBoard:
                     f"{'VERIFY-MISMATCH gen=%d' % gen if self.load_errors else ''}")
         if "kern.boottime" in cmd:
             return (f"{{ sec = {int(self.boot_epoch)} }}|"
-                    f"/dev/vtbd0p3 5900000 900000 4600000 16% /|"
+                    f"/dev/vtbd0p3 5900000 900000 {self.avail_kb} 16% /|"
                     f"{getattr(self, 'dmesg_errors', 0)}")
         if cmd.startswith("fsck_ffs"):
             self._count("fsck")
@@ -970,6 +1153,7 @@ class FakeBoard:
             if getattr(self, "fs_dirty_forever", False):
                 return "/dev/vtbd0p3 on / (ufs, local, read-only)"
             self.guest = "multiuser"
+            self.force_readonly = False
             return "/dev/vtbd0p3 on / (ufs, local, soft-updates)"
         if cmd.startswith("service netif"):
             return "Stopping netif.\nStarting netif.\n1"
@@ -1021,6 +1205,12 @@ class FakeBoard:
             self.emac = False
             self.guest = "down"
             return True
+        if self.breakglass_ineffective:
+            # The bytes are accepted (return True: "sent") but the watchdog
+            # never actually fires -- the board stays exactly as it was. This
+            # is the "sent is not done" case send_break_glass() exists to
+            # catch: nothing about board state changes here, on purpose.
+            return True
         self.phase = "uboot"
         self.emac = False
         self.guest = "down"
@@ -1033,6 +1223,15 @@ class FakeBoard:
         self.clock.sleep(120)             # a real reload is minutes, not free
         if self.never_returns or self.phase == "gone":
             return False, 120.0, "(killed: board never returned)", True
+        if self.reload_always_fails:
+            # The board is still PRESENT (unlike never_returns/"gone") but the
+            # reload itself never lands -- a bad on-disk image or a dead TFTP
+            # server, not a vanished board. Exercises do_reload()'s OTHER
+            # failure ending (the generic "reload failed twice" raise)
+            # instead of the board-off-usb one.
+            return (False, 120.0,
+                    "(dry-run) simulated reload failure: TFTP timeout, board "
+                    "stayed in U-Boot", False)
         self.phase = "hv"
         self.emac = True
         self.boot_epoch = self.clock.now()
