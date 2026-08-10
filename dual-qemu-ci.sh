@@ -33,14 +33,29 @@
 #     feasible and preferred over a synthetic CPU3 entry variant.
 #   - el2_exc_dual2_qemu.c's tick handler (running only on CPU0, which is the
 #     only core that ever arms a timer/unmasks IRQ on this target) samples
-#     BOTH payloads' own DRAM counters at tick 2 (~200 ms in) and again at
-#     tick 12 (~1.2 s in), entirely from the outside -- neither payload
+#     BOTH payloads' own progress counters at tick 2 (~200 ms in) and again
+#     at tick 12 (~1.2 s in), entirely from the outside -- neither payload
 #     cooperates with or even knows about the other -- and requires BOTH to
 #     have strictly increased across that interval before printing PASS.
 #     Two samples with a real gap, both climbing, is what distinguishes
 #     genuine concurrency from "one after the other"; this script re-checks
 #     that arithmetic itself (not just the firmware's own verdict string) by
 #     parsing the printed before/after values.
+#
+#     CPU3's counter (the "cpu3 before=.../after=..." half of that line) is
+#     vconsole.c's channel-1 "total_bytes" counter, bumped ONLY when
+#     el2_exc_dual2_qemu.c's el2_trap() actually services a stage-2 data
+#     abort CPU3 took on a UART0-THR write (zg3_trivial_payload.S writes
+#     'h','b','\n' to it every loop iteration; stage2_zephyr.c maps zero
+#     real MMIO for CPU3, so that write always faults). This is a
+#     FAULT-OBSERVED signal, not a DRAM word read from another core -- see
+#     docs/dual-guest.md, "Retrying a failed zboot ... and a probe that
+#     lied": an earlier version of this counter (a plain DRAM word CPU1 read
+#     directly) was reliable under QEMU but unsound on real hardware, where
+#     the payload's Device-typed stage-1-off writes never invalidate another
+#     core's cached copy. The DRAM word is still bumped by the payload and
+#     still printed (informational only, see el2_exc_dual2_qemu.c's
+#     "cpu3_dram=" field) but no longer decides PASS/FAIL.
 #
 # WHAT A PASS HERE DOES NOT PROVE:
 #   - Nothing about real Zephyr booting under QEMU (a separate, later step —

@@ -25,7 +25,13 @@
 #     other dual-guest target establishes it, by sampling BOTH cores' own
 #     counters twice across a real interval and requiring both to climb.
 #     state 3 means "about to enter", never "running", which is exactly the
-#     distinction the board failure turned on.
+#     distinction the board failure turned on. CPU3's counter here is
+#     vconsole.c's channel-1 "total_bytes" -- FAULT-OBSERVED progress (EL2
+#     itself serviced a real stage-2 abort from CPU3's UART0-THR write), not
+#     a DRAM word read from another core -- see el2_exc_dual2_qemu.c's
+#     header and docs/dual-guest.md's "a probe that lied" for why the older
+#     DRAM-word version of this same counter was retired from the PASS/FAIL
+#     arithmetic (it is still bumped and printed, informational only).
 #
 # WHAT IT DOES NOT PROVE: anything about the real board. QEMU does not model
 # caches, and the board's own failure involved staging over the debug channel
