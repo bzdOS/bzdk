@@ -357,7 +357,10 @@ class Board:
     def usb(self):
         """"uboot" | "hv" | "gone" | "other:<vid:pid>" — read off the OTG
         port's sysfs node (port-specific, unlike `lsusb`)."""
-        vp = self.B.usb_vidpid_str(self.B.USB_NODE)
+        # Resolve the board by IDENTITY, not by socket: a hard-coded port made
+        # this read None and declared the board GONE while it sat there healthy
+        # on a different port (2026-08-10). See bzd_board.usb_find_node().
+        vp = self.B.usb_board_vidpid()
         if vp is None:
             return "gone"
         if vp == self.B.UBOOT_VIDPID:

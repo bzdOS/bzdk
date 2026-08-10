@@ -1,5 +1,32 @@
 # bzdOS microkernel — progress checkpoint (internal task, Chimp / BPI-M64 / A64)
 
+**MILESTONE 2026-08-10 — TWO guests run concurrently on real hardware.** A real
+Zephyr RTOS v4.4.1 image runs on CPU3 (its own banner, its own heartbeats,
+climbing steadily) at the same time as the FreeBSD guest on CPU0 serves `ssh` and
+a 384 MB `dd` off `vtbd0p3` at 4.2 MB/s under load 2.00, with zero `dmesg`
+errors. Isolation is enforced by a second, disjoint stage-2 table and proved on
+the hardware itself (`AT S12E1W`, ISOL 1/1); `gr` still returns an unpolluted
+FreeBSD frame, so CPU0-side diagnostics survive a live second guest.
+
+The route in: `chimpd --zguest <elf>` TFTPs the image as a third file from
+U-Boot, and `zstage.c` copies it into the second guest's slice on CPU0 **before**
+`smp_init()` and `kload_enter()` — before any guest on any core has run an
+instruction. `zboot` starts it over EMAC; `zstage` + `zunhalt` retry a failed
+attempt without a board reload. See `docs/dual-guest.md` for the full transcript,
+including three real bugs the hardware found that QEMU could not (a ghost image
+surviving a warm reset, a `wfi` that can never wake on a core with no
+interrupts, and a latched `zboot` firing on re-arm), and one report that had to
+be RETRACTED because the liveness probe — not the firmware — was wrong.
+
+**Also 2026-08-10 — the `kldload` hang is not ours.** Five live modes of
+`hal/probe_test/probe_test_stepper.c` (bsdOS repo) exonerate, in order: the block
+layer, the probe/attach sweep, `DEVICE_IDENTIFY`, and finally this project's
+whole `platform_device` bridge. A driver whose probe is one line of
+`return (ENXIO)`, registered by the real `devclass_add_driver()` with no bridge
+code anywhere near it, wedges the guest just as `lima.ko` did. Four structural
+arguments were refuted by one board run each; see that file's ROOT-CAUSE-NOTES.md
+for what is left to bisect and why reading more source is the wrong next move.
+
 **MILESTONE 2026-07-30 — the FreeBSD guest boots to an interactive root shell on
 real hardware, and is reachable over ssh** (`root@192.168.88.82`). Four
 hypervisor bugs fixed to get there: the sync fallback racing CPU2 for the eMMC

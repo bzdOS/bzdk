@@ -38,7 +38,10 @@ USB_NODE = B.USB_NODE                               # board's OTG port on this h
 
 
 def usb_vidpid():
-    return B.usb_vidpid(USB_NODE)
+    # Resolve the board's node by identity first (see bzd_board.usb_find_node());
+    # a hard-coded port yields (None, None) whenever the board moves sockets.
+    node = B.usb_find_node() or USB_NODE
+    return B.usb_vidpid(node)
 
 
 def hv_alive(timeout=4.0):
