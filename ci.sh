@@ -40,6 +40,10 @@
 #                     regression. Wired in 2026-08-07 after a 10/10 clean
 #                     reliability run (see docs/linux-guest.md "Gate status").
 #   6. ./snapshot-qemu-ci.sh
+#   7. ./smp-qemu-ci.sh          (dual-guest Step 0: PSCI CPU_ON, 4 cores)
+#   8. ./dual-qemu-ci.sh         (two guests concurrently + ghost-image refusal)
+#   9. ./dual-rearm-qemu-ci.sh   (the ONLY target that runs a second zboot)
+#  10. ./dual-zephyr-qemu-ci.sh  (real Zephyr as the 2nd guest; SKIP-safe)
 #                   — GUEST CHECKPOINT/RESTORE (ROADMAP D1) round-trips end to
 #                     end: the REAL, unmodified snapshot_save()/
 #                     snapshot_restore() run against a live EL1 guest, and the
@@ -127,6 +131,53 @@ if ./snapshot-qemu-ci.sh; then
 else
     echo "ci: snapshot/restore target FAIL"
     fail=1
+fi
+
+echo "════════ ci: PSCI CPU_ON bring-up of all 4 cores (smp-qemu-ci.sh) ════════"
+# Dual-guest Step 0. No SKIP path: needs only the cross-compiler and QEMU.
+if ./smp-qemu-ci.sh; then
+    echo "ci: smp bring-up target PASS"
+else
+    echo "ci: smp bring-up target FAIL"
+    fail=1
+fi
+
+echo "════════ ci: two guests concurrently on CPU0+CPU3 (dual-qemu-ci.sh) ════════"
+# Dual-guest Step 1, two passes: the bulk-loader chain must WORK, and a
+# destination-only ("ghost") image must be REFUSED -- the stale-image wipe that
+# a warm reset made necessary (see zstage_invalidate_dest()). No SKIP path.
+if ./dual-qemu-ci.sh; then
+    echo "ci: dual-guest concurrency target PASS"
+else
+    echo "ci: dual-guest concurrency target FAIL"
+    fail=1
+fi
+
+echo "════════ ci: retry after zunhalt re-arm (dual-rearm-qemu-ci.sh) ════════"
+# The only target that exercises a SECOND zboot attempt. It exists because no
+# other one could have caught a retry defect -- and because a retry that merely
+# reaches kload_enter is not a retry that runs. No SKIP path.
+if ./dual-rearm-qemu-ci.sh; then
+    echo "ci: dual-guest retry target PASS"
+else
+    echo "ci: dual-guest retry target FAIL"
+    fail=1
+fi
+
+echo "════════ ci: real Zephyr as the 2nd guest (dual-zephyr-qemu-ci.sh) ════════"
+# Same SKIP-vs-FAIL distinction as the single-guest Zephyr stage above: this one
+# needs the bpi_m64_hv_dual board image, and a missing Zephyr tree must not be
+# able to turn the gate red.
+dzout=$(./dual-zephyr-qemu-ci.sh 2>&1)
+dzrc=$?
+echo "$dzout"
+if [ "$dzrc" -ne 0 ]; then
+    echo "ci: dual-guest real-Zephyr target FAIL"
+    fail=1
+elif echo "$dzout" | grep -q "dual-zephyr-qemu-ci: SKIP"; then
+    echo "ci: dual-guest real-Zephyr target SKIPPED (no Zephyr tree — not a regression)"
+else
+    echo "ci: dual-guest real-Zephyr target PASS"
 fi
 
 echo "════════════════════════════════════════════════════"
