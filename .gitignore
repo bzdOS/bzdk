@@ -24,6 +24,18 @@ boot-ledger.jsonl
 boot-ledger.txt
 soak-*
 !soak.py
+# `soak-*` matches at every level, so it swallowed docs/soak-and-breakglass.md
+# (the harness documentation) as if it were a runtime report. Un-ignore it.
+!docs/soak-and-breakglass.md
+
+# v1-gate long-run harness state (soak72.py / breakglass_cycle.py). Append-only
+# event logs and resumable state files: runtime data, never committed.
+soak72-state.json
+soak72-events.jsonl
+soak72-logs/
+breakglass-state.json
+breakglass-events.jsonl
+breakglass-logs/
 soak-logs/
 soak*.log
 soak*-report.json

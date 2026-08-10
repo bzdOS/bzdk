@@ -140,6 +140,8 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	python3 bmc_client.py selftest
 	python3 bzdctl.py selftest
 	python3 crash_report.py selftest
+	python3 soak72.py --dry-run
+	python3 breakglass_cycle.py --dry-run
 
 test_vblk_stitch: test_vblk_stitch.c
 	gcc -Wall -Wextra -O2 -o $@ $<
