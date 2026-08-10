@@ -348,9 +348,23 @@ def verdict(state, cfg, ev, ok, stopped_reason=None, show=True):
     d = state.d
     early, recent = d.get("early_rate"), d.get("recent_rate")
     degraded = (early and recent and recent < early * cfg["degrade_frac"])
+
+    # A recorded failure disqualifies the gate, even when the hours were made.
+    #
+    # This state is RESUMABLE by design, so d["failures"] accumulates across
+    # every interruption and restart of the same run. Without this check the
+    # summary printed "GATE CLOSED" and "failures recorded : 1" in the same
+    # box (observed 2026-08-10 on the first hardware run, where the earlier
+    # failure was a false board-off-usb). For a gate that exists to be started
+    # and left alone, a mixed verdict is the worst possible output: whoever
+    # comes back reads the headline and stops. If the recorded failures are
+    # known-bogus, clear them deliberately with --restart and measure again --
+    # that is what --restart is for.
+    failed = bool(d.get("failures"))
+    closed = bool(ok) and not degraded and not failed
+
     lines = [
-        "bzdOS 72h SOAK — " + ("GATE CLOSED" if ok and not degraded else
-                               "not closed"),
+        "bzdOS 72h SOAK — " + ("GATE CLOSED" if closed else "not closed"),
         f"healthy load time : {d['load_s'] / 3600.0:.2f} h of {cfg['hours']} h",
         f"samples           : {d['samples']} ({d.get('healthy_samples', 0)} healthy,"
         f" {d.get('warn_samples', 0)} with warnings)",
@@ -368,16 +382,19 @@ def verdict(state, cfg, ev, ok, stopped_reason=None, show=True):
     ]
     if stopped_reason:
         lines.append("STOPPED: " + stopped_reason[:160])
-    if d.get("failures"):
+    if failed:
         lines.append(f"failures recorded : {len(d['failures'])} "
-                     f"(first: {d['failures'][0]['kind']})")
+                     f"(first: {d['failures'][0]['kind']})"
+                     + ("   <-- DISQUALIFIES THE GATE; --restart to re-measure"
+                        if ok and not degraded else ""))
     if show:
         print("\n" + L.banner(lines))
-    ev.emit("verdict", "info" if ok and not degraded else FAIL,
-            gate_closed=bool(ok and not degraded),
+    ev.emit("verdict", "info" if closed else FAIL,
+            gate_closed=closed,
             load_h=round(d["load_s"] / 3600.0, 3), resets=d["resets"],
-            degraded=bool(degraded), stopped_reason=stopped_reason)
-    return bool(ok and not degraded)
+            degraded=bool(degraded), had_failures=failed,
+            stopped_reason=stopped_reason)
+    return closed
 
 
 def cmd_status(args):
