@@ -98,6 +98,13 @@ GUEST_BOARD=bpi_m64_hv_dual
 # copy of this same comment (Step 1 used the identical address for its
 # trivial payload).
 GUEST_STAGE_ADDR=0xBF000000
+# ZSTAGE_LOW_PA from zstage.h: the low-DRAM window U-Boot's third TFTP drops a
+# guest image into on the real board. Staging a REAL Zephyr image here (rather
+# than only the 144-byte trivial payload dual-qemu-ci.sh uses) is the point of
+# pass A below: it is the first thing that exercises zstage_span() + the copy
+# against an image of realistic size and shape -- many program headers, and
+# large .debug_* sections past the last PT_LOAD that must NOT be copied.
+GUEST_LOW_ADDR=0x4E000000
 # -m 2048 -smp 4: same requirement dual-qemu-ci.sh (Step 1) already
 # established -- Zephyr's stage-2 slice sits in the high GiB, which only
 # physically exists with >=2 GiB of QEMU RAM, and all 4 cores must be
@@ -151,60 +158,91 @@ if ! "${CROSS}readelf" -lW "$GUEST" 2>/dev/null | grep -q "0x00000000be000000"; 
 fi
 
 echo "dual-zephyr-qemu-ci: guest image $GUEST"
-echo "dual-zephyr-qemu-ci: running under $QEMU -M virt -smp 4 -m 2048 (timeout ${TIMEOUT}s) ..."
-OUT=$(timeout "$TIMEOUT" "$QEMU" \
-        -machine virt,gic-version=2,virtualization=on \
-        -cpu cortex-a53 -m 2048 -smp 4 -nographic \
-        -kernel "$ELF" \
-        -device "loader,file=$GUEST,addr=$GUEST_STAGE_ADDR,force-raw=on" 2>&1)
 
-if echo "$OUT" | grep -qiE "DUAL-ZEPHYR-QEMU-CI: FAIL|CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled"; then
-    echo "dual-zephyr-qemu-ci: FAIL — error line in output:"
-    echo "$OUT" | grep -iE "DUAL-ZEPHYR-QEMU-CI: FAIL|CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled" | head
-    echo "dual-zephyr-qemu-ci: full output:"
-    echo "$OUT"
-    exit 1
-fi
+# ---- 3. run it, TWICE, once per staging route -------------------------------
+# Same firmware binary, same assertions, only the payload's landing address
+# differs -- the arrangement dual-qemu-ci.sh (Step 1) documents in full.
+#
+#   Pass A (GUEST_LOW_ADDR)   -- the real bulk-loader chain, now with a REAL
+#                                Zephyr image: U-Boot's third TFTP lands it in
+#                                low DRAM and zstage.c's copy-in is the ONLY
+#                                thing that can move it to where
+#                                zload2_parse_and_place() reads. This is the
+#                                first test anywhere that exercises the span
+#                                computation against a realistically-shaped
+#                                image rather than a 144-byte payload.
+#   Pass B (GUEST_STAGE_ADDR) -- direct staging, the route commit 779153d
+#                                already proved. Regression guard: the copy-in
+#                                finding nothing at the landing window must be
+#                                a harmless no-op, not something that clobbers
+#                                an already-staged image.
+run_pass() {
+    pass_name=$1
+    load_addr=$2
 
-VERDICT=$(echo "$OUT" | grep "DUAL-ZEPHYR-QEMU-CI: cpu0 before=" | tail -1)
-if [ -z "$VERDICT" ]; then
-    echo "dual-zephyr-qemu-ci: FAIL — never saw the 'DUAL-ZEPHYR-QEMU-CI: cpu0 before=...' sample line within ${TIMEOUT}s. Full output:"
-    echo "$OUT"
-    exit 1
-fi
+    echo "dual-zephyr-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, guest at $load_addr (timeout ${TIMEOUT}s) ..."
+    OUT=$(timeout "$TIMEOUT" "$QEMU" \
+            -machine virt,gic-version=2,virtualization=on \
+            -cpu cortex-a53 -m 2048 -smp 4 -nographic \
+            -kernel "$ELF" \
+            -device "loader,file=$GUEST,addr=$load_addr,force-raw=on" 2>&1)
 
-# Re-derive the before/after numbers from the printed line and check the
-# arithmetic OURSELVES, same discipline dual-qemu-ci.sh (Step 1) applies.
-CPU0_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu0 before=\([0-9]*\).*/\1/p')
-CPU0_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu0 before=[0-9]* after=\([0-9]*\).*/\1/p')
-CPU3_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu3_bytes before=\([0-9]*\).*/\1/p')
-CPU3_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu3_bytes before=[0-9]* after=\([0-9]*\).*/\1/p')
-MARKER_SEEN=$(echo "$VERDICT" | sed -n 's/.*zephyr_marker_seen=\([01]\).*/\1/p')
+    if echo "$OUT" | grep -qiE "DUAL-ZEPHYR-QEMU-CI: FAIL|CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled"; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — error line in output:"
+        echo "$OUT" | grep -iE "DUAL-ZEPHYR-QEMU-CI: FAIL|CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled" | head
+        echo "dual-zephyr-qemu-ci: full output:"
+        echo "$OUT"
+        return 1
+    fi
 
-if [ -z "$CPU0_BEFORE" ] || [ -z "$CPU0_AFTER" ] || [ -z "$CPU3_BEFORE" ] || [ -z "$CPU3_AFTER" ] || [ -z "$MARKER_SEEN" ]; then
-    echo "dual-zephyr-qemu-ci: FAIL — could not parse before/after/marker values out of: $VERDICT"
-    exit 1
-fi
+    VERDICT=$(echo "$OUT" | grep "DUAL-ZEPHYR-QEMU-CI: cpu0 before=" | tail -1)
+    if [ -z "$VERDICT" ]; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — never saw the 'DUAL-ZEPHYR-QEMU-CI: cpu0 before=...' sample line within ${TIMEOUT}s. Full output:"
+        echo "$OUT"
+        return 1
+    fi
 
-if [ "$CPU0_AFTER" -le "$CPU0_BEFORE" ]; then
-    echo "dual-zephyr-qemu-ci: FAIL — CPU0's guest_demo_el1 counter did not strictly increase ($CPU0_BEFORE -> $CPU0_AFTER)"
-    exit 1
-fi
-if [ "$CPU3_AFTER" -le "$CPU3_BEFORE" ]; then
-    echo "dual-zephyr-qemu-ci: FAIL — CPU3's real Zephyr console byte counter did not strictly increase ($CPU3_BEFORE -> $CPU3_AFTER)"
-    exit 1
-fi
-if [ "$MARKER_SEEN" != "1" ]; then
-    echo "dual-zephyr-qemu-ci: FAIL — the real 'heartbeat 1' banner text was never confirmed in the console stream"
-    exit 1
-fi
+    # Re-derive the before/after numbers from the printed line and check the
+    # arithmetic OURSELVES, same discipline dual-qemu-ci.sh (Step 1) applies.
+    CPU0_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu0 before=\([0-9]*\).*/\1/p')
+    CPU0_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu0 before=[0-9]* after=\([0-9]*\).*/\1/p')
+    CPU3_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu3_bytes before=\([0-9]*\).*/\1/p')
+    CPU3_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu3_bytes before=[0-9]* after=\([0-9]*\).*/\1/p')
+    MARKER_SEEN=$(echo "$VERDICT" | sed -n 's/.*zephyr_marker_seen=\([01]\).*/\1/p')
 
-if echo "$OUT" | grep -q "DUAL-ZEPHYR-QEMU-CI: PASS"; then
-    echo "dual-zephyr-qemu-ci: PASS — cpu0 $CPU0_BEFORE -> $CPU0_AFTER, cpu3 console bytes $CPU3_BEFORE -> $CPU3_AFTER, real banner+heartbeat confirmed"
-    echo "$OUT" | grep -E "smp_num_online|baseline sample|Booting Zephyr|hello from EL1|heartbeat|DUAL-ZEPHYR-QEMU-CI:"
-    exit 0
-fi
+    if [ -z "$CPU0_BEFORE" ] || [ -z "$CPU0_AFTER" ] || [ -z "$CPU3_BEFORE" ] || [ -z "$CPU3_AFTER" ] || [ -z "$MARKER_SEEN" ]; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — could not parse before/after/marker values out of: $VERDICT"
+        return 1
+    fi
 
-echo "dual-zephyr-qemu-ci: FAIL — arithmetic and marker checked out but never saw 'DUAL-ZEPHYR-QEMU-CI: PASS'. Full output:"
-echo "$OUT"
-exit 1
+    if [ "$CPU0_AFTER" -le "$CPU0_BEFORE" ]; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — CPU0's guest_demo_el1 counter did not strictly increase ($CPU0_BEFORE -> $CPU0_AFTER)"
+        return 1
+    fi
+    if [ "$CPU3_AFTER" -le "$CPU3_BEFORE" ]; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — CPU3's real Zephyr console byte counter did not strictly increase ($CPU3_BEFORE -> $CPU3_AFTER)"
+        echo "dual-zephyr-qemu-ci: full output:"
+        echo "$OUT"
+        return 1
+    fi
+    if [ "$MARKER_SEEN" != "1" ]; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — the real 'heartbeat 1' banner text was never confirmed in the console stream"
+        return 1
+    fi
+
+    if ! echo "$OUT" | grep -q "DUAL-ZEPHYR-QEMU-CI: PASS"; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — arithmetic and marker checked out but never saw 'DUAL-ZEPHYR-QEMU-CI: PASS'. Full output:"
+        echo "$OUT"
+        return 1
+    fi
+
+    echo "dual-zephyr-qemu-ci: [$pass_name] PASS — cpu0 $CPU0_BEFORE -> $CPU0_AFTER, cpu3 console bytes $CPU3_BEFORE -> $CPU3_AFTER, real banner+heartbeat confirmed"
+    echo "$OUT" | grep -E "smp_num_online|zguest_stage_copyin|baseline sample|Booting Zephyr|hello from EL1|heartbeat|DUAL-ZEPHYR-QEMU-CI:"
+    return 0
+}
+
+run_pass "A: bulk-loader chain, real Zephyr at ZSTAGE_LOW_PA" "$GUEST_LOW_ADDR" || exit 1
+run_pass "B: direct staging at ZG3_ELF_STAGE_PA (regression guard)" "$GUEST_STAGE_ADDR" || exit 1
+
+echo "dual-zephyr-qemu-ci: PASS — real Zephyr ran concurrently with CPU0 via BOTH staging routes"
+exit 0

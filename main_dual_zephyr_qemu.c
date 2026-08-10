@@ -43,6 +43,7 @@
 #include "gic_timer_qemu.h"
 #include "guest.h"
 #include "zguest_cpu3.h"
+#include "zstage.h"
 
 /* smp.c's own "ISOLATION TEST flag" -- see main_dual_qemu.c (Step 0) for the
  * full rationale; reused verbatim here for the same reason: CPU1's
@@ -78,6 +79,18 @@ main(void)
 
 	dbg_core_enable = 0;
 	pl011_puts("HV: dbg_core_enable=0 (CPU1 debug-core MMIO skipped under QEMU -- smp.c unmodified)\n");
+
+	/* Dual-guest bulk loader (zstage.c), the REAL one main_dbg.c calls, in
+	 * the REAL position: before smp_init() and before any guest runs. Same
+	 * dual-route arrangement as main_dual2_qemu.c -- with a REAL Zephyr image
+	 * this time, which is the part that matters here: the trivial payload's
+	 * whole content is 144 bytes, so it could never have shown whether the
+	 * span computation and the copy hold up for an image of realistic size
+	 * and shape (many program headers, large .debug_* sections past the last
+	 * PT_LOAD that must NOT be copied). See zstage.h. */
+	pl011_puts("HV: zguest_stage_copyin() (zstage.c) -- move a staged guest ELF "
+	           "from the low-DRAM TFTP landing window into CPU3's slice\n");
+	zguest_stage_copyin();
 
 	pl011_puts("HV: calling the REAL smp_init() (smp.c, unmodified) -- PSCI CPU_ON for cores 1..3\n");
 	smp_init();

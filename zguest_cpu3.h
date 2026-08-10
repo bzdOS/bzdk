@@ -56,6 +56,17 @@
 #define BZDOS_ZGUEST_CPU3_H
 
 #include <stdint.h>
+#include "stage2_zephyr.h"
+
+/* Both halves of Zephyr's own 32 MiB slice — see the STAGING ADDRESSES note
+ * above for the "why inside Zephyr's slice, not FreeBSD's gigabyte" rationale.
+ * These live in the header (rather than privately in zguest_cpu3.c, where they
+ * started) because zstage.c needs ZG3_ELF_STAGE_PA as its copy destination,
+ * and two independently-maintained copies of a staging address is exactly the
+ * kind of drift that produces a silent wrong-window write. */
+#define ZG3_PA_BASE       (ZSTAGE2_DRAM_BASE)                    /* lower 16 MiB */
+#define ZG3_ELF_STAGE_PA  (ZSTAGE2_DRAM_BASE + (ZSTAGE2_DRAM_SIZE / 2u)) /* upper 16 MiB */
+#define ZG3_ELF_STAGE_SIZE (ZSTAGE2_DRAM_SIZE / 2u)
 
 /* The strong override of smp.c's weak zephyr_cpu3_run() (see smp.c). Called
  * from smp_secondary_main() when cpu==3, on CPU3 itself, and never returns
@@ -71,5 +82,28 @@ void zephyr_cpu3_run(void);
  * CPU3 has already left the poll loop has no effect (the flag is only ever
  * consulted there). */
 void zguest_cpu3_start_set(void);
+
+/* Set by dbgmon.c's `zunhalt` command: release CPU3 from the halt it entered
+ * after a FAILED boot attempt (breadcrumb 0xBAD1/0xBAD2), back to the parked
+ * wfe-poll loop so a corrected image can be staged and `zboot` retried without
+ * a full board reload.
+ *
+ * WHY THIS DOES NOT WEAKEN THE HALT-LOUD PROPERTY. The original design halted
+ * permanently on failure, deliberately: "fail loud and stopped, not silently
+ * proceed." That property is about never GUESSING past a failure, and it is
+ * preserved here — CPU3 still stops dead, still publishes why, and still does
+ * nothing further on its own. What changes is only that a human who has read
+ * the breadcrumb can say "I have fixed it, try again" instead of being forced
+ * to reload the whole board (which is, after all, also just a retry, only
+ * dearer). The failure code and an attempt counter are kept STICKY across
+ * re-arms precisely so that a retry cannot erase the evidence of what went
+ * wrong the first time.
+ *
+ * Note what re-arming does NOT do: it does not fix the underlying problem. In
+ * particular, re-arming after 0xBAD2 (stage-2 isolation self-check failed)
+ * with the same image will fail the same way — the self-check is re-run from
+ * scratch on every attempt and must pass again before Zephyr executes a single
+ * instruction. No-op if CPU3 is not currently halted. */
+void zguest_cpu3_rearm_set(void);
 
 #endif /* BZDOS_ZGUEST_CPU3_H */

@@ -118,13 +118,14 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
 	./test_vnet_ring
 	./test_kload_modinfo
 	./test_zload2_parsing
+	./test_zstage
 	./test_vconsole_uart
 	./test_gdbstub_resolve
 	./test_gdbstub_hwop
@@ -156,6 +157,11 @@ test_kload_modinfo: test_kload_modinfo.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_zload2_parsing: test_zload2_parsing.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+# Compiles the REAL zstage.c (behind ZSTAGE_HOSTED_TEST) rather than a
+# hand-transcribed mirror -- see test_zstage.c's header for why.
+test_zstage: test_zstage.c zstage.c zstage.h
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vconsole_uart: test_vconsole_uart.c
@@ -281,7 +287,7 @@ DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o 
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o flightrec.o coredump.o \
              netcon.o rsb.o axp803.o hdmi.o fb.o hud.o \
              gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o \
-             zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o
+             zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o zstage.o
 $(DUAL_ELF): $(DUAL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DUAL_OBJS)
 	$(SIZE) $@
@@ -460,7 +466,7 @@ DUAL2_QEMU_ELF  := microkernel-dual2-qemu.elf
 DUAL2_QEMU_OBJS := start_qemu.o start_secondary_qemu.o main_dual2_qemu.o exceptions.o \
                    el2_exc_dual2_qemu.o pl011_qemu.o timer.o gic_timer_qemu.o \
                    smp.o dual2_qemu_stub.o guest.o kload.o vconsole.o wdt.o flightrec.o \
-                   zguest_cpu3.o zload2.o stage2_zephyr.o libmin.o
+                   zguest_cpu3.o zload2.o stage2_zephyr.o zstage.o libmin.o
 
 dual2-qemu: $(DUAL2_QEMU_ELF)
 
@@ -493,7 +499,7 @@ DUAL_ZEPHYR_QEMU_ELF  := microkernel-dual-zephyr-qemu.elf
 DUAL_ZEPHYR_QEMU_OBJS := start_qemu.o start_secondary_qemu.o main_dual_zephyr_qemu.o exceptions.o \
                          el2_exc_dual_zephyr_qemu.o pl011_qemu.o timer.o gic_timer_qemu.o \
                          smp.o dual2_qemu_stub.o guest.o kload.o vconsole.o wdt.o flightrec.o \
-                         zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o libmin.o
+                         zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o zstage.o libmin.o
 
 dual-zephyr-qemu: $(DUAL_ZEPHYR_QEMU_ELF)
 
@@ -695,5 +701,5 @@ clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-
 	      $(DUAL_ELF) $(DUAL_BIN) \
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
-	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_vconsole_uart \
+	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart \
 	      test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq

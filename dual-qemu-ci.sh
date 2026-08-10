@@ -76,6 +76,14 @@ PAYLOAD_ELF=zg3_trivial_payload.elf
 # (ZG3_PA_BASE, 0xBE000000) so the raw-ELF staging buffer and the
 # relocated/placed image never overlap during zload2's copy.
 STAGE_ADDR=0xBF000000
+# ZSTAGE_LOW_PA from zstage.h: the low-DRAM window U-Boot TFTPs a guest image
+# into on the real board (0x4E000000, the first round boundary above the HDMI
+# framebuffer, 32 MiB, verified unclaimed). Pass A stages the payload HERE
+# instead of at STAGE_ADDR, so that zstage.c's copy-in is the only thing that can put it where
+# zload2_parse_and_place() looks -- see zstage.h for why the image cannot
+# simply be TFTP'd straight to STAGE_ADDR (U-Boot relocates itself to the top
+# of DRAM, which is exactly that neighbourhood).
+LOW_ADDR=0x4E000000
 # -m 2048 is required: Zephyr's stage-2 slice sits in the high GiB
 # (0x80000000-0xC0000000), which only physically exists with at least 2 GiB
 # of QEMU RAM -- same requirement snapshot-qemu-ci.sh already established for
@@ -115,56 +123,86 @@ if ! "${CROSS}readelf" -h "$PAYLOAD_ELF" 2>/dev/null | grep -q "0xbe000000"; the
     exit 1
 fi
 
-echo "dual-qemu-ci: running under $QEMU -M virt -smp 4 -m 2048 (timeout ${TIMEOUT}s) ..."
-OUT=$(timeout "$TIMEOUT" "$QEMU" \
-        -machine virt,gic-version=2,virtualization=on \
-        -cpu cortex-a53 -m 2048 -smp 4 -nographic \
-        -kernel "$ELF" \
-        -device "loader,file=$PAYLOAD_ELF,addr=$STAGE_ADDR,force-raw=on" 2>&1)
+# ---- 3. run it, TWICE, once per staging route -------------------------------
+# Both passes use the SAME firmware binary and the SAME assertions. The only
+# difference is where the payload is placed:
+#
+#   Pass A (LOW_ADDR)   -- the real bulk-loader chain: the image lands where
+#                          U-Boot's third TFTP puts it, and zstage.c's
+#                          copy-in is the ONLY thing that can move it to where
+#                          zload2_parse_and_place() reads. If the copy-in is
+#                          broken or mispositioned, CPU3's counter never moves.
+#   Pass B (STAGE_ADDR) -- the original Step 1 route (commit fc20b63), staged
+#                          directly. This is a regression guard: it proves the
+#                          copy-in finding nothing at the landing window is a
+#                          harmless no-op rather than something that clobbers
+#                          an already-staged image.
+#
+# Running A first is deliberate: it is the new, unproven path, and a failure
+# there should not be masked by B passing.
+run_pass() {
+    pass_name=$1
+    load_addr=$2
 
-if echo "$OUT" | grep -qiE "DUAL-QEMU-CI2: FAIL|DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort"; then
-    echo "dual-qemu-ci: FAIL — error line in output:"
-    echo "$OUT" | grep -iE "DUAL-QEMU-CI2: FAIL|DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort" | head
-    echo "dual-qemu-ci: full output:"
-    echo "$OUT"
-    exit 1
-fi
+    echo "dual-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, payload at $load_addr (timeout ${TIMEOUT}s) ..."
+    OUT=$(timeout "$TIMEOUT" "$QEMU" \
+            -machine virt,gic-version=2,virtualization=on \
+            -cpu cortex-a53 -m 2048 -smp 4 -nographic \
+            -kernel "$ELF" \
+            -device "loader,file=$PAYLOAD_ELF,addr=$load_addr,force-raw=on" 2>&1)
 
-VERDICT=$(echo "$OUT" | grep "DUAL-QEMU-CI2: cpu0 before=" | tail -1)
-if [ -z "$VERDICT" ]; then
-    echo "dual-qemu-ci: FAIL — never saw the 'DUAL-QEMU-CI2: cpu0 before=...' sample line within ${TIMEOUT}s. Full output:"
-    echo "$OUT"
-    exit 1
-fi
+    if echo "$OUT" | grep -qiE "DUAL-QEMU-CI2: FAIL|DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort"; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — error line in output:"
+        echo "$OUT" | grep -iE "DUAL-QEMU-CI2: FAIL|DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort" | head
+        echo "dual-qemu-ci: full output:"
+        echo "$OUT"
+        return 1
+    fi
 
-# Re-derive the before/after numbers from the printed line and check the
-# arithmetic OURSELVES — belt and suspenders on top of the firmware's own
-# PASS string, same discipline smp-qemu-ci.sh applies to Step 0's verdict.
-CPU0_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu0 before=\([0-9]*\).*/\1/p')
-CPU0_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu0 before=[0-9]* after=\([0-9]*\).*/\1/p')
-CPU3_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu3 before=\([0-9]*\).*/\1/p')
-CPU3_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu3 before=[0-9]* after=\([0-9]*\).*/\1/p')
+    VERDICT=$(echo "$OUT" | grep "DUAL-QEMU-CI2: cpu0 before=" | tail -1)
+    if [ -z "$VERDICT" ]; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — never saw the 'DUAL-QEMU-CI2: cpu0 before=...' sample line within ${TIMEOUT}s. Full output:"
+        echo "$OUT"
+        return 1
+    fi
 
-if [ -z "$CPU0_BEFORE" ] || [ -z "$CPU0_AFTER" ] || [ -z "$CPU3_BEFORE" ] || [ -z "$CPU3_AFTER" ]; then
-    echo "dual-qemu-ci: FAIL — could not parse before/after values out of: $VERDICT"
-    exit 1
-fi
+    # Re-derive the before/after numbers from the printed line and check the
+    # arithmetic OURSELVES — belt and suspenders on top of the firmware's own
+    # PASS string, same discipline smp-qemu-ci.sh applies to Step 0's verdict.
+    CPU0_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu0 before=\([0-9]*\).*/\1/p')
+    CPU0_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu0 before=[0-9]* after=\([0-9]*\).*/\1/p')
+    CPU3_BEFORE=$(echo "$VERDICT" | sed -n 's/.*cpu3 before=\([0-9]*\).*/\1/p')
+    CPU3_AFTER=$(echo  "$VERDICT" | sed -n 's/.*cpu3 before=[0-9]* after=\([0-9]*\).*/\1/p')
 
-if [ "$CPU0_AFTER" -le "$CPU0_BEFORE" ]; then
-    echo "dual-qemu-ci: FAIL — CPU0's guest_demo_el1 counter did not strictly increase ($CPU0_BEFORE -> $CPU0_AFTER)"
-    exit 1
-fi
-if [ "$CPU3_AFTER" -le "$CPU3_BEFORE" ]; then
-    echo "dual-qemu-ci: FAIL — CPU3's zguest_cpu3/zload2 trivial-payload counter did not strictly increase ($CPU3_BEFORE -> $CPU3_AFTER)"
-    exit 1
-fi
+    if [ -z "$CPU0_BEFORE" ] || [ -z "$CPU0_AFTER" ] || [ -z "$CPU3_BEFORE" ] || [ -z "$CPU3_AFTER" ]; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — could not parse before/after values out of: $VERDICT"
+        return 1
+    fi
 
-if echo "$OUT" | grep -q "DUAL-QEMU-CI2: PASS"; then
-    echo "dual-qemu-ci: PASS — cpu0 $CPU0_BEFORE -> $CPU0_AFTER, cpu3 $CPU3_BEFORE -> $CPU3_AFTER (both strictly increased over the same sampled interval)"
-    echo "$OUT" | grep -E "smp_num_online|baseline sample|final sample|DUAL-QEMU-CI2:"
-    exit 0
-fi
+    if [ "$CPU0_AFTER" -le "$CPU0_BEFORE" ]; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — CPU0's guest_demo_el1 counter did not strictly increase ($CPU0_BEFORE -> $CPU0_AFTER)"
+        return 1
+    fi
+    if [ "$CPU3_AFTER" -le "$CPU3_BEFORE" ]; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — CPU3's zguest_cpu3/zload2 trivial-payload counter did not strictly increase ($CPU3_BEFORE -> $CPU3_AFTER)"
+        echo "dual-qemu-ci: full output:"
+        echo "$OUT"
+        return 1
+    fi
 
-echo "dual-qemu-ci: FAIL — arithmetic checked out but never saw 'DUAL-QEMU-CI2: PASS'. Full output:"
-echo "$OUT"
-exit 1
+    if ! echo "$OUT" | grep -q "DUAL-QEMU-CI2: PASS"; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — arithmetic checked out but never saw 'DUAL-QEMU-CI2: PASS'. Full output:"
+        echo "$OUT"
+        return 1
+    fi
+
+    echo "dual-qemu-ci: [$pass_name] PASS — cpu0 $CPU0_BEFORE -> $CPU0_AFTER, cpu3 $CPU3_BEFORE -> $CPU3_AFTER (both strictly increased over the same sampled interval)"
+    echo "$OUT" | grep -E "smp_num_online|zguest_stage_copyin|baseline sample|final sample|DUAL-QEMU-CI2:"
+    return 0
+}
+
+run_pass "A: bulk-loader chain, payload at ZSTAGE_LOW_PA" "$LOW_ADDR" || exit 1
+run_pass "B: direct staging at ZG3_ELF_STAGE_PA (regression guard)" "$STAGE_ADDR" || exit 1
+
+echo "dual-qemu-ci: PASS — both staging routes proved concurrent execution on CPU0+CPU3"
+exit 0
