@@ -255,25 +255,65 @@ Two guards keep dry runs honest:
   removed. `soaklib.ledger_record()` now refuses to write when the dry-run flag
   is latched, at the one place that writes.
 
+### Hardware status, 2026-08-10 — both harnesses have now met the board
+
+The smoke runs the previous revision of this section asked for have been done,
+under supervision, and both gates closed:
+
+```
+soak72.py --restart --hours 0.05 --poll-s 20 --size-mb 16
+  bzdOS 72h SOAK — GATE CLOSED
+  healthy load time : 0.06 h of 0.05 h        samples: 7 (7 healthy, 0 warnings)
+  resets: 0   break-glass sent: 0   reloads: 0   max temperature: 36.2 C
+
+breakglass_cycle.py --restart --attempts 1
+  bzdOS BREAK-GLASS gate — CLOSED
+  streak: 1/1     magic bytes sent: 1     fsck: 1 attempt needed a repair
+  reset observed 20.0 s after the magic bytes; reload 49.9 s; ssh up 0.7 s after
+  recovery; root rw
+```
+
+**Verified on hardware.** The guest-side load script really runs under FreeBSD
+and the here-document install survives the console; `GUEST_LOAD_PROBE` /
+`GUEST_SYSINFO_PROBE` parse real `df -k` / `sysctl` / `dmesg` output; load
+generations accumulate (~71-79 gens/h at `--size-mb` 16-24) and cumulative
+healthy load time advances; benign events are classified benign rather than
+failed — `cpu2-idle` once per boot, and `emmc-retry-absorbed` repeatedly
+(`ebio_fails` climbing to 61 while `g_ioerrs` stayed 0, exactly the
+retry-covered case). For break-glass: the magic byte sequence, the USB-identity
+flip that proves the watchdog really fired, the reload, `fsck_ffs -y` with a real
+repair, the remount rw, and the ssh health verification — the whole chain.
+
+**A real bug each, found by the first hardware contact** (which is what smoke
+tests are for):
+
+1. `bzd_board.USB_NODE` was hard-coded to `/sys/bus/usb/devices/1-4` while the
+   board was on `2-4`, so `soak72.py` aborted instantly with *"board-off-usb —
+   the ONE case with no remote recovery path"* against a perfectly healthy
+   board. A false GONE is worse than no check, because it kills exactly the
+   unattended runs these harnesses exist for. Fixed: `usb_find_node()` resolves
+   the board by vid:pid, and `supervise.py` / `reliable_load.py` had the same
+   latent fault.
+2. The verdict printed **"GATE CLOSED"** and **"failures recorded : 1"** in the
+   same box, because the state is resumable and `failures` accumulates across
+   restarts. A mixed verdict is the worst output for something read by whoever
+   comes back later. A recorded failure now disqualifies the gate outright and
+   says so; use `--restart` to deliberately re-measure.
+
 ### Still unverified (read this before quoting any number)
 
-**Neither harness has been run against the real board.** They were written while
-another session owned the hardware, so:
+- **Duration.** The longest real run so far is minutes, not hours. Nothing is
+  known about behaviour over 72 h, and the degradation check (early vs recent
+  load rate, 50 % fraction) has never had enough samples to fire — note
+  `early_rate` was still `None` in both runs.
+- **20 break-glass resets in a row.** One has been proven. The gate wants 20, and
+  this project has a documented history of the *second* or *third* cycle being
+  the one that misbehaves.
+- **The failure paths.** `--max-resets`, the wedge-detection grace, the
+  load-stall timeout and the dead-board path have only ever run against
+  `FakeBoard`. The classifier's thresholds (60 s wedge grace, 15 min load stall,
+  50 % degradation) remain reasoned, not measured.
+- `--size-mb 48` (the default) has not been run; both smoke runs used 16-24 MB.
 
-- Every board-facing mechanic they drive is existing, board-proven code
-  (`supervise.break_glass`, `reliable_load`, `bzdctl.collect_status`,
-  `soak.capture_counters`, `guest_sh`, `a2_cycle`). The **harness logic around
-  it** has been exercised only against the fake.
-- Specifically unproven on hardware: the guest-side load script actually running
-  under FreeBSD (`md5 -q`, `jot`-free loop, `/dev/urandom` throughput at
-  `--size-mb 48`); the here-document that installs it surviving the lossy
-  console; `GUEST_LOAD_PROBE`/`GUEST_SYSINFO_PROBE` parsing real output
-  (`df -k`, `sysctl kern.boottime`, `dmesg`); the real timings behind
-  `--uboot-timeout-s`, `--settle-s` and `--guest-timeout-s`; and whether a real
-  `fsck_ffs -y` tail matches `FSCK_DIRTY_MARKERS`/`FSCK_REPAIRED_MARKERS`.
-- The classifier's thresholds (60 s wedge grace, 15 min load-stall,
-  `--max-resets 20`, the 50 % degradation fraction) are reasoned, not measured.
-
-So: run `soak72.py --hours 0.2` and `breakglass_cycle.py --attempts 2` under
-supervision, confirm the events look like the board you know, and only then
-start the long runs.
+So the harnesses are no longer untested code — but "the gate closed" above means
+minutes of load and one reset, and must not be quoted as the v1 numbers.
