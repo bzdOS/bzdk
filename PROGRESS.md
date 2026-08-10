@@ -18,14 +18,32 @@ surviving a warm reset, a `wfi` that can never wake on a core with no
 interrupts, and a latched `zboot` firing on re-arm), and one report that had to
 be RETRACTED because the liveness probe — not the firmware — was wrong.
 
-**Also 2026-08-10 — the `kldload` hang is not ours.** Five live modes of
-`hal/probe_test/probe_test_stepper.c` (bsdOS repo) exonerate, in order: the block
-layer, the probe/attach sweep, `DEVICE_IDENTIFY`, and finally this project's
-whole `platform_device` bridge. A driver whose probe is one line of
-`return (ENXIO)`, registered by the real `devclass_add_driver()` with no bridge
-code anywhere near it, wedges the guest just as `lima.ko` did. Four structural
-arguments were refuted by one board run each; see that file's ROOT-CAUSE-NOTES.md
-for what is left to bisect and why reading more source is the wrong next move.
+**SOLVED 2026-08-10/11 — the `kldload` "hang" was a panic, and `kldload` now
+works.** It was never a hang: the guest sat at `Press a key to reboot` while
+`ssh` went quiet and EL2 stayed healthy behind it. `kldload` of ANY driver ran
+`bus_generic_driver_added()` → `device_attach(pmu0)` → `pmu_attach()` →
+`intr_activate_irq()` → *panic: Attempt to double activation of resource id: 0*.
+
+The first cause is **our own DTB**: `/pmu` lists four interrupts (the A64 wires
+the PMU as SPIs 116-119, one per core) but one `interrupt-affinity` entry — a
+leftover from trimming `/cpus` to expose only CPU0 to the guest, which is correct
+and deliberate, except the `interrupts` list was never trimmed to match. So
+`pmu_attach()` failed at every boot with ENXIO *after* activating IRQ 0 and never
+undoing it, and `device_attach()` parked pmu0 in `DS_NOTPRESENT` explicitly to be
+retried when new drivers load.
+
+Fixed by `status = "disabled"` on `/pmu` and verified live: `kldunload`/`kldload`
+of the module that used to kill the guest both return 0, uptime continuous, zero
+panic lines. `lima.ko` still does not load, but now for an ordinary reason with
+the guest unharmed — it needs `drmn`, which this kernel neither contains nor
+ships, and `gpu@1c40000` is `disabled` in the DTB anyway. Mali is normal work
+with two named prerequisites now, not an investigation.
+
+Four structural arguments from reading source were each refuted by one board run
+before this was found, and the panic text was in the console ring the whole time —
+`bmc con read` was reading the ring's OLD address and returning its head instead
+of its tail (fixed, `9de6c1d`). Full accounts:
+`bsdOS/hal/probe_test/ROOT-CAUSE-NOTES.md` and `docs/guest-dtb.md`.
 
 **MILESTONE 2026-07-30 — the FreeBSD guest boots to an interactive root shell on
 real hardware, and is reachable over ssh** (`root@192.168.88.82`). Four

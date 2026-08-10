@@ -214,13 +214,16 @@ of them could have caught a retry defect; that one does nothing else.
    (of which there were several, including two under real disk load). Needs a
    soak run rather than more single-shot tests — `soak72.py` now exists for
    exactly this, see `docs/soak-and-breakglass.md`.
-5. **`zg3_trivial_payload`'s counter is not a sound liveness probe on hardware**
-   (see the retraction above). It is still useful under QEMU, where it is the
-   basis of three CI scripts, but nothing on the board should rely on reading a
-   guest-written DRAM word from another core. Giving the payload a
-   fault-observable heartbeat instead — a write to an address the HV traps, the
-   way real Zephyr's console already is — would make the board and QEMU paths
-   equally trustworthy. Not done.
+5. ~~`zg3_trivial_payload`'s counter is not a sound liveness probe~~ — **done**
+   (commit `4b183ce`). The payload now also writes `'h','b','\n'` to UART0's THR
+   every iteration; CPU3's stage-2 maps no MMIO at all, so that write always
+   faults into EL2 and lands in vconsole channel 1 — the same fault-observed path
+   real Zephyr's console already uses. `dual-qemu-ci.sh` and
+   `dual-rearm-qemu-ci.sh` now key PASS/FAIL on channel-1 `total_bytes`; the DRAM
+   counter is still bumped and printed as `cpu3_dram=`, informational only.
+   Proved by negative control: with the heartbeat stubbed out both scripts FAIL
+   at `cpu3 0 -> 0` while the old DRAM counter still climbed into the millions —
+   the false positive itself, reproduced on demand.
 6. **Phase 2** (repurposing CPU1/CPU2 for further guests) remains out of scope
    here — CPU1's unconditional watchdog-kick is still this project's only
    automatic crash-recovery path. It now has its own design document,

@@ -1,5 +1,13 @@
 # virtio-net-over-EMAC — guest DTB node (parent must apply on the board host)
 
+> **2026-08-11 — the recompile step below does NOT work on this blob.** `dtc`
+> refuses to rebuild `bananapi-min.dtb` from a decompile (it contains a U-Boot
+> `binman` child named `@fdt-SEQ`, a template name dtc will not accept back in).
+> Use `fdtput` for surgical edits instead. Everything else here still stands.
+> See `docs/guest-dtb.md` for the working flow and for the full list of edits
+> currently applied to the deployed blob.
+
+
 Mirrors `docs/virtio-blk-dtb.md` exactly, for the SECOND virtio-mmio device
 this tree now builds: `vnet_emac.c` (virtio-net, DeviceID 1) at `0x0A001000`,
 inside the SAME already-stage-2-trapped 2 MiB block vblk's device lives in

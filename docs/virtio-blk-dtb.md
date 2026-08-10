@@ -1,5 +1,13 @@
 # virtio-blk — guest DTB node (parent must apply on the board host)
 
+> **2026-08-11 — the recompile step below does NOT work on this blob.** `dtc`
+> refuses to rebuild `bananapi-min.dtb` from a decompile (it contains a U-Boot
+> `binman` child named `@fdt-SEQ`, a template name dtc will not accept back in).
+> Use `fdtput` for surgical edits instead. Everything else here still stands.
+> See `docs/guest-dtb.md` for the working flow and for the full list of edits
+> currently applied to the deployed blob.
+
+
 The hypervisor side of virtio-blk (`vblk_emmc.c`, MMIO trap @ `0x0A000000`,
 INTID injection into the real GICD) is built and integrated into the `dbg`
 target. For the FreeBSD guest to *probe* the device, its DTB must advertise a
