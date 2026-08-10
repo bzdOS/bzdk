@@ -63,7 +63,21 @@ UBOOT_VIDPID = f"{UBOOT_VID}:{UBOOT_PID}"    # "1f3a:efe8" (supervise.py's form)
 HVCON_VIDPID = f"{HVCON_VID}:{HVCON_PID}"    # "1d6b:0010"
 
 # The board's OTG port on this host, as a USB sysfs node.
-USB_NODE = "/sys/bus/usb/devices/1-4"
+#
+# This used to be the whole story, and it was wrong: a hard-coded port means
+# that the moment the board is plugged into a different physical socket (or the
+# host renumbers its root hubs across a reboot), every caller of
+# usb_vidpid_str() reads nothing and concludes the board has VANISHED. Found
+# live on 2026-08-10: the board was on 2-4 while this constant said 1-4, and
+# soak72.py failed instantly with "board-off-usb — the ONE case with no remote
+# recovery path" against a board that was sitting there perfectly healthy. A
+# false GONE is worse than no check at all, because it aborts the very harnesses
+# that exist to run unattended.
+#
+# So the constant is now only the FIRST GUESS. usb_find_node() below resolves
+# the board by its vid:pid, which is the identity that actually matters.
+USB_NODE_DEFAULT = "/sys/bus/usb/devices/1-4"
+USB_NODE = USB_NODE_DEFAULT
 
 # Stable udev symlink to the board's enumerated ttyACMn (survives renumbering)
 # — this is what U-Boot's CDC-ACM download gadget shows up as.
@@ -144,6 +158,42 @@ def read_sysfs(path):
         return open(path).read().strip()
     except Exception:
         return None
+
+
+def usb_find_node():
+    """Locate the board's USB sysfs node by identity rather than by position.
+
+    Scans /sys/bus/usb/devices for a device whose idVendor:idProduct is either
+    the U-Boot download gadget or the HV's own console gadget (the two identities
+    the board can present). Returns the node path, or None if neither is
+    enumerated — which is the only reading that should ever be taken as "the
+    board is off the bus".
+
+    Prefers USB_NODE (last known / configured position) when it still matches,
+    so a stable setup keeps its stable answer and does no scanning.
+    """
+    import glob
+
+    want = {UBOOT_VIDPID, HVCON_VIDPID}
+
+    if usb_vidpid_str(USB_NODE) in want:
+        return USB_NODE
+
+    for node in sorted(glob.glob("/sys/bus/usb/devices/*-*")):
+        if ":" in node.rsplit("/", 1)[-1]:
+            continue            # interface, not a device
+        if usb_vidpid_str(node) in want:
+            return node
+    return None
+
+
+def usb_board_vidpid():
+    """The board's current vid:pid wherever it happens to be plugged in, or
+    None if it is genuinely not enumerated. This is what callers asking "is the
+    board on the bus, and in which identity?" should use -- NOT
+    usb_vidpid_str(USB_NODE), which answers a question about a socket."""
+    node = usb_find_node()
+    return usb_vidpid_str(node) if node else None
 
 
 def usb_vidpid(node=USB_NODE):

@@ -36,7 +36,9 @@ def vidpid():
     # field (matching reliable_load.py's original _rd()), so a
     # never-observed-live non-OSError read failure now returns None instead
     # of propagating. See bzd_board.usb_vidpid_str()'s docstring.
-    return B.usb_vidpid_str(USB_NODE)
+    # By identity, not by socket -- a hard-coded port reads None and looks
+    # exactly like a vanished board (see bzd_board.usb_find_node()).
+    return B.usb_board_vidpid()
 
 def emac_alive():
     """Liveness: does the HV answer a breadcrumb read? Tries a few times so a
