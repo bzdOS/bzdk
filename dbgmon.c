@@ -738,6 +738,7 @@ static void cmd_help(void)
 	cputs("  hold               arm pause-before-guest-entry (takes effect NEXT warm reset)\r\n");
 	cputs("  release            release a currently-held pause-before-guest-entry\r\n");
 	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
+	cputs("  zstage             re-run the 2nd guest's copy-in from the landing window\r\n");
 	cputs("  zunhalt            re-arm CPU3 after a failed zboot (0xBAD1/0xBAD2), no reload\r\n");
 	cputs("  h | ?              this help\r\n");
 }
@@ -997,6 +998,30 @@ static void exec_line(char *line, struct el2_frame *frame)
 			cputs("zboot: CPU3 start requested\r\n");
 		} else {
 			cputs("zboot: not built with dual-guest support\r\n");
+		}
+		return;
+	}
+	if (streq(cmd, "zstage")) {
+		/* Re-run the second guest's boot-time copy-in NOW, so a retry
+		 * after a failed `zboot` has a supported way to get a corrected
+		 * image to where zload2 reads it. Full rationale, and why writing
+		 * straight to ZG3_ELF_STAGE_PA is NOT that way, in zstage.h.
+		 * Supported retry order: stage into the landing window ->
+		 * `zstage` -> `zunhalt` -> `zboot`. Weak-guarded exactly like
+		 * `zboot`/`zunhalt`. */
+		extern unsigned long zstage_restage(void) __attribute__((weak));
+		if (zstage_restage) {
+			unsigned long n = zstage_restage();
+			if (n) {
+				cputs("zstage: copied 0x");
+				print_hex32((uint32_t)n);
+				cputs(" bytes into the 2nd guest's slice\r\n");
+			} else {
+				cputs("zstage: nothing usable staged at the landing "
+				      "window -- destination wiped (see ZSTG bc)\r\n");
+			}
+		} else {
+			cputs("zstage: not built with dual-guest support\r\n");
 		}
 		return;
 	}

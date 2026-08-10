@@ -476,6 +476,31 @@ $(DUAL2_QEMU_ELF): $(DUAL2_QEMU_OBJS) link_qemu.ld
 	$(CC) $(LDFLAGS_QEMU) -o $@ $(DUAL2_QEMU_OBJS)
 	$(SIZE) $@
 
+# --- Dual-guest zunhalt RE-ARM repro on QEMU virt (see
+# main_dual_rearm_qemu.c's banner): the board found that a `zboot` AFTER a
+# `zunhalt` re-arm reaches kload_enter and then runs nothing, while a FIRST
+# attempt with the same firmware boots fine. No existing dual-guest QEMU
+# target exercises a second attempt at all, so none of them could catch it.
+#
+# Object list = DUAL2_QEMU_OBJS with main_dual_rearm_qemu.o in place of
+# main_dual2_qemu.o. Everything else, including el2_exc_dual2_qemu.o and its
+# two-sample PASS criteria, is shared verbatim -- the point is that the ONLY
+# difference from the passing Step 1 target is the re-arm in the middle.
+DUAL_REARM_QEMU_ELF  := microkernel-dual-rearm-qemu.elf
+DUAL_REARM_QEMU_OBJS := start_qemu.o start_secondary_qemu.o main_dual_rearm_qemu.o exceptions.o \
+                        el2_exc_dual2_qemu.o pl011_qemu.o timer.o gic_timer_qemu.o \
+                        smp.o dual2_qemu_stub.o guest.o kload.o vconsole.o wdt.o flightrec.o \
+                        zguest_cpu3.o zload2.o stage2_zephyr.o zstage.o libmin.o
+
+dual-rearm-qemu: $(DUAL_REARM_QEMU_ELF)
+
+$(DUAL_REARM_QEMU_ELF): $(DUAL_REARM_QEMU_OBJS) link_qemu.ld
+	$(CC) $(LDFLAGS_QEMU) -o $@ $(DUAL_REARM_QEMU_OBJS)
+	$(SIZE) $@
+
+clean-dual-rearm-qemu:
+	rm -f main_dual_rearm_qemu.o main_dual_rearm_qemu.d $(DUAL_REARM_QEMU_ELF)
+
 clean-dual2-qemu:
 	rm -f main_dual2_qemu.o el2_exc_dual2_qemu.o dual2_qemu_stub.o \
 	      main_dual2_qemu.d el2_exc_dual2_qemu.d dual2_qemu_stub.d \
