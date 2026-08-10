@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 /* el2_exc_dual2_qemu.c — EL2 trap handler for the QEMU `virt` dual-guest
- * Step 1 CI target (main_dual2_qemu.c / dual-qemu-ci.sh).
+ * Step 1 CI target (main_dual2_qemu.c / dual-qemu-ci.sh) and the zunhalt
+ * re-arm repro (main_dual_rearm_qemu.c / dual-rearm-qemu-ci.sh).
  *
  * Same rationale as every sibling *_qemu.c trap handler (see
  * el2_exc_qemu.c's header for the canonical statement of it): a NEW,
@@ -22,13 +23,20 @@
  *     accessor added to guest.h) at its documented fixed address, matching
  *     Step 0's own main_dual_qemu.c convention of reading fixed breadcrumb
  *     addresses straight from a QEMU CI target.
- *   - CPU3's progress: the fixed counter address zg3_trivial_payload.S
- *     writes to (ZSTAGE2_DRAM_BASE + 0x100 -- see that file's header and
- *     stage2_zephyr.h). EL2's own accesses are never subject to CPU3's
- *     stage-2 regime (stage-2 only ever governs EL1/EL0; VTCR_EL2/
- *     VTTBR_EL2 are per-PE banked -- see stage2_zephyr.h's header), so a
- *     plain volatile read of this physical address from EL2, on CPU0,
- *     works regardless of what CPU3's own stage-2 table says.
+ *   - CPU3's progress: vconsole.c's channel-1 "total_bytes" counter
+ *     (HVMAP_VCONSOLE_CHAN1_HDR word[1]), bumped by THIS FILE's own
+ *     el2_trap() every time it routes one of CPU3's UART0-THR stage-2
+ *     faults to vconsole_handle_fault(frame, 1) -- see the CPU3 dispatch
+ *     branch below and zg3_trivial_payload.S's header. This is a
+ *     FAULT-OBSERVED signal: every increment happened because EL2 itself,
+ *     on CPU0/this core, serviced a trap CPU3 took. There is no other
+ *     core's cache in the loop, unlike the OLD probe this replaces (a
+ *     DRAM word zg3_trivial_payload.S also still bumps, ZG3_TEST_COUNTER_PA
+ *     below, kept for information only -- see docs/dual-guest.md,
+ *     "Retrying a failed zboot ... and a probe that lied", for why that
+ *     older probe is unsound on real hardware despite being reliable
+ *     under QEMU, and open item 5 under "What's still open" for why this
+ *     file now uses the fault-observed counter instead).
  *
  * Tick 2 (~200 ms in) takes the baseline sample; tick 12 (~1.2 s in) takes
  * the final sample and requires BOTH counters to have strictly increased
@@ -45,6 +53,8 @@
 #include "pl011_qemu.h"
 #include "stage2_zephyr.h"
 #include "smp.h"
+#include "vconsole.h"
+#include "hv_addrmap.h"
 
 /* CPU0's guest.c breadcrumb window (GUEST_BC_BASE, "GST1") -- word[1] is
  * guest_demo_el1()'s own loop counter, bumped every iteration at EL1. See
@@ -52,14 +62,25 @@
 #define GUEST_BC_BASE          0x50000b00UL
 #define GUEST_LOOP_COUNT_ADDR  (GUEST_BC_BASE + 4UL)
 
-/* CPU3's trivial-payload counter -- see zg3_trivial_payload.S's header.
- * Kept in sync BY VALUE with that file; if it ever changes, update both. */
+/* CPU3's trivial-payload DRAM counter -- see zg3_trivial_payload.S's
+ * header ("signal #1"). Kept in sync BY VALUE with that file; if it ever
+ * changes, update both. INFORMATIONAL ONLY as of the fault-observed-probe
+ * change: printed, but no longer part of the PASS/FAIL arithmetic below. */
 #define ZG3_TEST_COUNTER_PA (ZSTAGE2_DRAM_BASE + 0x100UL)
+
+/* CPU3's FAULT-OBSERVED heartbeat ("signal #2"): vconsole.c's channel-1
+ * ring header word[1] (total_bytes), bumped only inside
+ * vconsole_handle_fault(frame, 1) -- i.e. only when EL2 itself serviced a
+ * real stage-2 data-abort trap from CPU3's UART0-THR write. THIS is what
+ * PASS/FAIL is keyed on now. See hv_addrmap.h for the header layout
+ * (word[0] magic, word[1] total_bytes, ...). */
+#define ZG3_CHAN1_TOTAL_BYTES_PA (HVMAP_VCONSOLE_CHAN1_HDR + 4UL)
 
 #define SAMPLE_TICK_BASE  2u
 #define SAMPLE_TICK_FINAL 12u
 
 static uint32_t g_cpu0_t0, g_cpu3_t0;
+static uint32_t g_cpu3_dram_t0;   /* informational only, see above */
 static int g_have_baseline;
 
 static inline uint32_t
@@ -105,15 +126,28 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 {
 	unsigned t = (unsigned)(kind & 3u);
 
-	/* Only CPU0 ever arms/unmasks this tick (main_dual2_qemu.c) -- a trap
-	 * reaching here on any other core is unexpected: CPU1/CPU2 park in
+	/* Only CPU0 ever arms/unmasks this tick (main_dual2_qemu.c) -- an IRQ/
+	 * FIQ reaching here on any other core is unexpected: CPU1/CPU2 park in
 	 * WFI (dbg_core_enable=0 / the weak vblk_async_cpu2_run() default),
-	 * and CPU3's trivial payload never touches MMIO/HVC and never arms
-	 * its own CNTP (see zg3_trivial_payload.S's header). Treat it as a
-	 * genuine, unambiguous FAIL rather than silently mis-attributing a
-	 * sample to the wrong core. */
-	if (smp_cpu_id() != 0)
+	 * and CPU3's trivial payload never arms its own CNTP (see
+	 * zg3_trivial_payload.S's header). CPU3's payload DOES now deliberately
+	 * take ONE well-formed, expected kind of trap on every loop iteration:
+	 * a lower-EL synchronous data abort on UART0's THR register, because
+	 * stage2_zephyr.c maps zero real MMIO for CPU3 (see that file's
+	 * header). Route exactly that one case to vconsole_handle_fault(...,
+	 * 1) -- the same channel-1 emulated 16550 real Zephyr's own console
+	 * output already goes through -- and treat anything else from a
+	 * non-CPU0 core (any trap on CPU1/CPU2, or any OTHER kind of trap from
+	 * CPU3) as the genuine, unambiguous FAIL it always was. */
+	if (smp_cpu_id() != 0) {
+		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
+
+		if (smp_cpu_id() == 3u && (kind >> 2) == 2u && t == EL2_KIND_SYNC &&
+		    ec == 0x24u && vconsole_handle_fault(frame, 1))
+			return;
+
 		report_fault(frame, kind);
+	}
 
 	if (t == EL2_KIND_IRQ || t == EL2_KIND_FIQ) {
 		if (gic_timer_qemu_irq(frame)) {
@@ -124,14 +158,17 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 
 			if (ticks == SAMPLE_TICK_BASE && !g_have_baseline) {
 				g_cpu0_t0 = read_u32(GUEST_LOOP_COUNT_ADDR);
-				g_cpu3_t0 = read_u32(ZG3_TEST_COUNTER_PA);
+				g_cpu3_t0 = read_u32(ZG3_CHAN1_TOTAL_BYTES_PA);
+				g_cpu3_dram_t0 = read_u32(ZG3_TEST_COUNTER_PA);
 				g_have_baseline = 1;
 				pl011_puts("HV: baseline sample (tick ");
 				pl011_put_udec((uint32_t)ticks);
 				pl011_puts(") cpu0_loop=");
 				pl011_put_udec(g_cpu0_t0);
-				pl011_puts(" cpu3_loop=");
+				pl011_puts(" cpu3_chan1_bytes=");
 				pl011_put_udec(g_cpu3_t0);
+				pl011_puts(" cpu3_dram=");
+				pl011_put_udec(g_cpu3_dram_t0);
 				pl011_puts("\n");
 			} else if (ticks % 4u == 0u) {
 				pl011_puts("HV: tick ");
@@ -141,18 +178,31 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 
 			if (ticks >= SAMPLE_TICK_FINAL) {
 				uint32_t cpu0_t1 = read_u32(GUEST_LOOP_COUNT_ADDR);
-				uint32_t cpu3_t1 = read_u32(ZG3_TEST_COUNTER_PA);
+				uint32_t cpu3_t1 = read_u32(ZG3_CHAN1_TOTAL_BYTES_PA);
+				uint32_t cpu3_dram_t1 = read_u32(ZG3_TEST_COUNTER_PA);
 				int cpu0_advanced = g_have_baseline && (cpu0_t1 > g_cpu0_t0);
+				/* PASS/FAIL is keyed on the FAULT-OBSERVED channel-1 byte
+				 * counter, not the DRAM word -- see this file's header and
+				 * zg3_trivial_payload.S's for why the DRAM word alone is
+				 * not trustworthy on real hardware. */
 				int cpu3_advanced = g_have_baseline && (cpu3_t1 > g_cpu3_t0);
 
 				pl011_puts("HV: final sample (tick ");
 				pl011_put_udec((uint32_t)ticks);
 				pl011_puts(") cpu0_loop=");
 				pl011_put_udec(cpu0_t1);
-				pl011_puts(" cpu3_loop=");
+				pl011_puts(" cpu3_chan1_bytes=");
 				pl011_put_udec(cpu3_t1);
+				pl011_puts(" cpu3_dram=");
+				pl011_put_udec(cpu3_dram_t1);
 				pl011_puts("\n");
 
+				/* "cpu3" here (and below) is the FAULT-OBSERVED vconsole
+				 * channel-1 byte counter -- see this file's header comment.
+				 * The line's shape (label text, before=/after= pairs) is
+				 * otherwise unchanged so dual-qemu-ci.sh's/
+				 * dual-rearm-qemu-ci.sh's existing sed/grep parsing keeps
+				 * working unmodified. */
 				pl011_puts("DUAL-QEMU-CI2: cpu0 before=");
 				pl011_put_udec(g_cpu0_t0);
 				pl011_puts(" after=");
@@ -166,7 +216,9 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 				if (cpu0_advanced && cpu3_advanced) {
 					pl011_puts("DUAL-QEMU-CI2: PASS (CPU0's guest_demo_el1 AND CPU3's "
 					           "zguest_cpu3/zload2 trivial payload both advanced "
-					           "concurrently between sample 1 and sample 2)\n");
+					           "concurrently between sample 1 and sample 2 -- CPU3's "
+					           "progress is the fault-observed vconsole channel-1 byte "
+					           "counter, not a DRAM word read from another core)\n");
 				} else {
 					pl011_puts("DUAL-QEMU-CI2: FAIL (");
 					if (!cpu0_advanced)
