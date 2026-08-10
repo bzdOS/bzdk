@@ -59,6 +59,14 @@ int  gdb_getc(void)  { emac_poll(); return emac_getc(); }
 void gdb_putc(int c) { emac_putc(c); }
 void gdb_flush(void) { emac_flush(); }
 
+/* zstage.c — dual-guest bulk loader. Weak no-op so this file, which is shared
+ * by the `dbg`, `gdb` and `dual` targets, links unchanged for the first two:
+ * only `dual` links zstage.o, whose strong definition wins. Same weak/strong
+ * linkage pattern smp.c already uses for zephyr_cpu3_run() (default: park in
+ * WFI) and vblk_async_cpu2_run() — see zstage.h and the call site below for
+ * why the copy has to happen exactly where it does. */
+__attribute__((weak)) void zguest_stage_copyin(void) { }
+
 /* DIAGNOSTIC (temporary): one-shot breakpoint inside pmap_bootstrap_dmap,
  * right after "ldr x0,[x21,#320]" (VA 0xffff000000939940) — x0 there is the
  * address about to be memset(0)'d by memset_early, which faults at FAR=0x1000.
@@ -441,6 +449,23 @@ int main(void)
 		hud_update(&g_last_guest_frame);   /* first frame (guest not yet running) */
 	}
 #endif
+
+	/* Dual-guest bulk loader (zstage.h): move a second guest's raw ELF from
+	 * the low-DRAM TFTP landing window (0x4E000000) into its own private
+	 * slice. Weak no-op below, strongly overridden by zstage.c, which is
+	 * linked ONLY into the `dual` target -- same weak/strong pattern smp.c
+	 * uses for zephyr_cpu3_run()/vblk_async_cpu2_run(), so this line is
+	 * provably inert for dbg/gdb/fbsd/zephyr.
+	 *
+	 * THE POSITION OF THIS CALL IS LOAD-BEARING, not stylistic. The landing
+	 * window is inside the FreeBSD guest's own gigabyte, memory FreeBSD may
+	 * allocate over the instant it runs. Copying here -- BEFORE smp_init()
+	 * brings CPU3 up and BEFORE kload_enter() hands control to FreeBSD --
+	 * means no guest on any core has executed a single instruction yet.
+	 * Moving it after smp_init(), or doing it on CPU3 itself once it parks,
+	 * reintroduces a real race: CPU0 would be free to enter FreeBSD while
+	 * CPU3 is still copying. See zstage.h's header comment. */
+	zguest_stage_copyin();
 
 	DBG_BC(1, 0x53591417);   /* 'SY..' about to call smp_init */
 	smp_init();

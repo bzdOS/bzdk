@@ -322,6 +322,18 @@ _Static_assert(HVMAP_SNAP_HDR_END <= 0x50200000UL,
 #define HVMAP_VCONSOLE_CHAN1_END \
 	(HVMAP_VCONSOLE_CHAN1_BUF + HVMAP_VCONSOLE_CHAN1_BUF_SIZE)
 
+/* zstage.c breadcrumbs ("ZSTG") — the CPU0-side copy-in that moves a raw
+ * guest ELF from the low-DRAM TFTP landing window into Zephyr's own private
+ * slice before the first guest ever runs (see zstage.h).
+ *
+ * Base picked with a deliberate one-page gap above HVMAP_VCONSOLE_CHAN1_END
+ * (0x50079000) rather than butting straight against it: this file's own
+ * history is that a buffer grown without slack marched over SIX neighbouring
+ * windows. The gap costs nothing and the next window after this one gets the
+ * same courtesy. */
+#define HVMAP_ZSTAGE_BC         0x5007A000UL
+#define HVMAP_ZSTAGE_BC_SIZE    0x40UL
+
 _Static_assert(HVMAP_ZGUEST3_BC >= HVMAP_SNAP_HDR_END,
                "zguest_cpu3 breadcrumb lane overlaps the snapshot header lane");
 _Static_assert(HVMAP_ZGUEST3_BC + HVMAP_ZGUEST3_BC_SIZE <= HVMAP_ZLOAD2_BC,
@@ -335,7 +347,9 @@ _Static_assert(HVMAP_MMIOABS_BC + HVMAP_MMIOABS_BC_SIZE <= HVMAP_VCONSOLE_CHAN1_
 _Static_assert(HVMAP_VCONSOLE_CHAN1_HDR + HVMAP_VCONSOLE_CHAN1_HDR_SIZE
                <= HVMAP_VCONSOLE_CHAN1_BUF,
                "vconsole chan1 header overlaps the vconsole chan1 buffer");
-_Static_assert(HVMAP_VCONSOLE_CHAN1_END <= 0x50100000UL,
+_Static_assert(HVMAP_VCONSOLE_CHAN1_END <= HVMAP_ZSTAGE_BC,
+               "vconsole chan1 buffer overlaps the zstage breadcrumbs");
+_Static_assert(HVMAP_ZSTAGE_BC + HVMAP_ZSTAGE_BC_SIZE <= 0x50100000UL,
                "dual-guest lanes run into el2_ncmap.c's non-cacheable DMA "
                "scratch window (SCRATCH_BASE 0x50100000)");
 

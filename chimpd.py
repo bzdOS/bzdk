@@ -62,6 +62,28 @@ DTB       = "/opt/bzdos/tftpboot/bananapi-min.dtb"
 KADDR     = 0x44000000
 DTBADDR   = 0x4a000000
 STAGE     = 0x48000000
+
+# ── second-guest (dual build) bulk staging ──────────────────────────────────
+# The `dual` hypervisor target can run a second guest concurrently on CPU3, but
+# it needs that guest's raw ELF already in DRAM before it starts. There was no
+# way to put it there at scale: dbgmon's single-word `w` command over the EMAC
+# debug channel is fine for the 144 meaningful bytes of a test payload and
+# hopeless for a real image (see docs/dual-guest.md).
+#
+# The fix is a third TFTP through the machinery already used for the kernel and
+# the DTB. It lands in a free low-DRAM window and the hypervisor moves it into
+# the second guest's own slice before any guest runs — see zstage.h for why the
+# copy cannot simply TFTP straight to the final address (U-Boot relocates itself
+# to the top of DRAM, which is exactly that neighbourhood).
+#
+# ZADDR must match zstage.h's ZSTAGE_LOW_PA. The window there is 32 MiB
+# ([0x4E000000, 0x50000000)) and images larger than that are refused up front
+# rather than allowed to run over the hv-scratch reserve at 0x50000000.
+TFTP_ROOT   = os.path.dirname(KERNEL)
+ZADDR       = 0x4E000000
+ZADDR_LIMIT = 0x02000000          # == zstage.h ZSTAGE_LOW_SIZE (32 MiB)
+ZGUEST_NAME = "zguest.elf"        # filename U-Boot fetches, inside TFTP_ROOT
+ZGUEST_ELF  = None                # path to stage; None = no second guest
 BOARD_IP  = B.BOARD_IP
 SRV_IP    = B.SRV_IP
 
@@ -303,6 +325,60 @@ def serial_load(sess):
     # each tftp returns quickly, our own retry loop (below) paces the link-up
     # wait with short sleeps that DON'T starve the gadget. autostart=no here
     # (flipped to yes right before bootelf; both directions bite — see 2026-07-16).
+    def _stage_zguest(tftp_retry):
+        """TFTP the second guest's raw ELF into the low-DRAM landing window.
+
+        Returns True on success, False on any failure (never raises — a broken
+        --zguest path must not take the whole boot down with it, see the call
+        site's comment).
+
+        U-Boot fetches by filename out of the TFTP root, so an ELF given by an
+        arbitrary path has to be published there first. It is copied rather
+        than symlinked because dnsmasq's TFTP server is chrooted to the root by
+        default and would not follow a link out of it.
+        """
+        try:
+            size = os.path.getsize(ZGUEST_ELF)
+        except OSError as e:
+            slog(f"  [serial] ⛔ 2-й гость: не читается {ZGUEST_ELF}: {e}")
+            return False
+
+        if size > ZADDR_LIMIT:
+            slog(f"  [serial] ⛔ 2-й гость: {size} байт > окна "
+                 f"{ZADDR_LIMIT} (0x{ZADDR:x}..0x{ZADDR + ZADDR_LIMIT:x}) — "
+                 f"отказ, иначе перезапись hv-scratch на 0x50000000")
+            return False
+
+        dst = os.path.join(TFTP_ROOT, ZGUEST_NAME)
+        try:
+            # Only copy when the content actually differs, so a re-run does not
+            # rewrite the TFTP root needlessly.
+            need = True
+            if os.path.exists(dst) and os.path.getsize(dst) == size:
+                with open(ZGUEST_ELF, "rb") as a, open(dst, "rb") as b:
+                    need = a.read() != b.read()
+            if need:
+                with open(ZGUEST_ELF, "rb") as a:
+                    data = a.read()
+                tmp = dst + ".tmp"
+                with open(tmp, "wb") as b:
+                    b.write(data)
+                os.replace(tmp, dst)   # atomic: never a half file for U-Boot
+                slog(f"  [serial] 2-й гость: {ZGUEST_ELF} → {dst} ({size} байт)")
+            else:
+                slog(f"  [serial] 2-й гость: {dst} уже актуален ({size} байт)")
+        except OSError as e:
+            slog(f"  [serial] ⛔ 2-й гость: не удалось положить в {dst}: {e}")
+            return False
+
+        slog(f"  [serial] TFTP 2-й гость → 0x{ZADDR:x} ({ZGUEST_NAME})")
+        if not tftp_retry(ZADDR, ZGUEST_NAME, 20, tries=5):
+            slog("  [serial] ⛔ TFTP 2-го гостя не удался — грузим без него "
+                 "(FreeBSD загрузится штатно; zstage покажет state=2)")
+            return False
+        slog("  [serial] 2-й гость в DRAM — HV скопирует его до старта гостей")
+        return True
+
     slog("  [serial] net setup (autostart no, netretry no)")
     ucmd(fd, f"setenv autostart no ; setenv netretry no ; setenv ipaddr {BOARD_IP} ; setenv serverip {SRV_IP}", 4, save)
 
@@ -343,12 +419,31 @@ def serial_load(sess):
         except: pass
         return False
 
+    # Optional third TFTP: a second guest's raw ELF for the `dual` build (see
+    # the ZADDR block at the top of this file). Deliberately AFTER the kernel,
+    # so a failure here cannot cost us the link-warming ordering above, and
+    # BEFORE bootelf, so the image is in DRAM by the time the hypervisor's
+    # CPU0-side copy-in runs.
+    #
+    # A failure here is logged as loudly as a required-file failure but does NOT
+    # abort the boot, unlike the DTB and the kernel. Those two are needed for
+    # ANY boot; this one is an extra. Turning "the optional second guest didn't
+    # transfer" into "the board is stuck in U-Boot" would be a worse outcome
+    # than booting FreeBSD normally with the second guest absent — which is a
+    # state the dual build already handles correctly and visibly (zstage
+    # breadcrumb state 2, and a later `zboot` failing with 0xBAD1).
+    zguest_ok = None
+    if ZGUEST_ELF:
+        zguest_ok = _stage_zguest(tftp_retry)
+
     # flip autostart ON so bootelf actually JUMPS to the loaded HV entry
     ucmd(fd, "setenv autostart yes", 4, save)
     slog(f"  [serial] loady {HYP_ELF} → staging 0x{STAGE:x} + bootelf -p (autostart yes)")
     ok, msg = L.do_loady_and_go(fd, save, HYP_ELF, addr=STAGE,
                                  exec_cmd=f"bootelf -p 0x{STAGE:x}")
     slog(f"  [serial] loady/bootelf: {msg}")
+    if zguest_ok is False:
+        slog("  [serial] ⚠ напоминание: 2-й гость НЕ загружен — `zboot` даст 0xBAD1")
     try: os.close(fd)
     except: pass
     return ok
@@ -557,13 +652,26 @@ def main():
     ap.add_argument("--interval", type=float, default=10, help="poll interval seconds (default 10)")
     ap.add_argument("--hang-samples", type=int, default=4,
                     help="frozen samples before hang verdict (default 4)")
+    ap.add_argument("--zguest", metavar="ELF", default=None,
+                    help="also TFTP this raw guest ELF to 0x%x for the `dual` "
+                         "hypervisor build's second guest on CPU3; the HV "
+                         "copies it into that guest's own slice before any "
+                         "guest runs, then `zboot` over EMAC starts it. "
+                         "Requires a `dual` HYP_ELF — harmless but useless "
+                         "otherwise." % ZADDR)
     args = ap.parse_args()
+
+    if args.zguest:
+        global ZGUEST_ELF
+        ZGUEST_ELF = os.path.abspath(args.zguest)
 
     slog(f"=== chimpd старт (once={args.once} no-reset={args.no_reset} "
          f"monitor-only={args.monitor_only} interval={args.interval}s "
          f"hang-samples={args.hang_samples}) ===")
     slog(f"    HYP_ELF={HYP_ELF}")
     slog(f"    kernel={KERNEL}  dtb={DTB}")
+    if ZGUEST_ELF:
+        slog(f"    zguest={ZGUEST_ELF} → 0x{ZADDR:x} (2-й гость на CPU3)")
 
     # graceful shutdown
     shutting_down = [False]

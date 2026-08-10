@@ -82,6 +82,24 @@
  * for a real Zephyr image; nothing about that code path is bypassed or
  * special-cased for this test.
  *
+ * TWO STAGING ROUTES, ONE BINARY (added with the bulk loader, zstage.c)
+ * --------------------------------------------------------------------
+ * Staging by QEMU's generic loader stands in for an operator writing the image
+ * into DRAM, which on real hardware originally meant dbgmon's single-word `w`
+ * command -- fine for this trivial payload's 144 meaningful bytes, hopeless for
+ * a real image. The real mechanism is now a third TFTP from U-Boot into a
+ * low-DRAM landing window (ZSTAGE_LOW_PA) plus a CPU0-side copy into
+ * ZG3_ELF_STAGE_PA before any guest runs -- see zstage.h.
+ *
+ * This target calls that copy-in unconditionally, in the same position
+ * main_dbg.c does, so ONE binary exercises both routes and dual-qemu-ci.sh
+ * asserts each in its own pass with identical criteria: load the payload at
+ * ZSTAGE_LOW_PA and the copy-in is what puts it where zload2 will find it;
+ * load it at ZG3_ELF_STAGE_PA and the copy-in finds garbage at the landing
+ * window, copies nothing, and the directly-staged image is untouched. The
+ * second pass is therefore a genuine regression guard on the original Step 1
+ * route, not a duplicate of the first.
+ *
  * ============================================================================
  * -m 2048 IS REQUIRED (see dual-qemu-ci.sh)
  * ============================================================================
@@ -98,6 +116,7 @@
 #include "gic_timer_qemu.h"
 #include "guest.h"
 #include "zguest_cpu3.h"
+#include "zstage.h"
 
 /* smp.c's own "ISOLATION TEST flag" -- see main_dual_qemu.c (Step 0) for the
  * full rationale; reused verbatim here for the same reason: CPU1's
@@ -135,6 +154,25 @@ main(void)
 	 * under QEMU. smp.c's own existing runtime switch, unmodified. */
 	dbg_core_enable = 0;
 	pl011_puts("HV: dbg_core_enable=0 (CPU1 debug-core MMIO skipped under QEMU -- smp.c unmodified)\n");
+
+	/* Dual-guest bulk loader (zstage.h), the REAL one main_dbg.c calls, in
+	 * the REAL position: before smp_init() brings CPU3 up and before any
+	 * guest runs. It moves a raw guest ELF from the low-DRAM landing window
+	 * that U-Boot TFTPs into (ZSTAGE_LOW_PA) to the staging address
+	 * zload2_parse_and_place() reads (ZG3_ELF_STAGE_PA).
+	 *
+	 * This target now exercises BOTH staging routes from one binary, which
+	 * is what lets dual-qemu-ci.sh assert them in two passes with identical
+	 * criteria:
+	 *   - payload loaded at ZSTAGE_LOW_PA  -> this call finds it and copies
+	 *     it, proving the whole new bulk-loader chain;
+	 *   - payload loaded at ZG3_ELF_STAGE_PA (the original Step 1 route) ->
+	 *     this call finds DRAM garbage at the landing window, copies
+	 *     nothing, and the directly-staged image is still there untouched.
+	 * Copying nothing is deliberately not an error -- see zstage.h. */
+	pl011_puts("HV: zguest_stage_copyin() (zstage.c) -- move a staged guest ELF "
+	           "from the low-DRAM TFTP landing window into CPU3's slice\n");
+	zguest_stage_copyin();
 
 	pl011_puts("HV: calling the REAL smp_init() (smp.c, unmodified) -- PSCI CPU_ON for cores 1..3\n");
 	smp_init();

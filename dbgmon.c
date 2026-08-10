@@ -737,6 +737,8 @@ static void cmd_help(void)
 	cputs("  bmc <verb> ...     software-BMC mgmt plane (bmc help)\r\n");
 	cputs("  hold               arm pause-before-guest-entry (takes effect NEXT warm reset)\r\n");
 	cputs("  release            release a currently-held pause-before-guest-entry\r\n");
+	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
+	cputs("  zunhalt            re-arm CPU3 after a failed zboot (0xBAD1/0xBAD2), no reload\r\n");
 	cputs("  h | ?              this help\r\n");
 }
 
@@ -995,6 +997,30 @@ static void exec_line(char *line, struct el2_frame *frame)
 			cputs("zboot: CPU3 start requested\r\n");
 		} else {
 			cputs("zboot: not built with dual-guest support\r\n");
+		}
+		return;
+	}
+	if (streq(cmd, "zunhalt")) {
+		/* Release CPU3 from the halt it entered after a FAILED `zboot`
+		 * (breadcrumb 0xBAD1 = image would not parse/place, 0xBAD2 =
+		 * stage-2 isolation self-check failed), back to the parked state
+		 * so a corrected image can be staged and `zboot` retried without
+		 * reloading the whole board.
+		 *
+		 * This does NOT weaken the halt-loud safety property -- CPU3
+		 * still stops dead and publishes why, and only a human who has
+		 * read that breadcrumb can release it. See zguest_cpu3.h's
+		 * zguest_cpu3_rearm_set() comment for the full argument, and note
+		 * that re-arming does not fix whatever caused the failure: the
+		 * same image will fail the same way. Weak-guarded exactly like
+		 * `zboot` above. */
+		extern void zguest_cpu3_rearm_set(void) __attribute__((weak));
+		if (zguest_cpu3_rearm_set) {
+			zguest_cpu3_rearm_set();
+			cputs("zunhalt: CPU3 re-arm requested "
+			      "(no-op unless halted)\r\n");
+		} else {
+			cputs("zunhalt: not built with dual-guest support\r\n");
 		}
 		return;
 	}
