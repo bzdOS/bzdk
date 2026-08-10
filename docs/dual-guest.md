@@ -9,9 +9,11 @@
 | CPU0 and CPU3 run **genuinely concurrently** under QEMU (not sequentially) | ✅ | `dual-qemu-ci.sh`, real hand-built ELF through the real `zguest_cpu3`/`zload2` path, 10/10 — commit `fc20b63` |
 | **Real Zephyr** boots concurrently under QEMU | ✅ | `dual-zephyr-qemu-ci.sh`, real banner + heartbeats via channel-1 vconsole, 10/10 — commit `779153d` (needed a new `bpi_m64_hv_dual` Zephyr board port, `sram0` moved to `0xBE000000`) |
 | CPU3 runs **genuinely concurrently with FreeBSD on the real board** | ✅ **confirmed 2026-08-10** | see below |
-| **Real Zephyr** on CPU3 on the real board | ❌ **not attempted** — needs a bulk loader that doesn't exist yet | see "What's still open" |
+| **Real Zephyr** on CPU3 on the real board | ✅ **confirmed 2026-08-10** | see "Real Zephyr on the real board" below |
+| A real guest image can be **loaded** onto the board at all (bulk loader) | ✅ **confirmed 2026-08-10** | `zstage.c` + `chimpd --zguest`, see below |
+| A failed `zboot` can be **retried** without a board reload (`zunhalt`) | ⚠️ **partly** — re-arm works, re-arm→successful-boot does NOT | see "zunhalt: what is and isn't proven" |
 
-None of these five rows are interchangeable — "the mechanism exists" is not "it boots," and "boots under QEMU" is not "boots on the board." This project has burned time before on reports that blurred exactly this kind of distinction (see `zephyr-guest.md`'s own header note).
+None of these rows are interchangeable — "the mechanism exists" is not "it boots," and "boots under QEMU" is not "boots on the board." This project has burned time before on reports that blurred exactly this kind of distinction (see `zephyr-guest.md`'s own header note). The `⚠️` row is deliberately not rounded up to ✅.
 
 ## Confirmed on real hardware (2026-08-10)
 
@@ -36,9 +38,143 @@ counter sample 2: 0x13b84cc8 (330845384)
 
 Board restored to the normal `dbg` configuration immediately afterward (two hard resets in total during this test — once to clear CPU3's permanent halt-on-failure, once to return to plain FreeBSD; both needed the standard `fsck_ffs -y` + `netif restart` + `sshd start` recovery this project has needed every time a running guest gets an uncooperative `power reset`). Confirmed recovered: `ssh` answers, root `rw`, `fsck` found nothing outstanding on the final check.
 
+## The bulk loader (2026-08-10)
+
+Open item 1 below — "a real bulk loader for staging a full guest image" — is now
+closed. The route deliberately avoids the debug protocol entirely: `chimpd`
+already TFTPs the FreeBSD kernel and the DTB from U-Boot before jumping into the
+hypervisor, so a guest image is a **third file** through machinery that already
+works. `chimpd --zguest <elf>` publishes it into the TFTP root and fetches it to
+`ZSTAGE_LOW_PA` (`0x4E000000`); `zstage.c`, called from `main_dbg.c` on CPU0
+**before `smp_init()` and before `kload_enter()`**, copies it into the second
+guest's own slice. See `zstage.h` for why it does not TFTP straight to
+`0xBF000000` (U-Boot relocates itself to the top of DRAM) and why the position of
+the copy is load-bearing rather than stylistic (the landing window is inside
+FreeBSD's own gigabyte).
+
+Confirmed live, first attempt, with the real Zephyr image:
+
+```
+ZSTAGE breadcrumb @0x5007A000:  state=4 (copied OK)  span=36924  copied=36924  dest_pa=0xBF000000
+```
+
+`span` is exactly `0x1000 + 0x803c` — the ELF header, the program headers, and
+the single `PT_LOAD`'s file content, out of a 481,296-byte file. Both numbers fit
+the 16 MiB window, so excluding the section headers and `.debug_*` is a 13×
+efficiency win here rather than a correctness save; the shape it avoids is
+nonetheless exactly what real images look like.
+
+## Real Zephyr on the real board (2026-08-10)
+
+`zboot` over EMAC, then read back Zephyr's own channel-1 console ring:
+
+```
+*** Booting Zephyr OS build v4.4.1 ***
+bzdOS/Zephyr: hello from EL1 (board: bpi_m64_hv_dual)
+heartbeat 0 ... heartbeat 41   (still climbing, 60 bytes / 10 s, steady)
+```
+
+— while FreeBSD on CPU0 was simultaneously healthy: `ssh` responsive, root
+mounted rw, a 384 MB `dd` off `vtbd0p3` at ~4.2 MB/s under load 2.00, and zero
+error lines in `dmesg`. `gr` (which `el2_exc.c` now gates to `smp_cpu_id() == 0`)
+still returned a real FreeBSD frame — every register a `ffff…` kernel KVA, EL1
+`spsr`, real `esr`/`far` — proving CPU3's concurrent activity does not pollute
+the diagnostic state FreeBSD-side tooling depends on.
+`stage2_zephyr_isolation_selfcheck()` passed on every boot (`ISOL` flags 1/1).
+
+**One honest caveat, stated because it happened.** Across the dual-guest boots
+this session, one was fully healthy as described above, and a *different* one
+showed FreeBSD wedged: 451 k stage-2 console faults/second with **zero** console
+bytes produced — i.e. the guest spinning on a UART register and emitting nothing
+— and the guest's network gone, while Zephyr on CPU3 stayed perfectly healthy
+(2 faults per byte, output flowing). That boot was the abnormal "ghost image"
+configuration described below, which the fix in this same change now makes
+impossible, so the two cannot be causally linked from the evidence available.
+It is recorded here rather than dropped: **"FreeBSD is unaffected by the second
+guest" is supported by the healthy boots, not established as a general
+property.** A soak run (see `docs/soak-and-breakglass.md`) is what would settle
+it.
+
+## The ghost-image bug, found on hardware and fixed
+
+A warm reset **preserves DRAM**, and `halt -p` on the guest goes PSCI
+`SYSTEM_OFF` → the HV's own clean warm reset. So the previous boot's copied image
+is still sitting at `ZG3_ELF_STAGE_PA` when the next boot starts.
+
+Observed live: an image was staged that `zstage_span()` correctly rejected
+(breadcrumb `state=2`, `span=0`, `copied=0`) — and `zboot` **booted a guest
+anyway**, reaching state 3, because `zload2_parse_and_place()` found the
+*previous* boot's perfectly valid Zephyr image at that address. Nothing anywhere
+reported a problem. An operator whose TFTP silently failed, or who forgot
+`--zguest`, would have booted the old image with every visible indicator
+agreeing that all was well — the breadcrumb said "no valid image staged", the
+guest ran regardless, and the reassuring reading won.
+
+Fixed: when a boot stages no usable image, `zstage_copy_to()` now zeroes the
+destination's header region (`zstage_invalidate_dest()`), so nothing bootable can
+survive from a previous boot. Confirmed live — `invalidated=4096`, and `zboot`
+then correctly reports `0xBAD1` instead of booting a ghost.
+
+This makes staging *directly* at `ZG3_ELF_STAGE_PA` a permanently unsupported
+route, which is why `dual-qemu-ci.sh`'s and `dual-zephyr-qemu-ci.sh`'s second
+pass now asserts that a destination-only image is **refused** rather than that it
+works. Hand-staging over EMAC after boot is unaffected: the copy-in runs during
+HV init, long before `dbgmon` exists to write anything.
+
+## zunhalt: what is and isn't proven
+
+**Proven on hardware.** `zboot` while CPU3 is halted is fully inert; `zunhalt`
+returns CPU3 to an *observable* parked state with `attempts` unchanged,
+`rearms` incremented, and `last_fail` sticky:
+
+```
+after zboot #1   state=0xbad1  attempts=1  last_fail=0xbad1  rearms=0
+after zboot #2   state=0xbad1  attempts=1  last_fail=0xbad1  rearms=0   (inert)
+after zunhalt    state=0x1     attempts=1  last_fail=0xbad1  rearms=1   (parked)
+```
+
+Two real bugs were found getting there, both only visible on hardware:
+
+1. The halt loop originally waited on `wfi`. CPU3 takes **no interrupts at all**
+   in this design, and `sev` (which `zguest_cpu3_rearm_set()` sends) wakes only
+   `wfe` — so it was a permanent sleep. `zunhalt` was acknowledged over EMAC and
+   CPU3 slept through it, `rearms` stuck at 0 across repeated attempts.
+2. A `zboot` issued *while* halted stayed latched and fired the instant the
+   re-arm released the core, so `zunhalt` alone silently started an attempt and
+   the parked state could never be observed at all. The request is now discarded
+   on re-arm.
+
+**NOT proven.** After a re-arm, a `zboot` with a freshly hand-staged trivial
+payload reached `kload_enter` — `state=3`, `attempts=2`, `entry_pa=0xBE000000`,
+`zload2` breadcrumb clean (`elf_valid=1`, `bytes_copied=24`, `fail_reason=0`),
+isolation self-check passed, and the placed bytes at `0xBE000000` verified
+byte-for-byte against `objdump` — and **the payload never executed**: its counter
+at `0xBE000100` was static across repeated samples, with zero absorbed MMIO
+faults, zero channel-1 faults and no exception recorded. Note that `state=3` is
+written *before* `kload_enter()`, so it means "about to enter", never "running".
+
+The same firmware boots the real Zephyr image correctly on a **first** attempt
+(verified immediately afterwards), so the suspicion is narrowed to the
+second-trip-through-the-loop path specifically. Cause not identified; not chased
+further this pass. So: **`zunhalt` gets you back to parked, but a retry is not
+yet known to produce a working guest.** A failed `zboot` should still be treated
+as needing a reload until this is understood.
+
 ## What's still open
 
-1. **A real bulk loader for staging a full guest image over EMAC.** `zguest_cpu3.h` flagged this as out of scope from the start; this test confirms exactly why it's needed — the manual per-word technique used here only works because the Step-1 trivial payload's real content is 144 bytes. A real Zephyr image (or anything bigger) needs either a proper bulk-write extension to the debug protocol, or reusing U-Boot's own `tftpboot` for a *second* image before `bootelf` jumps into the HV (chimpd's own flow already does exactly this for the DTB and the FreeBSD kernel — extending it to stage a third file at `ZG3_ELF_STAGE_PA` is probably the more natural fix, since the infrastructure already exists for two files).
-2. **Real Zephyr, on the real board, concurrently with FreeBSD** — blocked purely on (1); the mechanism itself is proven both under QEMU (`dual-zephyr-qemu-ci.sh`) and on hardware (this test, with a stand-in payload).
-3. **CPU3's halt-on-failure has no re-arm path.** A `zunhalt` (or similar) dbgmon command that resets `zephyr_cpu3_run()`'s internal state and re-enters the wfe-poll loop, without a full board reload, would make iterating on this much cheaper — not implemented, not required for this milestone's own DoD.
-4. **Phase 2** (repurposing CPU1/CPU2 for further guests) remains explicitly out of scope, per the original architecture plan — CPU1's unconditional watchdog-kick is still this project's only automatic crash-recovery path.
+1. ~~A real bulk loader~~ — **done**, see above.
+2. ~~Real Zephyr, on the real board, concurrently with FreeBSD~~ — **done**, see
+   above.
+3. **`zunhalt` re-arm → successful boot.** The re-arm itself works; the retry
+   reaching a running guest does not. Precise evidence above — this is the one
+   concrete, reproducible-looking defect left in this feature.
+4. **Whether the second guest can destabilise FreeBSD.** One boot this session
+   showed FreeBSD wedged spinning on its console while Zephyr stayed healthy. Not
+   attributable from the evidence, not reproduced on the healthy boots. Needs a
+   soak run rather than more single-shot tests.
+5. **Phase 2** (repurposing CPU1/CPU2 for further guests) remains out of scope
+   here — CPU1's unconditional watchdog-kick is still this project's only
+   automatic crash-recovery path. It now has its own design document,
+   `docs/phase2-all-cores.md`, which also corrects an assumption in this file:
+   the *first* blocker is not CPU1's watchdog but the single-instance module
+   state in `gic_timer.c`/`vgic.c`.

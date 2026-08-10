@@ -124,25 +124,37 @@ if ! "${CROSS}readelf" -h "$PAYLOAD_ELF" 2>/dev/null | grep -q "0xbe000000"; the
 fi
 
 # ---- 3. run it, TWICE, once per staging route -------------------------------
-# Both passes use the SAME firmware binary and the SAME assertions. The only
-# difference is where the payload is placed:
+# Both passes use the SAME firmware binary. What differs is where the payload is
+# placed -- and, because of that, what the correct outcome IS: pass A must
+# succeed, pass B must be refused.
 #
 #   Pass A (LOW_ADDR)   -- the real bulk-loader chain: the image lands where
 #                          U-Boot's third TFTP puts it, and zstage.c's
 #                          copy-in is the ONLY thing that can move it to where
 #                          zload2_parse_and_place() reads. If the copy-in is
 #                          broken or mispositioned, CPU3's counter never moves.
-#   Pass B (STAGE_ADDR) -- the original Step 1 route (commit fc20b63), staged
-#                          directly. This is a regression guard: it proves the
-#                          copy-in finding nothing at the landing window is a
-#                          harmless no-op rather than something that clobbers
-#                          an already-staged image.
+#   Pass B (STAGE_ADDR) -- payload staged DIRECTLY at the destination, which
+#                          was the original Step 1 route (commit fc20b63) and
+#                          is deliberately NO LONGER a supported one. CPU3 must
+#                          now FAIL, because a boot that stages no image at the
+#                          landing window actively zeroes the destination
+#                          header. That wipe exists because a warm reset
+#                          preserves DRAM, so the previous boot's image would
+#                          otherwise still be there and `zboot` would silently
+#                          boot a ghost -- observed live on 2026-08-10, see
+#                          zstage_invalidate_dest() in zstage.c. Asserting the
+#                          FAILURE here is what keeps that wipe honest; a pass
+#                          B that "worked" would mean the ghost is bootable
+#                          again.
 #
 # Running A first is deliberate: it is the new, unproven path, and a failure
 # there should not be masked by B passing.
+# $3: "concurrent" = both cores must advance; "wiped" = CPU3 must NOT advance,
+#     proving the stale-image wipe.
 run_pass() {
     pass_name=$1
     load_addr=$2
+    expect=$3
 
     echo "dual-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, payload at $load_addr (timeout ${TIMEOUT}s) ..."
     OUT=$(timeout "$TIMEOUT" "$QEMU" \
@@ -151,9 +163,19 @@ run_pass() {
             -kernel "$ELF" \
             -device "loader,file=$PAYLOAD_ELF,addr=$load_addr,force-raw=on" 2>&1)
 
-    if echo "$OUT" | grep -qiE "DUAL-QEMU-CI2: FAIL|DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort"; then
+    # A firmware FAIL line is fatal for the "concurrent" expectation but is the
+    # EXPECTED outcome for "wiped" -- there, the only acceptable FAIL is
+    # precisely "cpu3 did not advance", and a fault/panic still is not.
+    if echo "$OUT" | grep -qiE "DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort"; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — fault/panic in output:"
+        echo "$OUT" | grep -iE "DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort" | head
+        echo "dual-qemu-ci: full output:"
+        echo "$OUT"
+        return 1
+    fi
+    if [ "$expect" = "concurrent" ] && echo "$OUT" | grep -qi "DUAL-QEMU-CI2: FAIL"; then
         echo "dual-qemu-ci: FAIL [$pass_name] — error line in output:"
-        echo "$OUT" | grep -iE "DUAL-QEMU-CI2: FAIL|DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort" | head
+        echo "$OUT" | grep -i "DUAL-QEMU-CI2: FAIL" | head
         echo "dual-qemu-ci: full output:"
         echo "$OUT"
         return 1
@@ -183,6 +205,22 @@ run_pass() {
         echo "dual-qemu-ci: FAIL [$pass_name] — CPU0's guest_demo_el1 counter did not strictly increase ($CPU0_BEFORE -> $CPU0_AFTER)"
         return 1
     fi
+    if [ "$expect" = "wiped" ]; then
+        # CPU3 must have gone nowhere: the ghost image was zeroed, so
+        # zload2_parse_and_place() rejected it and CPU3 never entered a guest.
+        # CPU0 must still be perfectly healthy -- the wipe must not cost the
+        # first guest anything.
+        if [ "$CPU3_AFTER" -ne 0 ] || [ "$CPU3_BEFORE" -ne 0 ]; then
+            echo "dual-qemu-ci: FAIL [$pass_name] — CPU3 advanced ($CPU3_BEFORE -> $CPU3_AFTER) from an image staged only at the destination. The stale-image wipe did NOT happen, so a warm reset can boot a ghost image (see zstage_invalidate_dest())."
+            echo "dual-qemu-ci: full output:"
+            echo "$OUT"
+            return 1
+        fi
+        echo "dual-qemu-ci: [$pass_name] PASS — CPU3 correctly refused the destination-only image (0 -> 0) while CPU0 stayed healthy ($CPU0_BEFORE -> $CPU0_AFTER)"
+        echo "$OUT" | grep -E "smp_num_online|zguest_stage_copyin|baseline sample|final sample|DUAL-QEMU-CI2:"
+        return 0
+    fi
+
     if [ "$CPU3_AFTER" -le "$CPU3_BEFORE" ]; then
         echo "dual-qemu-ci: FAIL [$pass_name] — CPU3's zguest_cpu3/zload2 trivial-payload counter did not strictly increase ($CPU3_BEFORE -> $CPU3_AFTER)"
         echo "dual-qemu-ci: full output:"
@@ -201,8 +239,8 @@ run_pass() {
     return 0
 }
 
-run_pass "A: bulk-loader chain, payload at ZSTAGE_LOW_PA" "$LOW_ADDR" || exit 1
-run_pass "B: direct staging at ZG3_ELF_STAGE_PA (regression guard)" "$STAGE_ADDR" || exit 1
+run_pass "A: bulk-loader chain, payload at ZSTAGE_LOW_PA" "$LOW_ADDR" concurrent || exit 1
+run_pass "B: destination-only staging must be refused (stale-image wipe)" "$STAGE_ADDR" wiped || exit 1
 
-echo "dual-qemu-ci: PASS — both staging routes proved concurrent execution on CPU0+CPU3"
+echo "dual-qemu-ci: PASS — bulk-loader chain runs concurrently on CPU0+CPU3, and a destination-only (ghost) image is refused"
 exit 0

@@ -21,6 +21,7 @@
 #include "hv_addrmap.h"
 
 extern void *memcpy(void *dst, const void *src, unsigned long n);
+extern void *memset(void *dst, int c, unsigned long n);
 #else
 #include <string.h>
 #endif
@@ -160,11 +161,14 @@ zstage_span(const void *elf, uint64_t avail, uint64_t *span_out)
  *   [0] magic        0x5A535447 ("ZSTG")
  *   [1] state        1 = entered, 2 = no valid image staged (ordinary, not an
  *                    error — see zstage.h), 3 = image too large for the
- *                    destination window (refused, nothing written),
+ *                    destination window (refused, nothing copied),
  *                    4 = copied OK
  *   [2] span_lo      bytes zstage_span() asked for, low 32 bits
  *   [3] copied_lo    bytes actually memcpy'd, low 32 bits
  *   [4] dest_pa_lo   destination physical address, low 32 bits
+ *   [5] invalidated  bytes zeroed at dest_pa because this boot staged no
+ *                    usable image (see ZSTAGE_INVAL_BYTES below); 0 whenever
+ *                    an image WAS copied
  * Published as REAL zeros on entry before anything else runs, so "all zeros"
  * unambiguously means "this code never ran" rather than "it ran and found
  * nothing" — the distinction this project has been burned by before.
@@ -177,6 +181,7 @@ enum {
 	ZSTG_SPAN_IDX,
 	ZSTG_COPIED_IDX,
 	ZSTG_DEST_PA_IDX,
+	ZSTG_INVALIDATED_IDX,
 	ZSTG_NWORDS,
 };
 
@@ -210,6 +215,55 @@ zstage_cache_clean(uint64_t addr, uint64_t len)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* How much of the destination to zero when this boot staged no usable image.
+ * Only the ELF header (64 bytes) and the program-header table are ever read by
+ * zload2_parse_and_place() before it decides an image is valid, and this file's
+ * own ZSTAGE_MAX_PHDR bounds that table at 8 entries of 56 bytes; 4 KiB is
+ * comfortably more than either and still a trivial memset. */
+#define ZSTAGE_INVAL_BYTES 0x1000ul
+
+/* ==========================================================================
+ * WHY A FAILED/ABSENT STAGE MUST ACTIVELY WIPE THE DESTINATION
+ * ==========================================================================
+ * Found on real hardware, 2026-08-10, and it is a genuine trap rather than a
+ * theoretical one. A `halt -p` on the guest goes PSCI SYSTEM_OFF -> the HV's
+ * own clean WARM reset, and a warm reset PRESERVES DRAM. So the previous
+ * boot's copied image is still sitting at dest_pa, byte for byte, when the
+ * next boot starts.
+ *
+ * Observed consequence, live: an image was deliberately staged that
+ * zstage_span() correctly rejected (breadcrumb state 2, span 0, copied 0) --
+ * and `zboot` then booted a guest anyway, reaching state 3 ("entered guest"),
+ * because zload2_parse_and_place() found the PREVIOUS boot's perfectly valid
+ * Zephyr image at that address. Nothing anywhere reported a problem.
+ *
+ * That is exactly the class of confusion this project has repeatedly paid for:
+ * an operator whose TFTP silently failed, or who forgot --zguest, would boot
+ * the OLD image and have every visible indicator agree that all was well. The
+ * breadcrumb said "no valid image staged" and the guest ran regardless, so the
+ * two readings contradicted each other and the reassuring one won.
+ *
+ * So: if this boot did not put an image there, nothing bootable may remain
+ * there. zload2 then rejects the wiped header, `zboot` reports 0xBAD1, and the
+ * honest answer is the only available one.
+ *
+ * This cannot destroy a hand-staged image: zguest_stage_copyin() runs during
+ * HV init on CPU0, long before EMAC/dbgmon exists to write anything by hand
+ * (which is how the pre-bulk-loader milestone staged its payload).
+ * ========================================================================== */
+static void
+zstage_invalidate_dest(uint64_t dest_pa, uint64_t dest_limit)
+{
+	uint64_t n = ZSTAGE_INVAL_BYTES;
+
+	if (n > dest_limit)
+		n = dest_limit;
+
+	memset((void *)dest_pa, 0, (unsigned long)n);
+	zstage_cache_clean(dest_pa, n);
+	zstg_bc(ZSTG_INVALIDATED_IDX, (uint32_t)n);
+}
+
 uint64_t
 zstage_copy_to(uint64_t dest_pa, uint64_t dest_limit)
 {
@@ -224,12 +278,14 @@ zstage_copy_to(uint64_t dest_pa, uint64_t dest_limit)
 
 	if (!zstage_span((const void *)ZSTAGE_LOW_PA, ZSTAGE_LOW_SIZE, &span)) {
 		zstg_bc(ZSTG_STATE_IDX, 2u);
+		zstage_invalidate_dest(dest_pa, dest_limit);
 		return 0;
 	}
 	zstg_bc(ZSTG_SPAN_IDX, (uint32_t)span);
 
 	if (span > dest_limit) {
 		zstg_bc(ZSTG_STATE_IDX, 3u);
+		zstage_invalidate_dest(dest_pa, dest_limit);
 		return 0;
 	}
 

@@ -105,18 +105,43 @@ zg3_halt_until_rearm(uint32_t fail)
 	for (;;) {
 		if (g_zguest3_rearm_req) {
 			g_zguest3_rearm_req = 0u;
+			/* Discard any `zboot` issued WHILE halted. Without this,
+			 * such a request stays latched and fires the instant the
+			 * re-arm releases this core, so `zunhalt` alone silently
+			 * starts an attempt -- observed live on 2026-08-10: the
+			 * breadcrumb went straight from 0xBAD1 back to 0xBAD1
+			 * with attempts incremented, and the parked state could
+			 * never be seen at all. Two consequences, both bad: the
+			 * operator gets an attempt they did not ask for in that
+			 * moment, and the one state that proves the re-arm worked
+			 * is unobservable. Clearing it makes the two commands mean
+			 * exactly what they say -- `zunhalt` returns to waiting,
+			 * a separate `zboot` tries again. */
+			g_zguest3_start_req = 0u;
 			g_zg3_rearms++;
 			zg3_bc(ZG3_REARMS_IDX, g_zg3_rearms);
 			return;
 		}
-		/* wfi, not wfe: this is the halted state, and unlike the parked
-		 * loop below it must not busy-spin on every unrelated `sev` the
-		 * other three cores generate. zguest_cpu3_rearm_set()'s own
-		 * `sev` does not wake wfi, but any interrupt does, and the
-		 * flag is re-checked on each wake -- deliberately the cheapest
-		 * possible halt, since a halted core has nothing to be prompt
-		 * about. */
-		__asm__ volatile("wfi" ::: "memory");
+		/* wfe, NOT wfi -- and this is not a style choice.
+		 *
+		 * The first version of this loop used `wfi`, reasoning that a
+		 * halted core should sleep as cheaply as possible and would be
+		 * woken by "any interrupt". That was wrong, and it was caught
+		 * only on real hardware (2026-08-10): CPU3 takes NO interrupts
+		 * whatsoever in this design -- it never arms a timer, never
+		 * enables its GIC CPU interface, and runs with DAIF masked at
+		 * EL2 -- so there is nothing to wake a `wfi` here, ever. And
+		 * `sev`, which is what zguest_cpu3_rearm_set() sends, sets the
+		 * event register and so wakes `wfe` only. The result was a
+		 * permanent sleep: `zunhalt` was acknowledged over EMAC, the
+		 * flag was set, and CPU3 slept through it (breadcrumb rearms
+		 * stuck at 0 across repeated attempts).
+		 *
+		 * `wfe` is the mechanism the parked loop above already uses and
+		 * that `zboot` has proven works. Waking on an unrelated `sev`
+		 * from another core and re-checking one word costs nothing worth
+		 * counting on a core whose entire job is to wait. */
+		__asm__ volatile("wfe" ::: "memory");
 	}
 }
 
