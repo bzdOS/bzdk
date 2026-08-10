@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include "exceptions.h"
 #include "bmc.h"
+#include "vconsole.h"   /* VCONSOLE_BUF_BASE/SIZE -- never copy them, see below */
 
 /* ------------------------------------------------------------------ *
  * Console hooks — identical extern contract dbgmon.c/repl.c use. main_dbg.c
@@ -115,7 +116,20 @@ extern void axp803_read_health(struct axp803_health *out);
 #define BMC_SMP_BASE    0x50000900UL   /* smp.c      "SMP1": [1]=online [6..9]=heartbeats */
 #define BMC_UART_BASE   0x50000f00UL   /* vconsole.h "UART": [1]=total_bytes [2]=faults */
 #define BMC_FFV_BASE    0x50005800UL   /* firstfault.c "FF1V": [1]=count            */
-#define BMC_UART_RINGBUF 0x50000f10UL  /* vconsole.h captured-console byte buffer   */
+/* The captured-console byte buffer. Deliberately taken from vconsole.h rather
+ * than hard-coded here: this line USED to read 0x50000f10 -- the address the
+ * buffer had back when it sat immediately after the header -- and it was never
+ * updated when vconsole.h moved it to its own explicit, non-adjacent base
+ * (VCONSOLE_BUF_BASE, see that header for why). The result was that
+ * `bmc con read` spent months reading whatever now lives just past the header
+ * instead of the console ring, which is why `bzdctl.py console` reliably
+ * returned ancient boot text: it was showing the ring's OLD location. That
+ * misread cost the 2026-08-10 kldload investigation four passes, because the
+ * guest's panic message was in the real ring the whole time and this command
+ * could not see it. A private copy of another module's address is exactly how
+ * that drift happened, so there is no private copy any more. */
+#define BMC_UART_RINGBUF VCONSOLE_BUF_BASE
+#define BMC_UART_RINGCAP VCONSOLE_BUF_SIZE
 
 /* A64 THS (thermal sensor controller), 0x01C25000 — flat device-mapped, so an
  * EL2 read reaches it directly. THS0_DATA (@+0x80) holds the raw sample once
@@ -500,17 +514,43 @@ static void bmc_flag_set(const char *name, unsigned long val)
  * CONSOLE domain — the guest console over the vconsole rings.
  * ------------------------------------------------------------------ */
 
-/* `bmc con read [n]` — dump up to n bytes of the guest console CAPTURE ring as
- * raw ASCII (post-mortem log). Bounded; defaults to a screenful. */
+/* `bmc con read [n]` — dump the LAST n bytes of the guest console CAPTURE ring
+ * as raw ASCII (post-mortem log). Bounded; defaults to a screenful.
+ *
+ * THE TAIL, NOT THE HEAD, and this is the whole point of the command.
+ * The previous version started at offset 0 and walked forward, which is wrong
+ * twice over: once the ring has wrapped, offset 0 holds the OLDEST surviving
+ * bytes rather than the start of the log, and even before a wrap a default
+ * screenful showed the first n bytes instead of the most recent ones. Either
+ * way an operator asking "what did the guest say just before it died?" got the
+ * early boot banner. Combined with the wrong buffer address (see
+ * BMC_UART_RINGBUF above) that made this command actively misleading during the
+ * 2026-08-10 kldload investigation: the guest's panic backtrace was sitting in
+ * the ring and four passes in a row concluded "silent hang" instead.
+ *
+ * total_bytes is a running count that is NOT clamped to the buffer size, so it
+ * doubles as the write cursor: the newest byte is at (total-1) mod cap. Reading
+ * n bytes backwards from there covers both the wrapped and not-yet-wrapped
+ * cases with the same arithmetic, because when total <= cap the subtraction
+ * lands exactly at total-n. */
 static void bmc_con_read(uint32_t n)
 {
 	uint32_t total = rd32(BMC_UART_BASE + 4u);   /* UART word[1] = total_bytes */
-	uint32_t i;
-	if (n == 0 || n > total) n = total;
+	uint32_t cap = (uint32_t)BMC_UART_RINGCAP;
+	uint32_t avail = (total < cap) ? total : cap;
+	uint32_t start, i;
+
+	if (n == 0 || n > avail) n = avail;
 	if (n > 0x1000u) n = 0x1000u;                /* keep one service() bounded */
-	cputs("--- guest console ("); pdec(n); cputs("/"); pdec(total); cputs(" bytes) ---\r\n");
+
+	/* Offset of the first byte to print, walking n back from the cursor. */
+	start = (total - n) % cap;
+
+	cputs("--- guest console (last "); pdec(n); cputs(" of ");
+	pdec(avail); cputs(" held, "); pdec(total); cputs(" total) ---\r\n");
 	for (i = 0; i < n; i++) {
-		uint8_t b = *(volatile uint8_t *)(BMC_UART_RINGBUF + i);
+		uint32_t off = (start + i) % cap;
+		uint8_t b = *(volatile uint8_t *)(BMC_UART_RINGBUF + off);
 		console_putc((b == '\n' || (b >= 0x20 && b < 0x7f)) ? (int)b : '.');
 	}
 	cputs("\r\n--- end ---\r\n");

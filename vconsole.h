@@ -78,14 +78,32 @@
  *                                       starts on a clean word[4] boundary,
  *                                       matching the brief's "word[4]
  *                                       onward")
- *   bytes starting at word[4], i.e. VCONSOLE_RING_BASE + 0x10
- *   (= 0x50000f10) up to VCONSOLE_RING_BASE + 0x10 + VCONSOLE_BUF_SIZE
- *   (= 0x50001b10 for the default 3 KiB buffer): the captured console
- *   byte stream, oldest-to-newest within any given wrap, written 1 byte
- *   at a time and wrapping (overwriting from the start) once
- *   VCONSOLE_BUF_SIZE bytes have been captured. For early boot console
- *   output (a few KiB at most before the WDT fires), this will not wrap
- *   in practice.
+ * The captured byte stream does NOT follow the header. It lives at its own
+ * explicit base, VCONSOLE_BUF_BASE (0x50040000), for VCONSOLE_BUF_SIZE
+ * (0x10000, 64 KiB) — see that #define below for why the separation is
+ * deliberate. Bytes are written one at a time, oldest-to-newest within any
+ * given wrap, and wrap by overwriting from the start once the buffer is full.
+ * At 64 KiB it DOES wrap in practice: a full FreeBSD boot plus any running
+ * time exceeds it comfortably.
+ *
+ * This paragraph used to describe the buffer as starting at word[4], i.e.
+ * VCONSOLE_RING_BASE + 0x10 (0x50000f10), for a 3 KiB window ending at
+ * 0x50001b10 — the original layout. When the buffer moved, the #defines were
+ * updated and this prose was not, and bmc.c had copied the address out of the
+ * prose era into a private constant of its own. `bmc con read` then spent
+ * months dumping whatever now sits just past the header instead of the console,
+ * which is why `bzdctl.py console` always seemed to return ancient boot text.
+ * It cost the 2026-08-10 kldload investigation four passes: the guest's panic
+ * backtrace was in the real ring the whole time and the one command meant to
+ * show it could not. Keep prose and #define in step, and read the address from
+ * here rather than copying it.
+ *
+ * Because it wraps, a reader wanting the END of the log must treat
+ * total_bytes as the write cursor — the newest byte is at
+ * (total_bytes - 1) mod VCONSOLE_BUF_SIZE — and walk backwards. Starting at
+ * offset 0 and reading forward yields the oldest surviving bytes, not the
+ * beginning of the log. bmc_con_read() does this correctly; copy it rather
+ * than re-deriving it.
  *
  * Reading it back: `md.l 0x50000f00 4` gives magic/total_bytes/fault_count
  * /reserved; `md 0x50000f10 <n>` (byte-granularity memory dump) or
