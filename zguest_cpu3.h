@@ -78,9 +78,15 @@ void zephyr_cpu3_run(void);
  * cross-core-visible word, SMPEN cache coherency, no dc civac needed since
  * it is live/never-persisted state, matching e.g. vconsole.c's RX-ring
  * head/tail convention) to wake CPU3's wfe-poll loop and start the one-way
- * Zephyr boot sequence described above. Idempotent: calling it again once
- * CPU3 has already left the poll loop has no effect (the flag is only ever
- * consulted there). */
+ * Zephyr boot sequence described above.
+ *
+ * Calling it once CPU3 has entered a guest has no effect -- the flag is only
+ * ever consulted in the poll loop, which that core has left for good. Calling
+ * it while CPU3 sits in the post-failure halt also has no effect: the request
+ * is explicitly DISCARDED when `zunhalt` releases the halt (see the comment at
+ * that discard in zguest_cpu3.c for what went wrong when it was not), so
+ * re-arming never silently starts an attempt the operator did not ask for in
+ * that moment. */
 void zguest_cpu3_start_set(void);
 
 /* Set by dbgmon.c's `zunhalt` command: release CPU3 from the halt it entered

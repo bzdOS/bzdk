@@ -88,14 +88,20 @@ int zstage_span(const void *elf, uint64_t avail, uint64_t *span_out);
  * that will parse it sees the real bytes and not a stale line.
  *
  * `dest_limit` is the size of the destination window; the copy is refused
- * outright (nothing is written) if the image would not fit. Returns the number
- * of bytes copied, or 0 if nothing was copied — which is the ordinary,
- * expected result when no image was staged at all, and is deliberately NOT
- * treated as an error here: a `dual` build with no guest image is exactly the
- * `dual` build that has been running on the board all along. The failure
- * surfaces later, loudly, when `zboot` makes zload2_parse_and_place() reject
- * the empty buffer (breadcrumb 0xBAD1), which is the existing, already
- * hardware-exercised path.
+ * outright if the image would not fit. Returns the number of bytes copied, or
+ * 0 if nothing was copied — which is the ordinary, expected result when no
+ * image was staged at all, and is deliberately NOT treated as an error here: a
+ * `dual` build with no guest image is exactly the `dual` build that has been
+ * running on the board all along. The failure surfaces later, loudly, when
+ * `zboot` makes zload2_parse_and_place() reject the empty buffer (breadcrumb
+ * 0xBAD1), which is the existing, already hardware-exercised path.
+ *
+ * CRITICALLY, when nothing is copied the destination's header region is ZEROED
+ * rather than left alone. A warm reset preserves DRAM, so the previous boot's
+ * image would otherwise still be sitting there and `zboot` would silently boot
+ * a ghost — this was observed live on 2026-08-10 and is written up in full at
+ * zstage_invalidate_dest() in zstage.c. Read that before "optimising" the
+ * memset away.
  *
  * Breadcrumbs land in HVMAP_ZSTAGE_BC (see hv_addrmap.h). */
 uint64_t zstage_copy_to(uint64_t dest_pa, uint64_t dest_limit);

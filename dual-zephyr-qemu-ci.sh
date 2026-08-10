@@ -160,8 +160,8 @@ fi
 echo "dual-zephyr-qemu-ci: guest image $GUEST"
 
 # ---- 3. run it, TWICE, once per staging route -------------------------------
-# Same firmware binary, same assertions, only the payload's landing address
-# differs -- the arrangement dual-qemu-ci.sh (Step 1) documents in full.
+# Same firmware binary. The payload's landing address differs and so does the
+# correct outcome -- the arrangement dual-qemu-ci.sh (Step 1) documents in full.
 #
 #   Pass A (GUEST_LOW_ADDR)   -- the real bulk-loader chain, now with a REAL
 #                                Zephyr image: U-Boot's third TFTP lands it in
@@ -171,14 +171,22 @@ echo "dual-zephyr-qemu-ci: guest image $GUEST"
 #                                first test anywhere that exercises the span
 #                                computation against a realistically-shaped
 #                                image rather than a 144-byte payload.
-#   Pass B (GUEST_STAGE_ADDR) -- direct staging, the route commit 779153d
-#                                already proved. Regression guard: the copy-in
-#                                finding nothing at the landing window must be
-#                                a harmless no-op, not something that clobbers
-#                                an already-staged image.
+#   Pass B (GUEST_STAGE_ADDR) -- direct staging at the destination, the route
+#                                commit 779153d proved and which is
+#                                deliberately no longer supported. Zephyr must
+#                                now FAIL to start: a boot that stages no image
+#                                at the landing window actively zeroes the
+#                                destination header, because a warm reset
+#                                preserves DRAM and the previous boot's image
+#                                would otherwise still be bootable as a ghost
+#                                (observed live 2026-08-10, see
+#                                zstage_invalidate_dest() in zstage.c).
+# $3: "concurrent" = both guests must advance; "wiped" = Zephyr must NOT start,
+#     proving the stale-image wipe.
 run_pass() {
     pass_name=$1
     load_addr=$2
+    expect=$3
 
     echo "dual-zephyr-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, guest at $load_addr (timeout ${TIMEOUT}s) ..."
     OUT=$(timeout "$TIMEOUT" "$QEMU" \
@@ -187,9 +195,18 @@ run_pass() {
             -kernel "$ELF" \
             -device "loader,file=$GUEST,addr=$load_addr,force-raw=on" 2>&1)
 
-    if echo "$OUT" | grep -qiE "DUAL-ZEPHYR-QEMU-CI: FAIL|CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled"; then
+    # A firmware FAIL line is fatal for "concurrent" but is the EXPECTED outcome
+    # for "wiped"; a fault/panic is never acceptable either way.
+    if echo "$OUT" | grep -qiE "CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled"; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — fault/panic in output:"
+        echo "$OUT" | grep -iE "CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled" | head
+        echo "dual-zephyr-qemu-ci: full output:"
+        echo "$OUT"
+        return 1
+    fi
+    if [ "$expect" = "concurrent" ] && echo "$OUT" | grep -qi "DUAL-ZEPHYR-QEMU-CI: FAIL"; then
         echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — error line in output:"
-        echo "$OUT" | grep -iE "DUAL-ZEPHYR-QEMU-CI: FAIL|CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled" | head
+        echo "$OUT" | grep -i "DUAL-ZEPHYR-QEMU-CI: FAIL" | head
         echo "dual-zephyr-qemu-ci: full output:"
         echo "$OUT"
         return 1
@@ -219,6 +236,25 @@ run_pass() {
         echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — CPU0's guest_demo_el1 counter did not strictly increase ($CPU0_BEFORE -> $CPU0_AFTER)"
         return 1
     fi
+    if [ "$expect" = "wiped" ]; then
+        # Zephyr must have produced NOTHING: the ghost image was zeroed, so
+        # zload2_parse_and_place() rejected it and CPU3 never entered a guest.
+        # CPU0 must be unharmed by the wipe.
+        if [ "$CPU3_AFTER" -ne 0 ] || [ "$MARKER_SEEN" != "0" ]; then
+            echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — Zephyr produced console output ($CPU3_BEFORE -> $CPU3_AFTER, marker=$MARKER_SEEN) from an image staged only at the destination. The stale-image wipe did NOT happen, so a warm reset can boot a ghost image (see zstage_invalidate_dest())."
+            echo "dual-zephyr-qemu-ci: full output:"
+            echo "$OUT"
+            return 1
+        fi
+        if [ "$CPU0_AFTER" -le "$CPU0_BEFORE" ]; then
+            echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — CPU0 stalled ($CPU0_BEFORE -> $CPU0_AFTER); the wipe must not cost the first guest anything"
+            return 1
+        fi
+        echo "dual-zephyr-qemu-ci: [$pass_name] PASS — Zephyr correctly refused the destination-only image (0 bytes, no banner) while CPU0 stayed healthy ($CPU0_BEFORE -> $CPU0_AFTER)"
+        echo "$OUT" | grep -E "smp_num_online|zguest_stage_copyin|baseline sample|DUAL-ZEPHYR-QEMU-CI:"
+        return 0
+    fi
+
     if [ "$CPU3_AFTER" -le "$CPU3_BEFORE" ]; then
         echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — CPU3's real Zephyr console byte counter did not strictly increase ($CPU3_BEFORE -> $CPU3_AFTER)"
         echo "dual-zephyr-qemu-ci: full output:"
@@ -241,8 +277,8 @@ run_pass() {
     return 0
 }
 
-run_pass "A: bulk-loader chain, real Zephyr at ZSTAGE_LOW_PA" "$GUEST_LOW_ADDR" || exit 1
-run_pass "B: direct staging at ZG3_ELF_STAGE_PA (regression guard)" "$GUEST_STAGE_ADDR" || exit 1
+run_pass "A: bulk-loader chain, real Zephyr at ZSTAGE_LOW_PA" "$GUEST_LOW_ADDR" concurrent || exit 1
+run_pass "B: destination-only staging must be refused (stale-image wipe)" "$GUEST_STAGE_ADDR" wiped || exit 1
 
-echo "dual-zephyr-qemu-ci: PASS — real Zephyr ran concurrently with CPU0 via BOTH staging routes"
+echo "dual-zephyr-qemu-ci: PASS — real Zephyr ran concurrently with CPU0 via the bulk-loader chain, and a destination-only (ghost) image was refused"
 exit 0
