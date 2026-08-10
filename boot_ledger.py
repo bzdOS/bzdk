@@ -20,8 +20,12 @@ Storage (append-only, never rewritten so history is never lost):
     boot-ledger.jsonl   one JSON object per reload attempt
     boot-ledger.txt     human summary, recomputed from the jsonl after each add
 
+The same file also carries the OTHER purely-numeric v1 gate, "20 survived
+break-glass resets in a row" (see BREAKGLASS_SOURCE_PREFIX below and
+breakglass_cycle.py): one ledger, two gates, no parallel scoreboard.
+
 CLI:
-    python3 boot_ledger.py            # print the cumulative summary
+    python3 boot_ledger.py            # print the cumulative summary (both gates)
     python3 boot_ledger.py --tail 20  # last 20 entries
 """
 import json, os, sys, time
@@ -45,6 +49,27 @@ SUMMARY = os.path.join(HERE, "boot-ledger.txt")
 # than flattering. That is the safe direction, but it is still wrong, and the
 # summary says so rather than leaving a reader to trust a clean-looking ✅.
 SUPERVISOR_FIX_TS = 1785886000.0   # 2026-08-05, commit df611e3
+
+# ── the second gate that lives in this same ledger ─────────────────────────
+# ROADMAP §2 also wants "20 survived break-glass resets in a row, auto-
+# recovered". breakglass_cycle.py records one entry here per ATTEMPT (source
+# "breakglass"), for the same reason the boot streak lives here: one durable,
+# append-only file that accrues from real board work, not a parallel scoreboard
+# that has to be reconciled later.
+#
+# Those entries are deliberately EXCLUDED from stats() -- the clean-boot streak.
+# A break-glass attempt is not a reload attempt: the reload *inside* an attempt
+# is already recorded separately by reliable_load.py, so counting the attempt
+# too would double-count the good case and, worse, let a failed *recovery*
+# truncate the boot streak for something that was never a boot. Both gates are
+# then readable from one file without either polluting the other. (No historical
+# entry has a "breakglass" source, so this changes no existing number.)
+BREAKGLASS_SOURCE_PREFIX = "breakglass"
+BREAKGLASS_GATE = 20
+
+
+def _is_breakglass(rec):
+    return str(rec.get("source") or "").startswith(BREAKGLASS_SOURCE_PREFIX)
 
 
 def record(ok, isol_pass=None, sha=None, source="reliable_load", note=""):
@@ -77,7 +102,7 @@ def _read_all():
 
 
 def stats():
-    recs = _read_all()
+    recs = [r for r in _read_all() if not _is_breakglass(r)]
     total = len(recs)
     passes = sum(1 for r in recs if r.get("ok"))
     isol_ok = sum(1 for r in recs if r.get("isol_pass") == 1)
@@ -98,8 +123,30 @@ def stats():
                 last_ts=recs[-1]["ts"] if recs else None)
 
 
+def breakglass_stats():
+    """The "20 break-glass resets in a row" gate, from the same ledger.
+
+    Only entries written by breakglass_cycle.py (source "breakglass...") are
+    counted, so this number cannot be inflated by ordinary reloads."""
+    recs = [r for r in _read_all() if _is_breakglass(r)]
+    cur = best = 0
+    for r in recs:
+        if r.get("ok"):
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    passes = sum(1 for r in recs if r.get("ok"))
+    return dict(total=len(recs), passes=passes, fails=len(recs) - passes,
+                current_streak=cur, best_streak=best,
+                gate=BREAKGLASS_GATE,
+                first_ts=recs[0]["ts"] if recs else None,
+                last_ts=recs[-1]["ts"] if recs else None)
+
+
 def _rewrite_summary():
     s = stats()
+    bg = breakglass_stats()
     def when(ts):
         if not ts:
             return "n/a"
@@ -121,6 +168,20 @@ def _rewrite_summary():
         "",
         f"first entry       : {when(s['first_ts'])}",
         f"last entry        : {when(s['last_ts'])}",
+    ]
+    bg_gate = ("✅ CLOSED" if bg["current_streak"] >= BREAKGLASS_GATE else
+               f"{bg['current_streak']}/{BREAKGLASS_GATE}"
+               + (f" (need {BREAKGLASS_GATE - bg['current_streak']} more in a row)"
+                  if bg["total"] else " (no attempts recorded yet — run "
+                                       "breakglass_cycle.py)"))
+    lines += [
+        "",
+        f"break-glass gate  : {bg_gate}",
+        f"  attempts        : {bg['total']}  ({bg['passes']} recovered, "
+        f"{bg['fails']} failed)",
+        f"  best streak     : {bg['best_streak']}",
+        "  (source=breakglass entries only; excluded from the boot counts "
+        "above by design)",
     ]
     if s["pre_supervisor_fix"]:
         lines += [

@@ -409,5 +409,12 @@ if __name__ == "__main__":
                     help="after verify, auto-answer the guest's mountroot> "
                          "prompt over /dev/ttyACM0 so it reaches a real "
                          "shell with no manual console typing")
+    ap.add_argument("--ledger-source", default="reliable_load",
+                    help="tag this reload's boot_ledger entry with a source "
+                         "(e.g. soak72-reload, breakglass-recovery) so a long "
+                         "unattended run's boots are distinguishable from "
+                         "manual ones in boot-ledger.jsonl. The function "
+                         "already took this argument; only the CLI lacked it.")
     a = ap.parse_args()
-    sys.exit(0 if reliable_load(a.expect_vbk, a.cycles, a.boot_to_shell) else 1)
+    sys.exit(0 if reliable_load(a.expect_vbk, a.cycles, a.boot_to_shell,
+                                a.ledger_source) else 1)
