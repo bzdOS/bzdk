@@ -79,6 +79,7 @@ now exists.
 | USB nodes disabled | HV owns the OTG debug gadget | `.pre-usb-disable` |
 | `reserved-memory`: hv-image / hv-scratch / hv-fb | guest must not allocate over them | `.pre-resmem`, `.pre-fb`, `.pre-hvimage-2mb` |
 | virtio-mmio nodes (blk, net) | `vblk_emmc.c` / `vnet_emac.c` | `.pre-virtio`, `.pre-vnet` |
+| `gpu@1c40000` `status = "okay"` | Mali-400, so `lima.ko` can attach | `.pre-gpu-enable` |
 
 ## Why `/pmu` is disabled — the expensive one
 
@@ -113,3 +114,31 @@ invalidated a per-CPU list in a completely different node, and the failure did
 not surface at boot as anything worse than one line of dmesg — it surfaced weeks
 later as a panic in an unrelated operation. When trimming, grep the whole blob
 for anything that is per-CPU-indexed, not just the node being changed.
+
+## `gpu@1c40000` — enabled 2026-08-11, and what happened next
+
+The GPU node had been `disabled` since the DTB was first trimmed, which made
+`lima_pdev_probe()` provably dead code (`probe_test.c`'s header said as much).
+Enabling it with `fdtput -t s <dtb> /soc/gpu@1c40000 status okay` was the last DTB
+change needed for Mali, and it worked: with the `kldload` panic fixed and the DRM
+stack loaded (`dmabuf`, `drm`, `linuxkpi_video`, `lindebugfs`, `lima` — all
+`rc=0`, guest healthy), lima's probe matched and newbus created a real device:
+
+```
+lima_platform_driver0: <lima> mem 0x1c40000-0x1c4ffff irq 48,49,50,51,52,53,54 on simplebus0
+lima_platform_driver0: mmu gpmmu dte write test fail
+lima_platform_driver0: probe failed: -5
+```
+
+Attach then failed for a reason that is **not** a DTB problem: the guest reports
+`hw.clock.bus-gpu.enable_cnt: 0`. The GPU bus clock is never enabled, so lima's
+MMU directory-table-entry register write does not stick and its read-back test
+fails. The clocks are present and known to the CCU driver (`pll_gpu` 297 MHz,
+`gpu` 297 MHz, `bus-gpu` 300 MHz) — nobody turns them on, because
+`bsdOS/hal/lima/linux/clk.h` and `reset.h` were no-op stubs whose comments
+claimed "the actual clock enable happens via FDT overlays and the real CCU
+driver". FreeBSD's clk(9) has no such behaviour: a consumer must call
+`clk_get_by_ofw_name()` + `clk_enable()` itself.
+
+So the DTB side of Mali is done. The remaining work is in the bsdOS repo's
+linuxkpi shims, not here.
