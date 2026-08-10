@@ -194,6 +194,10 @@
 #include "timer.h"
 #include "vgic.h"
 #include "flightrec.h"
+#include "smp.h"   /* SMP_MAX_CPUS, smp_cpu_id() — Phase 2 P1 per-core state,
+                    * see the inventory comment above struct gt_percpu below.
+                    * Header-only (smp_cpu_id() is `static inline`): does not
+                    * pull in a new link dependency on smp.o. */
 
 /* ------------------------------------------------------------------ *
  * GIC-400 MMIO bases (see citation above) and the handful of registers
@@ -388,37 +392,134 @@ read_cntvct(void)
  * path must stay untouched; this only ever fires on a genuinely stuck mask. */
 #define CNTV_MASK_GRACE_TICKS 2u
 
-static uint32_t gt_cntv_el2_masked;     /* 1 = WE set IMASK, guest hasn't cleared */
-static uint32_t gt_cntv_masked_ticks;   /* EL2 ticks our mask has survived        */
-static uint32_t gt_cntv_rescues;        /* times we had to unmask it ourselves    */
+/* ------------------------------------------------------------------ *
+ * Per-core module state (Phase 2 step P1, docs/phase2-all-cores.md §1.6).
+ *
+ * STATE INVENTORY. Every mutable module-level variable this file had before
+ * this change, cited against the pre-P1 tree (line numbers as read by the
+ * pass that wrote docs/phase2-all-cores.md, confirmed unchanged here), and
+ * the per-core/global verdict for each:
+ *
+ *   gt_period_ticks    (gic_timer.c:496)  PER-CORE. CNTP_CVAL_EL0/CTL_EL0
+ *                       are banked per PE, so the period a core re-arms
+ *                       from is inherently that core's own fact.
+ *   gt_next_deadline    (gic_timer.c:497) PER-CORE, same reason — this is
+ *                       the software shadow of THIS core's banked CVAL.
+ *   gt_ticks            (gic_timer.c:498) PER-CORE: a count of ticks THIS
+ *                       core has handled.
+ *   gt_mismatches       (gic_timer.c:499) PER-CORE by the same logic. Note
+ *                       for whoever reads this next: it is dead weight
+ *                       either way — grepped before this change and nothing
+ *                       in this file has ever incremented it (only zeroed
+ *                       at init and read for the breadcrumb). Kept exactly
+ *                       as vestigial as it was found; this pass is a pure
+ *                       state-scoping change, not a logic fix.
+ *   gt_jitter           (gic_timer.c:500) PER-CORE: measures THIS core's
+ *                       own tick timing against timer_now().
+ *   irq_counter[160]    (gic_timer.c:505) PER-CORE. GICC_IAR is a banked,
+ *                       per-PE view (CLAUDE.md rule 4: "a read over the
+ *                       debug channel is serviced by CPU1 and tells you
+ *                       nothing about the guest's core") — the INTIDs
+ *                       counted here are "what THIS core's CPU interface
+ *                       handed THIS core", never a system-wide fact.
+ *   gt_cntv_el2_masked, (gic_timer.c:391-393) PER-CORE. CNTV_CTL_EL0 is
+ *   gt_cntv_masked_ticks,   banked per PE and belongs to whichever guest
+ *   gt_cntv_rescues         runs on THIS core — vtimer_mask_watchdog()'s own
+ *                       header comment above already made the argument:
+ *                       "the same read issued by the CPU1 debug core would
+ *                       report CPU1's bank and be worthless". That was
+ *                       already why this state is inherently per-core; P1
+ *                       just makes the storage match the argument.
+ *
+ * No global-only, and no "global but only ever touched by one core today"
+ * state was found among gic_timer.c's mutable module statics — every one of
+ * them shadows something the hardware itself banks per PE. All of it moves
+ * into struct gt_percpu below, one instance per core, indexed by
+ * smp_cpu_id() via gt_self().
+ *
+ * On CPU0 alone — every board target today; gic_timer_init()/gic_timer_irq()
+ * are called only from main_dbg.c's CPU0 boot path, grepped before this
+ * change — the index is always 0, so this is a pure storage-layout change
+ * with byte-identical behaviour: same values, same breadcrumbs, same IRQ
+ * handling, just addressed through g_gt[0] instead of file-scope statics.
+ * Cache-line-padded (64 B) exactly like smp.c's own per-core pattern
+ * (struct smp_percpu, smp.c:183-188), so a future second core taking this
+ * IRQ never shares a cache line with CPU0's copy.
+ *
+ * BREADCRUMB NOTE (hv_addrmap.h / the breadcrumb-window-hygiene discipline).
+ * GICT_BC_BASE (0x00018200) and IRQ_COUNTER_BC_BASE (0x00018300) stay
+ * SINGLE, file-scope windows — NOT split per core. Deliberate, not an
+ * oversight: nothing in the current tree ever calls gic_timer_init() or
+ * gic_timer_irq() from any core but CPU0 (see above), so there is exactly
+ * one writer today, and splitting the window now would be speculative
+ * complexity with no way to exercise or test it. Whichever later Phase-2
+ * step (P2b/P3+) actually arms this tick on a second core MUST give that
+ * core its own breadcrumb lane before doing so — allocated in
+ * hv_addrmap.h's _Static_assert chain like every other window, never
+ * squeezed into a neighbour's space — because at that point two cores
+ * really would interleave writes into these two windows. Flagged here, not
+ * fixed here: a lane for a caller that does not exist yet is exactly the
+ * kind of unused complexity this tree's breadcrumb history (hv_addrmap.h's
+ * own "lost six windows to a neighbour grown without slack" note) warns
+ * against.
+ * ------------------------------------------------------------------ */
+struct gt_percpu {
+	uint64_t period_ticks;
+	uint64_t next_deadline;
+	uint64_t ticks;
+	uint32_t mismatches;
+	struct jitter jitter;
+	uint32_t irq_counter[160];
+	uint32_t cntv_el2_masked;     /* 1 = WE set IMASK, guest hasn't cleared */
+	uint32_t cntv_masked_ticks;   /* EL2 ticks our mask has survived        */
+	uint32_t cntv_rescues;        /* times we had to unmask it ourselves    */
+} __attribute__((aligned(64)));
+
+static struct gt_percpu g_gt[SMP_MAX_CPUS];
+
+/* Defensive clamp only — MPIDR affinity0 on this SoC is architecturally
+ * 0..3 (SMP_MAX_CPUS==4, smp.h:42), so the out-of-range arm can never be hit
+ * on real hardware or under QEMU virt (single CPU => index 0). Guards the
+ * array the same way smp.c's own per-core accessors do (smp.c:420,
+ * smp.c:435: "if (cpu >= SMP_MAX_CPUS) return/skip") rather than trusting
+ * the invariant blindly inside an IRQ handler. */
+static inline struct gt_percpu *gt_self(void)
+{
+	uint32_t cpu = smp_cpu_id();
+
+	return &g_gt[(cpu < SMP_MAX_CPUS) ? cpu : 0u];
+}
 
 /* Called from the EL2 tick, on the guest's core, IRQ context. Bounded: a
- * couple of system-register accesses and at most one breadcrumb store. */
+ * couple of system-register accesses and at most one breadcrumb store.
+ * Takes the CALLING core's own gt_percpu slot (fetched once by the caller,
+ * gic_timer_irq()) — see the state-inventory comment above struct gt_percpu
+ * for why this trio is per-core: CNTV_CTL_EL0 is banked per PE. */
 static void
-vtimer_mask_watchdog(void)
+vtimer_mask_watchdog(struct gt_percpu *gt)
 {
 	uint32_t ctl;
 
-	if (!gt_cntv_el2_masked)
+	if (!gt->cntv_el2_masked)
 		return;                  /* nothing of ours outstanding */
 
 	ctl = read_cntv_ctl();
 	if (!(ctl & CNTV_CTL_IMASK)) {
 		/* Guest ISR ran and rewrote CNTV_CTL — the handshake worked. */
-		gt_cntv_el2_masked = 0;
-		gt_cntv_masked_ticks = 0;
+		gt->cntv_el2_masked = 0;
+		gt->cntv_masked_ticks = 0;
 		return;
 	}
 
-	if (++gt_cntv_masked_ticks < CNTV_MASK_GRACE_TICKS)
+	if (++gt->cntv_masked_ticks < CNTV_MASK_GRACE_TICKS)
 		return;
 
 	/* Our mask outlived the grace period: the guest never got the tick.
 	 * Undo our own write so CNTV can fire again. */
 	write_cntv_ctl(ctl & ~CNTV_CTL_IMASK);
-	gt_cntv_el2_masked = 0;
-	gt_cntv_masked_ticks = 0;
-	gt_cntv_rescues++;
+	gt->cntv_el2_masked = 0;
+	gt->cntv_masked_ticks = 0;
+	gt->cntv_rescues++;
 
 	/* Record it in the flight recorder and NOWHERE ELSE. This file's own
 	 * GICT breadcrumb window would be the obvious place, but confirmed live
@@ -451,13 +552,13 @@ vtimer_mask_watchdog(void)
 	 * Uses its OWN kind (FLTR_K_VTRESCUE) rather than tagging a bit inside
 	 * FLTR_K_TIMER's payload — see that enum's comment for the bug the first
 	 * attempt caused. */
-	if ((gt_cntv_rescues & 0xFFu) == 1u) {
+	if ((gt->cntv_rescues & 0xFFu) == 1u) {
 		uint64_t hcr_el2;
 		uint32_t gich_hcr = *(volatile uint32_t *)(0x01c84000UL);
 
 		__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr_el2));
 		flightrec_log(FLTR_K_VTRESCUE, ctl,
-		              ((uint64_t)gt_cntv_rescues << 32)
+		              ((uint64_t)gt->cntv_rescues << 32)
 		              | (uint64_t)((gich_hcr & 1u) << 1)
 		              | (uint64_t)((hcr_el2 >> 4) & 1u));
 	}
@@ -490,19 +591,18 @@ write_hcr_el2(uint64_t v)
 #define HCR_EL2_AMO (1ull << 5) /* physical SError routed to EL2 */
 
 /* ------------------------------------------------------------------ *
- * Module state - entirely private, no globals shared with other files
- * except through the accessor functions below.
+ * Module state: struct gt_percpu / g_gt[] / gt_self(), defined above (see
+ * the P1 state inventory just before vtimer_mask_watchdog()). Nothing left
+ * to declare here — kept as a section marker so a future reader who
+ * remembers this comment's old location still finds something.
  * ------------------------------------------------------------------ */
-static uint64_t gt_period_ticks;
-static uint64_t gt_next_deadline;
-static uint64_t gt_ticks;
-static uint32_t gt_mismatches;
-static struct jitter gt_jitter;
 
-/* INTID counter for interrupt storm diagnostics (internal task).
- * Track frequency of each interrupt ID entering gic_timer_irq().
- * Exposed via breadcrumb at 0x00018300+. */
-static uint32_t irq_counter[160] = {0};
+/* INTID counter for interrupt storm diagnostics (internal task). Lives in
+ * struct gt_percpu now (per-core — see the inventory above: GICC_IAR is
+ * banked per PE, so this was never really a global fact). This window still
+ * reports only the CALLING core's counts, which is byte-identical to before
+ * since only CPU0 ever calls gic_timer_irq() today (see the breadcrumb note
+ * above). Exposed via breadcrumb at 0x00018300+. */
 #define IRQ_COUNTER_BC_BASE 0x00018300UL
 
 /* Report to the shared jitter window (0x50000500) every this many ticks -
@@ -579,6 +679,7 @@ gic_timer_arm_preserving_cntvoff(uint32_t period_us)
 void
 gic_timer_init(uint32_t period_us)
 {
+	struct gt_percpu *gt = gt_self();
 	uint64_t freq = timer_freq();
 	uint64_t period_ticks;
 	uint64_t now;
@@ -608,10 +709,10 @@ gic_timer_init(uint32_t period_us)
 	if (period_ticks == 0)
 		period_ticks = 1;
 
-	gt_period_ticks = period_ticks;
-	gt_ticks = 0;
-	gt_mismatches = 0;
-	jitter_init(&gt_jitter, period_ticks);
+	gt->period_ticks = period_ticks;
+	gt->ticks = 0;
+	gt->mismatches = 0;
+	jitter_init(&gt->jitter, period_ticks);
 
 	/* --- GIC distributor -------------------------------------------- *
 	 * ROUTING FIX (v3): use INTID 30 (CNTP, non-secure physical timer),
@@ -644,8 +745,8 @@ gic_timer_init(uint32_t period_us)
 	/* gic_timer_irq()). CVAL is a FUTURE point (now + period); the timer  */
 	/* asserts (and CNTP_CTL.ISTATUS sets) when CNTPCT >= CVAL.            */
 	now = timer_now();
-	gt_next_deadline = now + period_ticks;
-	write_cntp_cval(gt_next_deadline);
+	gt->next_deadline = now + period_ticks;
+	write_cntp_cval(gt->next_deadline);
 	write_cntp_ctl(CNTP_CTL_ENABLE); /* ENABLE=1, IMASK=0 */
 
 	/* --- ROUTING FIX (v4): route physical IRQ to EL2 -------------------- *
@@ -694,7 +795,7 @@ gic_timer_init(uint32_t period_us)
 	gict_bc(10, GICC_CTLR);                         /* CPU-interface CTLR readback */
 	gict_bc(11, GICD_IGROUPR(GICD_WORD(TIMER_INTID))); /* IGROUPR0: bit30 => Grp1 */
 	gict_bc(12, (uint32_t)now);                     /* CNTPCT at arm time (lo) */
-	gict_bc(13, (uint32_t)gt_next_deadline);        /* CNTP_CVAL deadline (lo) */
+	gict_bc(13, (uint32_t)gt->next_deadline);       /* CNTP_CVAL deadline (lo) */
 	gict_bc(14, GICC_PMR);                          /* PMR readback (NS: ~0xf0) */
 	gict_bc(15, GICD_ISENABLER(GICD_WORD(TIMER_INTID))); /* ISENABLER0: bit30=1 */
 
@@ -726,7 +827,7 @@ gic_timer_init(uint32_t period_us)
 		uint32_t observed = 0;
 
 		for (i = 0; i < GT_POLL_MAX; i++) {
-			if (timer_now() >= gt_next_deadline) {
+			if (timer_now() >= gt->next_deadline) {
 				observed = 1;
 				break;
 			}
@@ -785,14 +886,19 @@ gic_timer_init(uint32_t period_us)
 void
 gic_timer_irq(struct el2_frame *frame)
 {
+	struct gt_percpu *gt = gt_self();
 	uint32_t iar = GICC_IAR;
 	uint32_t intid = GICC_IAR_INTID(iar);
 
 	(void)frame; /* not needed: we don't inspect/modify the trapped context */
 
-	/* Count this INTID for storm diagnostics */
+	/* Count this INTID for storm diagnostics. Per-core (see the state
+	 * inventory above struct gt_percpu): GICC_IAR is banked per PE, so this
+	 * is "what THIS core's CPU interface handed THIS core", not a global
+	 * fact — same byte-identical behaviour on CPU0 today, since gt is
+	 * g_gt[0] for as long as CPU0 is the only caller. */
 	if (intid < 160)
-		irq_counter[intid]++;
+		gt->irq_counter[intid]++;
 
 	if (intid >= GIC_SPURIOUS_MIN) {
 		/* 1020-1023: spurious, nothing pending for this CPU interface.
@@ -865,8 +971,8 @@ gic_timer_irq(struct el2_frame *frame)
 			 * comment) can undo it if the guest never does. Without this
 			 * one line, a single lost injection costs the guest its
 			 * timebase for the rest of the boot. */
-			gt_cntv_el2_masked = 1;
-			gt_cntv_masked_ticks = 0;
+			gt->cntv_el2_masked = 1;
+			gt->cntv_masked_ticks = 0;
 			GICC_EOIR = iar;
 			GICC_DIR  = iar;
 			vgic_inject_cntv();
@@ -930,15 +1036,15 @@ gic_timer_irq(struct el2_frame *frame)
 	}
 
 	/* Ours: sample jitter against the free-running physical counter. */
-	jitter_sample(&gt_jitter, timer_now());
+	jitter_sample(&gt->jitter, timer_now());
 
 	/* Re-arm the next interval from the *previous* deadline (not "now"),
 	 * so handler latency/runtime doesn't accumulate into the period.
 	 * Writing CVAL de-asserts the current timer output (CNTPCT < new CVAL
 	 * again) which is what clears the interrupt condition at the source;
 	 * the GICC_EOIR below then completes it at the GIC. */
-	gt_next_deadline += gt_period_ticks;
-	write_cntp_cval(gt_next_deadline);
+	gt->next_deadline += gt->period_ticks;
+	write_cntp_cval(gt->next_deadline);
 	/* Re-assert ENABLE=1, IMASK=0. Writing CVAL doesn't disturb CNTP_CTL,
 	 * but this is the one place a missed write would silently stop the
 	 * tick forever, so keep it explicit. */
@@ -947,31 +1053,36 @@ gic_timer_irq(struct el2_frame *frame)
 	GICC_EOIR = iar;
 	GICC_DIR = iar;
 
-	gt_ticks++;
+	gt->ticks++;
 
 	/* Undo our own CNTV mask if the guest never cleared it. Deliberately
 	 * placed on EVERY tick, not inside the REPORT_EVERY block below: the
 	 * whole point is a short, bounded recovery window, and REPORT_EVERY is
 	 * a diagnostics cadence, not a control-loop period. */
-	vtimer_mask_watchdog();
+	vtimer_mask_watchdog(gt);
 
-	if ((gt_ticks % REPORT_EVERY) == 0) {
-		jitter_report_bc(&gt_jitter);
+	if ((gt->ticks % REPORT_EVERY) == 0) {
+		jitter_report_bc(&gt->jitter);
 
-		gict_bc(1, (uint32_t)gt_ticks);
-		gict_bc(2, (uint32_t)(gt_ticks >> 32));
+		gict_bc(1, (uint32_t)gt->ticks);
+		gict_bc(2, (uint32_t)(gt->ticks >> 32));
 		gict_bc(3, iar);
-		gict_bc(5, gt_mismatches);
+		gict_bc(5, gt->mismatches);
 		gict_bc(7, read_cntp_ctl()); /* live timer state from IRQ ctx */
 
-		/* Storm diagnostics: find top storming INTID and dump to SRAM */
+		/* Storm diagnostics: find top storming INTID and dump to SRAM.
+		 * Per-core source data now (gt->irq_counter — see the inventory
+		 * above); the window itself stays a single global lane (see the
+		 * breadcrumb note above struct gt_percpu), so this still reports
+		 * only the calling core's counts, byte-identical to before while
+		 * CPU0 remains the sole caller. */
 		{
 			uint32_t max_intid = 0, max_count = 0;
 			uint32_t i;
 
 			for (i = 0; i < 160; i++) {
-				if (irq_counter[i] > max_count) {
-					max_count = irq_counter[i];
+				if (gt->irq_counter[i] > max_count) {
+					max_count = gt->irq_counter[i];
 					max_intid = i;
 				}
 			}
@@ -987,12 +1098,23 @@ gic_timer_irq(struct el2_frame *frame)
 uint64_t
 gic_timer_ticks(void)
 {
-	return gt_ticks;
+	/* Now per-core (see the state inventory above struct gt_percpu): returns
+	 * the CALLING core's own tick count. Grepped before this change — this
+	 * API has zero callers anywhere in the tree today, so there is no
+	 * existing caller whose behaviour could change; the natural semantics
+	 * for a genuinely per-core counter is "the core that asks gets its own
+	 * answer", which is also byte-identical to the old global on CPU0 (the
+	 * only core that ever ticks today). */
+	return gt_self()->ticks;
 }
 
 const struct jitter *
 gic_timer_jitter(void)
 {
-	return &gt_jitter;
+	/* Same per-core rule as gic_timer_ticks() just above. Returns a pointer
+	 * into the calling core's own g_gt[] slot — read-only, per the header's
+	 * existing contract ("do not call jitter_init/jitter_sample on it from
+	 * outside gic_timer.c"). */
+	return &gt_self()->jitter;
 }
 
