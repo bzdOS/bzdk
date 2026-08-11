@@ -967,6 +967,202 @@ stage2_isolation_selfcheck(void)
 	return (int)pass;
 }
 
+/* ------------------------------------------------------------------ *
+ * W^X self-check (ROADMAP v1 gate: "W^X на гостевых маппингах" — the last
+ * unchecked half of the isolation bullet; the other half, "HV вырезан из
+ * stage-2" / "гость пишет в HV-регион -> перехват", is stage2_isolation_
+ * selfcheck() above, already hardware-proven).
+ *
+ * WHAT THIS PROVES, EXACTLY: a general, exhaustive walk of every valid leaf
+ * this file's tables actually contain (not a sample of known addresses,
+ * unlike stage2_isolation_selfcheck() above) — for each one, is it
+ * simultaneously writable (S2AP write bit set) and executable (XN==0)?
+ *
+ * CURRENT MEASURED STATE (verified by this function and pinned board-free in
+ * test_stage2_tables.c's W^X section): every MMIO/device leaf this file ever
+ * builds is XN=1 (stage2_build_mmio_tables() passes xn=1 to every call, with
+ * no exception) — that half of W^X is real, permanent, and enforced by
+ * construction. Every guest-DRAM leaf, at every level this file can produce
+ * (the flat level-1 1 GiB block in stage2_init(), the level-2 blocks in
+ * stage2_build_dram_table(), and the level-3 pages in stage2_unmap_guest_
+ * vector()/stage2_map_guest_vector()), is S2AP=RW *and* XN=0 — writable and
+ * executable together. So this self-check WILL currently report violations
+ * > 0 on every real boot. That is an honest measurement, not a bug in this
+ * function or a regression to chase.
+ *
+ * WHY GUEST DRAM CANNOT SIMPLY BE FIXED HERE: stage2.c has no notion of the
+ * guest's own code/data split. That split lives in the guest ELF's program
+ * headers, which kload.c parses (kload_parse_elf()/kload_place_segments(),
+ * both of which run BEFORE stage2_init() in main_dbg.c, so the segment
+ * geometry — base/size/executable per PT_LOAD — is technically available in
+ * time). Inspecting the actual deployed kernel (readelf -lW on the TFTP'd
+ * ELF, done while investigating this gate item) shows a genuinely clean
+ * split — .text+.plt is R+E only, .rodata is R only, .data/.bss are RW only,
+ * no segment is both W and X — so a per-segment stage-2 refinement of the
+ * INITIAL kernel image is architecturally sound, not blocked by a messy ELF.
+ *
+ * But that refinement would only cover the kernel's initial boot-time image.
+ * FreeBSD's kldload path allocates NEW physical pages for every loaded
+ * kernel module from general free RAM *outside* that image and marks them
+ * executable on demand, at run time, with no hypercall or other channel that
+ * tells this hypervisor which page just became guest code. A static,
+ * boot-time-only split can only do one of two things to the REST of guest
+ * DRAM: leave it exactly as writable+executable as today (in which case the
+ * "fix" only narrows the initial kernel image and every kldload'd module is
+ * still sitting in a W+X page, unchanged), or mark it execute-never (in
+ * which case kldload — a real, previously hard-won, hardware-verified
+ * feature per project memory, "kldload hang SOLVED" — breaks outright, and
+ * nothing in this tree's QEMU CI boots a real FreeBSD guest that exercises
+ * kldload to catch that regression board-free). Neither is a genuine W^X
+ * close; the second is actively worse than today. That decision needs either
+ * a live guest-cooperative protocol (the guest tells the HV when a page
+ * becomes code) or a deliberate, hardware-verified acceptance of the kldload
+ * regression — this function does not make that call, and per this task's
+ * own instruction not to weaken a check (or, symmetrically, break the guest)
+ * just to force a pass, neither does the rest of this change. See
+ * docs/dma-bypass-stage2.md for this project's existing precedent of writing
+ * up exactly this kind of accepted, currently-open gap instead of forcing a
+ * close.
+ *
+ * Breadcrumbs (STG2 window 0x50000c00 — see the layout comment at the top of
+ * this file; this self-check's own block, added alongside ISOL's [14..18]):
+ *   [19] magic 0x5758434b ("WXCK")
+ *   [20] violations    total W+X leaf count found (leaves, not bytes)
+ *   [21] first_ipa_lo  low 32 bits of the first (lowest-IPA) violating
+ *        leaf's IPA — 0 if violations == 0
+ *   [22] pass          1 iff violations == 0 (informational; currently
+ *        always 0 on this build — see above, that is the honest state)
+ * ------------------------------------------------------------------ */
+
+/* A single leaf found to violate W^X: its IPA and the table level (1 = 1 GiB
+ * block, 2 = 2 MiB block, 3 = 4 KiB page) it was found at. Mirrors the shape
+ * test_stage2_tables.c's own s2_walk() already decodes per-address; this is
+ * the production counterpart that walks the raw tables directly instead of
+ * probing one IPA at a time. */
+struct stage2_wx_violation {
+	uint64_t ipa;
+	unsigned level;
+};
+
+/* Is a decoded (s2ap, xn) pair simultaneously writable and executable?
+ * S2AP[1:0] (descriptor bits[7:6]) encodes {00: none, 01: read-only,
+ * 10: write-only, 11: read/write} — bit1 (value 0x2) is the write-enable
+ * sub-bit (matching Linux/KVM's own stage-2 PTE bit naming: PTE_S2_RDONLY is
+ * 0b01, PTE_S2_RDWR is 0b11, i.e. bit0=read/bit1=write). XN==0 means
+ * executable (stage-2's sense is inverted: XN=1 forbids execution — see
+ * S2_XN_BIT's own comment above). Every descriptor this file ever builds
+ * uses S2AP_RW (0b11) — no S2AP_RO exists yet — so checking the write
+ * sub-bit vs. checking `s2ap == S2AP_RW` are equivalent for every leaf this
+ * tree currently produces; the sub-bit form is used so this stays correct if
+ * a read-only encoding is ever added. */
+static inline int
+stage2_leaf_is_wx(unsigned s2ap, unsigned xn)
+{
+	return ((s2ap & 0x2u) != 0u) && (xn == 0u);
+}
+
+/* Walk every valid leaf in the concatenated level-1 table set — both
+ * STAGE2_L1_TABLES tables, following each valid TABLE descriptor down
+ * through level-2 and, where present, level-3 — and count how many are
+ * W^X violations (stage2_leaf_is_wx()). A GENERAL walk: it does not assume
+ * which regions exist or at which level a given IPA resolves, so it stays
+ * correct if the topology changes (STAGE2_DRAM_SIZE grows, a new device
+ * window is added, a future fix narrows some leaves to read-only, etc.)
+ * without needing a matching edit here.
+ *
+ * first_violation, if non-NULL, is filled with the first (lowest-IPA, in
+ * scan order) offending leaf's IPA + level; left untouched if the return
+ * value is 0. Returns the total violation count in leaves, not bytes (three
+ * violating 2 MiB blocks count as 3, not 3*0x200000). */
+static uint32_t
+stage2_wx_scan(struct stage2_wx_violation *first_violation)
+{
+	uint32_t violations = 0;
+
+	for (unsigned t = 0; t < STAGE2_L1_TABLES; t++) {
+		for (unsigned i = 0; i < STAGE2_L1_ENTRIES; i++) {
+			uint64_t d1 = stage2_l1[t][i];
+			uint64_t ipa1 = ((uint64_t)t * STAGE2_L1_ENTRIES + i)
+				<< STAGE2_BLOCK_SHIFT;
+
+			if ((d1 & 0x3ull) == S2_DESC_VALID_BLOCK) {
+				unsigned s2ap = (unsigned)((d1 >> 6) & 0x3u);
+				unsigned xn   = (d1 & S2_XN_BIT) ? 1u : 0u;
+				if (stage2_leaf_is_wx(s2ap, xn)) {
+					if (violations == 0 && first_violation) {
+						first_violation->ipa = ipa1;
+						first_violation->level = 1;
+					}
+					violations++;
+				}
+				continue;
+			}
+			if ((d1 & 0x3ull) != S2_DESC_VALID_TABLE)
+				continue;   /* invalid: not guest-accessible at all */
+
+			const uint64_t *l2 = (const uint64_t *)(uintptr_t)
+				(d1 & STAGE2_TABLE_ADDR_MASK);
+			for (unsigned j = 0; j < STAGE2_L2_ENTRIES; j++) {
+				uint64_t d2 = l2[j];
+				uint64_t ipa2 = ipa1 + ((uint64_t)j << STAGE2_L2_BLOCK_SHIFT);
+
+				if ((d2 & 0x3ull) == S2_DESC_VALID_BLOCK) {
+					unsigned s2ap = (unsigned)((d2 >> 6) & 0x3u);
+					unsigned xn   = (d2 & S2_XN_BIT) ? 1u : 0u;
+					if (stage2_leaf_is_wx(s2ap, xn)) {
+						if (violations == 0 && first_violation) {
+							first_violation->ipa = ipa2;
+							first_violation->level = 2;
+						}
+						violations++;
+					}
+					continue;
+				}
+				if ((d2 & 0x3ull) != S2_DESC_VALID_TABLE)
+					continue;
+
+				const uint64_t *l3 = (const uint64_t *)(uintptr_t)
+					(d2 & STAGE2_TABLE_ADDR_MASK);
+				for (unsigned k = 0; k < STAGE2_L3_ENTRIES; k++) {
+					uint64_t d3 = l3[k];
+					uint64_t ipa3 = ipa2 + ((uint64_t)k << STAGE2_L3_PAGE_SHIFT);
+
+					/* Level-3 has no BLOCK encoding, only PAGE (0b11) or
+					 * invalid (anything else) — same as every stage2_page_
+					 * desc() consumer already relies on. */
+					if ((d3 & 0x3ull) != S2_DESC_VALID_TABLE)
+						continue;
+
+					unsigned s2ap = (unsigned)((d3 >> 6) & 0x3u);
+					unsigned xn   = (d3 & S2_XN_BIT) ? 1u : 0u;
+					if (stage2_leaf_is_wx(s2ap, xn)) {
+						if (violations == 0 && first_violation) {
+							first_violation->ipa = ipa3;
+							first_violation->level = 3;
+						}
+						violations++;
+					}
+				}
+			}
+		}
+	}
+	return violations;
+}
+
+int
+stage2_wx_selfcheck(void)
+{
+	struct stage2_wx_violation first = { 0, 0 };
+	uint32_t violations = stage2_wx_scan(&first);
+	uint32_t pass = (violations == 0u) ? 1u : 0u;
+
+	stg2_bc(19, 0x5758434bu);            /* "WXCK" */
+	stg2_bc(20, violations);
+	stg2_bc(21, (uint32_t)first.ipa);
+	stg2_bc(22, pass);
+	return (int)pass;
+}
+
 void
 stage2_selftest(void)
 {

@@ -219,4 +219,35 @@ void stage2_at_check(uint64_t va);
  * function's own comment in stage2.c for the exact layout. */
 int stage2_isolation_selfcheck(void);
 
+/* W^X self-check (ROADMAP v1 gate: "W^X на гостевых маппингах" — the isolation
+ * bullet's last unchecked half). Exhaustively walks EVERY valid leaf in the
+ * concatenated stage-2 tables (both level-1 tables, following every TABLE
+ * descriptor down through level-2 and, where present, level-3) and counts how
+ * many are simultaneously writable (S2AP write bit set) and executable
+ * (XN==0). Unlike stage2_isolation_selfcheck(), which probes three known
+ * addresses, this is a GENERAL walk that needs no per-region knowledge and
+ * stays correct as the table topology changes.
+ *
+ * HONESTLY: call this a measurement, not a gate. It currently reports FAIL
+ * (violations > 0) on every real boot, because guest DRAM genuinely is mapped
+ * RW+executable everywhere today (S2AP is hardcoded RW by every descriptor
+ * helper in this file; DRAM's XN=0 is what lets the guest's own code
+ * execute) — see stage2.c's own comment above stage2_wx_selfcheck() for why
+ * that is a real, currently-unclosed finding rather than an oversight, and
+ * why a real fix is a separate feature (kload.c segment-aware permissions),
+ * not a bug in this function. What IS fully closed and permanently enforced:
+ * no MMIO/device leaf is ever executable — this function proves that by the
+ * same general walk, not a hardcoded exemption, so a future regression there
+ * (e.g. a new device window added without XN=1) moves the violation count
+ * and is caught.
+ *
+ * Records violations / first-violation IPA / pass into the STG2 breadcrumb
+ * window (indices 19-22 — see the comment above the function in stage2.c for
+ * the exact layout). Like every other self-check in this file, does NOT halt
+ * or alter the boot on failure — it is diagnostic only, read via
+ * `bc 0x50000c00`. Returns 1 iff zero violations were found (currently always
+ * 0 on this build), 0 otherwise. Call AFTER stage2_init()/stage2_enable() so
+ * the tables it walks are the real, final ones. */
+int stage2_wx_selfcheck(void);
+
 #endif /* BZDOS_STAGE2_H */

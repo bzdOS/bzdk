@@ -304,6 +304,17 @@ int main(void)
 	 * [14..18]; see stage2_isolation_selfcheck(). Runs now that all stage-2
 	 * tables (incl. the vector-page split) are final and stage-2 is enabled. */
 	stage2_isolation_selfcheck();
+
+	/* W^X self-check (ROADMAP v1 gate, the isolation bullet's last unchecked
+	 * half): a general, read-only walk of the now-final stage-2 tables,
+	 * counting any leaf that is simultaneously writable and executable.
+	 * Result -> STG2 breadcrumb [19..22]; see stage2_wx_selfcheck()'s own
+	 * comment in stage2.c for the exact layout and, importantly, for why this
+	 * is honestly expected to report violations > 0 today (guest DRAM) rather
+	 * than a bug. Purely diagnostic like every self-check in this file — it
+	 * reads the tables built above and writes only its own breadcrumb words,
+	 * so it cannot alter guest-visible behavior or the boot sequence. */
+	stage2_wx_selfcheck();
 	DBG_BC(1, 5);
 
 	/* Zero CNTVOFF_EL2 so the guest's virtual counter CNTVCT_EL0 matches CNTPCT_EL0
