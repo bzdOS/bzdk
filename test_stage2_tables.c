@@ -519,6 +519,108 @@ stage2_selfcheck_ipa(uint64_t ipa)
 }
 
 /* ==================================================================== *
+ * W^X checker mirror (2026-08-11): stage2.c gained a REAL, general W^X
+ * scanner (stage2_leaf_is_wx()/stage2_wx_scan()/stage2_wx_selfcheck(), see
+ * stage2.c's own long comment above stage2_wx_selfcheck() for the full
+ * rationale) as part of closing the ROADMAP v1 gate's last isolation item.
+ * Mirrored verbatim here, same discipline as every other function in this
+ * file (exact stage2.c citation, no register/breadcrumb I/O — stage2_wx_
+ * selfcheck() itself is NOT mirrored, only the two pure functions under it).
+ * ==================================================================== */
+
+/* Mirrors stage2.c's stage2_wx_violation struct (added alongside
+ * stage2_wx_scan(), just above it). */
+struct stage2_wx_violation {
+	uint64_t ipa;
+	unsigned level;
+};
+
+/* Mirrors stage2.c's stage2_leaf_is_wx() verbatim. */
+static inline int
+stage2_leaf_is_wx(unsigned s2ap, unsigned xn)
+{
+	return ((s2ap & 0x2u) != 0u) && (xn == 0u);
+}
+
+/* Mirrors stage2.c's stage2_wx_scan() verbatim (the general table walk; the
+ * breadcrumb-writing stage2_wx_selfcheck() wrapper around it is EL2-register
+ * territory in spirit only insofar as it's a live self-check entry point —
+ * it does no register I/O itself either, but is deliberately left unmirrored
+ * since the tests below call stage2_wx_scan() directly, which is the part
+ * with anything to prove). */
+static uint32_t
+stage2_wx_scan(struct stage2_wx_violation *first_violation)
+{
+	uint32_t violations = 0;
+
+	for (unsigned t = 0; t < STAGE2_L1_TABLES; t++) {
+		for (unsigned i = 0; i < STAGE2_L1_ENTRIES; i++) {
+			uint64_t d1 = stage2_l1[t][i];
+			uint64_t ipa1 = ((uint64_t)t * STAGE2_L1_ENTRIES + i)
+				<< STAGE2_BLOCK_SHIFT;
+
+			if ((d1 & 0x3ull) == S2_DESC_VALID_BLOCK) {
+				unsigned s2ap = (unsigned)((d1 >> 6) & 0x3u);
+				unsigned xn   = (d1 & S2_XN_BIT) ? 1u : 0u;
+				if (stage2_leaf_is_wx(s2ap, xn)) {
+					if (violations == 0 && first_violation) {
+						first_violation->ipa = ipa1;
+						first_violation->level = 1;
+					}
+					violations++;
+				}
+				continue;
+			}
+			if ((d1 & 0x3ull) != S2_DESC_VALID_TABLE)
+				continue;
+
+			const uint64_t *l2 = (const uint64_t *)(uintptr_t)
+				(d1 & STAGE2_TABLE_ADDR_MASK);
+			for (unsigned j = 0; j < STAGE2_L2_ENTRIES; j++) {
+				uint64_t d2 = l2[j];
+				uint64_t ipa2 = ipa1 + ((uint64_t)j << STAGE2_L2_BLOCK_SHIFT);
+
+				if ((d2 & 0x3ull) == S2_DESC_VALID_BLOCK) {
+					unsigned s2ap = (unsigned)((d2 >> 6) & 0x3u);
+					unsigned xn   = (d2 & S2_XN_BIT) ? 1u : 0u;
+					if (stage2_leaf_is_wx(s2ap, xn)) {
+						if (violations == 0 && first_violation) {
+							first_violation->ipa = ipa2;
+							first_violation->level = 2;
+						}
+						violations++;
+					}
+					continue;
+				}
+				if ((d2 & 0x3ull) != S2_DESC_VALID_TABLE)
+					continue;
+
+				const uint64_t *l3 = (const uint64_t *)(uintptr_t)
+					(d2 & STAGE2_TABLE_ADDR_MASK);
+				for (unsigned k = 0; k < STAGE2_L3_ENTRIES; k++) {
+					uint64_t d3 = l3[k];
+					uint64_t ipa3 = ipa2 + ((uint64_t)k << STAGE2_L3_PAGE_SHIFT);
+
+					if ((d3 & 0x3ull) != S2_DESC_VALID_TABLE)
+						continue;
+
+					unsigned s2ap = (unsigned)((d3 >> 6) & 0x3u);
+					unsigned xn   = (d3 & S2_XN_BIT) ? 1u : 0u;
+					if (stage2_leaf_is_wx(s2ap, xn)) {
+						if (violations == 0 && first_violation) {
+							first_violation->ipa = ipa3;
+							first_violation->level = 3;
+						}
+						violations++;
+					}
+				}
+			}
+		}
+	}
+	return violations;
+}
+
+/* ==================================================================== *
  * Tests
  * ==================================================================== */
 
@@ -1003,6 +1105,90 @@ static void test_all_mmio_leaves_are_execute_never(void)
 }
 
 /* ==================================================================== *
+ * W^X checker: proving it against the real table set, AND proving it
+ * actually detects a violation (2026-08-11, ROADMAP v1 gate closure)
+ * ==================================================================== */
+
+/* stage2_leaf_is_wx(): the core predicate, tested directly against all four
+ * architectural (s2ap, xn) combinations before trusting it inside a
+ * 512-entry table walk. Only S2AP_RW (0b11) is ever produced by this file's
+ * builders, but the predicate is written to stay correct if a read-only
+ * encoding is ever added (see its own comment in stage2.c), so this test
+ * exercises all four rather than just the one value stage2.c happens to use
+ * today. */
+static void test_wx_leaf_predicate(void)
+{
+	assert(stage2_leaf_is_wx(S2AP_RW, /*xn=*/0) == 1);  /* RW + exec: violation */
+	assert(stage2_leaf_is_wx(S2AP_RW, /*xn=*/1) == 0);  /* RW + XN: clean */
+	assert(stage2_leaf_is_wx(0x1u,    /*xn=*/0) == 0);  /* read-only + exec: clean */
+	assert(stage2_leaf_is_wx(0x0u,    /*xn=*/0) == 0);  /* no access + exec: clean */
+	assert(stage2_leaf_is_wx(0x2u,    /*xn=*/0) == 1);  /* write-only + exec: violation */
+}
+
+/* stage2_wx_scan() against the REAL (mirrored) table set: cross-validates the
+ * new general walker against the count test_guest_dram_permissions_are_rwx_
+ * wx_not_enforced() already measured by probing known addresses at a 2 MiB
+ * stride (STAGE2_L2_ENTRIES - 2 == 510, every one a level-2 DRAM leaf) —
+ * proving the two independent methods agree, and pinning exactly which leaf
+ * the general walk finds first. */
+static void test_wx_scan_matches_measured_dram_state(void)
+{
+	stage2_init_tables();
+
+	struct stage2_wx_violation first = { 0xFFFFFFFFFFFFFFFFULL, 99u };
+	uint32_t violations = stage2_wx_scan(&first);
+
+	/* == 510: matches the existing per-address DRAM measurement exactly. */
+	assert(violations == STAGE2_L2_ENTRIES - 2u);
+	assert(first.level == 2u);
+	/* The lowest-IPA leaf that is not one of the two A1 carves: L2 index 0
+	 * of the DRAM table, i.e. STAGE2_DRAM_BASE itself. */
+	assert(first.ipa == STAGE2_DRAM_BASE);
+
+	/* NULL first_violation must not crash and must return the same count. */
+	assert(stage2_wx_scan(NULL) == violations);
+}
+
+/* THE proof the task asked for: a checker that has never seen a violation
+ * outside the known/measured DRAM condition is not known to work. Poison one
+ * MMIO leaf proven clean by test_all_mmio_leaves_are_execute_never() (index
+ * 0: identity block, Device-nGnRE, XN=1, S2AP=RW) by clearing its XN bit —
+ * simulating exactly the class of regression this checker exists to catch
+ * (a future device window added/edited without xn=1). The scan must then
+ * report EXACTLY one more violation than the DRAM-only baseline, and must
+ * name it as the new lowest-IPA violation (0x0, level 2) — proving the
+ * checker inspects the actual live bits rather than returning a hardcoded
+ * DRAM-shaped answer. Restoring the descriptor must return the count to
+ * exactly the original baseline. */
+static void test_wx_scan_catches_a_poisoned_mmio_leaf(void)
+{
+	stage2_init_tables();
+
+	uint32_t baseline = stage2_wx_scan(NULL);
+	assert(baseline == STAGE2_L2_ENTRIES - 2u);   /* the known DRAM condition only */
+
+	uint64_t clean = stage2_l2_mmio[0];
+	assert((clean & 0x3ull) == 0x1ull);        /* plain identity BLOCK */
+	assert(clean & S2_XN_BIT);                 /* confirmed XN=1 before poisoning */
+	assert(((clean >> 6) & 0x3u) == S2AP_RW);  /* confirmed RW before poisoning */
+
+	stage2_l2_mmio[0] = clean & ~S2_XN_BIT;    /* POISON: now RW *and* executable */
+
+	struct stage2_wx_violation first = { 0xFFFFFFFFFFFFFFFFULL, 99u };
+	uint32_t poisoned = stage2_wx_scan(&first);
+
+	assert(poisoned == baseline + 1u);   /* exactly one NEW violation */
+	assert(first.level == 2u);
+	/* Lower IPA than any DRAM violation (0x40000000+), so it must now be the
+	 * FIRST one the scan reports — not merely counted. */
+	assert(first.ipa == 0x0u);
+
+	/* Un-poison: the checker measures live state, not something cached. */
+	stage2_l2_mmio[0] = clean;
+	assert(stage2_wx_scan(NULL) == baseline);
+}
+
+/* ==================================================================== *
  * main()
  * ==================================================================== */
 struct test_case { const char *name; void (*fn)(void); };
@@ -1022,6 +1208,11 @@ static const struct test_case k_tests[] = {
 	                                 test_guest_dram_permissions_are_rwx_wx_not_enforced },
 	{ "all_mmio_leaves_are_execute_never",
 	                                 test_all_mmio_leaves_are_execute_never },
+	{ "wx_leaf_predicate",           test_wx_leaf_predicate },
+	{ "wx_scan_matches_measured_dram_state",
+	                                 test_wx_scan_matches_measured_dram_state },
+	{ "wx_scan_catches_a_poisoned_mmio_leaf",
+	                                 test_wx_scan_catches_a_poisoned_mmio_leaf },
 };
 
 int main(void)
