@@ -113,6 +113,24 @@ class BMC(HV):
     def console(self, n=0):
         return self.bmc(f"con read {n:x}" if n else "con read", 4)
 
+    def postmortem(self, n=0, off=None):
+        """Console text of the run BEFORE this one (the postmortem carry-over).
+
+        This is the one that answers "what did it print before the board
+        died?", because a crash bad enough to need an HV reload is a crash
+        whose evidence the reload itself would otherwise destroy — the
+        hypervisor now copies the ring aside on startup instead. See
+        hv_addrmap.h's VCPM lane comment.
+
+        off=None gives the TAIL (the last n bytes), which is almost always
+        what you want; pass off to page through the whole carry-over, since
+        the firmware caps one reply at 4 KiB to keep its service loop bounded.
+        """
+        if off is None:
+            return self.bmc(f"con pm {n:x}" if n else "con pm", 4)
+        return self.bmc(f"con pmat {off:x} {n:x}" if n
+                        else f"con pmat {off:x}", 4)
+
     def inject(self, text):
         return self.bmc(f"con inject {text}", 2)
 

@@ -353,4 +353,79 @@ _Static_assert(HVMAP_ZSTAGE_BC + HVMAP_ZSTAGE_BC_SIZE <= 0x50100000UL,
                "dual-guest lanes run into el2_ncmap.c's non-cacheable DMA "
                "scratch window (SCRATCH_BASE 0x50100000)");
 
+/* ---- vconsole POSTMORTEM carry-over lane (added 2026-08-11) -------------
+ * A verbatim copy of the PREVIOUS run's channel-0 console capture ring, made
+ * by vconsole_init() before it resets the live ring, so a crash's console text
+ * survives the reload that is the only way to get the debug channel back.
+ *
+ * WHY: the live ring (HVMAP_LOW_VCONSOLE_BUF, 64 KiB) is written by the guest
+ * and reset on every HV start. When a fault takes the whole board down — not
+ * just the guest — the sequence to regain the debug channel is TFTP-reload the
+ * hypervisor, which runs vconsole_init(), which zeroes the ring, and then boots
+ * a FreeBSD whose own output refills it. By the time a human can ask "what did
+ * it print?", the answer has been overwritten twice over. That is exactly what
+ * happened on 2026-08-11 chasing the Mali/lima whole-board crash: three
+ * different capture attempts (post-reload `con read`, live `--follow` on the TX
+ * tee, a raw EMAC sweep of the whole 64 KiB ring) all came back with the
+ * CURRENT boot's text, and the crash was never read at all.
+ *
+ * The bytes were in DRAM the whole time — every ring store is `dc civac`'d to
+ * PoC precisely so it survives a reset (see vconsole.h) — so nothing needed to
+ * be captured differently. Only the metadata was being thrown away, and then
+ * the bytes themselves. Copying them aside first is the whole fix.
+ *
+ * LINEARISED ON PURPOSE: offset 0 of the buffer is the OLDEST surviving byte
+ * and `len` runs forward to the newest, so a reader needs no modular
+ * arithmetic. Getting that arithmetic wrong on the live ring is what made
+ * `bmc con read` dump the boot banner for months (vconsole.h has the account);
+ * a postmortem reader is exactly the caller least able to afford re-deriving
+ * it, since it is used when something has already gone wrong.
+ *
+ * ONE GENERATION DEEP. Each HV start overwrites the lane, so the carry-over
+ * holds the run immediately before this one and nothing older. `gen` (word[3])
+ * counts captures and survives them, which is how a reader tells "this is the
+ * crash I am looking for" from "I reloaded twice and lost it". Read it before
+ * the second reload.
+ *
+ * Placed at 0x50080000: a page of slack above HVMAP_ZSTAGE_BC's end
+ * (0x5007A040) per this file's own hygiene rule, and 0x6f000 clear of
+ * el2_ncmap.c's non-cacheable boundary at 0x50100000, which this lane must
+ * stay below — it has to be Normal-WB for the `dc civac` stores to mean
+ * anything.
+ *
+ * Word layout (uint32_t, at HVMAP_VCPM_HDR):
+ *   [0] (+0x00) magic HVMAP_VCPM_MAGIC ("VCPM"), written LAST so a reader can
+ *       never see a half-filled lane as valid
+ *   [1] (+0x04) len         bytes valid in the buffer, 0..HVMAP_VCPM_BUF_SIZE
+ *   [2] (+0x08) prev_total  the previous run's unclamped total_bytes — i.e.
+ *       how much the guest printed in total, so `prev_total - len` is exactly
+ *       how much was lost to the ring's wrap and is NOT in this copy
+ *   [3] (+0x0c) gen         captures performed, ever (survives captures)
+ *   [4] (+0x10) buf_base    self-describing, same discipline as vconsole's own
+ *   [5] (+0x14) buf_size
+ *   [6] (+0x18) prev_faults the previous run's vconsole fault_count
+ *   [7] (+0x1c) reserved, 0
+ */
+#define HVMAP_VCPM_HDR        0x50080000UL
+#define HVMAP_VCPM_HDR_SIZE   0x20UL           /* 8 words, same shape as vconsole */
+#define HVMAP_VCPM_MAGIC      0x5643504DUL     /* "VCPM" */
+#define HVMAP_VCPM_BUF        0x50081000UL     /* explicit, NOT derived from HDR */
+#define HVMAP_VCPM_BUF_SIZE   0x10000UL        /* must be >= VCONSOLE_BUF_SIZE  */
+#define HVMAP_VCPM_END        (HVMAP_VCPM_BUF + HVMAP_VCPM_BUF_SIZE)
+
+_Static_assert(HVMAP_VCPM_HDR >= HVMAP_ZSTAGE_BC + HVMAP_ZSTAGE_BC_SIZE,
+               "postmortem lane overlaps the zstage breadcrumbs");
+_Static_assert(HVMAP_VCPM_HDR + HVMAP_VCPM_HDR_SIZE <= HVMAP_VCPM_BUF,
+               "postmortem header overlaps its own buffer");
+_Static_assert(HVMAP_VCPM_END <= 0x50100000UL,
+               "postmortem lane runs into el2_ncmap.c's non-cacheable DMA "
+               "scratch window (SCRATCH_BASE 0x50100000) -- it must stay "
+               "Normal-WB for the dc civac stores to reach DRAM");
+/* The lane must be able to hold the ENTIRE live ring, or a carry-over would
+ * silently truncate the newest bytes -- the ones that matter most. The
+ * VCONSOLE_BUF_SIZE side of this is asserted in vconsole.c, which is the only
+ * file that sees both headers. */
+_Static_assert(HVMAP_VCPM_BUF_SIZE >= HVMAP_LOW_VCONSOLE_BUF_SZ,
+               "postmortem buffer is smaller than the vconsole ring it copies");
+
 #endif /* HV_ADDRMAP_H */

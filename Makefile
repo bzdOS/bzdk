@@ -118,7 +118,7 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -127,6 +127,7 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_zload2_parsing
 	./test_zstage
 	./test_vconsole_uart
+	./test_vconsole_pm
 	./test_gdbstub_resolve
 	./test_gdbstub_hwop
 	./test_vgic_pendq
@@ -167,6 +168,9 @@ test_zstage: test_zstage.c zstage.c zstage.h
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vconsole_uart: test_vconsole_uart.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_vconsole_pm: test_vconsole_pm.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_gdbstub_resolve: test_gdbstub_resolve.c

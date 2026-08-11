@@ -19,6 +19,7 @@
 #include "exceptions.h"
 #include "bmc.h"
 #include "vconsole.h"   /* VCONSOLE_BUF_BASE/SIZE -- never copy them, see below */
+#include "hv_addrmap.h" /* HVMAP_VCPM_* -- the postmortem carry-over lane      */
 
 /* ------------------------------------------------------------------ *
  * Console hooks — identical extern contract dbgmon.c/repl.c use. main_dbg.c
@@ -556,6 +557,74 @@ static void bmc_con_read(uint32_t n)
 	cputs("\r\n--- end ---\r\n");
 }
 
+/* `bmc con pm [n]` / `bmc con pmat <off> [n]` — dump the POSTMORTEM CARRY-OVER:
+ * the console text of the run BEFORE this one, copied aside by vconsole_init()
+ * before it reset the live ring. See hv_addrmap.h's VCPM lane comment for why
+ * this exists; the short version is that after a crash that takes the whole
+ * board down, reloading the hypervisor is the only way to get this channel back
+ * and it is also what destroys the evidence — so the evidence is now saved
+ * first, and this is how you read it.
+ *
+ * `pm` shows the TAIL (the last n bytes, i.e. what was printed just before the
+ * end), which is the answer to the question anyone actually has. `pmat` takes
+ * an explicit offset so the whole carry-over can be paged from the host without
+ * this command having to stream 64 KiB inside one bounded service() call.
+ *
+ * NO WRAP ARITHMETIC HERE, deliberately: the lane is linearised at capture time
+ * (offset 0 == oldest surviving byte, running forward to `len`). bmc_con_read()
+ * above has to walk a live ring backwards from a cursor and the account of what
+ * that cost when it was done wrong is in this file's own comments — a
+ * postmortem reader is the last caller that should be re-deriving it. */
+static void bmc_con_pm(uint32_t n, uint32_t off, int have_off)
+{
+	uint32_t len, prev_total, gen, faults, i;
+
+	if (rd32(HVMAP_VCPM_HDR) != (uint32_t)HVMAP_VCPM_MAGIC) {
+		cputs("con pm: no carry-over held. Either this is a cold boot "
+		      "(nothing ran before us), or the run before this one was "
+		      "built without the postmortem lane.\r\n");
+		return;
+	}
+
+	len        = rd32(HVMAP_VCPM_HDR + 0x04u);
+	prev_total = rd32(HVMAP_VCPM_HDR + 0x08u);
+	gen        = rd32(HVMAP_VCPM_HDR + 0x0cu);
+	faults     = rd32(HVMAP_VCPM_HDR + 0x18u);
+
+	if (len > (uint32_t)HVMAP_VCPM_BUF_SIZE)
+		len = (uint32_t)HVMAP_VCPM_BUF_SIZE;   /* never trust a stale word */
+
+	if (n == 0u || n > 0x1000u)
+		n = 0x1000u;                           /* keep one service() bounded */
+
+	if (!have_off)
+		off = (len > n) ? len - n : 0u;         /* default: the tail        */
+	if (off >= len) {
+		cputs("con pm: offset past the end (len="); pdec(len); cputs(")\r\n");
+		return;
+	}
+	if (n > len - off)
+		n = len - off;
+
+	cputs("--- prev-run console, gen "); pdec(gen);
+	cputs(", bytes ["); pdec(off); cputs(","); pdec(off + n);
+	cputs(") of "); pdec(len); cputs(" held");
+	/* How much the previous run printed that this copy does NOT contain. Worth
+	 * stating outright: a reader looking for something and not finding it needs
+	 * to know whether it was never printed or scrolled out of the ring. */
+	if (prev_total > len) {
+		cputs(" ("); pdec(prev_total - len);
+		cputs(" earlier bytes lost to the ring wrap)");
+	}
+	cputs(", "); pdec(faults); cputs(" faults ---\r\n");
+
+	for (i = 0; i < n; i++) {
+		uint8_t b = *(volatile uint8_t *)(HVMAP_VCPM_BUF + off + i);
+		console_putc((b == '\n' || (b >= 0x20 && b < 0x7f)) ? (int)b : '.');
+	}
+	cputs("\r\n--- end ---\r\n");
+}
+
 /* `bmc con inject <text...>` — push host keystrokes into the guest's virtual
  * UART0 RX ring (mountroot>, login, shell). argv points at the remaining
  * tokens; we re-join them with single spaces and append a newline, which is
@@ -638,7 +707,9 @@ static void bmc_help(void)
 	cputs("  bmc battery             AXP803 VBAT/IBAT/charge status (RSB)\r\n");
 	cputs("  bmc flags               list debug flags + values\r\n");
 	cputs("  bmc flag <name> <0|1>   set a debug flag            [ARMED]\r\n");
-	cputs("  bmc con read [n]        dump guest console capture ring\r\n");
+	cputs("  bmc con read [n]        dump guest console capture ring (this run)\r\n");
+	cputs("  bmc con pm [n]          dump PREV run's console tail (survives reload)\r\n");
+	cputs("  bmc con pmat <off> [n]  ...same, at an explicit offset, for paging\r\n");
 	cputs("  bmc con inject <text>   type into guest console (RX inject)\r\n");
 	cputs("  bmc con tee [n]         drain pending guest->host TX bytes\r\n");
 	cputs("  bmc reset               clean reboot to U-Boot       [ARMED]\r\n");
@@ -672,17 +743,29 @@ void bmc_dispatch(char **argv, int argc, struct el2_frame *frame)
 		return;
 	}
 	if (streq(verb, "con")) {
-		if (argc < 2) { cputs("usage: bmc con <read|inject|tee> ...\r\n"); return; }
+		if (argc < 2) { cputs("usage: bmc con <read|pm|pmat|inject|tee> ...\r\n"); return; }
 		if (streq(argv[1], "read")) {
 			unsigned long n = 0; if (argc >= 3) parse_hex(argv[2], &n);
 			bmc_con_read((uint32_t)n); return;
+		}
+		if (streq(argv[1], "pm")) {
+			unsigned long n = 0; if (argc >= 3) parse_hex(argv[2], &n);
+			bmc_con_pm((uint32_t)n, 0u, 0); return;
+		}
+		if (streq(argv[1], "pmat")) {
+			unsigned long o = 0, n = 0;
+			if (argc < 3 || !parse_hex(argv[2], &o)) {
+				cputs("usage: bmc con pmat <off> [n]\r\n"); return;
+			}
+			if (argc >= 4) parse_hex(argv[3], &n);
+			bmc_con_pm((uint32_t)n, (uint32_t)o, 1); return;
 		}
 		if (streq(argv[1], "inject")) { bmc_con_inject(&argv[2], argc - 2); return; }
 		if (streq(argv[1], "tee")) {
 			unsigned long n = 0; if (argc >= 3) parse_hex(argv[2], &n);
 			bmc_con_tee((uint32_t)n); return;
 		}
-		cputs("usage: bmc con <read|inject|tee> ...\r\n");
+		cputs("usage: bmc con <read|pm|pmat|inject|tee> ...\r\n");
 		return;
 	}
 	if (streq(verb, "reset")) { bmc_reset(); return; }
