@@ -33,6 +33,12 @@
 #include "smp.h"
 #include "vblk_emmc.h"
 #include "vnet_emac.h"   /* vnet_mmio_fault() -- ROADMAP C1 virtio-net-over-EMAC */
+#ifdef HV_HDMI
+#include "scanout.h"     /* scanout_mmio_fault() -- zero-copy GPU scanout flip
+                           * doorbell, see docs/zero-copy-scanout.md. Guarded
+                           * the same way main_dbg.c guards hdmi.h/hud.h: with
+                           * no framebuffer there is nothing to flip. */
+#endif
 #include "reboot.h"
 #include "backtrace.h"
 #include "flightrec.h"
@@ -1015,6 +1021,23 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 					dbgmon_service(frame);
 				return;
 			}
+#ifdef HV_HDMI
+			/* Finally, the zero-copy-scanout flip doorbell at 0x0A002000
+			 * (ROADMAP: zero-copy GPU scanout -- see
+			 * docs/zero-copy-scanout.md). Same "handled -> return without
+			 * recording" contract as vconsole/vblk/vnet above;
+			 * scanout_mmio_fault() returns 0 for any abort outside its own
+			 * 0x100-byte window (disjoint from all three), so calling it
+			 * unconditionally here is safe. Compiled and called only in
+			 * HV_HDMI builds -- with no framebuffer there is nothing to
+			 * flip, and this keeps every non-HV_HDMI target's link exactly
+			 * as it was before this device existed. */
+			if (scanout_mmio_fault(frame)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
+#endif
 		}
 	}
 

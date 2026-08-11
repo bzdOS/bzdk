@@ -115,6 +115,14 @@ static uint32_t g_tcon1_div = 1;
 static uint32_t g_phy_div = 1;
 static uint32_t g_relock_count = 0;
 
+/* Zero-copy scanout (docs/zero-copy-scanout.md): the address last
+ * programmed into DE_UI1_CFG0_TOP_LADDR by hdmi_set_scanout_addr(). Starts
+ * equal to HDMI_FB_BASE, exactly what stage_de2() programs at boot, so
+ * hdmi_scanout_addr() is correct even if hdmi_set_scanout_addr() is never
+ * called (the default, single-buffer behaviour every existing caller —
+ * hud.c, hdmi_demo() — depends on). */
+static uint32_t g_scanout_addr = (uint32_t)HDMI_FB_BASE;
+
 static void bc_stage(int stage)
 {
 	bc_write(0, BC_HDMI_MAGIC);
@@ -1029,6 +1037,24 @@ uint32_t *hdmi_fb(void)   { return (uint32_t *)HDMI_FB_BASE; }
 int hdmi_width(void)      { return HDMI_MODE_HACTIVE; }
 int hdmi_height(void)     { return HDMI_MODE_VACTIVE; }
 int hdmi_stride(void)     { return HDMI_MODE_HACTIVE; }
+
+/* ==================================================================== *
+ * Zero-copy scanout flip primitive. See hdmi.h for the full contract;
+ * this is the exact same two-register write/commit sequence stage_de2()
+ * (line ~570/574) and stage_scanout()'s tail (line ~912) already use, and
+ * hdmi_relock() repeats again (line ~1021) — the ONLY difference here is
+ * the address is a caller-supplied buffer, not always HDMI_FB_BASE.
+ * ==================================================================== */
+void hdmi_set_scanout_addr(uint32_t pa)
+{
+	wr32(DE_UI1_CFG0_TOP_LADDR, pa);
+	wr32(DE_GLB_DBUFF, 1);   /* commit -- same "apply" strobe as every other
+	                          * mode-set write in this file (see above) */
+	g_scanout_addr = pa;
+	bc_write(8, pa);
+}
+
+uint32_t hdmi_scanout_addr(void) { return g_scanout_addr; }
 
 /* ==================================================================== *
  * hdmi_demo() -- the HUD skeleton: dark-blue clear, title bar, a border

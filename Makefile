@@ -118,7 +118,7 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -135,6 +135,7 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_snapshot_fmt
 	./test_bmc_arm_gate
 	./test_coredump_elf
+	./test_scanout_regs
 	python3 test_automount.py
 	python3 coredump-recv.py selftest
 	python3 snapshot_net.py selftest
@@ -183,6 +184,9 @@ test_sd_bio_addr: test_sd_bio_addr.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_snapshot_fmt: test_snapshot_fmt.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_scanout_regs: test_scanout_regs.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_bmc_arm_gate: test_bmc_arm_gate.c
@@ -253,7 +257,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
-            netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o \
+            netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o \
             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
