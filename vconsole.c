@@ -331,9 +331,129 @@ vconsole_init_chan(struct vc_chan *cs)
 		vc_zero_byte(cs, i);
 }
 
+/* ------------------------------------------------------------------ *
+ * POSTMORTEM CARRY-OVER (added 2026-08-11) — see hv_addrmap.h's VCPM lane
+ * comment for the full rationale and the word layout. In one line: copy the
+ * PREVIOUS run's ring aside, linearised, before this run resets it, because
+ * reloading the hypervisor is the only way to get the debug channel back after
+ * a crash and it is also what destroys the evidence.
+ * ------------------------------------------------------------------ */
+
+/* The lane must be able to hold the whole ring. hv_addrmap.h asserts its side
+ * against its own mirrored size constant; this is the one place that sees the
+ * real VCONSOLE_BUF_SIZE, so this is where the two are actually tied together.
+ * If this fires, the mirror in hv_addrmap.h has drifted from vconsole.h. */
+_Static_assert(HVMAP_VCPM_BUF_SIZE >= VCONSOLE_BUF_SIZE,
+               "postmortem carry-over lane cannot hold the whole capture ring");
+_Static_assert(HVMAP_LOW_VCONSOLE_BUF_SZ == VCONSOLE_BUF_SIZE,
+               "hv_addrmap.h's mirror of the vconsole buffer size has drifted");
+_Static_assert(HVMAP_LOW_VCONSOLE_BUF == VCONSOLE_BUF_BASE,
+               "hv_addrmap.h's mirror of the vconsole buffer base has drifted");
+
+/* A53 cache line. Only used to decide how OFTEN to clean/invalidate during the
+ * copy below; a `dc civac` covers the whole line containing its operand, so a
+ * wrong (smaller) value here would only cost time, never correctness. */
+#define VCPM_LINE 64u
+
+static inline void
+vcpm_store32(uint32_t idx, uint32_t v)
+{
+	volatile uint32_t *p = (volatile uint32_t *)(HVMAP_VCPM_HDR + idx * 4u);
+	*p = v;
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+static inline uint32_t
+vcpm_load32(uint32_t idx)
+{
+	return *(volatile uint32_t *)(HVMAP_VCPM_HDR + idx * 4u);
+}
+
+static void
+vconsole_postmortem_carry(void)
+{
+	uint32_t magic  = vc_load32(&vc_chan0, 0);
+	uint32_t total  = vc_load32(&vc_chan0, 1);
+	uint32_t faults = vc_load32(&vc_chan0, 2);
+	uint32_t ver    = vc_load32(&vc_chan0, 3);
+	uint32_t base   = vc_load32(&vc_chan0, 4);
+	uint32_t size   = vc_load32(&vc_chan0, 5);
+	uint32_t cap    = VCONSOLE_BUF_SIZE;
+	uint32_t n, start, gen, i;
+
+	/* Nothing to carry. Either a genuine cold boot (DRAM holds whatever it
+	 * held, and the magic is how dbgtools.c already distinguishes cold from
+	 * warm in this tree), or a previous run that never captured a byte. */
+	if (magic != VCONSOLE_MAGIC || total == 0u)
+		return;
+
+	/* Refuse to guess across a layout change. The previous run SAID where
+	 * its buffer was and how big it was (words 3/4/5, added for exactly this
+	 * reason — see vconsole.h's VCONSOLE_LAYOUT_VER note); if that does not
+	 * match what this build uses, its bytes are not where we would read
+	 * them, and copying the wrong region as if it were console text is worse
+	 * than copying nothing. This is the same class of silent host/firmware
+	 * disagreement that produced the "byte counts don't sum" reconstructions
+	 * vconsole.h warns about. */
+	if (ver != VCONSOLE_LAYOUT_VER ||
+	    base != (uint32_t)VCONSOLE_BUF_BASE || size != cap)
+		return;
+
+	/* total_bytes is unclamped, so it doubles as the write cursor: the newest
+	 * byte is at (total-1) mod cap and the oldest surviving one at
+	 * (total-n) mod cap. When total <= cap that lands exactly at 0, which is
+	 * why the wrapped and not-yet-wrapped cases need no separate branch. */
+	n = (total < cap) ? total : cap;
+	start = (total - n) % cap;
+
+	gen = (vcpm_load32(0) == (uint32_t)HVMAP_VCPM_MAGIC) ? vcpm_load32(3) : 0u;
+
+	/* Copy oldest-to-newest into offset 0 onward, i.e. LINEARISED: the reader
+	 * gets a flat buffer and never repeats the modular arithmetic. Cleaned a
+	 * cache line at a time rather than a byte at a time — 64 KiB with a
+	 * `dsb sy` per byte is ~128K barriers where ~2K will do, and the existing
+	 * init loop below already pays the per-byte price once. */
+	for (i = 0; i < n; i++) {
+		uint64_t src = (uint64_t)VCONSOLE_BUF_BASE + ((start + i) % cap);
+		uint64_t dst = (uint64_t)HVMAP_VCPM_BUF + i;
+
+		/* Read from DRAM, not from a line this run may have filled. The
+		 * producing run's stores all went to PoC and a reset invalidates
+		 * the caches, so in practice there is nothing stale to defeat —
+		 * this also covers the documented-idempotent re-init case, where
+		 * the current run is the producer. */
+		if (i == 0u || (src % VCPM_LINE) == 0u)
+			__asm__ volatile("dc civac, %0\n\tdsb sy"
+			                 :: "r"(src) : "memory");
+
+		*(volatile uint8_t *)dst = *(volatile uint8_t *)src;
+
+		if (i == n - 1u || (dst % VCPM_LINE) == VCPM_LINE - 1u)
+			__asm__ volatile("dc civac, %0" :: "r"(dst) : "memory");
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	vcpm_store32(1, n);
+	vcpm_store32(2, total);
+	vcpm_store32(3, gen + 1u);
+	vcpm_store32(4, (uint32_t)HVMAP_VCPM_BUF);
+	vcpm_store32(5, (uint32_t)HVMAP_VCPM_BUF_SIZE);
+	vcpm_store32(6, faults);
+	vcpm_store32(7, 0);
+	/* Magic LAST: everything above is now consistent, so a reader that sees
+	 * the magic sees a complete lane. A reader that catches us mid-copy sees
+	 * the PREVIOUS generation's magic with this generation's bytes, which is
+	 * why `gen` is published before it. */
+	vcpm_store32(0, (uint32_t)HVMAP_VCPM_MAGIC);
+}
+
 void
 vconsole_init(void)
 {
+	/* BEFORE the reset below wipes it — this is the entire ordering
+	 * requirement of the postmortem feature. */
+	vconsole_postmortem_carry();
+
 	vconsole_init_chan(&vc_chan0);
 
 	/* BUG FIX (found live on hardware): VC_RX_HEAD/TAIL (0x50000e40/

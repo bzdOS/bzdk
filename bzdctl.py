@@ -33,6 +33,7 @@ Usage:
     bzdctl.py power uboot            # catch the board in U-Boot (needs tty)
     bzdctl.py console [-n N] [--follow]
     bzdctl.py console --inject TEXT
+    bzdctl.py console --postmortem [--all|--at OFF]   # the PREVIOUS run's log
     bzdctl.py boot-watch [--timeout S]
     bzdctl.py crash [--out DIR]
     bzdctl.py ledger
@@ -194,10 +195,52 @@ def cmd_health(args):
     return 0
 
 
+def _pm_body(out):
+    """Strip the firmware's `--- ... ---` framing off one `con pm` reply.
+
+    Only used when paging (--all), where the framing would otherwise be
+    interleaved into the middle of the reconstructed log every 4 KiB. Returns
+    "" if the framing isn't there at all, which is how the pager detects "no
+    carry-over held" / a dropped reply and stops instead of spinning.
+    """
+    if not out:
+        return ""
+    lines = out.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines)
+                     if ln.startswith("--- prev-run console"))
+    except StopIteration:
+        return ""
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].startswith("--- end ---")), len(lines))
+    return "\n".join(lines[start + 1:end])
+
+
 def cmd_console(args):
     b = _bmc(args.iface)
     if args.inject is not None:
         print(b.inject(args.inject))
+        return 0
+    if args.postmortem:
+        # --all pages the whole carry-over: the firmware bounds one reply at
+        # 4 KiB so its service loop stays non-blocking, so walking it is the
+        # host's job. Stop on the first empty/failed page rather than looping
+        # to the nominal length, since a short reply means the lane ended.
+        if args.all:
+            off, page = 0, 0x1000
+            while True:
+                out = b.postmortem(page, off) or ""
+                body = _pm_body(out)
+                if not body:
+                    break
+                sys.stdout.write(body)
+                sys.stdout.flush()
+                if len(body) < page:
+                    break
+                off += page
+            print()
+            return 0
+        print(b.postmortem(args.n, args.at))
         return 0
     if args.follow:
         # The TX tee is a ring the board keeps appending to; poll it and print
@@ -984,6 +1027,12 @@ def main(argv=None):
     c.add_argument("-n", type=lambda x: int(x, 0), default=0)
     c.add_argument("--follow", action="store_true", help="poll the TX tee")
     c.add_argument("--inject", metavar="TEXT", help="push TEXT into guest RX")
+    c.add_argument("--postmortem", "--pm", action="store_true",
+                   help="PREVIOUS run's console (survives an HV reload)")
+    c.add_argument("--at", type=lambda x: int(x, 0), default=None,
+                   help="with --postmortem: byte offset instead of the tail")
+    c.add_argument("--all", action="store_true",
+                   help="with --postmortem: page the whole carry-over")
 
     bw = sub.add_parser("boot-watch", help="wait for liveness, record in ledger")
     bw.add_argument("--timeout", type=int, default=300)
