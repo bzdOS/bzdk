@@ -47,6 +47,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -195,25 +196,39 @@ def cmd_health(args):
     return 0
 
 
-def _pm_body(out):
-    """Strip the firmware's `--- ... ---` framing off one `con pm` reply.
+_PM_HDR_RE = re.compile(r"--- prev-run console, gen (\d+), "
+                        r"bytes \[(\d+),(\d+)\) of (\d+) held")
 
-    Only used when paging (--all), where the framing would otherwise be
-    interleaved into the middle of the reconstructed log every 4 KiB. Returns
-    "" if the framing isn't there at all, which is how the pager detects "no
-    carry-over held" / a dropped reply and stops instead of spinning.
+
+def _pm_parse(out):
+    """Split one `con pm` reply into ((gen, first, last, held), body).
+
+    Returns (None, "") if the framing isn't there — no carry-over held, or a
+    dropped reply — which is how the pager knows to stop rather than spin.
+
+    The window comes from the FIRMWARE'S OWN accounting, not from len(body),
+    and that is load-bearing: the body is reflowed on the way here (the
+    firmware emits CRLF, the transport and splitlines() do not preserve it),
+    so its length is smaller than the byte count requested even when nothing
+    was lost. A pager that advanced by len(body) would conclude the log ended
+    after the first page every single time.
     """
     if not out:
-        return ""
+        return None, ""
     lines = out.splitlines()
-    try:
-        start = next(i for i, ln in enumerate(lines)
-                     if ln.startswith("--- prev-run console"))
-    except StopIteration:
-        return ""
+    start = None
+    for i, ln in enumerate(lines):
+        m = _PM_HDR_RE.match(ln)
+        if m:
+            start = i
+            win = (int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                   int(m.group(4)))
+            break
+    if start is None:
+        return None, ""
     end = next((i for i in range(start + 1, len(lines))
                 if lines[i].startswith("--- end ---")), len(lines))
-    return "\n".join(lines[start + 1:end])
+    return win, "\n".join(lines[start + 1:end])
 
 
 def cmd_console(args):
@@ -227,18 +242,27 @@ def cmd_console(args):
         # host's job. Stop on the first empty/failed page rather than looping
         # to the nominal length, since a short reply means the lane ended.
         if args.all:
-            off, page = 0, 0x1000
+            off, page, guard = 0, 0x1000, 0
             while True:
-                out = b.postmortem(page, off) or ""
-                body = _pm_body(out)
-                if not body:
+                win, body = _pm_parse(b.postmortem(page, off) or "")
+                if win is None:
+                    if off == 0:
+                        print("no carry-over held", file=sys.stderr)
+                        return 1
                     break
-                sys.stdout.write(body)
+                _gen, first, last, held = win
+                sys.stdout.write(body + "\n")
                 sys.stdout.flush()
-                if len(body) < page:
+                # Advance by what the firmware SAYS it gave us. A reply that
+                # does not advance would otherwise loop forever; guard against
+                # that explicitly rather than trusting the board.
+                if last <= first or last >= held:
                     break
-                off += page
-            print()
+                off = last
+                guard += 1
+                if guard > 64:
+                    print("stopped after 64 pages", file=sys.stderr)
+                    break
             return 0
         print(b.postmortem(args.n, args.at))
         return 0
@@ -845,6 +869,49 @@ def case_render_console_state_labels():
         assert want in out, f"console_advancing={val!r} -> missing {want!r}"
 
 
+# ---- `console --postmortem --all` reply parsing --------------------------
+#
+# The pager MUST advance by the window the firmware reports, not by len(body).
+# The first cut did the latter and stopped after one page every time: the
+# firmware emits CRLF and asks for N bytes, but by the time the reply has been
+# through the transport and splitlines() the body is shorter than N even when
+# nothing was dropped. Caught on hardware; pinned here so it stays caught.
+def case_pm_parse_window_from_header_not_body():
+    reply = ("--- prev-run console, gen 3, bytes [4096,8192) of 35808 held, "
+             "12 faults ---\r\nhello\r\nworld\r\n--- end ---\r\n")
+    win, body = _pm_parse(reply)
+    assert win == (3, 4096, 8192, 35808), win
+    assert body == "hello\nworld", repr(body)
+    # The property that matters: the reported window is 4096 bytes wide while
+    # the body is 11 characters. A pager keying off the body would stop here.
+    assert (win[2] - win[1]) == 4096 and len(body) < 4096
+
+
+def case_pm_parse_reports_wrap_loss_header():
+    reply = ("--- prev-run console, gen 1, bytes [0,4096) of 65536 held "
+             "(9000 earlier bytes lost to the ring wrap), 5 faults ---\r\n"
+             "x\r\n--- end ---\r\n")
+    win, body = _pm_parse(reply)
+    assert win == (1, 0, 4096, 65536), win
+    assert body == "x", repr(body)
+
+
+def case_pm_parse_rejects_unframed():
+    for junk in ("", "dbg>", "con pm: no carry-over held.\r\n",
+                 "--- guest console (last 512 of 30681 held, 30681 total) ---"):
+        win, body = _pm_parse(junk)
+        assert win is None and body == "", (junk, win, body)
+
+
+def case_pm_parse_terminates_on_last_page():
+    # last == held is the end of the log; the pager must stop, not re-request.
+    win, _ = _pm_parse("--- prev-run console, gen 2, bytes [32768,35808) of "
+                       "35808 held, 0 faults ---\r\n--- end ---\r\n")
+    _gen, first, last, held = win
+    assert last >= held, win
+    assert last > first, win
+
+
 # ---- ROADMAP B3: _build_crash_report() / cmd_crash() report.txt wiring ---
 #
 # crash_report.py is a separate, already-tested module (its own `selftest`
@@ -974,6 +1041,11 @@ _ST_CASES = [
     ("render_battery_real_readings_shown",
      case_render_battery_real_readings_shown),
     ("render_console_state_labels", case_render_console_state_labels),
+    ("pm_parse_window_from_header_not_body",
+     case_pm_parse_window_from_header_not_body),
+    ("pm_parse_reports_wrap_loss_header", case_pm_parse_reports_wrap_loss_header),
+    ("pm_parse_rejects_unframed", case_pm_parse_rejects_unframed),
+    ("pm_parse_terminates_on_last_page", case_pm_parse_terminates_on_last_page),
     ("build_crash_report_no_fault_renders_cleanly",
      case_build_crash_report_no_fault_renders_cleanly),
     ("build_crash_report_fabricated_fault_produces_report",
