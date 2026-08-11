@@ -211,7 +211,15 @@ static inline uint32_t mmio32(uint32_t addr)
 #define VCON_BUF     0x50000f10UL   /* captured console bytes */
 #define VCON_SIZE    3072u
 #define GTRC_BC_BASE 0x50002000UL   /* "GTRC" — gtrace.c */
-#define HDMI_BC_BASE 0x50003000UL
+/* FIXED (found while adding zero-copy-scanout support, see
+ * docs/zero-copy-scanout.md): hdmi.c's breadcrumb moved from 0x50003000 to
+ * 0x50011800 on 2026-07-25 (hdmi.h's own "Relocated 2026-07-25" comment —
+ * that old address sits inside the vconsole capture ring and was being
+ * clobbered). This copy was never updated, so the HUD's "stage" readout
+ * below (kv_addr_val at line ~677) had been silently reading a dead address
+ * — whatever was last written there before the move, never hdmi.c's real,
+ * live pipeline state — in every HV_HDMI build since. */
+#define HDMI_BC_BASE 0x50011800UL
 
 #define VCON_MAGIC   0x55415254u    /* "UART" */
 #define EXC_MAGIC    0x45584331u    /* "EXC1" */
