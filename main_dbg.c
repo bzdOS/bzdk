@@ -34,6 +34,8 @@
 #ifdef HV_HDMI
 #include "hdmi.h"
 #include "hud.h"
+#include "scanout.h"   /* zero-copy GPU scanout flip doorbell, see
+                        * docs/zero-copy-scanout.md */
 #endif
 #include "onebp.h"
 #include "vgic.h"
@@ -459,6 +461,13 @@ int main(void)
 		hud_init();
 		hud_update(&g_last_guest_frame);   /* first frame (guest not yet running) */
 	}
+	/* Zero-copy GPU scanout (docs/zero-copy-scanout.md): populate the
+	 * guest-facing doorbell device's register file (buffer addresses,
+	 * geometry) regardless of whether hdmi_init() reported success --
+	 * matches hud_init()'s own "still draws into DRAM even with no signal"
+	 * tolerance above, and means the register file is inspectable via
+	 * dbgmon/`bc` even on a run with nothing plugged into the monitor. */
+	scanout_init();
 #endif
 
 	/* Dual-guest bulk loader (zstage.h): move a second guest's raw ELF from

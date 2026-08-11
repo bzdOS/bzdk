@@ -203,7 +203,17 @@ _Static_assert(HVMAP_DBGTOOLS_END <= 0x50030000UL,
 #define HVMAP_LOW_FFL1           0x50002400UL
 #define HVMAP_LOW_FFL1_END       0x50002530UL
 #define HVMAP_LOW_SST1           0x50002800UL
-#define HVMAP_LOW_HDMI_BC        0x50003000UL
+/* FIXED (found while adding zero-copy-scanout support, see
+ * docs/zero-copy-scanout.md): this used to mirror 0x50003000, hdmi.c's
+ * ORIGINAL breadcrumb base. hdmi.h relocated it to 0x50011800 on 2026-07-25
+ * ("Relocated 2026-07-25 from 0x50003000" — that address sits inside the
+ * vconsole capture ring and was being clobbered by guest console bytes).
+ * This mirror was never updated to match, so it spent months silently
+ * fencing a dead address instead of the real one — a live instance of the
+ * exact failure mode this file's own header comment warns about ("if one of
+ * those moves, update it here"). hud.c had the same bug independently (its
+ * own local HDMI_BC_BASE copy) — fixed there too. */
+#define HVMAP_LOW_HDMI_BC        0x50011800UL
 /* vconsole capture BUFFER — an explicit absolute base since 2026-08-01,
  * deliberately NOT derived from the header, and placed above every other
  * window so growing it can never reach a neighbour again. */
@@ -427,5 +437,80 @@ _Static_assert(HVMAP_VCPM_END <= 0x50100000UL,
  * file that sees both headers. */
 _Static_assert(HVMAP_VCPM_BUF_SIZE >= HVMAP_LOW_VCONSOLE_BUF_SZ,
                "postmortem buffer is smaller than the vconsole ring it copies");
+
+/* ---- hv-fb double-buffer geometry (zero-copy scanout, HV_HDMI builds) ---
+ * See docs/zero-copy-scanout.md for the full design. hv-fb itself is NOT a
+ * hv-scratch lane (it is its own DTB reserved-memory node, hv-fb@4d000000,
+ * excluded from the guest's stage-2 map by stage2.c's `#ifdef HV_HDMI`
+ * HVFB_BASE/HVFB_SIZE carve-out — see that file) but its two buffers are
+ * fixed windows exactly like every other allocation in this file, so they
+ * get the same _Static_assert treatment rather than a hand-picked offset
+ * some future edit silently outgrows.
+ *
+ * HVMAP_FB_BASE/HVMAP_FB_WINDOW_SIZE are LITERAL MIRRORS of hdmi.h's
+ * HDMI_FB_BASE and stage2.c's HVFB_SIZE (same "mirroring" compromise this
+ * file already makes for the LOW-BLOCK section above — hv_addrmap.h has no
+ * #include on hdmi.h/stage2.h and this keeps it that way). If either moves,
+ * update all three.
+ *
+ * HVMAP_FB_BUF_W/H mirror hdmi.h's HDMI_MODE_HACTIVE/HDMI_MODE_VACTIVE — the
+ * geometry hdmi_init() actually runs (720p; the 1080p PHY divider path never
+ * locked on real hardware, see hdmi.h's own comment) and the ONLY geometry
+ * fb_init() is ever called with (hud.c:282, hdmi.c:1047 — both call
+ * fb_init(hdmi_fb(), hdmi_width(), hdmi_height(), hdmi_stride()), i.e. these
+ * same numbers via accessors, never a literal 1920x1080 anywhere at runtime).
+ * If the mode ever changes back to 1080p, HVMAP_FB_BUF_W/H must change with
+ * it or the asserts below catch the mismatch at compile time instead of
+ * silently laying buffer 1 over the wrong bytes. */
+#define HVMAP_FB_BASE            0x4D000000UL   /* mirrors hdmi.h HDMI_FB_BASE /
+                                                  * stage2.c HVFB_BASE          */
+#define HVMAP_FB_WINDOW_SIZE     0x00800000UL   /* mirrors stage2.c HVFB_SIZE and
+                                                  * the hv-fb@4d000000 DTB node's
+                                                  * `reg` size (8 MiB) */
+
+#define HVMAP_FB_BUF_W           1280UL         /* mirrors hdmi.h HDMI_MODE_HACTIVE */
+#define HVMAP_FB_BUF_H           720UL          /* mirrors hdmi.h HDMI_MODE_VACTIVE */
+#define HVMAP_FB_BUF_BPP         4UL             /* XRGB8888, hdmi.h/fb.h        */
+#define HVMAP_FB_BUF_STRIDE      (HVMAP_FB_BUF_W * HVMAP_FB_BUF_BPP)    /* 5120 B/line, no padding */
+#define HVMAP_FB_BUF_SIZE        (HVMAP_FB_BUF_STRIDE * HVMAP_FB_BUF_H) /* 3,686,400 B == 0x384000 */
+
+/* Buffer 0 is BY CONSTRUCTION the same address hdmi.h's HDMI_FB_BASE /
+ * stage2.c's HVFB_BASE already use — this is what keeps the existing
+ * single-buffer behaviour (hud.c, hdmi_demo()) working completely unchanged
+ * by default: nobody has to touch hdmi_fb()/HDMI_FB_BASE for buffer 0 to be
+ * correct. Buffer 1 is the new back buffer, immediately after it. */
+#define HVMAP_FB_BUF0_BASE       (HVMAP_FB_BASE + 0UL)
+#define HVMAP_FB_BUF1_BASE       (HVMAP_FB_BASE + HVMAP_FB_BUF_SIZE)
+
+_Static_assert(HVMAP_FB_BUF_SIZE % 0x1000UL == 0UL,
+               "hv-fb buffer size is not 4 KiB page-aligned — pick a scanout "
+               "base alignment before changing HVMAP_FB_BUF_W/H");
+_Static_assert(HVMAP_FB_BUF0_BASE + HVMAP_FB_BUF_SIZE <= HVMAP_FB_BUF1_BASE,
+               "hv-fb buffer 0 and buffer 1 overlap");
+_Static_assert(HVMAP_FB_BUF1_BASE + HVMAP_FB_BUF_SIZE
+               <= HVMAP_FB_BASE + HVMAP_FB_WINDOW_SIZE,
+               "double-buffered hv-fb layout overflows the 8 MiB hv-fb DTB "
+               "reservation -- see docs/zero-copy-scanout.md's fit arithmetic");
+
+/* ---- scanout.c doorbell breadcrumb ("SCAN") ------------------------------
+ * scanout.c emulates a tiny guest-facing MMIO device at SCANOUT_MMIO_BASE
+ * (scanout.h, 0x0A002000 — inside the SAME already-stage-2-trapped 2 MiB
+ * block vblk_emmc.h/vnet_emac.h already use, so no stage2.c change was
+ * needed for that device; see scanout.h's own comment). This is the
+ * SEPARATE, EL2-only breadcrumb mirror of that device's state, readable via
+ * the existing `bc`/`md.l` debug convention without needing a guest at all
+ * (see docs/zero-copy-scanout.md's verification section). Placed a full
+ * page above HVMAP_VCPM_END per this file's own hygiene rule (a buffer
+ * grown without slack has marched into a neighbour before — see the VCPM
+ * section above), well below el2_ncmap.c's non-cacheable DMA scratch
+ * boundary (0x50100000) so the coherent-store (`dc civac`) pattern applies. */
+#define HVMAP_SCANOUT_BC         0x50092000UL
+#define HVMAP_SCANOUT_BC_SIZE    0x40UL
+
+_Static_assert(HVMAP_SCANOUT_BC >= HVMAP_VCPM_END,
+               "scanout breadcrumb lane overlaps the vconsole postmortem lane");
+_Static_assert(HVMAP_SCANOUT_BC + HVMAP_SCANOUT_BC_SIZE <= 0x50100000UL,
+               "scanout breadcrumb lane runs into el2_ncmap.c's non-cacheable "
+               "DMA scratch window (SCRATCH_BASE 0x50100000)");
 
 #endif /* HV_ADDRMAP_H */

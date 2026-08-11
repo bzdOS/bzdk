@@ -113,12 +113,57 @@ int hdmi_init(void);
 
 /* Framebuffer accessors — the geometry actually programmed into the DE2
  * mixer / TCON1, so callers (fb.c, the future HUD compositor) never have to
- * duplicate the mode constants above. */
+ * duplicate the mode constants above. hdmi_fb() always returns the ORIGINAL
+ * single buffer (HDMI_FB_BASE, == hv_addrmap.h's HVMAP_FB_BUF0_BASE) — this
+ * is deliberate: hud.c and hdmi_demo() must keep working completely
+ * unchanged whether or not anything ever calls hdmi_set_scanout_addr()
+ * below. It is NOT necessarily the buffer currently being scanned out once
+ * a flip has happened — see hdmi_scanout_addr(). */
 uint32_t *hdmi_fb(void);
 int hdmi_width(void);
 int hdmi_height(void);
 int hdmi_stride(void); /* pixels per scanline (== hdmi_width() in v1: no
                          * padding, tightly packed XRGB8888) */
+
+/* ------------------------------------------------------------------ *
+ * Zero-copy scanout flip primitive (ROADMAP: zero-copy GPU scanout — see
+ * docs/zero-copy-scanout.md for the full design, evidence and the guest-
+ * side HV-call contract this backs). This is the ONLY new HV-side entry
+ * point that touches real DE2 hardware for a flip; scanout.c (the guest-
+ * facing doorbell device) and any board-side manual test both funnel
+ * through it, so there is exactly one place that knows how a scanout
+ * address change is actually committed.
+ * ------------------------------------------------------------------ */
+
+/* Reprogram the DE2 mixer1 UI layer's scanout base address to the physical
+ * address `pa` and commit it via the SAME double-buffer "apply" strobe
+ * (DE_GLB_DBUFF) stage_de2()/stage_scanout()/hdmi_relock() already use after
+ * every batch of mode-set register writes (hdmi.c:574,912,1021 — always
+ * write-then-strobe, never left pending) — see docs/zero-copy-scanout.md for
+ * why that register is believed to be a vblank-latched shadow commit rather
+ * than an immediate one, and exactly what is NOT verified about that timing
+ * without hardware.
+ *
+ * `pa` is used EXACTLY as given — no bounds/alignment check against hv-fb —
+ * because this function is EL2-trusted-caller-only (scanout.c has already
+ * validated the buffer index against its own fixed table before calling
+ * this; a raw dbgmon/gdb `call` from a human tester is equally trusted).
+ * Does not change PITCH/format/size — v1 requires every buffer flipped
+ * between to share hdmi_stride()/hdmi_width()/hdmi_height() exactly (see
+ * the design doc's "what the guest needs" section for why).
+ *
+ * Records the new address into breadcrumb word [8] (below) so a post-run
+ * `md.l` shows the last-programmed scanout address independently of
+ * scanout.c even being linked in. Cheap (two MMIO writes); safe to call
+ * from CPU0 (guest-triggered) or CPU1 (a human's dbgmon `call`) — see the
+ * design doc's concurrency note for why no additional lock is needed. */
+void hdmi_set_scanout_addr(uint32_t pa);
+
+/* The address last programmed by hdmi_set_scanout_addr(), or HDMI_FB_BASE
+ * if it has never been called (matches what stage_de2() programmed at
+ * boot). This is the buffer CURRENTLY being scanned out — unlike hdmi_fb(),
+ * which always names buffer 0 regardless of what is live. */
+uint32_t hdmi_scanout_addr(void);
 
 /* Clear to a dark blue, draw a title bar, a border box (the future "guest
  * window"), and some sample hex/text (fake register readouts) using fb.h's
@@ -180,6 +225,10 @@ void hdmi_relock(void);
  *   [7] relock_count  # times CPU1 (smp.c) observed PHY_STATUS bit7 drop
  *                      post-boot and called hdmi_relock() to restore it
  *                      (0 = never needed it yet)
+ *   [8] scanout_addr  last physical address hdmi_set_scanout_addr() (below)
+ *                      programmed into DE_UI1_CFG0_TOP_LADDR — added for
+ *                      zero-copy scanout (docs/zero-copy-scanout.md); reads
+ *                      back HDMI_FB_BASE until the first flip ever happens
  * ------------------------------------------------------------------ */
 /* Relocated 2026-07-25 from 0x50003000 — that address sits INSIDE the
  * vconsole 64 KiB capture ring (0x50000f10..0x50010f10) and was being
