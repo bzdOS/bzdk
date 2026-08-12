@@ -430,6 +430,15 @@ static uint32_t g_busy_timeouts;  /* [10] post-write CARD_BUSY wait timeouts */
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
 #define EBIO_BC_NWORDS 13u
+/* hv_addrmap.h's assert chain proves this window does not overlap its
+ * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
+ * two drifted: the declared size said 8 words while the code wrote 13, and the
+ * only reason nothing broke is that the next window happened to start 0x100
+ * away instead of 0x20. Same shape as the vblk [59] slot-aliasing mistake --
+ * a window-level guarantee read as an index-level one. */
+_Static_assert(EBIO_BC_NWORDS * 4u <= HVMAP_EBIO_BC_SIZE,
+               "emmc_bio.c writes more EBIO breadcrumb slots than "
+               "HVMAP_EBIO_BC_SIZE reserves");
 static void ebio_bc_reset(void)
 {
 	unsigned i;
