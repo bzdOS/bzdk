@@ -111,6 +111,45 @@
 #define RINT_DATA_OVER      0x00000008u  /* bit3 */
 #define RINT_ALL            0xFFFFFFFFu
 
+/* Error bits. PROVENANCE MATTERS HERE, so it is written down rather than
+ * assumed: this is the sunxi SDXC layout Linux's sunxi-mmc.c uses, and the two
+ * bits this file already relied on before any of these were named -- bit2
+ * CMD_DONE and bit3 DATA_OVER -- match it exactly, which is the corroboration.
+ * It is NOT read off the A64 manual, so treat a bit that behaves unlike its
+ * name as evidence against the name, not against the hardware. */
+#define RINT_RESP_ERR       0x00000002u  /* bit1  */
+#define RINT_RESP_CRC_ERR   0x00000040u  /* bit6  */
+#define RINT_DATA_CRC_ERR   0x00000080u  /* bit7  */
+#define RINT_RESP_TIMEOUT   0x00000100u  /* bit8  -- SEE THE WARNING BELOW */
+#define RINT_DATA_TIMEOUT   0x00000200u  /* bit9  */
+#define RINT_FIFO_RUN_ERR   0x00000800u  /* bit11 */
+#define RINT_HW_LOCKER      0x00001000u  /* bit12 */
+#define RINT_START_BIT_ERR  0x00002000u  /* bit13 */
+#define RINT_END_BIT_ERR    0x00008000u  /* bit15 */
+
+/* The mask emmc_bio_read() fails a read on. DELIBERATELY EXCLUDES bit8.
+ *
+ * Measured on this board 2026-08-12 (breadcrumb [14], an OR across every
+ * SUCCESSFUL write since boot): bit8 was set at the end of at least one write
+ * that completed fine. That is one write, not every write -- the accumulator
+ * cannot distinguish -- but it is enough to disqualify bit8 from a fatal mask
+ * until something explains it, because a bit whose observed behaviour
+ * contradicts the name "RESP_TIMEOUT" is exactly the wrong thing to start
+ * failing I/O on. The write path's own long-standing 0x0180 check DOES include
+ * bit8; that is not evidence it is safe, it is unexamined.
+ *
+ * Everything in this mask has been observed NEVER to be set at the end of a
+ * successful read: [13] holds only {CMD_DONE, DATA_OVER, RX_DATA_REQ} = 0x2c
+ * across a full boot plus a 68 MB read workload. So switching this check on
+ * cannot break a path that works today -- it can only start reporting a
+ * condition that was previously returned to the guest as good data. If [20]
+ * ever climbs, read [19] to see WHICH bit fired before assuming the medium is
+ * at fault; a benign bit in this mask would look identical to a real error. */
+#define RINT_READ_ERR_MASK  (RINT_RESP_ERR | RINT_RESP_CRC_ERR | \
+                             RINT_DATA_CRC_ERR | RINT_DATA_TIMEOUT | \
+                             RINT_FIFO_RUN_ERR | RINT_HW_LOCKER | \
+                             RINT_START_BIT_ERR | RINT_END_BIT_ERR)
+
 /* STAR (status) bits */
 #define STAR_FIFO_EMPTY     0x00000004u  /* bit2 */
 #define STAR_FIFO_FULL      0x00000008u  /* bit3 */
@@ -489,9 +528,36 @@ static uint32_t g_busy_el_hi;     /* [17] (uint32_t)(el >> 32)               */
  * damage -- which is the intended outcome, not a reason to stop looking. */
 static uint32_t g_cnt_anom;       /* [18] over-cap read followed by under-cap */
 
+/* [19]/[20]: reads that finished with a full block AND an error bit set --
+ * previously returned as rc=0, i.e. silently. [19] is the OR of the offending
+ * bits so a climb in [20] can be attributed to a specific bit. */
+static uint32_t g_read_err_bits;  /* [19] OR of bits that failed a read       */
+static uint32_t g_read_errs;      /* [20] reads failed on RINT_READ_ERR_MASK  */
+
+/* [21]/[22]: how the FIFO reset actually behaves, which is the evidence for
+ * replacing the fixed small_delay() with a real wait. [21] is the worst spin
+ * count seen before GCTL's self-clearing reset bits went to 0; [22] counts
+ * resets that never cleared within the cap. [21] staying 0 would mean the reset
+ * is always complete by the first read-back and the old fixed delay was never
+ * the problem -- which is a useful negative result, not a wasted change. */
+static uint32_t g_gctl_rst_spins;    /* [21] worst-case poll count            */
+static uint32_t g_gctl_rst_timeouts; /* [22] resets that never self-cleared   */
+
+/* [23]: error bits observed at the moment the WRITE data phase saw DATA_OVER.
+ *
+ * Observation only, on purpose. emmc_bio_write()'s loop checks `ri & 0x0180`
+ * AFTER its `if (ri & RINT_DATA_OVER) break;`, so any error bit that latches no
+ * later than DATA_OVER is never examined -- the same structural hole as the read
+ * path's missing check, and it is still open. It is not being closed in the same
+ * change that closed the read side, because the write path currently produces
+ * ZERO corrupt sectors in a 68 MB round trip and making a mask fatal there could
+ * only regress that. Record which bits actually co-occur with DATA_OVER first;
+ * make it fatal when the data says which bits are safe to fail on. */
+static uint32_t g_write_dataover_errs; /* [23] err bits seen with DATA_OVER   */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 19u
+#define EBIO_BC_NWORDS 24u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -577,6 +643,46 @@ static void wait_card_idle(void)
  * on Allwinner parts -- see the sunxi "fatal err update clk timeout" reports).
  * A [9] that tracks [8] means recovery itself is failing and the card needs a
  * heavier reset, not a retry. */
+/* Reset the FIFO and WAIT for the self-clearing pulse to actually finish.
+ *
+ * This is the fix for a defect ebio_fail_settle() below had already diagnosed in
+ * its own comment and fixed only for itself: "never WAITED for the reset pulse to
+ * finish. A fixed small_delay() is not the same as polling the self-clearing
+ * bits: if the reset had not completed when we returned, the next transfer was
+ * issued into a controller that was still resetting -- which is the exact
+ * failure mode this function exists to prevent." Both hot paths --
+ * emmc_bio_read() and emmc_bio_write() -- went on doing precisely that, with
+ * small_delay() being 64 register reads, a few microseconds fixed.
+ *
+ * The lesson was applied in one function and not in the two that run on every
+ * single sector. Now it is shared, so there is one implementation to be right.
+ *
+ * Bounded, like the sibling: a controller that will not clear these bits is not
+ * going to be rescued by waiting longer, and a caller that cannot proceed is
+ * better off failing than spinning. Instrumented ([21]/[22]) because the whole
+ * point is to find out whether the fixed delay was ever actually too short.
+ *
+ * NOT used by emmc_bio_init(), which writes GCTL_RESET_ALL wholesale as its
+ * bring-up reset rather than OR-ing bits into the live register. That path is
+ * hardware-validated and semantically different; left alone deliberately. */
+static int gctl_reset_and_wait(uint32_t bits)
+{
+	uint32_t i;
+
+	wreg(REG_GCTL, rreg(REG_GCTL) | bits);
+	for (i = 0; i < EMMC_POLL_CAP; i++) {
+		if ((rreg(REG_GCTL) & GCTL_RESET_ALL) == 0) {
+			if (i > g_gctl_rst_spins) {
+				g_gctl_rst_spins = i;
+				ebio_bc(21, i);
+			}
+			return 0;
+		}
+	}
+	ebio_bc(22, ++g_gctl_rst_timeouts);
+	return -1;
+}
+
 static void ebio_fail_settle(void)
 {
 	uint32_t i;
@@ -637,9 +743,10 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 	 * which is the normal case. */
 	wait_card_idle();
 
-	/* FIFO reset (GCTL bit1) + tiny settle delay. */
-	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
-	small_delay();
+	/* FIFO reset, WAITING for the self-clearing pulse -- not a fixed delay.
+	 * See gctl_reset_and_wait(): this used small_delay() (64 register reads),
+	 * which is the very thing ebio_fail_settle()'s comment documents as wrong. */
+	gctl_reset_and_wait(GCTL_FIFO_RST);
 
 	wreg(REG_BKSR, 512);
 	wreg(REG_BYCR, 512);
@@ -696,13 +803,39 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 			break;
 	}
 
-	/* Observation only -- see g_rint_or_read. This read is about to be reported
-	 * as a success; record what the controller was flagging while it was. */
+	/* THE READ-SIDE ERROR CHECK. Until now this function returned 0 the moment
+	 * 128 words had drained and DATA_OVER had latched, without ever looking at a
+	 * single error bit -- so a block the controller had flagged as bad was handed
+	 * to the guest as good data, with no counter anywhere able to see it. The
+	 * write path has checked (a narrow mask of) error bits all along; the read
+	 * path checked none. That asymmetry was the defect.
+	 *
+	 * Settle before returning, for the same reason every other failure exit here
+	 * does: bailing without settling leaves the data phase retiring and poisons
+	 * whatever call comes next. Reads are NOT retried below us -- vblk_emmc.c has
+	 * VBLK_WRITE_RETRIES and no read equivalent -- so this becomes S_IOERR to the
+	 * guest and FreeBSD retries it. That is the correct trade: a reported error
+	 * the guest can retry beats silently correct-looking wrong bytes. */
 	{
 		uint32_t ri = rreg(REG_RINT);
+
 		if ((ri | g_rint_or_read) != g_rint_or_read) {
 			g_rint_or_read |= ri;
 			ebio_bc(13, g_rint_or_read);
+		}
+
+		if (ri & RINT_READ_ERR_MASK) {
+			g_read_err_bits |= (ri & RINT_READ_ERR_MASK);
+			ebio_bc(19, g_read_err_bits);
+			ebio_bc(20, ++g_read_errs);
+			ebio_bc(1, lba);
+			ebio_bc(2, ri);
+			ebio_bc(3, rreg(REG_STAR));
+			ebio_bc(4, 0x40000u | (ri & 0x3fffu)); /* tag: read error bits */
+			ebio_bc(5, rreg(REG_GCTL));
+			ebio_bc(0, ++g_ebio_fails);
+			ebio_fail_settle();
+			return -1;
 		}
 	}
 
@@ -722,9 +855,10 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	/* FIFO reset (GCTL bit1) + tiny settle delay. */
-	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
-	small_delay();
+	/* FIFO reset, WAITING for the self-clearing pulse -- not a fixed delay.
+	 * See gctl_reset_and_wait(): this used small_delay() (64 register reads),
+	 * which is the very thing ebio_fail_settle()'s comment documents as wrong. */
+	gctl_reset_and_wait(GCTL_FIFO_RST);
 
 	wreg(REG_BKSR, 512);
 	wreg(REG_BYCR, 512);
@@ -761,8 +895,19 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 		uint32_t ri;
 		for (;;) {
 			ri = rreg(REG_RINT);
-			if (ri & RINT_DATA_OVER)
+			if (ri & RINT_DATA_OVER) {
+				/* Observation only -- see g_write_dataover_errs. The error
+				 * check below is UNREACHABLE for any bit that latches no later
+				 * than DATA_OVER, because this break wins. Record what those
+				 * bits are instead of guessing; that hole stays open until the
+				 * data says which bits are safe to fail a write on. */
+				uint32_t e = ri & (RINT_READ_ERR_MASK | RINT_RESP_TIMEOUT);
+				if (e && (e | g_write_dataover_errs) != g_write_dataover_errs) {
+					g_write_dataover_errs |= e;
+					ebio_bc(23, g_write_dataover_errs);
+				}
 				break;
+			}
 			/* Record the controller state, like the READ path already does.
 			 * Without this a write failure left only its encoded rc and
 			 * nothing about the controller, which is why 0x40000104 could be
