@@ -194,6 +194,17 @@
  * until then advertise a conservative fixed size (see vblk_emmc.c). */
 #define VBLK_SECTOR_BYTES         512u
 
+/* Boot-critical LBA floor: guest WRITES below this are refused (reads are not).
+ *
+ * Derived from bsdOS's own image recipe (infra/scripts/bpi-image.sh), not from a
+ * guess: SPL_OFFSET_KIB=8 is BROM-mandated and FIXED (the A64 boot ROM reads the
+ * SPL from byte offset 8 KiB == LBA 16, ignoring the partition table entirely),
+ * and UBOOT_RESERVE_MIB=8 reserves an 8 MiB front gap for SPL + U-Boot ahead of
+ * partition 1. 9 MiB == 18432 sectors covers the GPT, that whole gap, and 1 MiB
+ * of slack so a larger FIT/full U-Boot build does not silently outgrow the
+ * guard. See serve_data()'s block comment for why this exists at all. */
+#define VBLK_BOOT_GUARD_LBA       18432u   /* 9 MiB / 512 */
+
 /* ------------------------------------------------------------------ *
  * eMMC-CONTROLLER MUTUAL EXCLUSION (design §8.1, the stated TOP RISK).
  *

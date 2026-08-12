@@ -103,6 +103,9 @@
  *   [45] .. rc == VBLK_RC_UNALIGNED (partial-sector stitch, unimplemented)
  *   [46] .. any other rc — a real emmc_bio_read/write failure (-1..-9)
  *   [47] .. rejected for exceeding the advertised capacity (no rc involved)
+ *   [59] .. rejected: guest WRITE below VBLK_BOOT_GUARD_LBA (boot area). A
+ *        NON-ZERO value here means the guest tried to write SPL/U-Boot and was
+ *        stopped -- worth investigating on its own, not just a stat.
  *   [48] .. rejected because emmc_ready == 0 (no rc involved)
  *   [49] first IOERR: sector lo32        [53] last IOERR: sector lo32
  *   [50] first IOERR: rc                 [54] last IOERR: rc
@@ -652,6 +655,7 @@ static void vblk_inject_irq(void)
 #define VBLK_RC_UNALIGNED  (-100)   /* partial-sector stitch, unimplemented */
 #define VBLK_RC_BUSY       (-200)   /* eMMC cross-core lock acquire timed out */
 #define VBLK_RC_BADPA      (-300)   /* data-descriptor PA outside DRAM */
+#define VBLK_RC_BOOTGUARD  (-400)   /* WRITE below the boot-reserved LBA floor */
 
 /* Bounded retries for a transient write stall (emmc_bio_write() rc == -2, "card
  * never signaled program-done"). See serve_data()'s retry loop for the hardware
@@ -785,6 +789,43 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			g_gmem_oob++;
 			vblk_bc(27, g_gmem_oob);
 			return VBLK_RC_BADPA;        /* guest PA outside DRAM -> S_IOERR */
+		}
+
+		/* STORAGE ISOLATION: refuse guest WRITES into the boot-critical LBAs.
+		 *
+		 * This device exposes the whole eMMC 1:1 -- virtio sector N is eMMC LBA
+		 * N, no offset (see vblk_emmc.h's geometry comment). That is deliberate:
+		 * the guest must read the GPT to find its own root on p3. The cost,
+		 * unguarded until now, is that the guest could WRITE anywhere on the
+		 * device, including LBA 16 -- where the A64 BROM reads the SPL from a
+		 * fixed byte offset, and the only thing that makes this board bootable.
+		 *
+		 * SESSION-RULES.md R2 states the board "не кирпичится (anti-brick
+		 * SPL@8KiB всегда даёт U-Boot)". Nothing enforced that. It was an
+		 * assumption that the guest would only ever write inside p3, and this
+		 * project has a documented history of vblk LBA-level bugs -- lost kicks
+		 * at unexpected LBAs, partial-sector stitching, a CPU0/CPU2 lock race --
+		 * any of which can misdirect a write. On 2026-08-12 the board came up in
+		 * FEL mode (BROM found nothing bootable) after a session of heavy guest
+		 * writes. That is not proof the guest did it, but it removes "it could
+		 * not have" as a defence, so the floor is now enforced here rather than
+		 * assumed.
+		 *
+		 * The floor comes from the image recipe, not a guess: bpi-image.sh sets
+		 * SPL_OFFSET_KIB=8 (BROM-mandated, FIXED) and UBOOT_RESERVE_MIB=8, i.e.
+		 * the GPT plus an 8 MiB front gap holding SPL and U-Boot. One extra MiB
+		 * of slack covers a larger FIT/full U-Boot build without another audit.
+		 *
+		 * READS are deliberately NOT restricted: the guest's own GPT parse must
+		 * see LBA 0..33, and a read cannot brick anything.
+		 *
+		 * This is enforcement, not policy. Mounting the guest's root read-only
+		 * is worth doing too, but that is the guest deciding not to write; this
+		 * is the hypervisor refusing to let it. */
+		if (!is_read && lba < VBLK_BOOT_GUARD_LBA) {
+			/* Counted once, in vblk_note_ioerr()'s classifier below, so the
+			 * refusal and the resulting S_IOERR cannot be double-counted. */
+			return VBLK_RC_BOOTGUARD;    /* -> S_IOERR, boot area untouched */
 		}
 
 		/* Serialize this single controller transaction against CPU1 (design
@@ -998,6 +1039,7 @@ static uint32_t g_ioerr_unaligned;     /* [45] rc == VBLK_RC_UNALIGNED        */
 static uint32_t g_ioerr_emmc;          /* [46] real emmc_bio failure (-1..-9) */
 static uint32_t g_ioerr_capacity;      /* [47] past advertised capacity       */
 static uint32_t g_ioerr_notready;      /* [48] emmc_ready == 0                */
+static uint32_t g_ioerr_bootguard;     /* [59] WRITE below the boot LBA floor  */
 
 /* Cause tags for the two rc-less rejects, so one call site shape covers all
  * five ways a request can end up S_IOERR. */
@@ -1027,6 +1069,7 @@ static void vblk_note_ioerr(uint32_t cause, int rc, uint64_t sector,
 		case VBLK_RC_BUSY:      vblk_bc(43, ++g_ioerr_busy);      break;
 		case VBLK_RC_BADPA:     vblk_bc(44, ++g_ioerr_badpa);     break;
 		case VBLK_RC_UNALIGNED: vblk_bc(45, ++g_ioerr_unaligned); break;
+		case VBLK_RC_BOOTGUARD: vblk_bc(59, ++g_ioerr_bootguard); break;
 		default:                vblk_bc(46, ++g_ioerr_emmc);      break;
 		}
 		break;

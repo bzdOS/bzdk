@@ -86,6 +86,26 @@ static int emmc_bio_write_stub(uint32_t lba, const uint8_t *src)
  * the untouched bytes are destroyed -- that is the corruption this file exists
  * to rule out.
  * ------------------------------------------------------------------ */
+/* Mirrored from vblk_emmc.h / vblk_emmc.c. Kept as literals for the same reason
+ * the rest of this file mirrors rather than includes: vblk_emmc.c is full of
+ * AArch64 inline asm that host gcc cannot assemble. If either value changes
+ * there, change it here -- the tests below are what makes the drift visible. */
+#define VBLK_BOOT_GUARD_LBA  18432u   /* 9 MiB / 512; bpi-image.sh's 8 MiB
+                                       * U-Boot reserve + GPT + 1 MiB slack   */
+#define VBLK_RC_BOOTGUARD    (-400)
+
+/* In vblk_emmc.c the floor is a compile-time constant. Here it is a variable,
+ * for one reason: the fake device is 64 sectors, so EVERY sector these tests
+ * use is below the real 18432 floor. Hard-coding it would make the guard refuse
+ * the pre-existing stitching tests and silently destroy what they prove -- which
+ * is exactly what happened on the first attempt at this change.
+ *
+ * So: the stitching tests run with the floor at 0 (guard inert, their original
+ * meaning intact), and the guard tests set a small floor the 64-sector device
+ * can straddle. g_guard_floor's DEFAULT is the production value, and
+ * t_guard_matches_production() asserts that, so the two cannot drift silently. */
+static uint32_t g_guard_floor = VBLK_BOOT_GUARD_LBA;
+
 static int stitch_serve(uint32_t is_read, uint32_t gpa, uint32_t len,
                         uint64_t *sector, uint32_t *sector_fill)
 {
@@ -99,6 +119,14 @@ static int stitch_serve(uint32_t is_read, uint32_t gpa, uint32_t len,
 
 		if (chunk > len - done)
 			chunk = len - done;
+
+		/* Mirrors serve_data()'s storage-isolation guard (vblk_emmc.c): a guest
+		 * WRITE below the boot-critical LBA floor is refused; READS are not.
+		 * The device exposes the whole eMMC 1:1, so without this the guest can
+		 * overwrite LBA 16 -- the SPL the A64 BROM boots from -- and brick the
+		 * board. See that function's block comment. */
+		if (!is_read && lba < g_guard_floor)
+			return VBLK_RC_BOOTGUARD;
 
 		if (is_read) {
 			rc = emmc_bio_read_stub(lba, bounce);
@@ -251,15 +279,102 @@ static void t_error_propagates(void)
 	check(rc == -1, "rc == -1 from the stub's out-of-range sector");
 }
 
+/* STORAGE ISOLATION. These four are the ones that would have mattered: the
+ * board came up in FEL mode on 2026-08-12 -- BROM found no bootable SPL -- after
+ * a session of heavy guest writes to an eMMC this device exposes 1:1 with no
+ * write floor at all. Whether the guest did it was never proven, but nothing
+ * prevented it. */
+/* The production floor must be what the image recipe implies. If bpi-image.sh's
+ * UBOOT_RESERVE_MIB ever changes, this is what says so out loud. */
+static void t_guard_matches_production(void)
+{
+	printf("guard: mirrored floor still matches vblk_emmc.h\n");
+	/* The CONSTANT, not g_guard_floor -- main() mutates the variable to run the
+	 * stitching tests with the guard inert, so asserting on it here would just
+	 * be reading test scaffolding. First version of this check did exactly that
+	 * and failed for a reason that had nothing to do with the guard. */
+	check(VBLK_BOOT_GUARD_LBA == 18432u, "mirrored floor is 9 MiB / 512 = 18432");
+	check(VBLK_BOOT_GUARD_LBA > 16u,
+	      "floor is above the BROM-mandated SPL sector 16");
+}
+
+static void t_guard_blocks_spl_write(void)
+{
+	uint64_t sec = 16; uint32_t fill = 0;          /* LBA 16 == the SPL slot */
+	printf("guard: write to the SPL sector is refused\n");
+	g_guard_floor = 20;                            /* small: 64-sector device */
+	dev_writes = 0;
+	int rc = stitch_serve(0, 0, VBLK_SECTOR_BYTES, &sec, &fill);
+	check(rc == VBLK_RC_BOOTGUARD, "rc == VBLK_RC_BOOTGUARD");
+	check(dev_writes == 0, "NOTHING was written to the device");
+	check(sec == 16, "sector not advanced past the refusal");
+}
+
+/* A read of the same sector must still work: the guest parses the GPT itself,
+ * and a read cannot brick anything. A guard that blocked reads would break
+ * partition discovery and look like a dead disk. */
+static void t_guard_allows_boot_read(void)
+{
+	uint64_t sec = 16; uint32_t fill = 0;
+	printf("guard: reads of the boot area still work\n");
+	g_guard_floor = 20;
+	dev_reads = 0;
+	int rc = stitch_serve(1, 0, VBLK_SECTOR_BYTES, &sec, &fill);
+	check(rc == 0, "read succeeded");
+	check(dev_reads == 1, "the read reached the device");
+}
+
+/* The floor is exclusive: the first sector of the guest's own data must be
+ * writable, or the guard breaks the very thing it protects. */
+static void t_guard_boundary_is_exclusive(void)
+{
+	uint64_t sec = 20; uint32_t fill = 0;
+	printf("guard: the floor sector itself is writable\n");
+	g_guard_floor = 20;
+	dev_writes = 0;
+	int rc = stitch_serve(0, 0, VBLK_SECTOR_BYTES, &sec, &fill);
+	check(rc == 0, "write at exactly the floor is allowed");
+	check(dev_writes == 1, "it reached the device");
+
+	sec = 19; fill = 0; dev_writes = 0;
+	rc = stitch_serve(0, 0, VBLK_SECTOR_BYTES, &sec, &fill);
+	check(rc == VBLK_RC_BOOTGUARD, "one sector below is refused");
+	check(dev_writes == 0, "and wrote nothing");
+}
+
+/* The check is per-chunk inside the loop, not once per request: a write that
+ * STARTS legally must still be stopped if it walks down into the boot area.
+ * (It cannot here -- sectors only ascend -- so this pins the converse: a
+ * multi-sector write starting below the floor must be refused on its FIRST
+ * sector, before any of it lands.) */
+static void t_guard_stops_before_first_write(void)
+{
+	uint64_t sec = 8; uint32_t fill = 0;
+	printf("guard: multi-sector write below the floor writes nothing at all\n");
+	g_guard_floor = 20;
+	dev_writes = 0;
+	int rc = stitch_serve(0, 0, 4 * VBLK_SECTOR_BYTES, &sec, &fill);
+	check(rc == VBLK_RC_BOOTGUARD, "refused");
+	check(dev_writes == 0, "not one sector leaked through");
+}
+
 int main(void)
 {
 	printf("test_vblk_stitch: reference partial-sector stitch\n\n");
+	/* The stitching tests predate the guard and use low sectors throughout.
+	 * Run them with the guard inert so they still prove what they proved. */
+	g_guard_floor = 0;
 	t_aligned_read();
 	t_unaligned_read_tail();
 	t_carry_across_descriptors();
 	t_partial_write_preserves();
 	t_full_write_skips_read();
 	t_error_propagates();
+	t_guard_matches_production();
+	t_guard_blocks_spl_write();
+	t_guard_allows_boot_read();
+	t_guard_boundary_is_exclusive();
+	t_guard_stops_before_first_write();
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
 	       failures, failures == 1 ? "" : "s");
 	return failures ? 1 : 0;
