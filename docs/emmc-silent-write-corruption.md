@@ -210,15 +210,77 @@ Both fixes in, same test: readback hash identical to the reference,
 `TOTAL DAMAGED SECTORS: 0`. `write_retries`, `busy_timeouts`, `settles`,
 `ebio_fails`, `read_errs` and `g_ioerrs` all 0 across 6763 reads and 4655 writes.
 
+## The third hole, closed afterwards (`97e107b`)
+
+`emmc_bio_write()`'s `ri & 0x0180` check sits after
+`if (ri & RINT_DATA_OVER) break;`, so any error bit latching no later than
+`DATA_OVER` was never examined and the write completed as a success. The same
+defect as the read path's missing check, in a different shape.
+
+### The precondition mattered more than the check
+
+Failing a write here makes `vblk_emmc.c` **retry** it, and a retry landing on a
+still-programming card is the corruption mechanism this entire document is about.
+So the check could not be made fatal until the retry path was safe.
+
+It was not safe. `ebio_fail_settle()` waited for card-idle using
+`wait_card_idle()`, bounded by `EMMC_POLL_CAP` **register reads** — a count, not a
+duration. A flash program takes tens of milliseconds, so that wait could return
+with the card still busy, and the caller's next act is the retry. **The settle was
+never sufficient protection**; it only looked like it because the FIFO/DMA reset
+half of it is real. That is worth stating plainly, because "we settle before
+retrying" was the standing reassurance in this file's comments.
+
+`wait_card_idle_timed()` is bounded by time and uses the **same two-read
+discipline** as the timeout loops — writing it the obvious way would have
+re-introduced, inside the fix, the exact CNTPCT-goes-backwards bug the fix exists
+to prevent. Its fast path reads one register and no clock at all, so
+`emmc_bio_read()`'s entry guard keeps the cheapness the original had. Used by
+both the settle and that entry guard.
+
+### Measured
+
+Same test, all three fixes in: readback and a second independent read both
+identical to the reference, **`TOTAL DAMAGED SECTORS: 0`**. Across a boot plus a
+full 68 MB round trip (6762 reads, 4645+ writes):
+
+```
+ebio_fails 0   settles 0   busy_timeouts 0   write_retries 0   g_ioerrs 0
+read_errs 0    dataover_fails 0              cnt_anomalies 0
+RINT_or_read 0x002c   RINT_or_write 0x001c   write_dataover_errs 0x0000
+```
+
+`[24] dataover_fails = 0`: the new fatal check has not fired once — no false
+positives, as `[23]`'s prior `0x0000` predicted.
+
+### What is NOT validated, and why
+
+`[25] settle_busy_ms = 0` with `[8] settles = 0`. The settle path is only reached
+on a failure, and there are no failures any more — so the timed card-idle wait
+has **not been exercised as the retry safeguard at all**. What `[25] = 0` does
+show is that `emmc_bio_read()`'s entry guard never finds the card busy for a
+measurable millisecond.
+
+So the retry-path fix is insurance whose value appears only when something fails.
+It is correct by construction and unproven under load, and those are different
+claims. The same honesty applies to `[21] gctl_rst_spins = 1`: the FIFO reset
+takes about one register-read time, which the old fixed `small_delay()` of 64
+reads comfortably covered.
+
+Two of the three secondary fixes, then, are hardening rather than caught bugs.
+Only the read-side missing error check closed a hole that was demonstrably
+capable of returning bad data as good.
+
 ## Still open
 
-- **`emmc_bio_write()`'s error check is unreachable for early bits.** It sits
-  after `if (ri & RINT_DATA_OVER) break;`, so any error bit latching no later
-  than `DATA_OVER` is never examined. `[23]` now records which bits actually
-  co-occur with `DATA_OVER`; it currently reads `0x0000`, so the hole is hiding
-  nothing. Not made fatal, because the write path now produces zero corrupt
-  sectors and a speculative mask could only regress that. Make it fatal when
-  `[23]` says which bits are safe to fail on.
+- **Why `CNTPCT_EL0` reads backwards at all.** The guard makes it harmless, not
+  absent. `[18]` and the timeout counters are the instruments; note that `[18]`
+  counts only the over-then-under pair, and the *backwards* read is caught
+  silently by the ternary — which is itself how the direction of the glitch was
+  established.
+- **The retry path's safety is untested**, per the section above. A deliberate
+  fault-injection run (force a write failure and confirm the retry waits for
+  card-idle before re-issuing CMD24) is the missing verification.
 - **Why `CNTPCT_EL0` reads backwards at all.** The guard makes it harmless, not
   absent. `[18]` and the timeout counters are the instruments; note that `[18]`
   counts only the over-then-under pair, and the *backwards* read is caught
