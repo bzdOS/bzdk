@@ -427,9 +427,29 @@ static uint32_t g_settles;        /* [8] error-recovery runs                */
 /* [9] was g_settle_clkfail; the clk_update() it counted is gone (see below). */
 static uint32_t g_busy_timeouts;  /* [10] post-write CARD_BUSY wait timeouts */
 
+/* [13]/[14]: OR of every RINT bit observed at the END of a SUCCESSFUL transfer,
+ * accumulated separately for reads and writes. Pure observation -- neither one
+ * changes a return value.
+ *
+ * Why this exists. emmc_bio_write() bails on `ri & 0x0180`, but emmc_bio_read()
+ * checks NO error bits at all: it returns 0 as soon as 128 words drained and
+ * DATA_OVER latched. So if this controller can latch a data-integrity error
+ * while still delivering a full block, a read returns rc=0 with wrong bytes --
+ * silent corruption, invisible to every vblk IOERR counter (they only count
+ * non-zero rc). That is a mechanism, not yet a measurement.
+ *
+ * It is deliberately NOT being "fixed" by adding a mask first. The two error
+ * bits the write path does check are commented as DATA_CRC(bit7)/DATA_TIMEOUT
+ * (bit8), and in the sunxi layout used elsewhere bit8 is RESP_TIMEOUT while
+ * DATA_TIMEOUT is bit9 -- so the existing mask may already be naming the wrong
+ * bit, and guessing a wider one from recollection would just add a second guess.
+ * Accumulate what the hardware actually sets on THIS board, then mask. */
+static uint32_t g_rint_or_read;   /* [13] OR of RINT after successful reads  */
+static uint32_t g_rint_or_write;  /* [14] OR of RINT after successful writes */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 13u
+#define EBIO_BC_NWORDS 15u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -634,6 +654,16 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 			break;
 	}
 
+	/* Observation only -- see g_rint_or_read. This read is about to be reported
+	 * as a success; record what the controller was flagging while it was. */
+	{
+		uint32_t ri = rreg(REG_RINT);
+		if ((ri | g_rint_or_read) != g_rint_or_read) {
+			g_rint_or_read |= ri;
+			ebio_bc(13, g_rint_or_read);
+		}
+	}
+
 	__asm__ volatile("dsb sy" ::: "memory");
 	return 0;
 }
@@ -820,6 +850,21 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			}
 		}
 	}
+
+	/* Observation only -- see g_rint_or_write. Counterpart to the read side, and
+	 * the reason both are needed: the write path DOES bail on `ri & 0x0180`, so
+	 * comparing the two accumulators says whether the read path's missing check
+	 * would ever have fired. If [13] shows bits that 0x0180 would have caught
+	 * and [14] does not, the asymmetry is real and reads have been passing
+	 * flagged data through as success. */
+	{
+		uint32_t ri = rreg(REG_RINT);
+		if ((ri | g_rint_or_write) != g_rint_or_write) {
+			g_rint_or_write |= ri;
+			ebio_bc(14, g_rint_or_write);
+		}
+	}
+
 	__asm__ volatile("dsb sy" ::: "memory");
 	return 0;
 }
