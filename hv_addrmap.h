@@ -82,6 +82,16 @@
 #define HVMAP_USED_LOCK      0x50020700UL
 #define HVMAP_USED_LOCK_SIZE 0x4UL
 
+/* SD-card single-sector scratch buffer, for dbgmon's `sd read/write` probe
+ * (sd_bio.c has no caller in any build -- see dbgmon.c's cmd_sd()). Placed at
+ * 0x50020800 rather than reusing HVMAP_EMMC_HS_TESTBUF: that buffer belongs to
+ * emmc_bio.c's high-speed probe, and this file's whole reason for existing is
+ * that two purposes sharing one window is how the 2026-07-24 alias bug
+ * happened. 0x50020704..0x50020fff was free (HVMAP_USED_LOCK is 4 bytes at
+ * 0x50020700), and 0x800 keeps it aligned and clear of it. */
+#define HVMAP_SD_TESTBUF     0x50020800UL
+#define HVMAP_SD_TESTBUF_SIZE 0x200UL    /* one 512-byte sector */
+
 /* End of the reserved I/O-storage block (one 4 KiB page). */
 #define HVMAP_IO_BLOCK_END   0x50021000UL
 
@@ -167,8 +177,12 @@ _Static_assert(HVMAP_SD_BC + HVMAP_SD_BC_SIZE <= HVMAP_ASYNC_BC,
                "SD breadcrumbs overlap the async breadcrumbs");
 _Static_assert(HVMAP_ASYNC_BC + HVMAP_ASYNC_BC_SIZE <= HVMAP_USED_LOCK,
                "async breadcrumbs overlap the used-ring lock word");
-_Static_assert(HVMAP_USED_LOCK + HVMAP_USED_LOCK_SIZE <= HVMAP_IO_BLOCK_END,
-               "used-ring lock overruns the I/O-storage block");
+_Static_assert(HVMAP_USED_LOCK + HVMAP_USED_LOCK_SIZE <= HVMAP_SD_TESTBUF,
+               "used-ring lock overlaps the SD scratch buffer");
+_Static_assert(HVMAP_SD_TESTBUF + HVMAP_SD_TESTBUF_SIZE <= HVMAP_IO_BLOCK_END,
+               "SD scratch buffer overruns the I/O-storage block");
+_Static_assert(HVMAP_SD_BC + HVMAP_SD_BC_SIZE <= HVMAP_SD_TESTBUF,
+               "SD breadcrumbs overlap the SD scratch buffer");
 _Static_assert(HVMAP_IO_BLOCK_END <= HVMAP_DBGTOOLS_BASE,
                "dbgtools lane overlaps the I/O-storage block");
 _Static_assert(HVMAP_DBGTOOLS_END <= 0x50030000UL,

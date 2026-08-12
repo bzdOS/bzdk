@@ -16,6 +16,7 @@
  * (dbgmon.c/.h are the only two files this module owns).
  */
 #include <stdint.h>
+#include "hv_addrmap.h"   /* HVMAP_SD_BC, HVMAP_SD_TESTBUF */
 #include "exceptions.h"
 #include "dbgmon.h"
 
@@ -40,6 +41,16 @@ extern int el2_ss_toggle(struct el2_frame *frame);
 extern int  hwbp_set(int idx, uint64_t va, int is_write_wp);
 extern int  hwbp_clear(int idx, int is_write_wp);
 extern void hwbp_clear_all(void);
+
+/* sd_bio.c — SD-card block I/O. Linked into dbg/gdb and, until this command
+ * existed, called from NOWHERE: its own header says "dbgmon `call` on CPU1 is
+ * this file's only caller today", i.e. the intended way to exercise it was to
+ * resolve the symbol with nm and `call` the address. That is exactly the
+ * practice dbgtools.h exists to warn about -- an nm-resolved address against a
+ * stale on-disk ELF silently jumps into garbage. Hence a real command. */
+extern int sd_bio_init(void);
+extern int sd_bio_read(uint32_t lba, uint64_t buf_pa);
+extern int sd_bio_write(uint32_t lba, uint64_t buf_pa);
 
 /* Guest console RX injection (vconsole.c): push one host byte into the
  * guest's virtual UART0 RX ring. Used by the `poweroff` command to type a
@@ -220,6 +231,104 @@ static int tokenize(char *line, char *tok[MAX_TOKENS])
  * el2_frame the tick handler just saved. This is the headline command --
  * it shows exactly where the EL1 guest is executing and its full register
  * state, live, without stopping it. */
+/* Defined below; cmd_sd() hexdumps the sector it just read with it. */
+static void cmd_read_bytes(unsigned long addr, uint32_t n);
+
+/* ------------------------------------------------------------------ *
+ * `sd` — exercise the SD-card driver (sd_bio.c).
+ *
+ * WHY THIS EXISTS: sd_bio.c is a careful, register-for-register port of the
+ * hardware-verified emmc_bio.c (same SMHC IP), but it has never executed. It is
+ * linked into dbg/gdb and called from nowhere. When a microSD card arrives, this
+ * is what says whether the driver works -- and if it does not, WHERE it stopped,
+ * because `sd init` decodes sd_bio's own breadcrumb window rather than just
+ * reporting an errno.
+ *
+ * The breadcrumb decode is the point. sd_bio_init() stamps slot 0 with a
+ * distinct negative value at each of its seven failure points, and the
+ * interesting values (CMD8 response, ACMD41 OCR, block-addressing, the card's
+ * RCA) into slots 2..6. A bare "rc=-5" says nothing; "ACMD41 never left busy"
+ * says what to look at.
+ * ------------------------------------------------------------------ */
+static void sd_show_bc(void)
+{
+	const volatile uint32_t *bc = (const volatile uint32_t *)HVMAP_SD_BC;
+	uint32_t st = bc[0];
+
+	cputs("  sdbc[0] fail-stage = "); print_hex32(st);
+	switch (st) {
+	case 0u:            cputs("  (no failure recorded)");                break;
+	case 0xffffffffu:   cputs("  (-1 clk_update before 400kHz)");        break;
+	case 0xfffffffeu:   cputs("  (-2 clk_update after 400kHz)");         break;
+	case 0xfffffffdu:   cputs("  (-3 CMD0 GO_IDLE / SEND_INIT)");        break;
+	case 0xfffffffcu:   cputs("  (-4 ACMD41 command error)");            break;
+	case 0xfffffffbu:   cputs("  (-5 ACMD41 never left busy: no card?)"); break;
+	case 0xfffffffau:   cputs("  (-6 CMD2 ALL_SEND_CID)");               break;
+	case 0xfffffff9u:   cputs("  (-7 CMD3 SEND_RELATIVE_ADDR)");         break;
+	default:            cputs("  (unrecognised)");                       break;
+	}
+	cputs("\r\n  sdbc[2] CMD8 resp  = "); print_hex32(bc[2]);
+	cputs("\r\n  sdbc[3] CMD8 ok    = "); print_hex32(bc[3]);
+	cputs("\r\n  sdbc[4] OCR        = "); print_hex32(bc[4]);
+	cputs("\r\n  sdbc[5] block-addr = "); print_hex32(bc[5]);
+	cputs("  (1 = SDHC/SDXC, 0 = byte-addressed SDSC)");
+	cputs("\r\n  sdbc[6] card RCA   = "); print_hex32(bc[6]);
+	cputs("\r\n");
+}
+
+static void cmd_sd(char **tok, int nt)
+{
+	unsigned long lba = 0;
+	int rc;
+
+	if (nt < 2) {
+		err("usage: sd <init|read <lba>|write <lba> CONFIRM>");
+		return;
+	}
+
+	if (streq(tok[1], "init")) {
+		rc = sd_bio_init();
+		cputs("sd init: rc="); print_hex32((uint32_t)rc);
+		cputs(rc == 0 ? "  OK\r\n" : "  FAILED\r\n");
+		sd_show_bc();
+		return;
+	}
+
+	if (streq(tok[1], "read")) {
+		if (nt < 3 || !parse_hex(tok[2], &lba)) {
+			err("usage: sd read <lba>");
+			return;
+		}
+		rc = sd_bio_read((uint32_t)lba, (uint64_t)HVMAP_SD_TESTBUF);
+		cputs("sd read lba="); print_hex32((uint32_t)lba);
+		cputs(" rc="); print_hex32((uint32_t)rc);
+		if (rc != 0) { cputs("  FAILED\r\n"); sd_show_bc(); return; }
+		cputs("  OK, first 64 bytes:\r\n");
+		cmd_read_bytes(HVMAP_SD_TESTBUF, 64u);
+		return;
+	}
+
+	if (streq(tok[1], "write")) {
+		/* Destructive and irreversible on a real card, so it takes an explicit
+		 * literal rather than relying on the operator having read the help.
+		 * Writes whatever HVMAP_SD_TESTBUF currently holds -- normally a buffer
+		 * a prior `sd read` filled, which makes read-write-read a real
+		 * round-trip test rather than a blind write of stack garbage. */
+		if (nt < 4 || !parse_hex(tok[2], &lba) || !streq(tok[3], "CONFIRM")) {
+			err("usage: sd write <lba> CONFIRM   (writes HVMAP_SD_TESTBUF; destructive)");
+			return;
+		}
+		rc = sd_bio_write((uint32_t)lba, (uint64_t)HVMAP_SD_TESTBUF);
+		cputs("sd write lba="); print_hex32((uint32_t)lba);
+		cputs(" rc="); print_hex32((uint32_t)rc);
+		cputs(rc == 0 ? "  OK\r\n" : "  FAILED\r\n");
+		if (rc != 0) sd_show_bc();
+		return;
+	}
+
+	err("usage: sd <init|read <lba>|write <lba> CONFIRM>");
+}
+
 static void cmd_gr(struct el2_frame *f)
 {
 	int i;
@@ -716,6 +825,9 @@ static void cmd_help(void)
 	cputs("  sr                 guest EL1 sysregs (SCTLR/TCR/TTBRn/MAIR/VBAR/...)\r\n");
 	cputs("  r  <addr> [n]      read n phys words (default n=1)\r\n");
 	cputs("  rb <addr> [n]      read n phys bytes (default n=1)\r\n");
+	cputs("  sd init            bring up the SD card, decode sd_bio breadcrumbs\r\n");
+	cputs("  sd read <lba>      read one sector, hexdump it\r\n");
+	cputs("  sd write <lba> CONFIRM   write the scratch buffer back [DESTRUCTIVE]\r\n");
 	cputs("  d  <addr> <len>    hex+ascii dump\r\n");
 	cputs("  gva <addr>         translate guest VA via AT S1E1R, read the word\r\n");
 	cputs("  w  <addr> <val>    write phys word\r\n");
@@ -918,6 +1030,10 @@ static void exec_line(char *line, struct el2_frame *frame)
 			return;
 		}
 		cmd_read_words(a0, (uint32_t)n);
+		return;
+	}
+	if (streq(cmd, "sd")) {
+		cmd_sd(tok, nt);
 		return;
 	}
 	if (streq(cmd, "rb")) {
