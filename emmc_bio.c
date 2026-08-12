@@ -470,9 +470,28 @@ static uint32_t g_busy_cap_lo;    /* [15] (uint32_t)cap at the last timeout   */
 static uint32_t g_busy_el_lo;     /* [16] (uint32_t)el                       */
 static uint32_t g_busy_el_hi;     /* [17] (uint32_t)(el >> 32)               */
 
+/* [18]: consecutive rd_cntpct() reads that DISAGREED about whether the cap had
+ * expired -- one read said elapsed > cap, the very next said elapsed < cap.
+ *
+ * That is measured, not hypothetical. With cap recorded as exactly 96000000
+ * ticks (4.000 s, correct) the busy-wait branch fired while its own re-read of
+ * `rd_cntpct() - start`, two instructions later, came to 7627 ticks (0.32 ms).
+ * Both are the same expression over the same `start`; the reads themselves
+ * disagree by roughly 4 seconds. rd_cntpct() already carries the ISB that the
+ * architecture requires before reading CNTPCT_EL0, so that is not the gap.
+ *
+ * Why the counter behaves this way is still open. The fix does not depend on
+ * knowing: a bounded wait must not be decidable by a SINGLE read of an
+ * unreliable clock. Both timeout loops now require the cap to be exceeded on
+ * two consecutive reads, and an over-then-under pair lands here so the anomaly
+ * stays visible instead of being smoothed away. If [18] climbs while the
+ * timeouts stop firing, that is the anomaly still happening and no longer doing
+ * damage -- which is the intended outcome, not a reason to stop looking. */
+static uint32_t g_cnt_anom;       /* [18] over-cap read followed by under-cap */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 18u
+#define EBIO_BC_NWORDS 19u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -738,6 +757,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	{
 		uint64_t start = rd_cntpct();
 		uint64_t cap = ms_to_ticks(EMMC_WRITE_DATA_TIMEOUT_MS);
+		uint32_t over = 0;       /* consecutive over-cap reads; see g_cnt_anom */
 		uint32_t ri;
 		for (;;) {
 			ri = rreg(REG_RINT);
@@ -785,7 +805,24 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				ebio_fail_settle();
 				return (int)(0x40000000u | (ri & 0x3fffu));
 			}
-			if (rd_cntpct() - start > cap) {
+			/* Two-read confirmation -- see g_cnt_anom. A single CNTPCT read
+			 * is not trusted to end a bounded wait, because consecutive reads
+			 * have been measured disagreeing by ~4 s. */
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el  = (now >= start) ? (now - start) : 0ull;
+				if (el > cap) {
+					if (++over < 2)
+						continue;      /* re-read before believing it */
+				} else {
+					if (over) {
+						ebio_bc(18, ++g_cnt_anom);
+						over = 0;
+					}
+					continue;
+				}
+			}
+			{
 				uint32_t r2 = rreg(REG_RINT);
 				ebio_bc(1, lba);
 				ebio_bc(2, r2);
@@ -829,10 +866,28 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	{
 		uint64_t start = rd_cntpct();
 		uint64_t cap = ms_to_ticks(EMMC_WRITE_BUSY_TIMEOUT_MS);
+		uint32_t over = 0;       /* consecutive over-cap reads; see g_cnt_anom */
 		for (;;) {
 			if ((rreg(REG_STAR) & STAR_CARD_BUSY) == 0)
 				break;
-			if (rd_cntpct() - start > cap) {
+			/* Two-read confirmation -- see g_cnt_anom. THIS is the loop where
+			 * the disagreement was measured (14710 spurious timeouts, each
+			 * recording under 1 ms elapsed against a correct 4 s cap). */
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el2 = (now >= start) ? (now - start) : 0ull;
+				if (el2 > cap) {
+					if (++over < 2)
+						continue;
+				} else {
+					if (over) {
+						ebio_bc(18, ++g_cnt_anom);
+						over = 0;
+					}
+					continue;
+				}
+			}
+			{
 				/* Settle for the same reason as the data-phase returns above:
 				 * this bails with CARD_BUSY still set by definition, which is
 				 * precisely the state that poisons the next call. -2 is the code
