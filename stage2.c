@@ -453,13 +453,24 @@ static void stage2_tlb_flush(void);
 #define HVFB_L2_COUNT   ((unsigned)(HVFB_SIZE >> STAGE2_L2_BLOCK_SHIFT))
 #endif
 
+/* Default XN for a freshly-built guest-DRAM leaf: 0 (executable — today's
+ * behavior, and what every target still gets since STAGE2_WX_DYNAMIC
+ * defaults to 0 in stage2.h) or 1 (writable-but-execute-never, the starting
+ * state the opt-in dynamic W^X mechanism flips away from on demand — see
+ * stage2.h's STAGE2_WX_DYNAMIC block and docs/wx-enforcement.md). Used at
+ * every call site that used to hard-code a literal xn argument of 0 for a
+ * DRAM leaf, so there is exactly one place this policy is decided. When the
+ * flag is 0 this expands to the literal constant 0 those call sites already
+ * had — byte-for-byte the same descriptors as before this change. */
+#define STAGE2_DRAM_XN_DEFAULT ((unsigned)STAGE2_WX_DYNAMIC)
+
 /* Build the level-2 DRAM table for the 1 GiB block starting at `block_base`
- * into stage2_l2_dram[]: identity Normal-WB executable 2 MiB blocks
- * everywhere, EXCEPT the hv-image/hv-scratch entries, left INVALID
- * (all-zero). Only called for the DRAM block that actually contains those
- * windows (see stage2_dram_block_needs_split()) — a block with neither
- * stays the simple flat 1 GiB descriptor, unchanged from before this
- * milestone. Returns stage2_l2_dram[]'s PA for the caller to install. */
+ * into stage2_l2_dram[]: identity Normal-WB 2 MiB blocks everywhere, EXCEPT
+ * the hv-image/hv-scratch entries, left INVALID (all-zero). Only called for
+ * the DRAM block that actually contains those windows (see
+ * stage2_dram_block_needs_split()) — a block with neither stays the simple
+ * flat 1 GiB descriptor, unchanged from before this milestone. Returns
+ * stage2_l2_dram[]'s PA for the caller to install. */
 static uint64_t
 stage2_build_dram_table(uint64_t block_base)
 {
@@ -475,7 +486,7 @@ stage2_build_dram_table(uint64_t block_base)
 		}
 		uint64_t pa = block_base + (uint64_t)i * STAGE2_L2_BLOCK_SIZE;
 		stage2_l2_dram[i] = stage2_l2_block_desc(pa,
-			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 	}
 	return (uint64_t)(uintptr_t)&stage2_l2_dram[0];
 }
@@ -509,8 +520,10 @@ stage2_unmap_guest_vector(void)
 	uint64_t l2_block_base = l1_block_base +
 		((uint64_t)VEC_L2_IDX << STAGE2_L2_BLOCK_SHIFT);
 
-	/* Level-3: identity Normal-WB executable 4 KiB pages across the 2 MiB
-	 * block, EXCEPT the vector page itself (invalid -> stage-2 abort). */
+	/* Level-3: identity Normal-WB 4 KiB pages across the 2 MiB block
+	 * (executable unless STAGE2_WX_DYNAMIC opts into the writable-but-XN
+	 * default — see STAGE2_DRAM_XN_DEFAULT's comment), EXCEPT the vector
+	 * page itself (invalid -> stage-2 abort). */
 	for (unsigned j = 0; j < STAGE2_L3_ENTRIES; j++) {
 		if (j == VEC_L3_IDX) {
 			stage2_l3_vec[j] = 0;   /* INVALID: the trapped vector page */
@@ -518,7 +531,7 @@ stage2_unmap_guest_vector(void)
 		}
 		uint64_t pa = l2_block_base + (uint64_t)j * STAGE2_L3_PAGE_SIZE;
 		stage2_l3_vec[j] = stage2_page_desc(pa,
-			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 	}
 
 	/* A1 NOTE: stage2_l2_dram[] was already fully built by stage2_init()
@@ -552,7 +565,7 @@ stage2_map_guest_vector(void)
 	 * stage2_unmap_guest_vector() already built stage2_l3_vec[]. */
 	uint64_t pa = GUEST_VECTOR_IPA & STAGE2_L3_ADDR_MASK;
 	stage2_l3_vec[VEC_L3_IDX] = stage2_page_desc(pa,
-		S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+		S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 	stage2_tlb_flush();
 }
 
@@ -731,10 +744,15 @@ stage2_init(void)
 		ndesc++;
 	}
 
-	/* Index 1..N: DRAM as contiguous 1 GiB Normal WB blocks, XN=0
-	 * (guest code lives here and must be executable). N is derived
+	/* Index 1..N: DRAM as contiguous 1 GiB Normal WB blocks. N is derived
 	 * from STAGE2_DRAM_SIZE so bumping that one #define is enough to
-	 * map more RAM later.
+	 * map more RAM later. XN is STAGE2_DRAM_XN_DEFAULT: 0 (executable —
+	 * guest code lives here) unless STAGE2_WX_DYNAMIC opts into starting
+	 * writable-but-XN instead (see that macro's comment and
+	 * docs/wx-enforcement.md) — today STAGE2_DRAM_SIZE == STAGE2_BLOCK_SIZE
+	 * so this flat-block branch is never actually taken (the one DRAM block
+	 * always needs the A1 split below), but it is kept correct for when
+	 * DRAM ever grows past 1 GiB.
 	 *
 	 * A1: a block that overlaps the hv-image or hv-scratch DTB-reserved
 	 * windows gets a TABLE descriptor down to a level-2 table (built by
@@ -751,7 +769,7 @@ stage2_init(void)
 				stage2_l1[0][base_idx + b] = stage2_table_desc(l2_pa);
 			} else {
 				stage2_l1[0][base_idx + b] = stage2_block_desc(pa,
-					S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+					S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 			}
 			ndesc++;
 		}
@@ -1162,6 +1180,266 @@ stage2_wx_selfcheck(void)
 	stg2_bc(22, pass);
 	return (int)pass;
 }
+
+/* ------------------------------------------------------------------ *
+ * DYNAMIC W^X enforcement for guest DRAM (ROADMAP v1 gate, opt-in — see
+ * stage2.h's STAGE2_WX_DYNAMIC block and docs/wx-enforcement.md for the
+ * full design, the evidence behind every number in it, and why this is
+ * shipped disabled rather than either claiming the gate closed or refusing
+ * to write it at all).
+ *
+ * THE MECHANISM: when STAGE2_WX_DYNAMIC is nonzero, every guest-DRAM leaf
+ * this file builds starts life RW+XN (writable, not executable —
+ * STAGE2_DRAM_XN_DEFAULT above) instead of today's RW+X. The FIRST
+ * instruction fetch from a 4 KiB page therefore takes a stage-2 PERMISSION
+ * fault (not a translation fault — the page IS mapped, just not
+ * executable); el2_exc.c routes it here (stage2_wx_fault()), which splits
+ * that page's 2 MiB block into an L3 table on demand (from the bounded
+ * pool below) if it is not split already, then flips that ONE 4 KiB leaf
+ * to READ+EXECUTE — and, critically, REVOKES WRITE on it (S2AP_RO, not
+ * just XN=0), because a leaf that is executable AND still writable is
+ * exactly the W^X violation stage2_wx_scan() above already knows how to
+ * detect. A LATER write to that same page (e.g. the module it belongs to
+ * is unloaded and the physical page recycled for data) takes the symmetric
+ * PERMISSION fault on the data side and flips it back to RW+XN. At every
+ * instant, every dynamically-managed leaf is in EXACTLY ONE of those two
+ * states — never both W and X — which is what makes this a real W^X
+ * mechanism and not merely "sometimes XN".
+ *
+ * WHY A LEAF NEVER NEEDS EVICTING (bounding Q4's ping-pong risk): the pool
+ * below hands out an L3 TABLE once per 2 MiB block, permanently, the first
+ * time ANY page in that block executes. After that, EVERY flip (either
+ * direction) rewrites one already-allocated L3 entry — it costs one fault
+ * and one TLB invalidate, never a new table. So the pool's occupancy is
+ * bounded by "how many distinct 2 MiB regions have ever contained guest
+ * code this boot", not by how many times any one of them ping-pongs.
+ *
+ * WHY POOL EXHAUSTION FAILS OPEN, NOT CLOSED: if a brand-new 2 MiB block
+ * takes its first execute fault after the pool is already full,
+ * stage2_wx_flip() does NOT deny the fetch — denying would hang the guest
+ * (a guest stage-2 fault never advances ELR, so a denied fetch just
+ * re-faults forever until the watchdog resets the board: exactly the
+ * "static split breaks kldload" failure this whole feature exists to
+ * avoid). Instead it flips the WHOLE 2 MiB block back to plain RW+X —
+ * today's unconditional, hardware-verified behavior for that region — and
+ * counts the fallback. stage2_wx_scan() will then honestly report that
+ * region as a violation: that is the TRUTH (it is not enforced there) and
+ * is the documented, bounded cost of a fixed-size pool, not a bug. See
+ * docs/wx-enforcement.md Q2/Q4 for the numbers behind the pool size and why
+ * "never freed" is the deliberately simple, bounded-risk choice.
+ *
+ * SCOPE NOTE: only ever touches stage2_l2_dram[] — the ONE L2 table for the
+ * ONE DRAM L1 block that exists today (STAGE2_DRAM_SIZE == STAGE2_BLOCK_
+ * SIZE; see stage2_build_dram_table()'s own comment). If STAGE2_DRAM_SIZE
+ * ever grows past 1 GiB this narrows to "only the first 1 GiB block" and
+ * would need generalizing — flagged here, not silently assumed.
+ *
+ * CONCURRENCY NOTE: only CPU0 ever runs the FreeBSD guest and takes its
+ * traps (smp.c's design; the `dual` target's second guest on CPU3 has its
+ * own, wholly disjoint stage-2 tables in stage2_zephyr.c and never reaches
+ * this code). A core cannot take a second synchronous exception while
+ * still inside this handler for the first, so there is no concurrent
+ * access to stage2_l2_dram[]/the pool from this mechanism to guard against
+ * on any target this tree builds today.
+ * ------------------------------------------------------------------ */
+#if STAGE2_WX_DYNAMIC
+#include "hv_addrmap.h"   /* HVMAP_WXDYN_BC / HVMAP_WXDYN_MAGIC */
+
+/* S2AP encoding this file otherwise never needs: every OTHER descriptor
+ * helper in stage2.c hardcodes S2AP_RW (see stage2_leaf_is_wx()'s own
+ * comment above, which already anticipated this exact addition: "the
+ * sub-bit form is used so this stays correct if a read-only encoding is
+ * ever added"). Bit layout per the ARMv8-A stage-2 S2AP field: bit1 (0x2)
+ * = write-enable, bit0 (0x1) = read-enable — 0b01 is therefore genuinely
+ * read-only, not a made-up value. */
+#define S2AP_RO   0x1u
+
+/* Bit-for-bit the same layout as stage2_page_desc() above, with an
+ * explicit S2AP argument instead of that function's hardcoded S2AP_RW.
+ * Deliberately a SEPARATE function rather than adding a parameter to
+ * stage2_page_desc() itself: every one of that function's existing call
+ * sites (UART/MMIO pages, the vector-page probe, the plain DRAM L3
+ * builder below) stays completely untouched by this feature, on every
+ * build, flag on or off — the smallest possible blast radius for a change
+ * to the most safety-critical file in the tree. */
+static uint64_t
+stage2_wx_page_desc(uint64_t pa, unsigned s2ap, unsigned xn)
+{
+	uint64_t d = S2_DESC_VALID_TABLE;   /* page descriptor at level 3 */
+	d |= (uint64_t)(S2_MEMATTR_NORMAL_WB & 0xFu) << 2;
+	d |= (uint64_t)(s2ap & 0x3u) << 6;
+	d |= (uint64_t)(S2_SH_INNER & 0x3u) << 8;
+	d |= S2_AF_BIT;
+	d |= (pa & STAGE2_L3_ADDR_MASK);
+	if (xn)
+		d |= S2_XN_BIT;
+	return d;
+}
+
+/* The bounded pool: STAGE2_WX_POOL_TABLES (stage2.h) on-demand L3 tables.
+ * A plain monotonic counter is the whole allocator — matching alloc.h's
+ * arena_bump() philosophy (no free, no search: "is this block already
+ * split" is answered by the L2 descriptor's OWN type, not a side table, so
+ * there is nothing here to look up by IPA). */
+static uint64_t stage2_wx_pool[STAGE2_WX_POOL_TABLES][STAGE2_L3_ENTRIES]
+	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
+static uint32_t stage2_wx_pool_used;
+static uint32_t stage2_wx_pool_exhausted;   /* distinct blocks that fell back */
+static uint32_t stage2_wx_flip_count;       /* total flips, either direction */
+
+static inline void
+wxd_bc(unsigned i, uint32_t v)
+{
+	volatile uint32_t *p = (volatile uint32_t *)(HVMAP_WXDYN_BC + (uint32_t)i * 4u);
+	*p = v;
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+static void
+wxd_publish(uint64_t last_ipa)
+{
+	wxd_bc(0, HVMAP_WXDYN_MAGIC);
+	wxd_bc(1, stage2_wx_pool_used);
+	wxd_bc(2, stage2_wx_pool_exhausted);
+	wxd_bc(3, stage2_wx_flip_count);
+	wxd_bc(4, (uint32_t)last_ipa);
+}
+
+/* Split-or-reuse-then-flip ONE 4 KiB leaf inside the 1 GiB DRAM window's L2
+ * table (stage2_l2_dram[] — see the SCOPE NOTE above). `ipa` must already
+ * be known to lie inside guest DRAM and outside both HV windows —
+ * stage2_wx_fault() below is the only caller and checks that first.
+ * `want_exec` selects the direction: 1 = an execute (instruction-fetch)
+ * fault, flip to RO+X; 0 = a write fault on a currently-RO+X leaf, flip
+ * back to RW+XN. Always returns 1 once called with an in-range DRAM IPA,
+ * except the defensive (should-be-unreachable) case noted inline. */
+static int
+stage2_wx_flip(uint64_t ipa, unsigned want_exec)
+{
+	uint64_t block_ipa = ipa & STAGE2_L2_ADDR_MASK;
+	unsigned l2_idx = (unsigned)((block_ipa - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT);
+	uint64_t l2d;
+	uint64_t *l3;
+
+	if (l2_idx >= STAGE2_L2_ENTRIES)
+		return 0;   /* defensive: unreachable given stage2_wx_fault()'s range check */
+
+	l2d = stage2_l2_dram[l2_idx];
+
+	if ((l2d & 0x3ull) == S2_DESC_VALID_TABLE) {
+		/* Already split — a previous flip of this same block, or (if
+		 * l2_idx == VEC_L2_IDX) the first-fault vector probe's own L3
+		 * table. Either way, reuse it: the walker cannot tell the
+		 * difference and neither do we need to. */
+		l3 = (uint64_t *)(uintptr_t)(l2d & STAGE2_TABLE_ADDR_MASK);
+	} else if ((l2d & 0x3ull) == S2_DESC_VALID_BLOCK) {
+		/* First-ever touch of this 2 MiB block. This can only be an
+		 * EXECUTE fault: the block is still a plain RW+XN descriptor, so a
+		 * WRITE to it is already permitted and could not have faulted. */
+		if (!want_exec)
+			return 0;   /* defensive: unreachable, see above */
+
+		if (stage2_wx_pool_used >= STAGE2_WX_POOL_TABLES) {
+			/* FAIL OPEN — see this block's own header comment for why.
+			 * Degrade this one 2 MiB region to plain RW+X (today's
+			 * unconditional behavior) and let the guest proceed; never
+			 * deny the fetch. */
+			stage2_l2_dram[l2_idx] = stage2_l2_block_desc(block_ipa,
+				S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+			stage2_wx_pool_exhausted++;
+			wxd_publish(block_ipa);
+			stage2_tlb_flush();
+			return 1;
+		}
+
+		l3 = &stage2_wx_pool[stage2_wx_pool_used][0];
+		stage2_wx_pool_used++;
+
+		/* Populate every page in the new table identically to the block
+		 * descriptor it replaces (RW+XN) — splitting alone must change
+		 * nothing observable except granularity. The one faulting page is
+		 * flipped below, same as the already-split case. */
+		for (unsigned k = 0; k < STAGE2_L3_ENTRIES; k++) {
+			uint64_t pa = block_ipa + (uint64_t)k * STAGE2_L3_PAGE_SIZE;
+			l3[k] = stage2_page_desc(pa, S2_MEMATTR_NORMAL_WB,
+				S2_SH_INNER, /*xn=*/1);
+		}
+		stage2_l2_dram[l2_idx] = stage2_table_desc((uint64_t)(uintptr_t)l3);
+	} else {
+		return 0;   /* invalid — unreachable given stage2_wx_fault()'s
+		             * HV-window check, but never guess here */
+	}
+
+	{
+		unsigned l3_idx = (unsigned)((ipa & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT);
+		uint64_t pa = ipa & STAGE2_L3_ADDR_MASK;
+
+		if (want_exec)
+			l3[l3_idx] = stage2_wx_page_desc(pa, S2AP_RO, /*xn=*/0);
+		else
+			l3[l3_idx] = stage2_page_desc(pa, S2_MEMATTR_NORMAL_WB,
+				S2_SH_INNER, /*xn=*/1);
+	}
+
+	/* Broad, hardware-proven flush — the SAME primitive stage2_unmap_guest_
+	 * vector()/stage2_map_guest_vector() already use for a runtime table
+	 * edit — rather than a narrower by-IPA invalidate this tree has never
+	 * exercised. See docs/wx-enforcement.md Q5 for why a wrong-scoped or
+	 * wrong-timed narrower invalidate is a WORSE risk here (a stale TLB
+	 * entry could keep permitting a write the new descriptor just denied)
+	 * than the extra cost of flushing everything on every flip. */
+	stage2_tlb_flush();
+	stage2_wx_flip_count++;
+	wxd_publish(ipa);
+	return 1;
+}
+
+int
+stage2_wx_fault(struct el2_frame *frame)
+{
+	uint32_t ec  = (uint32_t)((frame->esr >> 26) & 0x3Fu);
+	uint32_t fsc = (uint32_t)(frame->esr & 0x3Fu);   /* IFSC or DFSC alike */
+	unsigned want_exec;
+	uint64_t hpfar, ipa;
+
+	if (ec == 0x20u || ec == 0x21u)
+		want_exec = 1u;   /* instruction abort: the guest tried to FETCH */
+	else if (ec == 0x24u || ec == 0x25u)
+		want_exec = 0u;   /* data abort: the guest tried to WRITE (or read) */
+	else
+		return 0;         /* not one of ours at all */
+
+	/* PERMISSION fault only (status code class 0b0011 at bits[5:2] of the
+	 * ISS, any level — the same field position/encoding for both IFSC and
+	 * DFSC). Anything else — a translation fault into the still-genuinely-
+	 * unmapped hv-image/hv-scratch carve, the vblk/vnet trapped MMIO
+	 * windows, a real out-of-range access — is NOT ours: it must fall
+	 * through to every existing handler and the generic fault recorder
+	 * exactly as it does today. Getting this test wrong in either direction
+	 * would be a real regression: too loose swallows a genuine A1 boundary
+	 * violation; too tight and this function never fires. */
+	if ((fsc & 0x3Cu) != 0x0Cu)
+		return 0;
+
+	__asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
+	ipa = (hpfar & 0xFFFFFFFFF0ULL) << 8;
+
+	if (ipa < STAGE2_DRAM_BASE || ipa >= STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE)
+		return 0;   /* not guest DRAM at all */
+
+	/* The two HV windows are supposed to be UNMAPPED (stage2_dram_block_
+	 * needs_split()'s carve), not permission-denied — if either one ever
+	 * produces a PERMISSION fault instead of a translation fault, that is a
+	 * bug somewhere else in this file and must NOT be silently absorbed
+	 * here as if it were an ordinary W^X flip. */
+	if (ipa >= HVIMG_BASE && ipa < HVIMG_BASE + STAGE2_L2_BLOCK_SIZE)
+		return 0;
+	if (ipa >= HVSCR_BASE && ipa < HVSCR_BASE + STAGE2_L2_BLOCK_SIZE)
+		return 0;
+
+	return stage2_wx_flip(ipa, want_exec);
+}
+#endif /* STAGE2_WX_DYNAMIC */
 
 void
 stage2_selftest(void)

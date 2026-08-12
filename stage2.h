@@ -250,4 +250,73 @@ int stage2_isolation_selfcheck(void);
  * the tables it walks are the real, final ones. */
 int stage2_wx_selfcheck(void);
 
+/* ------------------------------------------------------------------ *
+ * DYNAMIC W^X enforcement for guest DRAM (opt-in, OFF by default).
+ *
+ * See docs/wx-enforcement.md for the full design, the five questions it was
+ * asked to answer with evidence, and why the outcome is "implement it, but
+ * disabled" rather than either a silent claim of victory or a flat refusal.
+ * One-line summary: stage2_wx_selfcheck() above measures that guest DRAM is
+ * RW+executable everywhere (510 leaves, every boot) and explains why a
+ * STATIC boot-time split cannot close that without either leaving kldload's
+ * pages unenforced or breaking kldload outright. This is the DYNAMIC
+ * alternative a static split cannot be: guest DRAM defaults to
+ * writable-but-execute-never; the FIRST instruction fetch from a page takes
+ * a stage-2 permission fault, which flips that ONE 4 KiB page to
+ * read-execute (and revokes write on it); a LATER write to a page currently
+ * in that state flips it back. Needs no guest cooperation and no hypercall.
+ *
+ * STAGE2_WX_DYNAMIC defaults to 0 (off): every existing target continues to
+ * build, and — per every hardware-verified boot to date — boot EXACTLY as
+ * before. This header default is what makes that true without editing a
+ * single Makefile target. Override with `-DSTAGE2_WX_DYNAMIC=1` on a
+ * dedicated build to exercise the mechanism; nothing in this tree does that
+ * yet, so IT HAS NEVER RUN ON HARDWARE — see the doc for exactly what that
+ * does and does not leave proven (the flip logic is proven board-free, in
+ * test_stage2_tables.c; whether the pool below is big enough for a REAL
+ * kldload's physical-page fragmentation is not, and cannot be answered
+ * without the board this task was expressly forbidden from touching). */
+#ifndef STAGE2_WX_DYNAMIC
+#define STAGE2_WX_DYNAMIC 0
+#endif
+
+#if STAGE2_WX_DYNAMIC
+#include "exceptions.h"   /* struct el2_frame */
+
+/* Number of on-demand L3 (4 KiB-granularity) tables this mechanism may ever
+ * create in one boot. Each is created ONCE — the first time ANY page in its
+ * 2 MiB block is executed — and never freed for the life of the boot (see
+ * docs/wx-enforcement.md Q2/Q4 for why "never freed" is the deliberately
+ * simple, bounded-risk choice here, and what happens when the pool is
+ * exhausted: fail OPEN, not closed — see stage2.c's stage2_wx_flip()).
+ * Sized against the hv-image's hard 2 MiB ceiling (link.ld's ASSERT):
+ * 64 * 4 KiB = 256 KiB, well inside the ~1.36 MiB of slack this image had
+ * free as of the commit that added this (see the doc for the exact
+ * `size microkernel-dbg.elf` numbers). This is NOT a validated capacity for
+ * any real kldload workload — just a conservative starting point that
+ * leaves headroom for everything else in this tree. One #define to retune
+ * once someone actually runs a hardware experiment. */
+#ifndef STAGE2_WX_POOL_TABLES
+#define STAGE2_WX_POOL_TABLES 64u
+#endif
+
+/* el2_trap dispatch entry (see el2_exc.c's guest-sync-trap chain, alongside
+ * firstfault_handle()/hwbp_handle()/vconsole_handle_fault()/etc. — same
+ * calling convention as all of them). Called on every lower-EL instruction
+ * OR data abort (EC 0x20/0x21/0x24/0x25) when STAGE2_WX_DYNAMIC is nonzero;
+ * reads ESR_EL2 (from `frame`) and HPFAR_EL2 (itself, same pattern every
+ * sibling handler already uses) and returns 1 iff this was a guest-DRAM
+ * stage-2 PERMISSION fault it fully handled (el2_trap should then return
+ * without recording it as a generic fault, exactly like vblk_mmio_fault()'s
+ * contract) — this INCLUDES the pool-exhaustion fallback (still returns 1:
+ * see stage2.c's stage2_wx_flip() for why fail-OPEN, not closed, is the
+ * only safe choice there). Returns 0 for anything else this is not
+ * (translation fault, non-DRAM IPA, one of the two HV windows, an EC this
+ * mechanism doesn't own) — el2_trap handles those exactly as it does today.
+ * Never advances ELR itself (matches the house rule for every guest-fault
+ * handler): fixing the permission and re-executing the SAME instruction is
+ * the entire point. */
+int stage2_wx_fault(struct el2_frame *frame);
+#endif /* STAGE2_WX_DYNAMIC */
+
 #endif /* BZDOS_STAGE2_H */
