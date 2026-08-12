@@ -73,7 +73,7 @@
  * apart again. The asserts here prove windows do not overlap; only that one
  * proves a window is big enough for its own writer. */
 #define HVMAP_EBIO_BC        0x50020200UL
-#define HVMAP_EBIO_BC_SIZE   0x40UL
+#define HVMAP_EBIO_BC_SIZE   0x60UL
 
 /* eMMC high-speed probe test buffer (emmc_bio.c: one 512-byte sector). */
 #define HVMAP_EMMC_HS_TESTBUF      0x50020300UL
