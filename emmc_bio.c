@@ -555,9 +555,31 @@ static uint32_t g_gctl_rst_timeouts; /* [22] resets that never self-cleared   */
  * make it fatal when the data says which bits are safe to fail on. */
 static uint32_t g_write_dataover_errs; /* [23] err bits seen with DATA_OVER   */
 
+/* [24]: writes failed because an error bit was set at the moment DATA_OVER
+ * latched -- the hole that used to be unreachable. See the check itself. */
+static uint32_t g_write_dataover_fails;
+
+/* [25]/[26]: the retry path's safety precondition, measured.
+ *
+ * ebio_fail_settle() used wait_card_idle(), which is bounded by ITERATIONS
+ * (EMMC_POLL_CAP register reads), not by time. A flash program can take tens of
+ * milliseconds, so that wait could return with the card still busy -- and the
+ * caller's next act is a retry, which is precisely how a retried CMD24 lands on
+ * a still-programming card. That is the corruption mechanism this whole
+ * investigation traced. The settle was never sufficient protection; it only
+ * looked like it because the FIFO/DMA reset half of it is real.
+ *
+ * This matters most right now: making the write path fail on MORE conditions
+ * (the DATA_OVER check above) increases retries, so the retry path has to be
+ * safe FIRST or the fix makes the disease worse. [25] is the worst-case wait
+ * actually observed in ms, [26] counts settles where the card never went idle
+ * inside the bound. */
+static uint32_t g_settle_busy_ms;       /* [25] worst observed idle wait, ms  */
+static uint32_t g_settle_busy_timeouts; /* [26] card never went idle          */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 24u
+#define EBIO_BC_NWORDS 27u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -665,6 +687,60 @@ static void wait_card_idle(void)
  * NOT used by emmc_bio_init(), which writes GCTL_RESET_ALL wholesale as its
  * bring-up reset rather than OR-ing bits into the live register. That path is
  * hardware-validated and semantically different; left alone deliberately. */
+/* Wait for the card to stop programming, bounded by TIME rather than by a
+ * register-read count. See g_settle_busy_ms for why the iteration-bounded
+ * wait_card_idle() is not good enough on the retry path.
+ *
+ * Uses the same two-read discipline as the timeout loops in emmc_bio_write():
+ * a single CNTPCT read must never decide a bounded wait on this board, because
+ * consecutive reads have been measured disagreeing by ~4 s. Writing this loop
+ * the naive way would re-introduce, in the fix, the exact bug the fix exists to
+ * prevent. Returns 0 once the card is idle, -1 if it never was. */
+#define EMMC_SETTLE_BUSY_TIMEOUT_MS  500u
+
+static int wait_card_idle_timed(uint32_t ms)
+{
+	uint64_t start, cap;
+	uint32_t over = 0;
+
+	/* Fast path costs exactly one register read and NO clock reads. This runs on
+	 * the entry of every read, where the controller is idle in the normal case;
+	 * the original wait_card_idle() was cheap for the same reason and that
+	 * property is worth keeping. */
+	if (!(rreg(REG_STAR) & STAR_CARD_BUSY))
+		return 0;
+
+	start = rd_cntpct();
+	cap = ms_to_ticks(ms);
+
+	for (;;) {
+		if (!(rreg(REG_STAR) & STAR_CARD_BUSY)) {
+			uint64_t now = rd_cntpct();
+			uint64_t el  = (now >= start) ? (now - start) : 0ull;
+			uint64_t f   = rd_cntfrq();
+			uint32_t el_ms = f ? (uint32_t)((el * 1000ull) / f) : 0u;
+			if (el_ms > g_settle_busy_ms) {
+				g_settle_busy_ms = el_ms;
+				ebio_bc(25, el_ms);
+			}
+			return 0;
+		}
+		{
+			uint64_t now = rd_cntpct();
+			uint64_t el  = (now >= start) ? (now - start) : 0ull;
+			if (el > cap) {
+				if (++over >= 2)
+					break;
+			} else if (over) {
+				ebio_bc(18, ++g_cnt_anom);
+				over = 0;
+			}
+		}
+	}
+	ebio_bc(26, ++g_settle_busy_timeouts);
+	return -1;
+}
+
 static int gctl_reset_and_wait(uint32_t bits)
 {
 	uint32_t i;
@@ -687,7 +763,11 @@ static void ebio_fail_settle(void)
 {
 	uint32_t i;
 
-	wait_card_idle();
+	/* TIME-bounded, not iteration-bounded -- see g_settle_busy_ms. The caller's
+	 * next act after a settle is typically a RETRY, and a retry that lands on a
+	 * still-programming card is the corruption mechanism this file's history is
+	 * about. wait_card_idle()'s EMMC_POLL_CAP register reads are not a duration. */
+	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
 
 	/* (1) FIFO + DMA reset. */
 	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST | GCTL_DMA_RST);
@@ -739,9 +819,11 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 	int i;
 
 	/* Do not start on top of a transfer that is still retiring -- see
-	 * ebio_fail_settle(). Costs nothing when the controller is already idle,
-	 * which is the normal case. */
-	wait_card_idle();
+	 * ebio_fail_settle(). Still costs nothing when the controller is already
+	 * idle (wait_card_idle_timed()'s fast path reads one register and no clock),
+	 * but when it is NOT idle the bound is now a duration rather than a count of
+	 * register reads, which is what "still retiring" actually needs. */
+	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
 
 	/* FIFO reset, WAITING for the self-clearing pulse -- not a fixed delay.
 	 * See gctl_reset_and_wait(): this used small_delay() (64 register reads),
@@ -896,15 +978,45 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 		for (;;) {
 			ri = rreg(REG_RINT);
 			if (ri & RINT_DATA_OVER) {
-				/* Observation only -- see g_write_dataover_errs. The error
-				 * check below is UNREACHABLE for any bit that latches no later
-				 * than DATA_OVER, because this break wins. Record what those
-				 * bits are instead of guessing; that hole stays open until the
-				 * data says which bits are safe to fail a write on. */
+				/* THE THIRD HOLE, now closed. The `ri & 0x0180` check further
+				 * down is UNREACHABLE for any error bit that latches no later
+				 * than DATA_OVER, because this break wins the race -- so a write
+				 * the controller had flagged completed as a success. Same defect
+				 * as the read path's missing check, in a different shape.
+				 *
+				 * Why it is safe to make fatal NOW and was not before. Failing a
+				 * write here makes vblk_emmc.c retry it, and a retry landing on a
+				 * still-programming card is exactly the corruption mechanism this
+				 * file's history is about -- so the precondition was making the
+				 * retry path safe first: ebio_fail_settle() now waits for
+				 * card-idle on a TIME bound (see g_settle_busy_ms), where it
+				 * previously used an iteration count that is not a duration.
+				 *
+				 * And it is measured to be a no-op on healthy hardware: [23],
+				 * which accumulated exactly this mask at exactly this point,
+				 * read 0x0000 across a boot plus a 68 MB round trip. So this can
+				 * only start reporting a condition that was previously completed
+				 * as a success -- it cannot break a path that works today. [23]
+				 * keeps accumulating, and [24] counts the failures, so if this
+				 * ever fires the offending bit is already recorded. */
 				uint32_t e = ri & (RINT_READ_ERR_MASK | RINT_RESP_TIMEOUT);
-				if (e && (e | g_write_dataover_errs) != g_write_dataover_errs) {
-					g_write_dataover_errs |= e;
-					ebio_bc(23, g_write_dataover_errs);
+				if (e) {
+					if ((e | g_write_dataover_errs) != g_write_dataover_errs) {
+						g_write_dataover_errs |= e;
+						ebio_bc(23, g_write_dataover_errs);
+					}
+					ebio_bc(24, ++g_write_dataover_fails);
+					ebio_bc(1, lba);
+					ebio_bc(2, ri);
+					ebio_bc(3, rreg(REG_STAR));
+					ebio_bc(4, 0x50000u | (ri & 0x3fffu)); /* tag: err@DATA_OVER */
+					ebio_bc(5, rreg(REG_GCTL));
+					ebio_bc(0, ++g_ebio_fails);
+					ebio_fail_settle();
+					/* Same encoding the pre-DATA_OVER error path returns, so
+					 * VBLK_RC_WR_RETRYABLE() treats it identically and the
+					 * sector is retried rather than handed to the guest. */
+					return (int)(0x40000000u | (ri & 0x3fffu));
 				}
 				break;
 			}
