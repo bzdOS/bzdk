@@ -23,6 +23,16 @@
 #define VBLK_ASYNC_BC_BASE   HVMAP_ASYNC_BC   /* see hv_addrmap.h */
 #define VBLK_ASYNC_BC_MAGIC  0x56424131u   /* "VBA1" */
 
+/* This window is reserved at EXACTLY the three words above -- zero headroom, so
+ * a fourth counter added here overflows into the next window silently. The
+ * assert makes that a build failure instead; grow HVMAP_ASYNC_BC_SIZE first.
+ * (emmc_bio.c's window was already 5 words past its reservation before anyone
+ * noticed, which is why this is asserted rather than commented.) */
+#define VBLK_ASYNC_BC_MAX_IDX  2u
+_Static_assert((VBLK_ASYNC_BC_MAX_IDX + 1u) * 4u <= HVMAP_ASYNC_BC_SIZE,
+               "vblk_async.c writes more breadcrumb slots than "
+               "HVMAP_ASYNC_BC_SIZE reserves");
+
 static inline void async_bc(uint32_t idx, uint32_t v)
 {
 	volatile uint32_t *p = (volatile uint32_t *)(VBLK_ASYNC_BC_BASE + idx * 4u);

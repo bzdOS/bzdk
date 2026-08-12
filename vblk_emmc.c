@@ -133,6 +133,17 @@
 #define VBLK_BC_BASE   HVMAP_VBLK_BC
 #define VBLK_BC_MAGIC  0x56424B31u   /* "VBK1" */
 
+/* Highest slot any vblk_bc() call site in this file uses. Kept next to the
+ * helper so adding a counter forces a look at it, and asserted against the
+ * window: hv_addrmap.h proves this window does not overlap its neighbours, but
+ * only this can prove it is big enough for its own writer. emmc_bio.c's window
+ * had drifted exactly that way (13 slots written, 8 reserved). Raising this
+ * past 63 means the window has to grow first -- see the INDEX MAP WARNING. */
+#define VBLK_BC_MAX_IDX  62u
+_Static_assert((VBLK_BC_MAX_IDX + 1u) * 4u <= HVMAP_VBLK_BC_SIZE,
+               "vblk_emmc.c writes more breadcrumb slots than "
+               "HVMAP_VBLK_BC_SIZE reserves");
+
 static inline void vblk_bc(uint32_t idx, uint32_t v)
 {
 	volatile uint32_t *p = (volatile uint32_t *)(VBLK_BC_BASE + idx * 4u);

@@ -61,9 +61,19 @@
 #define HVMAP_EMMC_LOCK      0x50020100UL
 #define HVMAP_EMMC_LOCK_SIZE 0x4UL
 
-/* eMMC failure-diagnostics breadcrumbs (emmc_bio.c: 8 words, idx 0..7). */
+/* eMMC failure-diagnostics breadcrumbs (emmc_bio.c).
+ *
+ * SIZE WAS WRONG (0x20 = 8 words) while emmc_bio.c's own EBIO_BC_NWORDS is 13
+ * and it writes as high as ebio_bc(11). The writes landed in the unused padding
+ * up to HS_TESTBUF at 0x50020300, so nothing was ever corrupted -- but the
+ * _Static_assert chain below was protecting a size the code does not honour, so
+ * moving HS_TESTBUF down to 0x50020220 would have passed the assert and let
+ * slots [8..12] silently eat it. Sized to 16 words now, and emmc_bio.c carries a
+ * _Static_assert tying EBIO_BC_NWORDS to this constant so the two cannot drift
+ * apart again. The asserts here prove windows do not overlap; only that one
+ * proves a window is big enough for its own writer. */
 #define HVMAP_EBIO_BC        0x50020200UL
-#define HVMAP_EBIO_BC_SIZE   0x20UL
+#define HVMAP_EBIO_BC_SIZE   0x40UL
 
 /* eMMC high-speed probe test buffer (emmc_bio.c: one 512-byte sector). */
 #define HVMAP_EMMC_HS_TESTBUF      0x50020300UL
