@@ -513,4 +513,35 @@ _Static_assert(HVMAP_SCANOUT_BC + HVMAP_SCANOUT_BC_SIZE <= 0x50100000UL,
                "scanout breadcrumb lane runs into el2_ncmap.c's non-cacheable "
                "DMA scratch window (SCRATCH_BASE 0x50100000)");
 
+/* ---- Dynamic W^X breadcrumb ("WXD1") -------------------------------------
+ * stage2.c's opt-in dynamic W^X mechanism (STAGE2_WX_DYNAMIC, off by
+ * default — see stage2.h and docs/wx-enforcement.md). Diagnostic only, same
+ * discipline as every other lane here: never read back by any code path,
+ * never gates behavior. Placed a full page above HVMAP_SCANOUT_BC's end
+ * (0x50092040) per this file's own hygiene rule (a buffer grown without
+ * slack has marched into a neighbour before — see the VCPM section above);
+ * confirmed clear by grepping the whole tree for `0x5009[0-9a-f]{4}` /
+ * `0x500a[0-9a-f]{4}` before picking it — only HVMAP_SCANOUT_BC itself
+ * matched. Well below el2_ncmap.c's non-cacheable DMA scratch boundary
+ * (0x50100000), so the coherent-store (`dc civac`) pattern applies.
+ *
+ * Word layout (uint32_t):
+ *   [0] magic HVMAP_WXDYN_MAGIC ("WXD1")
+ *   [1] pool_used        on-demand L3 tables handed out so far (see
+ *       STAGE2_WX_POOL_TABLES, stage2.h)
+ *   [2] pool_exhausted   distinct 2 MiB blocks that fell back to plain
+ *       RW+X because the pool was already full when they first executed
+ *       (fail OPEN, not closed -- see stage2.c's stage2_wx_flip())
+ *   [3] flip_count       total W<->X flips performed, either direction
+ *   [4] last_ipa         low 32 bits of the most recent flip's IPA */
+#define HVMAP_WXDYN_BC        0x50093000UL
+#define HVMAP_WXDYN_BC_SIZE   0x20UL
+#define HVMAP_WXDYN_MAGIC     0x57584431UL   /* "WXD1" */
+
+_Static_assert(HVMAP_WXDYN_BC >= HVMAP_SCANOUT_BC + HVMAP_SCANOUT_BC_SIZE,
+               "dynamic W^X breadcrumb lane overlaps the scanout breadcrumb lane");
+_Static_assert(HVMAP_WXDYN_BC + HVMAP_WXDYN_BC_SIZE <= 0x50100000UL,
+               "dynamic W^X breadcrumb lane runs into el2_ncmap.c's "
+               "non-cacheable DMA scratch window (SCRATCH_BASE 0x50100000)");
+
 #endif /* HV_ADDRMAP_H */

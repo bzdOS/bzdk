@@ -1189,6 +1189,377 @@ static void test_wx_scan_catches_a_poisoned_mmio_leaf(void)
 }
 
 /* ==================================================================== *
+ * DYNAMIC W^X (2026-08-12): stage2.c's opt-in, off-by-default mechanism
+ * (STAGE2_WX_DYNAMIC, see stage2.h and docs/wx-enforcement.md). Mirrors
+ * stage2.c's stage2_wx_page_desc()/stage2_wx_flip() verbatim (the pure
+ * table-mutation logic), and stage2_wx_fault() with its two register reads
+ * (ESR_EL2 via the trap frame, HPFAR_EL2 via `mrs`) turned into plain `esr`/
+ * `hpfar` parameters — the SAME "mirror the arithmetic, not the register
+ * plumbing" discipline this file already uses throughout (see the file's
+ * own header comment). stage2_tlb_flush() and the wxd_bc()/wxd_publish()
+ * breadcrumb writes are the register/telemetry half omitted, exactly like
+ * every other mirror in this file omits them from stage2_unmap_guest_
+ * vector() etc. — the tables are fully mutated before either would run in
+ * the source, so omitting them does not change what is asserted below.
+ * ==================================================================== */
+
+/* Mirrors stage2.c's S2AP_RO. */
+#define S2AP_RO   0x1u
+
+/* Mirrors stage2.c's stage2_wx_page_desc() verbatim. */
+static uint64_t
+stage2_wx_page_desc(uint64_t pa, unsigned s2ap, unsigned xn)
+{
+	uint64_t d = S2_DESC_VALID_TABLE;
+	d |= (uint64_t)(S2_MEMATTR_NORMAL_WB & 0xFu) << 2;
+	d |= (uint64_t)(s2ap & 0x3u) << 6;
+	d |= (uint64_t)(S2_SH_INNER & 0x3u) << 8;
+	d |= S2_AF_BIT;
+	d |= (pa & STAGE2_L3_ADDR_MASK);
+	if (xn)
+		d |= S2_XN_BIT;
+	return d;
+}
+
+/* Mirrors stage2.c's STAGE2_WX_POOL_TABLES default (stage2.h: 64u). */
+#define STAGE2_WX_POOL_TABLES 64u
+
+/* Mirrors stage2.c's stage2_wx_pool[]/stage2_wx_pool_used/_exhausted/
+ * _flip_count. */
+static uint64_t stage2_wx_pool[STAGE2_WX_POOL_TABLES][STAGE2_L3_ENTRIES]
+	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
+static uint32_t stage2_wx_pool_used;
+static uint32_t stage2_wx_pool_exhausted;
+static uint32_t stage2_wx_flip_count;
+
+/* TEST-ONLY HARNESS, no counterpart in stage2.c: the real mechanism is
+ * boot-once and monotonic for the life of one boot by design (see
+ * stage2.c's own comment on why a leaf never needs evicting) and so never
+ * resets this state. This process runs many independent test cases, so the
+ * harness needs a reset the production code deliberately does not have. */
+static void
+stage2_wx_test_reset(void)
+{
+	memset(stage2_wx_pool, 0, sizeof(stage2_wx_pool));
+	stage2_wx_pool_used = 0;
+	stage2_wx_pool_exhausted = 0;
+	stage2_wx_flip_count = 0;
+}
+
+/* Seeds ONE 2 MiB DRAM leaf as plain RW+XN — what STAGE2_DRAM_XN_DEFAULT==1
+ * (i.e. STAGE2_WX_DYNAMIC compiled in) would have produced for this entry
+ * at boot, without re-deriving the whole stage2_init_tables()/stage2_build_
+ * dram_table() mirror a second time with a different flag value. Callers
+ * run stage2_init_tables() first for a realistic, fully-populated baseline
+ * (same as every other test in this file), then override just the one or
+ * two entries a given test cares about via this helper — so every OTHER
+ * DRAM leaf is untouched, exactly as test_guest_dram_permissions_are_rwx_
+ * wx_not_enforced() already measured and pinned. */
+static void
+stage2_wx_seed_block_rwxn(unsigned l2_idx)
+{
+	uint64_t pa = STAGE2_DRAM_BASE + (uint64_t)l2_idx * STAGE2_L2_BLOCK_SIZE;
+	stage2_l2_dram[l2_idx] = stage2_l2_block_desc(pa,
+		S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/1);
+}
+
+/* Mirrors stage2.c's stage2_wx_flip() verbatim, minus stage2_tlb_flush()
+ * and the wxd_bc()/wxd_publish() breadcrumb writes (register/telemetry —
+ * see this section's header comment). */
+static int
+stage2_wx_flip(uint64_t ipa, unsigned want_exec)
+{
+	uint64_t block_ipa = ipa & STAGE2_L2_ADDR_MASK;
+	unsigned l2_idx = (unsigned)((block_ipa - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT);
+	uint64_t l2d;
+	uint64_t *l3;
+
+	if (l2_idx >= STAGE2_L2_ENTRIES)
+		return 0;
+
+	l2d = stage2_l2_dram[l2_idx];
+
+	if ((l2d & 0x3ull) == S2_DESC_VALID_TABLE) {
+		l3 = (uint64_t *)(uintptr_t)(l2d & STAGE2_TABLE_ADDR_MASK);
+	} else if ((l2d & 0x3ull) == S2_DESC_VALID_BLOCK) {
+		if (!want_exec)
+			return 0;
+
+		if (stage2_wx_pool_used >= STAGE2_WX_POOL_TABLES) {
+			stage2_l2_dram[l2_idx] = stage2_l2_block_desc(block_ipa,
+				S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
+			stage2_wx_pool_exhausted++;
+			return 1;
+		}
+
+		l3 = &stage2_wx_pool[stage2_wx_pool_used][0];
+		stage2_wx_pool_used++;
+
+		for (unsigned k = 0; k < STAGE2_L3_ENTRIES; k++) {
+			uint64_t pa = block_ipa + (uint64_t)k * STAGE2_L3_PAGE_SIZE;
+			l3[k] = stage2_page_desc(pa, S2_MEMATTR_NORMAL_WB,
+				S2_SH_INNER, /*xn=*/1);
+		}
+		stage2_l2_dram[l2_idx] = stage2_table_desc((uint64_t)(uintptr_t)l3);
+	} else {
+		return 0;
+	}
+
+	{
+		unsigned l3_idx = (unsigned)((ipa & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT);
+		uint64_t pa = ipa & STAGE2_L3_ADDR_MASK;
+
+		if (want_exec)
+			l3[l3_idx] = stage2_wx_page_desc(pa, S2AP_RO, /*xn=*/0);
+		else
+			l3[l3_idx] = stage2_page_desc(pa, S2_MEMATTR_NORMAL_WB,
+				S2_SH_INNER, /*xn=*/1);
+	}
+
+	stage2_wx_flip_count++;
+	return 1;
+}
+
+/* Mirrors stage2.c's stage2_wx_fault(), with esr_el2 (read from the trap
+ * frame there) and hpfar_el2 (an `mrs` there) turned into plain parameters
+ * here. */
+static int
+stage2_wx_fault_sim(uint64_t esr, uint64_t hpfar)
+{
+	uint32_t ec  = (uint32_t)((esr >> 26) & 0x3Fu);
+	uint32_t fsc = (uint32_t)(esr & 0x3Fu);
+	unsigned want_exec;
+	uint64_t ipa;
+
+	if (ec == 0x20u || ec == 0x21u)
+		want_exec = 1u;
+	else if (ec == 0x24u || ec == 0x25u)
+		want_exec = 0u;
+	else
+		return 0;
+
+	if ((fsc & 0x3Cu) != 0x0Cu)
+		return 0;
+
+	ipa = (hpfar & 0xFFFFFFFFF0ULL) << 8;
+
+	if (ipa < STAGE2_DRAM_BASE || ipa >= STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE)
+		return 0;
+	if (ipa >= HVIMG_BASE && ipa < HVIMG_BASE + STAGE2_L2_BLOCK_SIZE)
+		return 0;
+	if (ipa >= HVSCR_BASE && ipa < HVSCR_BASE + STAGE2_L2_BLOCK_SIZE)
+		return 0;
+
+	return stage2_wx_flip(ipa, want_exec);
+}
+
+/* Builds a synthetic ESR_EL2 value with the given EC (bits[31:26]) and ISS
+ * status-code bits[5:2] (the class; level bits[1:0] left 0, matching the
+ * real fault's level-2 report for a still-flat 2 MiB block — see
+ * stage2_wx_fault()'s own comment on why the mask ignores the level). This
+ * is the test's own instrument (not a mirror of anything in stage2.c), used
+ * to drive stage2_wx_fault_sim() the same way a real trap frame would. */
+static uint64_t
+mk_esr(uint32_t ec, uint32_t fsc_class4)
+{
+	return ((uint64_t)ec << 26) | (uint64_t)(fsc_class4 & 0x3Cu);
+}
+
+/* Builds a synthetic HPFAR_EL2 for a given IPA, inverting the exact
+ * `(hpfar & 0xFFFFFFFFF0ULL) << 8` decode stage2_wx_fault_sim() (and the
+ * real stage2_wx_fault()) uses. */
+static uint64_t
+mk_hpfar(uint64_t ipa)
+{
+	return (ipa >> 8) & 0xFFFFFFFFF0ULL;
+}
+
+/* THE POSITIVE PROOF: a plain RW+XN leaf (what STAGE2_WX_DYNAMIC's default
+ * looks like) takes a synthesized instruction-abort permission fault and
+ * comes out the other side genuinely read+execute-only — S2AP_RO, not just
+ * XN=0 — which is what makes this real W^X rather than "sometimes XN".
+ * Every OTHER page in the same 2 MiB block must still be exactly RW+XN,
+ * unchanged by the split. Cross-checked against stage2_leaf_is_wx() — the
+ * EXISTING, already-trusted predicate — rather than only against this
+ * file's own new mirror, so the proof does not rest solely on code this
+ * same change also added. */
+static void test_wx_dynamic_execute_fault_flips_to_read_execute(void)
+{
+	stage2_init_tables();
+	stage2_wx_test_reset();
+
+	unsigned l2_idx = 200u;   /* an ordinary DRAM block, clear of both A1 carves */
+	uint64_t block_ipa = STAGE2_DRAM_BASE + (uint64_t)l2_idx * STAGE2_L2_BLOCK_SIZE;
+	uint64_t code_ipa = block_ipa + 0x3000u;   /* some page inside the block */
+
+	stage2_wx_seed_block_rwxn(l2_idx);
+	assert(s2_walk(code_ipa).s2ap == S2AP_RW);
+	assert(s2_walk(code_ipa).xn == 1u);   /* confirmed RW+XN before the fault */
+
+	uint64_t esr = mk_esr(0x20u /* instr abort, lower EL */, 0x0Eu /* perm fault, level 2 */);
+	int handled = stage2_wx_fault_sim(esr, mk_hpfar(code_ipa));
+	assert(handled == 1);
+
+	struct s2_leaf l = s2_walk(code_ipa);
+	assert(l.mapped == 1 && l.level == 3u);
+	assert(l.s2ap == S2AP_RO);
+	assert(l.xn == 0u);
+	assert(stage2_leaf_is_wx(l.s2ap, l.xn) == 0);   /* NOT a violation: RO+X */
+	assert(stage2_wx_pool_used == 1u);
+	assert(stage2_wx_flip_count == 1u);
+
+	/* Every other page in the same 2 MiB block: untouched by the split,
+	 * still RW+XN. Sampled across the block, not just adjacent to code_ipa. */
+	for (unsigned k = 0; k < STAGE2_L3_ENTRIES; k += 37u) {
+		uint64_t pa = block_ipa + (uint64_t)k * STAGE2_L3_PAGE_SIZE;
+		if (pa == (code_ipa & STAGE2_L3_ADDR_MASK))
+			continue;
+		struct s2_leaf other = s2_walk(pa);
+		assert(other.mapped == 1 && other.level == 3u);
+		assert(other.s2ap == S2AP_RW);
+		assert(other.xn == 1u);
+		assert(stage2_leaf_is_wx(other.s2ap, other.xn) == 0);   /* RW+XN: clean */
+	}
+}
+
+/* THE SYMMETRIC PROOF (Q4, "the dangerous case"): a page currently RO+X
+ * (module unloaded, its physical page recycled for data) takes a
+ * synthesized DATA-abort permission fault on a WRITE and flips back to
+ * RW+XN — never left as RW+X (which would silently reopen the exact
+ * violation the first half of this feature closes) and never left
+ * unhandled (which would hang the guest on an ordinary, legitimate data
+ * write). Continues from the state test_wx_dynamic_execute_fault_flips_
+ * to_read_execute() proved, showing the two directions compose. */
+static void test_wx_dynamic_write_fault_flips_back_to_writable(void)
+{
+	stage2_init_tables();
+	stage2_wx_test_reset();
+
+	unsigned l2_idx = 201u;
+	uint64_t block_ipa = STAGE2_DRAM_BASE + (uint64_t)l2_idx * STAGE2_L2_BLOCK_SIZE;
+	uint64_t page_ipa = block_ipa + 0x7000u;
+
+	stage2_wx_seed_block_rwxn(l2_idx);
+	assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(page_ipa)) == 1);
+	assert(s2_walk(page_ipa).s2ap == S2AP_RO);   /* now code, per the test above */
+
+	/* The module unloads; its page is reused for data and written to. */
+	uint64_t esr = mk_esr(0x24u /* data abort, lower EL */, 0x0Fu /* perm fault, level 3 */);
+	int handled = stage2_wx_fault_sim(esr, mk_hpfar(page_ipa));
+	assert(handled == 1);
+
+	struct s2_leaf l = s2_walk(page_ipa);
+	assert(l.mapped == 1 && l.level == 3u);
+	assert(l.s2ap == S2AP_RW);
+	assert(l.xn == 1u);
+	assert(stage2_leaf_is_wx(l.s2ap, l.xn) == 0);   /* RW+XN: clean, not RW+X */
+	assert(stage2_wx_flip_count == 2u);   /* one flip each direction */
+
+	/* NEGATIVE CONTROL, proving the checker actually discriminates rather
+	 * than passing by construction: hand-poison the SAME leaf to RW+X (the
+	 * bug this mechanism exists to prevent — write permission left on an
+	 * executable page) and confirm stage2_leaf_is_wx() — the existing,
+	 * already-trusted predicate, unmodified by this change — flags it. If
+	 * this assertion ever failed to fire, the positive assertions above
+	 * would not be trustworthy evidence of anything. */
+	uint64_t poisoned = stage2_page_desc(page_ipa & STAGE2_L3_ADDR_MASK,
+		S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);   /* RW (default) + X */
+	unsigned bad_s2ap = (unsigned)((poisoned >> 6) & 0x3u);
+	unsigned bad_xn   = (poisoned & S2_XN_BIT) ? 1u : 0u;
+	assert(stage2_leaf_is_wx(bad_s2ap, bad_xn) == 1);   /* violation, correctly caught */
+}
+
+/* THE BOUNDED-COVERAGE PROOF (Q2/Q4): drive the pool to exactly its limit,
+ * then touch one more, previously-untouched 2 MiB block. Must NOT deny the
+ * fetch (a denial would hang the guest — see stage2_wx_flip()'s own
+ * comment) — it must fail OPEN: the new block falls back to plain RW+X
+ * (today's unconditional, hardware-verified behavior), the fallback is
+ * counted, and the pool itself does not grow past its configured size. */
+static void test_wx_dynamic_pool_exhaustion_fails_open(void)
+{
+	stage2_init_tables();
+	stage2_wx_test_reset();
+
+	/* Fill the pool exactly: STAGE2_WX_POOL_TABLES distinct blocks, clear of
+	 * both A1 carves (HVIMG_L2_IDX==16, HVSCR_L2_IDX==128) and of the two
+	 * blocks the tests above used (200, 201) — start well clear at 300. */
+	unsigned base = 300u;
+	for (uint32_t i = 0; i < STAGE2_WX_POOL_TABLES; i++) {
+		unsigned l2_idx = base + i;
+		uint64_t block_ipa = STAGE2_DRAM_BASE + (uint64_t)l2_idx * STAGE2_L2_BLOCK_SIZE;
+		uint64_t code_ipa = block_ipa + 0x100u;
+
+		stage2_wx_seed_block_rwxn(l2_idx);
+		assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(code_ipa)) == 1);
+		assert(s2_walk(code_ipa).s2ap == S2AP_RO);
+	}
+	assert(stage2_wx_pool_used == STAGE2_WX_POOL_TABLES);
+	assert(stage2_wx_pool_exhausted == 0u);
+
+	/* One more, brand-new block: the pool is already full. */
+	unsigned overflow_idx = base + STAGE2_WX_POOL_TABLES;
+	uint64_t overflow_block_ipa = STAGE2_DRAM_BASE + (uint64_t)overflow_idx * STAGE2_L2_BLOCK_SIZE;
+	uint64_t overflow_code_ipa = overflow_block_ipa + 0x100u;
+
+	stage2_wx_seed_block_rwxn(overflow_idx);
+	int handled = stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(overflow_code_ipa));
+
+	assert(handled == 1);   /* FAILS OPEN: still handled, guest is NOT denied */
+	assert(stage2_wx_pool_used == STAGE2_WX_POOL_TABLES);   /* pool did not grow */
+	assert(stage2_wx_pool_exhausted == 1u);
+
+	/* The overflow block is now a plain 2 MiB BLOCK again (not split), RW+X
+	 * — today's unconditional behavior, honestly still a W^X violation. */
+	struct s2_leaf l = s2_walk(overflow_code_ipa);
+	assert(l.mapped == 1 && l.level == 2u);
+	assert(l.s2ap == S2AP_RW);
+	assert(l.xn == 0u);
+	assert(stage2_leaf_is_wx(l.s2ap, l.xn) == 1);   /* honestly reported, not hidden */
+
+	/* Every block filled BEFORE exhaustion is unaffected by the overflow —
+	 * bounded means bounded, not "everything degrades together". */
+	struct s2_leaf still_good = s2_walk(STAGE2_DRAM_BASE + (uint64_t)base * STAGE2_L2_BLOCK_SIZE + 0x100u);
+	assert(still_good.level == 3u && still_good.s2ap == S2AP_RO && still_good.xn == 0u);
+}
+
+/* THE DISPATCH-CORRECTNESS PROOF (Q1): stage2_wx_fault_sim() must fire on
+ * exactly the (EC, fault-class) combinations it is supposed to, and defer
+ * to the existing/generic path on every other combination — most
+ * importantly, it must NOT swallow a genuine translation fault (which is
+ * how the A1 hv-image/hv-scratch boundary violation and the vblk/vnet
+ * trapped-window faults are reported) or a fault on a non-DRAM IPA. */
+static void test_wx_dynamic_fault_classification(void)
+{
+	stage2_init_tables();
+	stage2_wx_test_reset();
+
+	unsigned l2_idx = 210u;
+	uint64_t block_ipa = STAGE2_DRAM_BASE + (uint64_t)l2_idx * STAGE2_L2_BLOCK_SIZE;
+	uint64_t code_ipa = block_ipa + 0x100u;
+	stage2_wx_seed_block_rwxn(l2_idx);
+
+	/* Not one of the four ECs at all (e.g. 0x18, TVM sysreg trap). */
+	assert(stage2_wx_fault_sim(mk_esr(0x18u, 0x0Eu), mk_hpfar(code_ipa)) == 0);
+
+	/* Right EC, but a TRANSLATION fault (class 0b0001), not permission —
+	 * must NOT be absorbed here. */
+	assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x04u), mk_hpfar(code_ipa)) == 0);
+
+	/* Right EC and class, but the IPA is MMIO, not DRAM. */
+	assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(0x01C28000UL)) == 0);
+
+	/* Right EC and class, DRAM range, but inside the hv-image window —
+	 * must be refused even though it is technically "in DRAM". */
+	assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(HVIMG_BASE + 0x100u)) == 0);
+	/* ... and hv-scratch. */
+	assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(HVSCR_BASE + 0x100u)) == 0);
+
+	/* The genuine positive case: right EC, right class, ordinary DRAM IPA. */
+	assert(stage2_wx_fault_sim(mk_esr(0x20u, 0x0Eu), mk_hpfar(code_ipa)) == 1);
+	assert(stage2_wx_pool_used == 1u);
+}
+
+/* ==================================================================== *
  * main()
  * ==================================================================== */
 struct test_case { const char *name; void (*fn)(void); };
@@ -1213,6 +1584,14 @@ static const struct test_case k_tests[] = {
 	                                 test_wx_scan_matches_measured_dram_state },
 	{ "wx_scan_catches_a_poisoned_mmio_leaf",
 	                                 test_wx_scan_catches_a_poisoned_mmio_leaf },
+	{ "wx_dynamic_execute_fault_flips_to_read_execute",
+	                                 test_wx_dynamic_execute_fault_flips_to_read_execute },
+	{ "wx_dynamic_write_fault_flips_back_to_writable",
+	                                 test_wx_dynamic_write_fault_flips_back_to_writable },
+	{ "wx_dynamic_pool_exhaustion_fails_open",
+	                                 test_wx_dynamic_pool_exhaustion_fails_open },
+	{ "wx_dynamic_fault_classification",
+	                                 test_wx_dynamic_fault_classification },
 };
 
 int main(void)

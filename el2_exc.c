@@ -33,6 +33,13 @@
 #include "smp.h"
 #include "vblk_emmc.h"
 #include "vnet_emac.h"   /* vnet_mmio_fault() -- ROADMAP C1 virtio-net-over-EMAC */
+#include "stage2.h"      /* stage2_wx_fault() -- opt-in dynamic W^X, see
+                           * stage2.h's STAGE2_WX_DYNAMIC block and
+                           * docs/wx-enforcement.md. The prototype itself is
+                           * only visible when STAGE2_WX_DYNAMIC is set (it
+                           * defaults to 0), so the call site below is
+                           * wrapped in the SAME #if -- an off build neither
+                           * declares nor calls it. */
 #ifdef HV_HDMI
 #include "scanout.h"     /* scanout_mmio_fault() -- zero-copy GPU scanout flip
                            * doorbell, see docs/zero-copy-scanout.md. Guarded
@@ -935,6 +942,20 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		if ((ec == 0x20u || ec == 0x21u || ec == 0x24u || ec == 0x25u) &&
 		    firstfault_handle(frame))
 			return;
+#if STAGE2_WX_DYNAMIC
+		/* Opt-in dynamic W^X (stage2.h, off by default — see
+		 * docs/wx-enforcement.md): the SAME four ECs as the first-fault
+		 * probe above (a stage-2 abort can only be one or the other —
+		 * firstfault_handle() already returned 0, i.e. "not the vector
+		 * page"), but this one is a general guest-DRAM W^X permission
+		 * flip rather than a single fixed IPA. stage2_wx_fault() itself
+		 * filters everything that isn't a DRAM PERMISSION fault back out
+		 * (translation faults, non-DRAM IPAs, the two HV windows), so it
+		 * is safe to try unconditionally here for every one of these ECs. */
+		if ((ec == 0x20u || ec == 0x21u || ec == 0x24u || ec == 0x25u) &&
+		    stage2_wx_fault(frame))
+			return;
+#endif
 		/* Hardware breakpoint (EC 0x30) / watchpoint (EC 0x34) taken from the
 		 * guest, routed to EL2 by MDCR_EL2.TDE. hwbp_handle records the hit and
 		 * one-shot-disables the slot so the guest makes forward progress on
