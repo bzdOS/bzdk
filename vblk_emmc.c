@@ -103,9 +103,18 @@
  *   [45] .. rc == VBLK_RC_UNALIGNED (partial-sector stitch, unimplemented)
  *   [46] .. any other rc — a real emmc_bio_read/write failure (-1..-9)
  *   [47] .. rejected for exceeding the advertised capacity (no rc involved)
- *   [59] .. rejected: guest WRITE below VBLK_BOOT_GUARD_LBA (boot area). A
+ *   [62] .. rejected: guest WRITE below VBLK_BOOT_GUARD_LBA (boot area). A
  *        NON-ZERO value here means the guest tried to write SPL/U-Boot and was
  *        stopped -- worth investigating on its own, not just a stat.
+ *
+ * INDEX MAP WARNING. Slots 0..61 are ALL taken, and this window is 64 words
+ * (HVMAP_VBLK_BC_SIZE 0x100). 62 is this counter; 63 is the last one free.
+ * The boot-guard counter was first put at [59] and that slot already belonged to
+ * g_lock_retries (line ~854) -- eMMC lock-acquire retries, a normal and frequent
+ * event -- so the aliased reading looked like "the guest tried to write the boot
+ * area 4 times" when it was 4 lock retries. Read live and briefly believed.
+ * hv_addrmap.h's _Static_asserts prove windows do not overlap; nothing proves
+ * INDICES inside a window do not. Grep before claiming one.
  *   [48] .. rejected because emmc_ready == 0 (no rc involved)
  *   [49] first IOERR: sector lo32        [53] last IOERR: sector lo32
  *   [50] first IOERR: rc                 [54] last IOERR: rc
@@ -1039,7 +1048,7 @@ static uint32_t g_ioerr_unaligned;     /* [45] rc == VBLK_RC_UNALIGNED        */
 static uint32_t g_ioerr_emmc;          /* [46] real emmc_bio failure (-1..-9) */
 static uint32_t g_ioerr_capacity;      /* [47] past advertised capacity       */
 static uint32_t g_ioerr_notready;      /* [48] emmc_ready == 0                */
-static uint32_t g_ioerr_bootguard;     /* [59] WRITE below the boot LBA floor  */
+static uint32_t g_ioerr_bootguard;     /* [62] WRITE below the boot LBA floor  */
 
 /* Cause tags for the two rc-less rejects, so one call site shape covers all
  * five ways a request can end up S_IOERR. */
@@ -1069,7 +1078,7 @@ static void vblk_note_ioerr(uint32_t cause, int rc, uint64_t sector,
 		case VBLK_RC_BUSY:      vblk_bc(43, ++g_ioerr_busy);      break;
 		case VBLK_RC_BADPA:     vblk_bc(44, ++g_ioerr_badpa);     break;
 		case VBLK_RC_UNALIGNED: vblk_bc(45, ++g_ioerr_unaligned); break;
-		case VBLK_RC_BOOTGUARD: vblk_bc(59, ++g_ioerr_bootguard); break;
+		case VBLK_RC_BOOTGUARD: vblk_bc(62, ++g_ioerr_bootguard); break;
 		default:                vblk_bc(46, ++g_ioerr_emmc);      break;
 		}
 		break;
@@ -1990,6 +1999,11 @@ int vblk_init(void)
 	g_lock_retries = g_lock_giveups = 0;
 	for (uint32_t i = 57; i <= 60; i++)
 		vblk_bc(i, 0);
+	/* Same reasoning again for the boot-guard counter: "the guest never tried to
+	 * write the boot area" is only meaningful if it can be distinguished from
+	 * "this build has no such counter". */
+	g_ioerr_bootguard = 0;
+	vblk_bc(62, 0);
 
 	/* Release the eMMC-controller lock unconditionally. It lives in a fixed
 	 * DRAM word (not .bss), so a warm WDT reset (which preserves DRAM) can

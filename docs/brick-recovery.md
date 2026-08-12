@@ -1,4 +1,47 @@
-# Board unbootable: the 2026-08-12 FEL incident, and how to get back
+# The 2026-08-12 "brick" that was not one — and what it actually taught
+
+## CORRECTION FIRST: the board was never bricked, and this file said it was
+
+Everything below the next section was written while I believed the board had lost
+its SPL and dropped into the BROM's FEL recovery mode. **That was wrong.** The
+correction, established afterwards by measurement:
+
+- `1f3a:efe8` is **U-Boot's own USB gadget in this project**, not only FEL.
+  `SESSION-RULES.md` R2 says so in as many words: *"Гаджет U-Boot
+  (`1f3a:efe8`, `ttyACM0`/`ttyCHIMP`) появляется ЦИКЛАМИ"*. `lsusb`'s string
+  *"sunxi SoC OTG connector in FEL/flashing mode"* is just `usb.ids`' label for
+  that VID:PID, and I read the label instead of the evidence.
+- The evidence was in `dmesg` the whole time:
+  `Product: USB download gadget` / **`Manufacturer: bzdOS`** — the BROM does not
+  announce itself as bzdOS. And `cdc_acm 2-4:1.0: ttyACM0: USB ACM device`: the
+  console attached successfully.
+- **The watchdog did exactly what R2 says it does.** The board reset and came
+  back to a U-Boot prompt on its own. Confirmed afterwards by the project's own
+  tooling: `board_ctl.board_state()` → `AT_UBOOT`.
+- `sunxi-fel version` timed out **because it is not FEL**. Worse, running it
+  detached `cdc_acm` from the interface (`usbfs: process (sunxi-fel) did not
+  claim interface 1 before use`), so my own diagnosis broke the working console I
+  was trying to reach.
+- Recovery was one line, no card, no FEL:
+  `echo 2-4:1.0 > /sys/bus/usb/drivers/cdc_acm/bind`, then a normal reload.
+
+**So: no brick, no lost SPL, and the anti-brick path worked.** What follows is
+kept because the observations are accurate and the FEL procedure is still the
+right thing to have written down — but read it as "what I thought at the time",
+not as an incident record.
+
+### The actual lesson, which is not the one I first drew
+
+Two independent channels degrading within minutes was real and worth stopping
+for. But the failure was **a board that reset itself and waited in U-Boot** —
+the designed behaviour — and I turned it into an emergency by trusting a
+human-readable USB label over `dmesg`. Check `Manufacturer:` before concluding
+anything about which firmware is answering, and run `board_ctl.board_state()`,
+which exists precisely to answer this question, before reaching for `sunxi-fel`.
+
+---
+
+# Original account, written under the mistaken FEL diagnosis
 
 Written while the board was still down, so the state is recorded rather than
 remembered. Nothing here has been executed — the recovery procedure below is
@@ -43,17 +86,27 @@ history of LBA-level bugs (lost kicks at unexpected LBAs, partial-sector
 stitching, a CPU0/CPU2 lock race).
 
 **This is not a proof that the guest destroyed the SPL.** It is a statement that
-nothing prevented it, that heavy guest writes immediately preceded the failure,
-and that "it could not have been us" is not available as a defence. The
-alternative explanation — the watchdog reset the board and the boot medium
-failed for its own reasons — is equally unproven.
+nothing prevented it.
+
+**And it has since been measured: the guest does NOT write there.** With the
+guard deployed on real hardware and its counter on a slot that is actually free
+(see below), 227 guest write requests — including a deliberate 2 MiB `dd` — produced
+**zero** refusals. So the guard does not false-positive on normal guest I/O, and
+there is no evidence the guest ever wrote the boot area. Combined with the
+correction at the top of this file (the SPL was never lost), the
+"guest bricked the board" hypothesis has nothing left supporting it.
+
+The guard is still right to exist: it turns an unenforced assumption into an
+enforced boundary, and it costs one comparison per request.
 
 Fixed since, in `vblk_emmc.c` (`cb8186c`): guest **writes** below
 `VBLK_BOOT_GUARD_LBA` (18432 = 9 MiB, derived from `bpi-image.sh`'s
 `UBOOT_RESERVE_MIB=8` plus the GPT plus 1 MiB slack) are refused by the
-hypervisor. Reads are not restricted. Breadcrumb `[59]` counts refusals — a
+hypervisor. Reads are not restricted. Breadcrumb **`[62]`** counts refusals — a
 non-zero value there means the guest tried to write the boot area and was
-stopped. R2 has been corrected to withdraw the guarantee.
+stopped. (It was `[59]` for one build; that slot was already taken. See the last
+section of this file.) R2 has been corrected to say the guarantee is *now*
+enforced rather than assumed — not, as it first said, that it had been violated.
 
 ## Recovery route 1 (preferred): bootable microSD
 
@@ -134,3 +187,22 @@ hindsight, is a progressive loss of every channel, and the useful signal was the
 Concretely: **if two independent channels to the board degrade within minutes of
 each other, stop and take a full snapshot before continuing.** Reading each one
 as "probably load" is locally correct and globally wrong.
+
+
+## One more mistake, recorded because it nearly became a published fact
+
+The boot-guard counter was first put at breadcrumb index `[59]`. That slot
+already belonged to `g_lock_retries` — eMMC lock-acquire retries, a normal and
+frequent event during guest I/O. So the very first reading, `[59] = 2` and then
+`[59] = 4` after a `dd`, looked exactly like "the guest tried to write the boot
+area and was stopped four times", and I said so before checking.
+
+It was four lock retries. `hv_addrmap.h`'s `_Static_assert` chain proves that
+breadcrumb *windows* do not overlap; nothing proves that *indices inside* a
+window do not. Moved to `[62]` (0..61 were all taken; 63 is the last one free),
+zeroed at init so "never happened" is distinguishable from "this build has no
+such counter", and the index map is now documented in `vblk_emmc.c` with this
+story attached.
+
+Two wrong readings in one afternoon, both from trusting a number without
+checking who else writes it. Grep for the slot before believing the value.
