@@ -138,20 +138,89 @@ Two traps, both of which caught this investigation before it got a real number:
   comment says that is exactly why `dbgmon`/CPU1 callers never hit back-to-back
   timing bugs. A paced test structurally cannot reproduce this.
 
-## Deliberately left open
+## The other two defects, fixed afterwards (`d57607e`)
 
-Two defects found in the same reading and **not** bundled into this fix, so that
-this one could be measured on its own:
+Both were found in the same reading and deliberately kept out of the CNTPCT fix
+so that one could be measured alone. Both are now closed, and measuring them
+produced a result worth more than the fixes.
 
-- `emmc_bio_read()` checks **no** RINT error bits at all, while the write path
-  checks two. A read can therefore return `rc = 0` on data the controller
-  flagged. Measured this boot, the read-side accumulator `[13]` holds only
-  `{CMD_DONE, DATA_OVER, RX_DATA_REQ}` — no error bit — so the missing check has
-  not been swallowing anything yet. It is still a missing check.
-- Both hot paths reset the FIFO with a fixed `small_delay()` (64 register reads)
-  rather than polling the self-clearing reset bits. `ebio_fail_settle()`'s own
-  comment documents that approach as *"reasoned from first principles and it was
-  wrong"* and polls `GCTL_RESET_ALL` instead — the lesson was applied in one
-  function and not in the two on the hot path.
+### The read path checked no error bits
+
+`emmc_bio_read()` returned 0 the moment 128 words had drained and `DATA_OVER` had
+latched, so a block the controller had flagged went to the guest as good data —
+invisible to every vblk IOERR counter, since those only count non-zero `rc`. The
+write path had checked error bits all along. That asymmetry was the defect.
+
+`RINT_READ_ERR_MASK` covers response/data CRC, data timeout, FIFO-run,
+hardware-locker, and start/end-bit errors. **It excludes bit 8**, and the reason
+turned into the interesting part — see below.
+
+Reads are not retried below this layer (`vblk_emmc.c` has `VBLK_WRITE_RETRIES`
+and no read equivalent), so a flagged read becomes `S_IOERR` and FreeBSD retries.
+A reported error the guest can retry beats silently plausible wrong bytes.
+
+**Validated no-op on healthy hardware:** across a boot plus a 68 MB raw round
+trip — 6763 reads — `[20] read_errs = 0` and `[19] read_err_bits = 0x0000`. Zero
+false positives, exactly as the accumulator predicted.
+
+### Bit 8 was a symptom, not a mystery
+
+The mask excluded bit 8 because `[14]` — an OR across every *successful* write
+since boot — had it set, and a bit that behaves unlike its documented name
+`RESP_TIMEOUT` is the wrong thing to start failing I/O on.
+
+With the CNTPCT fix in place, **bit 8 disappeared**: `[14]` went from `0x011c` to
+`0x001c`. So bit 8 was never anomalous. It was the retry storm issuing CMD24 at
+cards that were still programming and collecting genuine response timeouts —
+`RESP_TIMEOUT` was correctly named the whole time, and it was a *consequence* of
+the bug, observed while the bug was still live.
+
+The exclusion is therefore conservative rather than necessary, and can be
+revisited. It costs nothing to leave in place, and the reasoning is recorded here
+so a future reader does not have to re-derive why bit 8 looked suspicious.
+
+Also worth noting: this is a warning about OR accumulators generally. `[14]`
+having a bit set means *at least one* operation set it, never *every* one — a
+distinction easy to overstate, and overstated once during this hunt.
+
+### The FIFO reset now waits — and probably never needed to
+
+Both hot paths reset the FIFO with a fixed `small_delay()` (64 register reads)
+instead of polling the self-clearing bits. `ebio_fail_settle()`'s own comment
+calls that approach *"reasoned from first principles and it was wrong"* and polls
+`GCTL_RESET_ALL` — the lesson was applied in one function and not in the two that
+run on every sector. Now shared as `gctl_reset_and_wait()`, bounded, and used by
+both.
+
+**But the measurement does not support calling this a live bug.** `[21]`, the
+worst spin count before the reset bits self-cleared, reads **1** — the reset is
+not instantaneous, but it completes in about one register-read time, which
+`small_delay()`'s 64 reads comfortably covered. `[22]` (resets that never
+cleared) is 0.
+
+So: correct by construction, and honestly not a defect that was firing. The value
+is that a slow reset can no longer be silently overrun, and the claim is now
+measured instead of assumed. `emmc_bio_init()` is left alone — it writes
+`GCTL_RESET_ALL` wholesale as a bring-up reset, which is a different operation and
+is hardware-validated.
+
+### Regression check
+
+Both fixes in, same test: readback hash identical to the reference,
+`TOTAL DAMAGED SECTORS: 0`. `write_retries`, `busy_timeouts`, `settles`,
+`ebio_fails`, `read_errs` and `g_ioerrs` all 0 across 6763 reads and 4655 writes.
+
+## Still open
+
+- **`emmc_bio_write()`'s error check is unreachable for early bits.** It sits
+  after `if (ri & RINT_DATA_OVER) break;`, so any error bit latching no later
+  than `DATA_OVER` is never examined. `[23]` now records which bits actually
+  co-occur with `DATA_OVER`; it currently reads `0x0000`, so the hole is hiding
+  nothing. Not made fatal, because the write path now produces zero corrupt
+  sectors and a speculative mask could only regress that. Make it fatal when
+  `[23]` says which bits are safe to fail on.
 - **Why `CNTPCT_EL0` reads backwards at all.** The guard makes it harmless, not
-  absent. `[18]` and the timeout counters are the instruments to watch.
+  absent. `[18]` and the timeout counters are the instruments; note that `[18]`
+  counts only the over-then-under pair, and the *backwards* read is caught
+  silently by the ternary — which is itself how the direction of the glitch was
+  established.
