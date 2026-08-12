@@ -105,13 +105,28 @@ VBK_LABELS = {
     # absorbed instead of handed to the guest as an S_IOERR. [60] moving means
     # the lock is genuinely STUCK (a leaked unlock), which waiting cannot fix.
     59: "lock_retries", 60: "lock_giveups",
+    # [61] is the IRQ re-arm counter (published as a real zero by vblk_init).
+    # [62] non-zero means the HV REFUSED a guest write below
+    # VBLK_BOOT_GUARD_LBA -- i.e. the guest tried to write the boot area.
+    # Measured 0 across 227 guest writes, so any non-zero here is new news.
+    62: "g_ioerr_bootguard",
 }
+
+# Slots that describe ONE recorded failure rather than counting events. They are
+# deliberately NOT cleared by vblk_init() (see its comment: "they mean nothing
+# until [42] is non-zero"), so on a warm reset -- which preserves DRAM -- they
+# still hold the PREVIOUS boot's failure and read as if it were this boot's.
+# Printing them with meaningful labels next to a "g_ioerrs=0" verdict is how a
+# reader ends up believing a failure that did not happen this boot; that
+# happened on 2026-08-12. Gated on [42] below.
+VBK_IOERR_SNAPSHOT_SLOTS = range(49, 57)
 
 # bc[42..56] decode. Read as signed: serve_data's codes are negative.
 VBK_IOERR_RC = {0: "n/a (capacity/not-ready reject)",
                 -100: "VBLK_RC_UNALIGNED (partial-sector stitch)",
                 -200: "VBLK_RC_BUSY (eMMC cross-core lock timeout)",
-                -300: "VBLK_RC_BADPA (data PA outside DRAM)"}
+                -300: "VBLK_RC_BADPA (data PA outside DRAM)",
+                -400: "VBLK_RC_BOOTGUARD (write below the boot-reserved floor)"}
 
 # Interrupts this tree actually cares about, so the GIC section is a verdict
 # rather than a register dump. The third field says whether the enable/pending
@@ -222,6 +237,11 @@ def dump_vbk(out, vbk_a, vbk_b):
     if not vbk_a:
         return
     out += section("virtio-blk breadcrumbs (VBK1 @0x50020000)")
+    # See VBK_IOERR_SNAPSHOT_SLOTS: with no failure THIS boot, [49..56] hold
+    # whatever survived in DRAM from the last one. Say so on the line itself --
+    # a caveat further down the dump is read after the number, which is too late.
+    ioerrs_now = vbk_a[42] if len(vbk_a) > 42 else None
+    snapshot_stale = ioerrs_now == 0
     for i, v in enumerate(vbk_a):
         if v == 0xFFFFFFFF:
             continue
@@ -230,6 +250,8 @@ def dump_vbk(out, vbk_a, vbk_b):
         if vbk_b and vbk_b[i] != v:
             moved = f"  -> {vbk_b[i]}  MOVING"
         extra = ""
+        if snapshot_stale and i in VBK_IOERR_SNAPSHOT_SLOTS:
+            extra = "   <- STALE (g_ioerrs==0: prior boot's, means nothing now)"
         if i == 41:
             extra = "   " + ("virtio-mmio window + 0x%02x" % (v & 0xFFF)
                              if 0x0A000000 <= v < 0x0A200000 else "")
@@ -283,7 +305,9 @@ def dump_vbk_ioerr(out, g):
                      ("g_ioerr_badpa", "data descriptor PA outside DRAM"),
                      ("g_ioerr_unaligned", "partial-sector stitch (unimplemented)"),
                      ("g_ioerr_capacity", "read past advertised capacity"),
-                     ("g_ioerr_notready", "emmc_ready == 0")):
+                     ("g_ioerr_notready", "emmc_ready == 0"),
+                     ("g_ioerr_bootguard",
+                      "REFUSED: guest write below the boot-reserved LBA floor")):
         c = g.get(key)
         if c:
             out.append(f"      {c:6d}  {key:<18s} {why}")
