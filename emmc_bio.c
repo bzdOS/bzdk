@@ -447,9 +447,32 @@ static uint32_t g_busy_timeouts;  /* [10] post-write CARD_BUSY wait timeouts */
 static uint32_t g_rint_or_read;   /* [13] OR of RINT after successful reads  */
 static uint32_t g_rint_or_write;  /* [14] OR of RINT after successful writes */
 
+/* [15]..[17]: the raw inputs of the post-write CARD_BUSY timeout decision,
+ * recorded WITHOUT arithmetic, because the derived value already contradicts
+ * itself.
+ *
+ * Measured 2026-08-12: g_busy_timeouts[10] = 14710 while [11] (the elapsed time
+ * that same branch computes, in ms) = 0, with [12] = CNTFRQ = 24000000, i.e.
+ * correct. Those two cannot both be right. The branch is only entered when
+ * `rd_cntpct() - start > cap`, and cap = ms_to_ticks(4000) = 96e6 ticks, so the
+ * elapsed time must exceed 96e6 ticks = 4000 ms; the branch then re-reads the
+ * counter and gets under 24000 ticks = under 1 ms. Either `cap` is not what the
+ * arithmetic says, or two consecutive rd_cntpct() reads disagree by four
+ * orders of magnitude.
+ *
+ * emmc_bio.c's own comment at the branch predicted exactly this fork: "If [11]
+ * is ~4000 the card really does stall that long ... if it is tiny, the cap is
+ * expiring early and the timeout math is the bug." It is tiny. So record the
+ * ingredients rather than a derived number: cap as computed, and el as the raw
+ * 64-bit difference split across two words so an unsigned underflow (el near
+ * 2^64, high word all ones) is unmistakable. */
+static uint32_t g_busy_cap_lo;    /* [15] (uint32_t)cap at the last timeout   */
+static uint32_t g_busy_el_lo;     /* [16] (uint32_t)el                       */
+static uint32_t g_busy_el_hi;     /* [17] (uint32_t)(el >> 32)               */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 15u
+#define EBIO_BC_NWORDS 18u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -844,6 +867,16 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 					ebio_bc(10, ++g_busy_timeouts);
 					ebio_bc(11, f ? (uint32_t)((el * 1000ull) / f) : 0xffffffffu);
 					ebio_bc(12, (uint32_t)f);
+					/* See g_busy_cap_lo: [11] above contradicts the branch
+					 * condition that got us here, so record the raw ingredients
+					 * too. el is split so an unsigned underflow (high word all
+					 * ones) cannot hide inside a truncating cast. */
+					g_busy_cap_lo = (uint32_t)cap;
+					g_busy_el_lo  = (uint32_t)el;
+					g_busy_el_hi  = (uint32_t)(el >> 32);
+					ebio_bc(15, g_busy_cap_lo);
+					ebio_bc(16, g_busy_el_lo);
+					ebio_bc(17, g_busy_el_hi);
 				}
 				ebio_fail_settle();
 				return -2;   /* card never signaled program-done: do NOT claim success */
