@@ -615,6 +615,25 @@ static uint32_t g_settle_busy_timeouts; /* [26] card never went idle          */
 static uint32_t g_fi_every;       /* inject on every Nth eligible write; 0=off */
 static uint32_t g_fi_min_lba;     /* never inject below this LBA (interlock)   */
 static uint32_t g_fi_legacy_wait; /* 1 = settle with the OLD iteration wait    */
+/* WHICH failure to inject. Added after the first A/B came back negative and
+ * forced a re-reading of the original numbers.
+ *
+ *   0 = bail AFTER DATA_OVER latched (the post-write CARD_BUSY path).
+ *   1 = bail on the FIRST poll of the DATA-PHASE wait, before DATA_OVER.
+ *
+ * Point 0 produced zero corruption with BOTH waits, which is not a null result:
+ * once DATA_OVER has latched the data phase is complete and all 128 words have
+ * reached the card, so bailing there CANNOT leave a partial block -- and a
+ * partial block is precisely what the damage signature requires (card holds
+ * words[0..N-1] then words[0..127-N]).
+ *
+ * Point 1 is where the words are still in the FIFO undelivered, and the settle's
+ * FIFO reset discards them. The original counters agree: 160 corrupt sectors
+ * against ebio_fails=950 is 1 in 6, while against busy_timeouts=14710 it is 1 in
+ * 92. The data-phase path was the corrupting one; the busy path supplied the
+ * volume. Both came from the same unguarded CNTPCT subtraction, so the fix covers
+ * both -- but the causal chain as first written named the wrong loop. */
+static uint32_t g_fi_point;
 static uint32_t g_fi_injected;    /* [27] injections performed                 */
 static uint32_t g_fi_seq;         /* internal: eligible writes since last hit  */
 
@@ -1024,6 +1043,21 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 		uint32_t ri;
 		for (;;) {
 			ri = rreg(REG_RINT);
+
+			/* FAULT INJECTION point 1 -- see g_fi_point. Fires on the FIRST
+			 * poll, before DATA_OVER, which is exactly what the CNTPCT
+			 * underflow did: it made the timeout comparison true immediately.
+			 * The 128 words are in the FIFO but not yet all delivered to the
+			 * card, and ebio_fail_settle()'s reset discards the remainder. */
+			if (g_fi_every && g_fi_point == 1u && lba >= g_fi_min_lba &&
+			    ++g_fi_seq >= g_fi_every) {
+				g_fi_seq = 0;
+				ebio_bc(27, ++g_fi_injected);
+				ebio_fail_settle();
+				/* Same encoding the real data-phase timeout returns. */
+				return (int)(0x20000000u | (ri & 0x3fffu));
+			}
+
 			if (ri & RINT_DATA_OVER) {
 				/* THE THIRD HOLE, now closed. The `ri & 0x0180` check further
 				 * down is UNREACHABLE for any error bit that latches no later
@@ -1079,8 +1113,8 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				 * The LBA floor is an interlock, not a nicety: this can corrupt
 				 * real data, so it must be impossible to reach the guest's root
 				 * filesystem with it. */
-				if (g_fi_every && lba >= g_fi_min_lba &&
-				    ++g_fi_seq >= g_fi_every) {
+				if (g_fi_every && g_fi_point == 0u &&
+				    lba >= g_fi_min_lba && ++g_fi_seq >= g_fi_every) {
 					g_fi_seq = 0;
 					ebio_bc(27, ++g_fi_injected);
 					ebio_fail_settle();
@@ -1287,17 +1321,20 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
  * confirm what is actually live rather than what it believes it asked for.
  * Callable over the debug channel via dbgmon `call`, and from dbgmon's own
  * `fi` command. */
-void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba, uint32_t legacy_wait)
+void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba, uint32_t point,
+                           uint32_t legacy_wait)
 {
 	g_fi_every = every;
 	g_fi_min_lba = min_lba;
+	g_fi_point = point ? 1u : 0u;
 	g_fi_legacy_wait = legacy_wait ? 1u : 0u;
 	g_fi_seq = 0;
 	g_fi_injected = 0;
 	ebio_bc(27, 0);
 	/* [28]: 0 = disarmed. Otherwise every | (legacy<<16) | 0x8000 as an
 	 * armed marker, so a reader cannot mistake "disarmed" for "unwritten". */
-	ebio_bc(28, every ? (every | (g_fi_legacy_wait << 16) | 0x8000u) : 0u);
+	ebio_bc(28, every ? (every | (g_fi_legacy_wait << 16) |
+	                     (g_fi_point << 17) | 0x8000u) : 0u);
 }
 
 /* ------------------------------------------------------------------ */
