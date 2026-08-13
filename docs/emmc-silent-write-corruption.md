@@ -271,8 +271,88 @@ Two of the three secondary fixes, then, are hardening rather than caught bugs.
 Only the read-side missing error check closed a hole that was demonstrably
 capable of returning bad data as good.
 
+## What fault injection found (`35d2b91`..`1b3c02e`)
+
+The retry safeguard shipped unproven, so injection was built to execute it on
+demand: bail out of a write at a chosen point, with a chosen card-idle wait, at a
+chosen rate, confined above an LBA floor so it can never reach the guest's root.
+It refuted two things I had already written down and committed, and found a bug
+the CNTPCT fix had hidden rather than removed.
+
+### It named the wrong loop
+
+Injecting **after `DATA_OVER`** — the post-write `CARD_BUSY` path, which the
+document blamed — produced **zero** corruption with both the timed and the legacy
+wait. 267 injections, 267 retries, 267 rescues, 0 damaged, twice.
+
+Correctly so: once `DATA_OVER` has latched, all 128 words have reached the card,
+so no partial block is possible — and a partial block is what the signature
+requires. Re-reading the original counters agrees, and I had read them the wrong
+way round: 160 corrupt sectors against `ebio_fails = 950` is 1 in 6, while against
+`busy_timeouts = 14710` it is 1 in 92. **The data-phase timeout was the corrupting
+path; the busy timeout supplied the volume.** Both loops shared the unguarded
+subtraction, so `58c3624` fixes both — but the mechanism was mis-attributed.
+
+### The timed card-idle wait does not prevent this
+
+Injecting at the **data-phase** point with the timed wait in place: **267
+injections, 267 damaged sectors. One for one.** So the retry-path hardening was
+not the precondition this document claimed it was. It was worth doing on its own
+terms and it does not prevent this.
+
+### And it exposed a live bug the CNTPCT fix had only hidden
+
+This file asserted, as a note of fact:
+
+> NOTE the FIFO reset discards the undelivered words. That is correct here and
+> only here: these are single-block CMD24 transfers, so the caller re-pushes the
+> whole 512 B sector from the bounce buffer on retry — nothing is half-written
+> from the host's side.
+
+The host side is not half-written. **The card side is.** Discarding the FIFO
+abandons a block the card has already begun accepting, and the retry's 128 words
+are appended to what it already took rather than replacing it — exactly the
+measured shape. So **any genuine data-phase failure** — a real CRC error, a real
+timeout — would still corrupt on retry. Fixing `CNTPCT` removed the trigger and
+left the mechanism armed.
+
+The remedy was written two lines below the wrong claim (*"an explicit CMD12
+STOP_TRANSMISSION ... is the next step"*), gated on `ebio_fails` climbing, which
+it stopped doing once the spurious failures went away.
+
+### CMD12, and what it took to aim it
+
+| run | damaged sectors |
+|---|---|
+| no CMD12 | **267** of 133632 |
+| CMD12 from every settle | 75 (in a run that aborted early — see below) |
+| CMD12 only where the card can have a transfer open | **2** |
+
+Sending it from every settle was wrong and measurement said so at once: CMD12
+failed 106 of 547 times, `ebio_fails` went 0 → 354, and one write reached the
+guest as `S_IOERR`, aborting the workload at 49 MB of 68. `STOP_TRANSMISSION` with
+no transfer open is an illegal command, and the settle is called from every
+failure path — most of them past `DATA_OVER`.
+
+Now `ebio_fail_settle_full(stop_card)`, with the plain wrapper defaulting to **no**
+CMD12 so the dangerous case must be spelled out. Sent from exactly the three write
+paths that can leave words undelivered (push loop short, data-phase error branch,
+data-phase timeout branch) and from the injection that mimics the third.
+
+**Remaining gap, precisely bounded:** CMD12 still fails **141 of 268** times
+(53%), and the 2 sectors that still get damaged have a *different* signature —
+`first_off 0`, the whole sector wrong rather than a head-plus-own-head hybrid —
+consistent with the abort not taking. Damage is down 130× with a CMD12 that works
+barely half the time; making its delivery reliable is the path to 0. Candidates,
+in order: issue it *before* the FIFO reset while the transfer is still live on the
+bus; handle its R1b busy response rather than polling `CMD_DONE` alone; or
+re-program the controller clock after the reset, which `ebio_fail_settle()`'s
+comment records as removed for breaking the guest and would need its own soak.
+
 ## Still open
 
+- **CMD12 delivery** — see the table above: 53% failure rate, 2 sectors, a clear
+  candidate list.
 - **Why `CNTPCT_EL0` reads backwards at all.** The guard makes it harmless, not
   absent. `[18]` and the timeout counters are the instruments; note that `[18]`
   counts only the over-then-under pair, and the *backwards* read is caught
