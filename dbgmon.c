@@ -52,6 +52,15 @@ extern int sd_bio_init(void);
 extern int sd_bio_read(uint32_t lba, uint64_t buf_pa);
 extern int sd_bio_write(uint32_t lba, uint64_t buf_pa);
 
+/* eMMC write fault injection (emmc_bio.c). extern-decl only, per this file's
+ * self-contained convention. See emmc_bio.h for the full rationale: it makes
+ * write failures happen on demand so that ebio_fail_settle()'s card-idle wait --
+ * the safeguard that stops a retried CMD24 landing on a still-programming card
+ * -- can actually be executed and observed. Since the corruption fix there are
+ * no real failures left to enter that path. */
+extern void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba,
+                                  uint32_t legacy_wait);
+
 /* Guest console RX injection (vconsole.c): push one host byte into the
  * guest's virtual UART0 RX ring. Used by the `poweroff` command to type a
  * clean-shutdown line into the guest. extern-decl only, per this file's
@@ -274,6 +283,64 @@ static void sd_show_bc(void)
 	cputs("  (1 = SDHC/SDXC, 0 = byte-addressed SDSC)");
 	cputs("\r\n  sdbc[6] card RCA   = "); print_hex32(bc[6]);
 	cputs("\r\n");
+}
+
+/* `fi` -- arm/disarm eMMC write fault injection. See emmc_bio.h.
+ *
+ * Deliberately requires the LBA floor to be typed out every time rather than
+ * defaulting it. Injection can corrupt real data, and the floor is the only
+ * thing standing between this command and the guest's root filesystem; a default
+ * would be a default that someone eventually forgets to override. The guest's
+ * unused swap partition starts at 12863488 (0xC44000), which is the intended
+ * target.
+ *
+ *   fi off
+ *   fi <every> <min_lba_hex> [legacy]
+ *
+ * legacy=1 selects the OLD iteration-bounded card-idle wait in the settle, so
+ * corruption should REAPPEAR; omit it (or 0) for the timed wait, where it should
+ * not. Running both is what validates the fix instead of merely exercising it. */
+static void cmd_fi(char **tok, int nt)
+{
+	unsigned long every = 0, min_lba = 0, legacy = 0;
+
+	if (nt < 2) {
+		err("usage: fi off | fi <every> <min_lba_hex> [legacy]");
+		return;
+	}
+	if (streq(tok[1], "off")) {
+		emmc_bio_fault_inject(0, 0, 0);
+		cputs("fi: DISARMED\r\n");
+		return;
+	}
+	if (nt < 4) {
+		err("usage: fi <every> <min_lba_hex> [legacy]  (min_lba is mandatory)");
+		return;
+	}
+	if (!parse_hex(tok[1], &every) || every == 0) {
+		err("bad every (hex, nonzero)");
+		return;
+	}
+	if (!parse_hex(tok[2], &min_lba)) {
+		err("bad min_lba (hex)");
+		return;
+	}
+	if (nt >= 5 && !parse_hex(tok[3], &legacy)) {
+		err("bad legacy flag");
+		return;
+	}
+	if (nt == 4 && !parse_hex(tok[3], &legacy))
+		legacy = 0;
+
+	emmc_bio_fault_inject((uint32_t)every, (uint32_t)min_lba,
+	                      (uint32_t)legacy);
+	cputs("fi: ARMED every=");
+	print_hex32((uint32_t)every);
+	cputs(" min_lba=");
+	print_hex32((uint32_t)min_lba);
+	cputs(legacy ? " wait=LEGACY(iteration-bounded)\r\n"
+	             : " wait=TIMED\r\n");
+	cputs("fi: injection point is AFTER DATA_OVER -- the card is mid-program\r\n");
 }
 
 static void cmd_sd(char **tok, int nt)
@@ -828,6 +895,8 @@ static void cmd_help(void)
 	cputs("  sd init            bring up the SD card, decode sd_bio breadcrumbs\r\n");
 	cputs("  sd read <lba>      read one sector, hexdump it\r\n");
 	cputs("  sd write <lba> CONFIRM   write the scratch buffer back [DESTRUCTIVE]\r\n");
+	cputs("  fi <every> <min_lba> [legacy]  eMMC write fault injection [DESTRUCTIVE]\r\n");
+	cputs("  fi off             disarm fault injection\r\n");
 	cputs("  d  <addr> <len>    hex+ascii dump\r\n");
 	cputs("  gva <addr>         translate guest VA via AT S1E1R, read the word\r\n");
 	cputs("  w  <addr> <val>    write phys word\r\n");
@@ -1034,6 +1103,10 @@ static void exec_line(char *line, struct el2_frame *frame)
 	}
 	if (streq(cmd, "sd")) {
 		cmd_sd(tok, nt);
+		return;
+	}
+	if (streq(cmd, "fi")) {
+		cmd_fi(tok, nt);
 		return;
 	}
 	if (streq(cmd, "rb")) {

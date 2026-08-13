@@ -297,8 +297,12 @@ static int clk_update(void)
 
 /* cmd(op, arg, fl, dm): issue one MMC command with dm defaulting to
  * RINT_CMD_DONE in the source sequence's cmd() helper. Returns 0 on
- * success (with *rint_out/*resp0_out filled in if non-NULL), -1 on a
- * bounded poll timeout. */
+ * success (with *rint_out and *resp0_out filled in if non-NULL), -1 on a
+ * bounded poll timeout.
+ *
+ * (The "/" before "*resp0_out" used to sit directly against it, which C reads as
+ * a nested comment opener and -Wcomment warns about. Worth fixing rather than
+ * tolerating: a standing warning is where a real one goes to hide.) */
 static int emmc_cmd(uint32_t op, uint32_t arg, uint32_t fl, uint32_t dm,
                      uint32_t *rint_out, uint32_t *resp0_out)
 {
@@ -577,9 +581,46 @@ static uint32_t g_write_dataover_fails;
 static uint32_t g_settle_busy_ms;       /* [25] worst observed idle wait, ms  */
 static uint32_t g_settle_busy_timeouts; /* [26] card never went idle          */
 
+/* ------------------------------------------------------------------ *
+ * FAULT INJECTION -- off unless armed over the debug channel.
+ *
+ * Exists to answer the one question the fix for the retry path could not answer
+ * about itself. ebio_fail_settle() now waits for card-idle on a TIME bound
+ * instead of a register-read count, so that a retried CMD24 can never land on a
+ * still-programming card. But with the corruption fixed there are no failures
+ * left, so the settle path is never entered and that safeguard has never
+ * executed -- "correct by construction, unproven under load".
+ *
+ * The injection point is deliberately the DANGEROUS one: bail out of a write
+ * AFTER the data phase has completed and DATA_OVER has latched, i.e. exactly
+ * when the card has begun programming, returning the same retryable -2 the old
+ * spurious busy-timeout returned. That reproduces the original bug's
+ * precondition on demand.
+ *
+ * g_fi_legacy_wait then makes the settle use the OLD iteration-bounded
+ * wait_card_idle(), so ONE build can demonstrate both halves:
+ *
+ *   inject + legacy wait -> corruption should REAPPEAR
+ *   inject + timed wait  -> it should not
+ *
+ * which is a validation of the fix rather than a mere exercise of it. That is
+ * also the only remaining caller of wait_card_idle(), which -Wunused-function
+ * had started warning about once both real call sites moved to the timed wait.
+ *
+ * g_fi_min_lba is a SAFETY interlock, not a convenience: injection can produce
+ * real corruption, so it is confined to LBAs at or above a floor the operator
+ * sets. Point it at the unused swap partition (12863488) and the guest's root
+ * filesystem cannot be touched no matter how the run goes wrong.
+ * ------------------------------------------------------------------ */
+static uint32_t g_fi_every;       /* inject on every Nth eligible write; 0=off */
+static uint32_t g_fi_min_lba;     /* never inject below this LBA (interlock)   */
+static uint32_t g_fi_legacy_wait; /* 1 = settle with the OLD iteration wait    */
+static uint32_t g_fi_injected;    /* [27] injections performed                 */
+static uint32_t g_fi_seq;         /* internal: eligible writes since last hit  */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 27u
+#define EBIO_BC_NWORDS 29u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -766,8 +807,14 @@ static void ebio_fail_settle(void)
 	/* TIME-bounded, not iteration-bounded -- see g_settle_busy_ms. The caller's
 	 * next act after a settle is typically a RETRY, and a retry that lands on a
 	 * still-programming card is the corruption mechanism this file's history is
-	 * about. wait_card_idle()'s EMMC_POLL_CAP register reads are not a duration. */
-	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
+	 * about. wait_card_idle()'s EMMC_POLL_CAP register reads are not a duration.
+	 *
+	 * g_fi_legacy_wait selects the OLD behaviour on purpose, so a fault-injection
+	 * run can show the difference instead of asserting it. Off unless armed. */
+	if (g_fi_legacy_wait)
+		wait_card_idle();
+	else
+		wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
 
 	/* (1) FIFO + DMA reset. */
 	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST | GCTL_DMA_RST);
@@ -1018,6 +1065,27 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 					 * sector is retried rather than handed to the guest. */
 					return (int)(0x40000000u | (ri & 0x3fffu));
 				}
+
+				/* FAULT INJECTION -- see the g_fi_* block. Off unless armed.
+				 *
+				 * THIS is the dangerous moment, which is why the injection sits
+				 * exactly here: the data phase is done and DATA_OVER has latched,
+				 * so the card has begun PROGRAMMING. Bailing out now with a
+				 * retryable code reproduces, on demand, the precondition of the
+				 * bug this file's history is about -- the old spurious busy
+				 * timeout returned -2 from a handful of instructions further down,
+				 * with the card in exactly this state.
+				 *
+				 * The LBA floor is an interlock, not a nicety: this can corrupt
+				 * real data, so it must be impossible to reach the guest's root
+				 * filesystem with it. */
+				if (g_fi_every && lba >= g_fi_min_lba &&
+				    ++g_fi_seq >= g_fi_every) {
+					g_fi_seq = 0;
+					ebio_bc(27, ++g_fi_injected);
+					ebio_fail_settle();
+					return -2;   /* the code the old busy-timeout returned */
+				}
 				break;
 			}
 			/* Record the controller state, like the READ path already does.
@@ -1212,6 +1280,24 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 
 	__asm__ volatile("dsb sy" ::: "memory");
 	return 0;
+}
+
+/* Arm or disarm write fault injection. See the g_fi_* block for the rationale.
+ * every == 0 disarms. Echoes the armed configuration into [28] so the host can
+ * confirm what is actually live rather than what it believes it asked for.
+ * Callable over the debug channel via dbgmon `call`, and from dbgmon's own
+ * `fi` command. */
+void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba, uint32_t legacy_wait)
+{
+	g_fi_every = every;
+	g_fi_min_lba = min_lba;
+	g_fi_legacy_wait = legacy_wait ? 1u : 0u;
+	g_fi_seq = 0;
+	g_fi_injected = 0;
+	ebio_bc(27, 0);
+	/* [28]: 0 = disarmed. Otherwise every | (legacy<<16) | 0x8000 as an
+	 * armed marker, so a reader cannot mistake "disarmed" for "unwritten". */
+	ebio_bc(28, every ? (every | (g_fi_legacy_wait << 16) | 0x8000u) : 0u);
 }
 
 /* ------------------------------------------------------------------ */
