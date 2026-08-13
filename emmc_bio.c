@@ -849,7 +849,16 @@ static int gctl_reset_and_wait(uint32_t bits)
 	return -1;
 }
 
-static void ebio_fail_settle(void)
+/* stop_card: issue CMD12 to make the CARD abandon an open data transfer.
+ *
+ * Must be 0 wherever the data phase already COMPLETED. Sent unconditionally at
+ * first, and the measurement said no: CMD12 failed 106 times out of 547 (19%),
+ * ebio_fails went from 0 to 354, and one write finally reached the guest as
+ * S_IOERR -- because STOP_TRANSMISSION with no transfer open is an illegal
+ * command, and this function is called from every failure path, most of which
+ * are past DATA_OVER. Targeting it is the difference between aborting a real
+ * transfer and generating fresh errors. */
+static void ebio_fail_settle_full(int stop_card)
 {
 	uint32_t i;
 
@@ -881,9 +890,12 @@ static void ebio_fail_settle(void)
 	 * the card keeps the fragment it already accepted and the retry appends to
 	 * it. Measured: 267 injected mid-data-phase bails corrupted 267 sectors
 	 * without this, with everything else already in place. */
-	ebio_bc(29, ++g_stop_cmds);
-	if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0, CMDR_RESP_EXP, NULL) != 0)
-		ebio_bc(30, ++g_stop_fails);
+	if (stop_card) {
+		ebio_bc(29, ++g_stop_cmds);
+		if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0, CMDR_RESP_EXP,
+		                  NULL) != 0)
+			ebio_bc(30, ++g_stop_fails);
+	}
 
 	/* (2c) The abort itself can leave the card busy retiring it. Same time
 	 * bound as above -- an iteration count is not a duration. */
@@ -920,6 +932,11 @@ static void ebio_fail_settle(void)
 	 * around it, not this one call, and it needs its own soak. */
 	ebio_bc(8, ++g_settles);
 }
+
+/* Default: no CMD12. Every caller that can leave the CARD mid-transfer calls
+ * ebio_fail_settle_full(1) explicitly, so the dangerous case is the one that
+ * must be spelled out rather than the safe one. */
+static void ebio_fail_settle(void) { ebio_fail_settle_full(0); }
 
 int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 {
@@ -1084,8 +1101,10 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	if (nwords < 128) {
 		/* Same reason as the read side: bailing mid-transfer leaves the data
 		 * phase retiring and poisons whatever call comes next, read or write.
-		 * See ebio_fail_settle(). */
-		ebio_fail_settle();
+		 * See ebio_fail_settle_full(). CMD12 here: the push never finished, so
+		 * the card is holding a partial block that the retry would otherwise
+		 * append to. */
+		ebio_fail_settle_full(1);
 		return -1; /* FIFO never drained enough to accept all words */
 	}
 
@@ -1110,7 +1129,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			if (fi_now && g_fi_point == 1u) {
 				fi_now = 0;
 				ebio_bc(27, ++g_fi_injected);
-				ebio_fail_settle();
+				ebio_fail_settle_full(1);   /* mimic the real data-phase path */
 				/* Same encoding the real data-phase timeout returns. */
 				return (int)(0x20000000u | (ri & 0x3fffu));
 			}
@@ -1217,7 +1236,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				ebio_bc(4, 0x20000u | (ri & 0x3fffu));
 				ebio_bc(5, rreg(REG_GCTL));
 				ebio_bc(0, ++g_ebio_fails);
-				ebio_fail_settle();
+				ebio_fail_settle_full(1);   /* data phase open: stop the card */
 				return (int)(0x40000000u | (ri & 0x3fffu));
 			}
 			/* Two-read confirmation -- see g_cnt_anom. A single CNTPCT read
@@ -1245,7 +1264,7 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				ebio_bc(4, 0x30000u | (r2 & 0x3fffu));
 				ebio_bc(5, rreg(REG_GCTL));
 				ebio_bc(0, ++g_ebio_fails);
-				ebio_fail_settle();
+				ebio_fail_settle_full(1);   /* data phase open: stop the card */
 				return (int)(0x20000000u | (r2 & 0x3fffu));
 			}
 		}
