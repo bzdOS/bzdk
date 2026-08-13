@@ -637,9 +637,39 @@ static uint32_t g_fi_point;
 static uint32_t g_fi_injected;    /* [27] injections performed                 */
 static uint32_t g_fi_seq;         /* internal: eligible writes since last hit  */
 
+/* [29]/[30]: the CMD12 STOP_TRANSMISSION added to the settle, and its failures.
+ *
+ * This closes a bug that the CNTPCT fix hid rather than removed, proven by fault
+ * injection at 267 out of 267. This file asserted, as a note of fact:
+ *
+ *   "NOTE the FIFO reset discards the undelivered words. That is correct here and
+ *    only here: these are single-block CMD24 transfers, so the caller re-pushes
+ *    the whole 512 B sector from the bounce buffer on retry -- nothing is
+ *    half-written from the host's side."
+ *
+ * The host side is indeed not half-written. The CARD side is. Discarding the
+ * FIFO abandons a block the card has already begun ACCEPTING, and the retry's
+ * 128 words are then appended to what the card already took instead of replacing
+ * it -- which is exactly the measured damage signature (the card ends up holding
+ * words[0..N-1] followed by words[0..127-N]). Injecting a mid-data-phase bail
+ * corrupted the sector every single time, 267 for 267, with the timed card-idle
+ * wait in place. So any GENUINE data-phase failure -- a real CRC error, a real
+ * timeout -- would still corrupt on retry. Only the spurious trigger was gone.
+ *
+ * The remedy was already written down two lines below the wrong claim: "an
+ * explicit CMD12 STOP_TRANSMISSION (or a controller soft reset) is the next
+ * step". Issued AFTER the FIFO/DMA reset, because the controller has to be able
+ * to put a command on the bus, and followed by another idle wait because the card
+ * may take time to retire the abort. Best-effort by design: [30] counts CMD12
+ * failures rather than escalating, since a settle that cannot even stop the card
+ * has already lost and the retry is the remaining hope either way. */
+#define CMD12_STOP_TRANSMISSION  12u
+static uint32_t g_stop_cmds;      /* [29] CMD12s issued from the settle        */
+static uint32_t g_stop_fails;     /* [30] of those, ones that did not complete */
+
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 29u
+#define EBIO_BC_NWORDS 31u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -845,6 +875,19 @@ static void ebio_fail_settle(void)
 	for (i = 0; i < EMMC_POLL_CAP; i++)
 		if ((rreg(REG_GCTL) & GCTL_RESET_ALL) == 0)
 			break;
+
+	/* (2b) Tell the CARD to abandon the partial block. See g_stop_cmds: the
+	 * FIFO reset above only discards the HOST's undelivered words; without this
+	 * the card keeps the fragment it already accepted and the retry appends to
+	 * it. Measured: 267 injected mid-data-phase bails corrupted 267 sectors
+	 * without this, with everything else already in place. */
+	ebio_bc(29, ++g_stop_cmds);
+	if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0, CMDR_RESP_EXP, NULL) != 0)
+		ebio_bc(30, ++g_stop_fails);
+
+	/* (2c) The abort itself can leave the card busy retiring it. Same time
+	 * bound as above -- an iteration count is not a duration. */
+	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
 
 	/* (3) Re-program the internal clock after the reset -- REMOVED, it broke
 	 * the guest (2026-07-30, same day it was added).
