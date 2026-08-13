@@ -1000,6 +1000,21 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
 	unsigned nwords = 0;
 	int i;
+	/* Decide ONCE per write whether this call is the one to fault, then let the
+	 * selected point consume the decision.
+	 *
+	 * This used to be decided at each point directly, and point 1 sits INSIDE
+	 * the data-phase polling loop -- so `every` counted POLLS, not writes, and a
+	 * run armed for "every 500th write" injected 62839 times across ~133632
+	 * sectors, roughly every second one. The measurement was still useful but it
+	 * was not the experiment that had been armed, and a knob that silently means
+	 * something different depending on which point is selected is a trap. */
+	uint32_t fi_now = 0;
+
+	if (g_fi_every && lba >= g_fi_min_lba && ++g_fi_seq >= g_fi_every) {
+		g_fi_seq = 0;
+		fi_now = 1u;
+	}
 
 	__asm__ volatile("dsb sy" ::: "memory");
 
@@ -1049,9 +1064,8 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 			 * underflow did: it made the timeout comparison true immediately.
 			 * The 128 words are in the FIFO but not yet all delivered to the
 			 * card, and ebio_fail_settle()'s reset discards the remainder. */
-			if (g_fi_every && g_fi_point == 1u && lba >= g_fi_min_lba &&
-			    ++g_fi_seq >= g_fi_every) {
-				g_fi_seq = 0;
+			if (fi_now && g_fi_point == 1u) {
+				fi_now = 0;
 				ebio_bc(27, ++g_fi_injected);
 				ebio_fail_settle();
 				/* Same encoding the real data-phase timeout returns. */
@@ -1113,9 +1127,8 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 				 * The LBA floor is an interlock, not a nicety: this can corrupt
 				 * real data, so it must be impossible to reach the guest's root
 				 * filesystem with it. */
-				if (g_fi_every && g_fi_point == 0u &&
-				    lba >= g_fi_min_lba && ++g_fi_seq >= g_fi_every) {
-					g_fi_seq = 0;
+				if (fi_now && g_fi_point == 0u) {
+					fi_now = 0;
 					ebio_bc(27, ++g_fi_injected);
 					ebio_fail_settle();
 					return -2;   /* the code the old busy-timeout returned */
