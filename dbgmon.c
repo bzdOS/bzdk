@@ -59,7 +59,7 @@ extern int sd_bio_write(uint32_t lba, uint64_t buf_pa);
  * -- can actually be executed and observed. Since the corruption fix there are
  * no real failures left to enter that path. */
 extern void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba,
-                                  uint32_t legacy_wait);
+                                  uint32_t point, uint32_t legacy_wait);
 
 /* Guest console RX injection (vconsole.c): push one host byte into the
  * guest's virtual UART0 RX ring. Used by the `poweroff` command to type a
@@ -302,19 +302,19 @@ static void sd_show_bc(void)
  * not. Running both is what validates the fix instead of merely exercising it. */
 static void cmd_fi(char **tok, int nt)
 {
-	unsigned long every = 0, min_lba = 0, legacy = 0;
+	unsigned long every = 0, min_lba = 0, point = 0, legacy = 0;
 
 	if (nt < 2) {
-		err("usage: fi off | fi <every> <min_lba_hex> [legacy]");
+		err("usage: fi off | fi <every> <min_lba_hex> <point> [legacy]");
 		return;
 	}
 	if (streq(tok[1], "off")) {
-		emmc_bio_fault_inject(0, 0, 0);
+		emmc_bio_fault_inject(0, 0, 0, 0);
 		cputs("fi: DISARMED\r\n");
 		return;
 	}
 	if (nt < 4) {
-		err("usage: fi <every> <min_lba_hex> [legacy]  (min_lba is mandatory)");
+		err("usage: fi <every> <min_lba_hex> <point> [legacy]  (min_lba mandatory)");
 		return;
 	}
 	if (!parse_hex(tok[1], &every) || every == 0) {
@@ -325,22 +325,24 @@ static void cmd_fi(char **tok, int nt)
 		err("bad min_lba (hex)");
 		return;
 	}
-	if (nt >= 5 && !parse_hex(tok[3], &legacy)) {
+	if (nt >= 4 && !parse_hex(tok[3], &point)) {
+		err("bad point (0 = after DATA_OVER, 1 = data-phase wait)");
+		return;
+	}
+	if (nt >= 5 && !parse_hex(tok[4], &legacy)) {
 		err("bad legacy flag");
 		return;
 	}
-	if (nt == 4 && !parse_hex(tok[3], &legacy))
-		legacy = 0;
 
 	emmc_bio_fault_inject((uint32_t)every, (uint32_t)min_lba,
-	                      (uint32_t)legacy);
+	                      (uint32_t)point, (uint32_t)legacy);
 	cputs("fi: ARMED every=");
 	print_hex32((uint32_t)every);
 	cputs(" min_lba=");
 	print_hex32((uint32_t)min_lba);
-	cputs(legacy ? " wait=LEGACY(iteration-bounded)\r\n"
-	             : " wait=TIMED\r\n");
-	cputs("fi: injection point is AFTER DATA_OVER -- the card is mid-program\r\n");
+	cputs(legacy ? " wait=LEGACY(iteration-bounded)" : " wait=TIMED");
+	cputs(point ? " point=DATA-PHASE(words still in FIFO)\r\n"
+	            : " point=AFTER-DATA_OVER(all words delivered)\r\n");
 }
 
 static void cmd_sd(char **tok, int nt)
@@ -895,7 +897,7 @@ static void cmd_help(void)
 	cputs("  sd init            bring up the SD card, decode sd_bio breadcrumbs\r\n");
 	cputs("  sd read <lba>      read one sector, hexdump it\r\n");
 	cputs("  sd write <lba> CONFIRM   write the scratch buffer back [DESTRUCTIVE]\r\n");
-	cputs("  fi <every> <min_lba> [legacy]  eMMC write fault injection [DESTRUCTIVE]\r\n");
+	cputs("  fi <every> <min_lba> <point> [legacy]  eMMC write fault inject [DESTRUCTIVE]\r\n");
 	cputs("  fi off             disarm fault injection\r\n");
 	cputs("  d  <addr> <len>    hex+ascii dump\r\n");
 	cputs("  gva <addr>         translate guest VA via AT S1E1R, read the word\r\n");

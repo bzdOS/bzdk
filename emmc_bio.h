@@ -90,6 +90,14 @@ int emmc_bio_set_highspeed(void);
  *               can corrupt real data; point this at scratch (the unused swap
  *               partition starts at 12863488) so the guest's root filesystem
  *               is unreachable regardless of how the run behaves.
+ *   point       WHICH failure to inject. 0 = bail after DATA_OVER latched
+ *               (the post-write CARD_BUSY path); 1 = bail on the first poll of
+ *               the DATA-PHASE wait, before DATA_OVER, which is what the CNTPCT
+ *               underflow actually did. Point 0 produced ZERO corruption with
+ *               both waits -- correctly, since once DATA_OVER has latched all
+ *               128 words have reached the card and no partial block is
+ *               possible. Point 1 is where words are still undelivered in the
+ *               FIFO and the settle's reset discards them.
  *   legacy_wait 1 = make the settle use the OLD iteration-bounded wait, so one
  *               build can show corruption reappearing with it and staying away
  *               without it. That is what validates the fix rather than merely
@@ -97,7 +105,7 @@ int emmc_bio_set_highspeed(void);
  *
  * Breadcrumbs: [27] injections performed, [28] the armed configuration echoed
  * back (0 when disarmed, and distinguishable from an unwritten slot). */
-void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba,
+void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba, uint32_t point,
                            uint32_t legacy_wait);
 
 #endif /* BZDOS_EMMC_BIO_H */
