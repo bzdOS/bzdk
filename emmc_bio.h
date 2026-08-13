@@ -74,4 +74,30 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa);
  * failed when word[6]==2 (0 otherwise). Always returns 0. */
 int emmc_bio_set_highspeed(void);
 
+/* Arm/disarm WRITE fault injection. OFF by default; nothing in a normal boot
+ * touches this.
+ *
+ * WHY IT EXISTS. ebio_fail_settle() waits for the card to finish programming
+ * before its caller retries, and since the corruption fix there are no failures
+ * left to enter that path -- so the safeguard has never actually executed. This
+ * makes failures happen on demand, at the one moment that matters: after the
+ * data phase has completed and DATA_OVER has latched, i.e. with the card
+ * mid-program. That is precisely the state the old spurious busy-timeout bailed
+ * out in, and retrying CMD24 from there is what corrupted ~0.1% of sectors.
+ *
+ *   every       inject on every Nth eligible write; 0 disarms.
+ *   min_lba     SAFETY INTERLOCK -- never inject below this sector. Injection
+ *               can corrupt real data; point this at scratch (the unused swap
+ *               partition starts at 12863488) so the guest's root filesystem
+ *               is unreachable regardless of how the run behaves.
+ *   legacy_wait 1 = make the settle use the OLD iteration-bounded wait, so one
+ *               build can show corruption reappearing with it and staying away
+ *               without it. That is what validates the fix rather than merely
+ *               exercising it.
+ *
+ * Breadcrumbs: [27] injections performed, [28] the armed configuration echoed
+ * back (0 when disarmed, and distinguishable from an unwritten slot). */
+void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba,
+                           uint32_t legacy_wait);
+
 #endif /* BZDOS_EMMC_BIO_H */
