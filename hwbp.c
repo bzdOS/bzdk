@@ -37,10 +37,56 @@
  *   [8]  hit FAR (FAR_EL2 low 32)     [9] hit FAR high 32
  *   [10] armed-bp bitmap (bit i = bp slot i enabled)
  *   [11] armed-wp bitmap (bit i = wp slot i enabled)
- *   [12..15] reserved
+ *   [12] hit x1 (low 32)              [13] hit x1 high 32
+ *   [14] 64-bit word read from the guest at (x1 + HWBP_ARG1_PROBE_OFF),
+ *        or 0xDEADBEEF if the guest VA could not be translated
+ *                                       [15] that word's high 32
+ *
+ * Slots [12..15] were reserved; they now carry the FIRST ARGUMENT of the
+ * breakpointed function and one word dereferenced from it. Recording ESR/PC/FAR
+ * alone is enough to prove a breakpoint fired but not to say anything about WHY
+ * -- and the case this was added for needs an argument's contents, not the fact
+ * of the call: a guest kernel panic in linux_dma_unmap_sg_attrs() whose faulting
+ * dereference is `sgl->dma_map`, with sgl arriving in x1 and dma_map at offset
+ * 24 of struct scatterlist.
+ *
+ * The read is done HERE, on the core that took the hit, deliberately. Guest
+ * kernel VAs cannot be translated from CPU1 over the debug channel -- AT S1E1R
+ * there uses CPU1's TTBR_EL1, which is not the guest's, and that has produced
+ * confidently wrong answers in this project before. On the hit core the guest's
+ * translation regime is live, so AT S12E1R resolves the whole stage-1+stage-2
+ * walk to a PA that EL2 can then read directly.
  */
 #define HWBP_BC_BASE 0x50000600UL
 #define HWBP_MAGIC   0x48574250u   /* "HWBP" */
+
+/* Byte offset dereferenced from the breakpointed function's first argument and
+ * published in [14]/[15]. 24 = offsetof(struct scatterlist, dma_map) in
+ * linuxkpi's scatterlist.h: page_link(8) + offset(4) + length(4) +
+ * dma_address(8). Change this when breakpointing something else -- it is
+ * deliberately a compile-time constant so the recorded value always has one
+ * documented meaning rather than depending on who read it. */
+#define HWBP_ARG1_PROBE_OFF 24u
+
+/* Read one 64-bit word from a GUEST virtual address, on the core that is
+ * currently executing the guest's translation regime. Returns 0 and sets *ok=0
+ * if the address does not translate, rather than faulting EL2 -- a diagnostic
+ * must never be able to bring down the thing it is diagnosing. */
+static uint64_t hwbp_guest_read64(uint64_t gva, int *ok)
+{
+	uint64_t par;
+
+	__asm__ volatile("at s12e1r, %0\n\tisb" :: "r"(gva) : "memory");
+	__asm__ volatile("mrs %0, par_el1" : "=r"(par));
+
+	if (par & 1u) {              /* PAR_EL1.F: translation failed */
+		*ok = 0;
+		return 0;
+	}
+	*ok = 1;
+	return *(volatile uint64_t *)((par & 0x0000FFFFFFFFF000ULL) |
+	                             (gva & 0xFFFULL));
+}
 
 static inline void bc_wr(int i, uint32_t v)
 {
@@ -334,6 +380,17 @@ static void record_hit(struct el2_frame *f, uint64_t esr, int kind, int slot)
 	bc_wr(7, (uint32_t)(f->elr >> 32));
 	bc_wr(8, (uint32_t)f->far);
 	bc_wr(9, (uint32_t)(f->far >> 32));
+
+	/* First argument and one word dereferenced from it -- see the map above. */
+	bc_wr(12, (uint32_t)f->x[1]);
+	bc_wr(13, (uint32_t)(f->x[1] >> 32));
+	{
+		int ok = 0;
+		uint64_t w = hwbp_guest_read64(f->x[1] + HWBP_ARG1_PROBE_OFF, &ok);
+		bc_wr(14, ok ? (uint32_t)w : 0xDEADBEEFu);
+		bc_wr(15, ok ? (uint32_t)(w >> 32) : 0xDEADBEEFu);
+	}
+
 	bc_bitmaps();
 }
 
