@@ -215,7 +215,21 @@ static void hwbp_init(void)
 	__asm__ volatile("isb" ::: "memory");
 
 	bc_wr(0, HWBP_MAGIC);
-	bc_wr(1, 0);
+	/* Publish EVERY hit-record slot as a real zero, not just the hit count.
+	 *
+	 * Learned the hard way on this very instrument: slots [12..15] were added
+	 * for the argument capture and left unwritten until a hit. This window
+	 * survives a warm reset, so a fresh boot with ZERO hits read back a PC, an
+	 * x1 and a dereferenced word left over from an experiment fifteen days
+	 * earlier -- values that look exactly like data and mean nothing. Only
+	 * slot [1] was being cleared, which made the hit COUNT trustworthy while
+	 * everything it described stayed stale.
+	 *
+	 * Same trap the vblk and EBIO lanes were fixed for: a reader cannot tell
+	 * "never happened" from "this build has no such field". A diagnostic that
+	 * can be misread as evidence is worse than no diagnostic. */
+	for (int z = 1; z <= 15; z++)
+		bc_wr(z, 0);
 	bc_bitmaps();
 	hwbp_inited = 1;
 }
