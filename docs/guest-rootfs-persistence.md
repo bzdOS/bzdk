@@ -69,10 +69,27 @@ place:
 /sbin/reboot     15000 bytes      (sane)
 ```
 
-`cat` and `shutdown` reporting the *same* absurd 17 MB size is the known
-corrupt-`di_size` / shared-inode damage this project has hit before (project
-memory: "Unclean-stop ratchet: /sbin/shutdown was ENOEXEC", corrupt inode 1725
-shared between `shutdown` and `poweroff`).
+`cat` and `shutdown` reporting the *same* absurd 17 MB size was read here as
+corrupt-`di_size` / shared-inode damage. **For `/bin/cat` that was wrong, and it
+is worth correcting rather than quietly dropping.**
+
+Measured 2026-08-18 against the official 15.1-RELEASE `base.txz`: `/bin/cat` was
+inode 1647 with **147 links**, and that inode is shared with the whole of
+`/rescue/*`. `/rescue` on FreeBSD is one ~17 MB statically linked *crunched*
+binary hardlinked under ~147 names, which dispatches on `argv[0]` — so
+`/bin/cat` was a hardlink into the rescue crunch and it **worked correctly**.
+17348632 bytes is the rescue binary's real size, not a corrupt `di_size`.
+
+Two unrelated files sharing a size is only a damage signature when the size is
+also implausible for both. Here it was the *correct* size for what the inode
+actually was, and the link count said so immediately — a field the original
+reading never looked at.
+
+`/sbin/shutdown` and `/sbin/poweroff` are a separate matter: those really were
+broken (the binary would not exec, which is why a clean stop was impossible) and
+restoring them from `base.txz` really did fix it. See also the practical
+consequence: a hardlink into `/rescue` must be `rm`'d before being replaced, or
+writing "the file" writes the crunch binary and takes all 147 names with it.
 
 That is a self-sustaining loop:
 
@@ -119,3 +136,46 @@ The manual recovery in the scratchpad (`fsck_ffs -y` → `mount -u -o rw /` →
 `netif`/`route`/`sshd`) should become unnecessary once the fsck flag is proven.
 Until then, keep it. `breakglass_cycle.py` performs the same sequence itself and
 is unaffected either way.
+
+
+## Full base-system verification (2026-08-18)
+
+Prompted by the eMMC silent-write corruption
+(`docs/emmc-silent-write-corruption.md`): that bug wrote wrong bytes and reported
+success, so nothing in the guest could know which files it had damaged. `fsck`
+cannot help — it checks metadata consistency, not file contents.
+
+Method: official `base.txz` for 15.1-RELEASE aarch64 (sha256 verified against the
+release `MANIFEST`), extracted on the build host, per-file sha256 taken there, and
+the manifest compared on the guest. Scope deliberately limited to
+`/bin /sbin /lib /libexec /usr/{bin,sbin,lib,libexec}` — 1988 files, 495 MB —
+because `/etc` changes legitimately and mixing it in would drown the signal.
+
+The guest's userland is genuinely 15.1-RELEASE (`freebsd-version -u`); only the
+kernel is the locally cross-built 15.1-RC3, so `base.txz` is the right reference.
+
+**Result: 1978 of 1988 byte-identical.** The 10 anomalies were:
+
+| what | files | signature |
+|---|---|---|
+| hardlink into `/rescue` | `/bin/cat` | correct size for the crunch, 147 links |
+| truncated | `libm.a`, `libmagic.a` | both exactly 393216 B = 768 sectors |
+| absent | 6 small binaries/libraries | not present at all |
+
+**None of these is the eMMC bug.** That bug's signature is *identical length,
+different content* — it overwrote bytes inside sectors without changing file
+size. Every anomaly here has the wrong *length* or no file at all, and two
+unrelated libraries truncated to the same exactly-sector-aligned 384 KiB points at
+an incomplete extraction when the rootfs was originally built, not at sector-level
+content damage.
+
+So the base system carries no detectable trace of the corruption. That is a real
+negative result and it was not the expected one. It does not clear everything:
+this covered 495 MB of ~1.7 GB used, and `/usr/share`, `/var`, `/root` and
+`/usr/local` were not checked — and the Mesa tarball in `/root` *is* measurably
+damaged (94 sectors). Damaged sectors may also simply have been overwritten since.
+
+All 10 files were restored from the verified archive and re-checked: 9 of 9 now
+match (the 10th, `/bin/cat`, is among them). `/bin/cat` was `rm`'d before
+extraction so the write could not land on the shared `/rescue` inode; `/rescue`'s
+link count went 147 -> 146 and the crunch still runs.
