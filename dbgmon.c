@@ -449,6 +449,34 @@ static void cmd_sr(void)
 
 /* r <addr> [n]: read n 32-bit words of PHYSICAL memory (flat EL2 map --
  * any PA is directly readable/writable, guest or host). */
+/* Make a memory read HONEST.
+ *
+ * cmd_read_words()/cmd_read_bytes() used a plain volatile load. That is fine for
+ * EL2's own breadcrumbs, and quietly wrong for anything the GUEST wrote: this
+ * code runs on CPU1, and a value the guest stored -- especially through a
+ * non-cacheable mapping, which is exactly what dma_alloc_coherent() gives it --
+ * does not invalidate CPU1's copy. So the debug channel could report a stale
+ * line, most dangerously as ZEROS, and zeros read like "nothing is there".
+ *
+ * Cost of not doing this, 2026-08-18: walking the Mali-400 GPU page tables from
+ * EL2 reported the entire page directory empty, which would have been read as a
+ * driver that never maps anything. The tables are guest-written coherent memory;
+ * the reading could not be trusted either way.
+ *
+ * civac, NOT ivac. `dc ivac` discards a dirty line without writing it back, so an
+ * `r` aimed at EL2's own recently-written data would DESTROY it -- a debug
+ * command must never be able to corrupt the thing it inspects. `dc civac` cleans
+ * first, then invalidates, which is also what every breadcrumb writer in this
+ * tree already uses.
+ *
+ * This is the project's own rule made operational: per-PE state and cached copies
+ * lie, and a read from the wrong core has produced confidently wrong diagnoses
+ * here more than once. */
+static inline void dbg_read_fresh(unsigned long addr)
+{
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(addr) : "memory");
+}
+
 static void cmd_read_words(unsigned long addr, uint32_t n)
 {
 	uint32_t i;
@@ -461,6 +489,7 @@ static void cmd_read_words(unsigned long addr, uint32_t n)
 			console_putc(':');
 		}
 		console_putc(' ');
+		dbg_read_fresh(addr + (unsigned long)i * 4u);
 		print_hex32(*(volatile uint32_t *)(addr + (unsigned long)i * 4u));
 	}
 	newline();
@@ -479,6 +508,7 @@ static void cmd_read_bytes(unsigned long addr, uint32_t n)
 			console_putc(':');
 		}
 		console_putc(' ');
+		dbg_read_fresh(addr + i);
 		print_hex8(*(volatile uint8_t *)(addr + i));
 	}
 	newline();
