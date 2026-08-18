@@ -234,7 +234,7 @@ $(NET_BIN): $(NET_ELF)
 # REPL pokes at (mi/mp/mpN). start.o + main_repl.o + repl.o + emac.o + musb.o
 # + wdt.o, linked at 0x42000000 via link.ld.
 REPL_OBJS := start.o main_repl.o repl.o emac.o musb.o wdt.o exceptions.o el2_exc.o \
-             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o rsb.o
+             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o vgicd.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o rsb.o
 $(REPL_ELF): $(REPL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(REPL_OBJS)
 	$(SIZE) $@
@@ -253,7 +253,7 @@ $(HDMI_BIN): $(HDMI_ELF)
 
 dbg: $(DBG_BIN)
 
-DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
@@ -291,7 +291,7 @@ DUAL_BIN   := microkernel-dual.bin
 
 dual: $(DUAL_BIN)
 
-DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
              emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o flightrec.o coredump.o \
@@ -309,7 +309,7 @@ $(DUAL_BIN): $(DUAL_ELF)
 # header comment). NEW target — does not touch/replace `dbg`. ---
 gdb: $(GDB_BIN)
 
-GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o dbgtools.o
@@ -321,7 +321,7 @@ $(GDB_BIN): $(GDB_ELF)
 
 fbsd: $(FBSD_BIN)
 
-FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
 $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(FBSD_OBJS)
@@ -338,7 +338,7 @@ $(FBSD_BIN): $(FBSD_ELF)
 # kernel ELF. ---
 zephyr: $(ZEPHYR_BIN)
 
-ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o guest.o \
+ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
                gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgmon.o bmc.o dbgtools.o rsb.o axp803.o
 $(ZEPHYR_ELF): $(ZEPHYR_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(ZEPHYR_OBJS)
@@ -365,7 +365,7 @@ $(ZEPHYR_BIN): $(ZEPHYR_ELF)
 # above (different link address/layout — see link_qemu.ld) but DOES reuse
 # the same freestanding compiler flags, just with its own linker script.
 QEMU_ELF  := microkernel-qemu.elf
-QEMU_OBJS := start_qemu.o main_qemu.o exceptions.o guest.o stage2.o timer.o \
+QEMU_OBJS := start_qemu.o main_qemu.o exceptions.o guest.o stage2.o vgicd.o timer.o \
              gic_timer_qemu.o pl011_qemu.o el2_exc_qemu.o guest_qemu_payload.o libmin.o
 LDFLAGS_QEMU := -nostdlib -static -no-pie -Wl,--build-id=none -T link_qemu.ld
 
@@ -380,7 +380,7 @@ $(QEMU_ELF): $(QEMU_OBJS) link_qemu.ld
 # for the full tick schedule and what the printed verdict means.
 #
 # Object list = the `qemu` target's skeleton (start_qemu.o, exceptions.o,
-# guest.o, stage2.o, timer.o, gic_timer_qemu.o, pl011_qemu.o, libmin.o) with
+# guest.o, stage2.o vgicd.o, timer.o, gic_timer_qemu.o, pl011_qemu.o, libmin.o) with
 # el2_exc_snapshot_qemu.o in place of el2_exc_qemu.o and
 # guest_snapshot_payload.o in place of guest_qemu_payload.o, PLUS:
 #   snapshot.o        -- the REAL, unmodified snapshot_save()/
@@ -395,7 +395,7 @@ $(QEMU_ELF): $(QEMU_OBJS) link_qemu.ld
 # EMAC bulk transport (which needs emac.o and a real NIC this target has
 # none of).
 SNAPSHOT_QEMU_ELF  := microkernel-snapshot-qemu.elf
-SNAPSHOT_QEMU_OBJS := start_qemu.o main_snapshot_qemu.o exceptions.o guest.o stage2.o timer.o \
+SNAPSHOT_QEMU_OBJS := start_qemu.o main_snapshot_qemu.o exceptions.o guest.o stage2.o vgicd.o timer.o \
              gic_timer_qemu.o pl011_qemu.o el2_exc_snapshot_qemu.o guest_snapshot_payload.o \
              snapshot.o wdt_qemu_stub.o libmin.o
 
@@ -418,7 +418,7 @@ clean-qemu:
 # Proves the REAL, UNMODIFIED smp.c (smp_init()/smp_secondary_main()) brings
 # up all 3 secondary vCPUs via PSCI CPU_ON under QEMU's `-smp 4`, with NO
 # board attached and NO guest entered. This is a NARROWER skeleton than every
-# other QEMU target: no stage2.o/guest.o/gic_timer_qemu.o (no guest, no
+# other QEMU target: no stage2.o vgicd.o/guest.o/gic_timer_qemu.o (no guest, no
 # timer — see main_dual_qemu.c for why this proof doesn't need either).
 #
 # start_secondary_qemu.o provides `_start_secondary` — a byte-for-byte copy of
@@ -555,7 +555,7 @@ clean-dual-zephyr-qemu:
 # guest's console served by the real vconsole.c 16550 trap-emulator.
 #
 # Object list = the `qemu` target's board-free skeleton (start_qemu.o entry,
-# exceptions.o vectors, pl011_qemu.o HV console, stage2.o, guest.o, libmin.o),
+# exceptions.o vectors, pl011_qemu.o HV console, stage2.o vgicd.o, guest.o, libmin.o),
 # MINUS the timer/demo-payload pieces this target does not use
 # (gic_timer_qemu.o, timer.o, guest_qemu_payload.o -- no tick is armed, see
 # main_zephyr_qemu.c), PLUS the three objects that make it a real guest boot
@@ -572,7 +572,7 @@ clean-dual-zephyr-qemu:
 #                   no init, so it is portable as-is.
 # and el2_exc_zephyr_qemu.o in place of el2_exc_qemu.o.
 ZEPHYR_QEMU_ELF  := microkernel-zephyr-qemu.elf
-ZEPHYR_QEMU_OBJS := start_qemu.o main_zephyr_qemu.o exceptions.o guest.o stage2.o \
+ZEPHYR_QEMU_OBJS := start_qemu.o main_zephyr_qemu.o exceptions.o guest.o stage2.o vgicd.o \
                     kload.o vconsole.o wdt.o flightrec.o \
                     el2_exc_zephyr_qemu.o pl011_qemu.o libmin.o
 
@@ -586,7 +586,7 @@ $(ZEPHYR_QEMU_ELF): $(ZEPHYR_QEMU_OBJS) link_qemu.ld
 # main_linux_qemu.c's banner for the full argument, and linux-qemu-ci.sh).
 #
 # Runs the SAME board-free skeleton zephyr-qemu uses -- start_qemu.o entry,
-# exceptions.o vectors, pl011_qemu.o HV console, stage2.o, guest.o, kload.o
+# exceptions.o vectors, pl011_qemu.o HV console, stage2.o vgicd.o, guest.o, kload.o
 # (for kload_enter() ONLY -- this guest's Image format is not an ELF, so
 # kload_parse_elf()/kload_place_segments() are linked in but never called;
 # see main_linux_qemu.c), vconsole.o + wdt.o + flightrec.o (the real 16550
@@ -601,7 +601,7 @@ $(ZEPHYR_QEMU_ELF): $(ZEPHYR_QEMU_OBJS) link_qemu.ld
 # console trap-emulation, EL2->EL1 handoff) is guest-OS-agnostic and Linux is
 # the second, independent proof of that, not a reason to invent a new one.
 LINUX_QEMU_ELF  := microkernel-linux-qemu.elf
-LINUX_QEMU_OBJS := start_qemu.o main_linux_qemu.o exceptions.o guest.o stage2.o \
+LINUX_QEMU_OBJS := start_qemu.o main_linux_qemu.o exceptions.o guest.o stage2.o vgicd.o \
                    kload.o vconsole.o wdt.o flightrec.o \
                    el2_exc_linux_qemu.o pl011_qemu.o libmin.o
 
@@ -634,7 +634,7 @@ clean-linux-qemu:
 # interface directly and the redirect itself stays hardware-only.
 #
 # Object list = the `qemu` target's skeleton (start_qemu.o, exceptions.o,
-# guest.o, stage2.o, timer.o, gic_timer_qemu.o, pl011_qemu.o, libmin.o) with
+# guest.o, stage2.o vgicd.o, timer.o, gic_timer_qemu.o, pl011_qemu.o, libmin.o) with
 # el2_exc_vgic_qemu.o in place of el2_exc_qemu.o, no guest_qemu_payload.o (the
 # EL1 payload lives inside vgic.c), PLUS vgic_qemu.o and flightrec.o (pulled
 # in by vgic.c's flightrec_log() on each injected LR; writes only DRAM at
@@ -655,7 +655,7 @@ VGIC_QEMU_ELF  := microkernel-vgic-qemu.elf
 VGIC_QEMU_DEFS := -DVGIC_GICD_BASE=0x08000000UL -DVGIC_GICC_BASE=0x08040000UL \
                   -DVGIC_GICH_BASE=0x08030000UL -DVGIC_GICV_BASE=0x08040000UL \
                   -DVGST_BC_BASE=0x50200000UL
-VGIC_QEMU_OBJS := start_qemu.o main_vgic_qemu.o exceptions.o guest.o stage2.o \
+VGIC_QEMU_OBJS := start_qemu.o main_vgic_qemu.o exceptions.o guest.o stage2.o vgicd.o \
                   timer.o gic_timer_qemu.o el2_exc_vgic_qemu.o vgic_qemu.o \
                   flightrec.o pl011_qemu.o libmin.o
 
@@ -685,7 +685,7 @@ $(VGIC_QEMU_ELF): $(VGIC_QEMU_OBJS) link_qemu.ld
 # main_holdtest_qemu.c's banner for exactly why) -- reuses ONLY the generic,
 # board-independent QEMU-target pieces (start_qemu.o entry, exceptions.o
 # vector table, pl011_qemu.o console), same as the `qemu` target above.
-# Deliberately skips stage2.o/gic_timer_qemu.o: this hypothesis does not
+# Deliberately skips stage2.o vgicd.o/gic_timer_qemu.o: this hypothesis does not
 # depend on stage-2 translation or a timer tick existing at all.
 HOLDTEST_ELF  := microkernel-holdtest.elf
 HOLDTEST_OBJS := start_qemu.o main_holdtest_qemu.o exceptions.o \

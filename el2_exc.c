@@ -21,6 +21,7 @@
  *   [8]  x0(lo) [9] x1(lo) [10] x30(lo)  (a few regs for context)
  */
 #include <stdint.h>
+#include "vgicd.h"   /* vgicd_handle_fault() -- trapped GIC distributor */
 #include "exceptions.h"
 #include "guest.h"
 #include "sched.h"
@@ -995,6 +996,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			if (vconsole_handle_fault(frame, 1)) {
 				return;
 			}
+			/* GICD is policed for BOTH partitions, not just the one we
+			 * happen to distrust: the guarantee is symmetric or it is not a
+			 * guarantee. Must come BEFORE mmio_absorb_fault(), which would
+			 * otherwise swallow the access as read-as-zero/write-as-noop and
+			 * silently drop a legitimate interrupt configuration. */
+			if (vgicd_handle_fault(frame)) {
+				return;
+			}
 			if (mmio_absorb_fault(frame)) {
 				return;
 			}
@@ -1015,6 +1024,15 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			if (vconsole_handle_fault(frame, 0)) {
 				if (!dbg_core_active)
 					dbgmon_service(frame);
+				return;
+			}
+			/* The trapped GIC distributor page (vgicd.c). Same
+			 * "handled -> return without recording" contract as vconsole:
+			 * a guest touching GICD is normal interrupt setup, not a fault.
+			 * Under IMO=0 the guest owns interrupt delivery, so this only
+			 * polices the two affinity fields that can reach across the
+			 * partition boundary -- see vgicd.h. */
+			if (vgicd_handle_fault(frame)) {
 				return;
 			}
 			/* Next, the eMMC-backed virtio-blk device at 0x0A000000. Same
