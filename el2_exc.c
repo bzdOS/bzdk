@@ -647,14 +647,11 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		__asm__ volatile("mrs %0, oslsr_el1" : "=r"(oslsr));
 
 		/* Publish the raw values so each precondition is a READING, not a
-		 * belief: [0x638] MDSCR_EL1, [0x63c] MDCR_EL2, [0x640] OSLSR_EL1. */
-		{
-			volatile uint32_t *p = (volatile uint32_t *)0x50000638UL;
-			p[0] = (uint32_t)mdscr;
-			p[1] = (uint32_t)mdcr;
-			p[2] = (uint32_t)oslsr;
-			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
-		}
+		 * belief. Goes through hwbp.c, which OWNS this window: the hardcoded
+		 * 0x50000638 this used to write was slots [14],[15],[16] of hwbp's own
+		 * breadcrumb window, silently destroying its first-argument probe and
+		 * its re-arm counter. Never address a neighbour's window by literal. */
+		hwbp_publish_preconditions(mdscr, mdcr, oslsr);
 
 		/* MDSCR_EL1.MDE (bit 15): master enable for breakpoints/watchpoints,
 		 * and MDSCR_EL1 belongs to the guest — FreeBSD clears it during its

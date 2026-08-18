@@ -26,7 +26,7 @@
  * Breadcrumb window @ 0x50000600, magic "HWBP". Distinct from every other
  * instrument (MUSB 0x50000000, EMAC 0x50000100, REPL 0x50000300, EXC
  * 0x50000400, dbg 0x50000e00, vconsole 0x50000f00, gtrace 0x50002000, FFL1
- * 0x50002400, SST1 0x50002800, HDMI 0x50003000). 20 words -> ..0x50000650,
+ * 0x50002400, SST1 0x50002800, HDMI 0x50003000). 21 words -> ..0x50000654,
  * still far below the next instrument (dbg 0x50000e00).
  *   [0]  magic 0x48574250 ("HWBP")
  *   [1]  hit count (total bp+wp hits seen)
@@ -46,6 +46,18 @@
  *   [17] DBGBCR0_EL1 as actually read back from the hardware, so the [10]
  *        bitmap (which is only this file's own bookkeeping) can be checked
  *        against the PE instead of believed
+ *   [18] MDSCR_EL1  [19] MDCR_EL2  [20] OSLSR_EL1 -- the keep-alive's live
+ *        precondition readings, via hwbp_publish_preconditions().
+ *
+ * Slots [18..20] are here because el2_exc.c used to write those three words to a
+ * HARDCODED 0x50000638, which is slots [14],[15],[16] of THIS window. So the
+ * "first argument" probe never worked: it always read back MDSCR/MDCR, and on
+ * 2026-08-18 that produced a beautifully plausible sgl->dma_map value of
+ * 0x0000010600008000 -- which is just (MDCR_EL2 0x106 << 32) | MDSCR_EL1 0x8000.
+ * The re-arm counter added the same day landed on OSLSR_EL1 and read "8", which
+ * is OSLSR, not a count. Exactly the failure this tree already has a rule
+ * against: never derive a window address from a neighbour. Owning the slots
+ * instead of squatting them is the fix.
  *
  * Slots [12..15] were reserved; they now carry the FIRST ARGUMENT of the
  * breakpointed function and one word dereferenced from it. Recording ESR/PC/FAR
@@ -292,6 +304,16 @@ void hwbp_reassert(void)
 	bc_wr(17, (uint32_t)rd_bcr(0));
 }
 
+/* Publish the keep-alive's precondition readings as OWNED slots. Replaces
+ * el2_exc.c writing them to a hardcoded address that turned out to be the middle
+ * of this window -- see the [18..20] note above for what that cost. */
+void hwbp_publish_preconditions(uint64_t mdscr, uint64_t mdcr, uint64_t oslsr)
+{
+	bc_wr(18, (uint32_t)mdscr);
+	bc_wr(19, (uint32_t)mdcr);
+	bc_wr(20, (uint32_t)oslsr);
+}
+
 static void bc_bitmaps(void)
 {
 	uint32_t bm = 0, wm = 0;
@@ -325,7 +347,7 @@ static void hwbp_init(void)
 	 * Same trap the vblk and EBIO lanes were fixed for: a reader cannot tell
 	 * "never happened" from "this build has no such field". A diagnostic that
 	 * can be misread as evidence is worse than no diagnostic. */
-	for (int z = 1; z <= 19; z++)
+	for (int z = 1; z <= 20; z++)
 		bc_wr(z, 0);
 	bc_bitmaps();
 	hwbp_inited = 1;
