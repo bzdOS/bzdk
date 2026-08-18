@@ -450,6 +450,75 @@ def serial_load(sess):
 
 
 # ── monitor phase: poll breadcrumbs over EMAC ───────────────────────────────
+EVIDENCE_DIR = os.path.join(HERE, "crash-evidence")
+
+# Windows worth keeping across a reset, as (name, address, words). Deliberately a
+# flat table rather than a scan: an unknown address reads back 0xFFFFFFFF, and a
+# dump full of all-ones would be indistinguishable from a dump of real zeros --
+# the exact ambiguity that has cost this project time before.
+EVIDENCE_WINDOWS = (
+    ("hwbp",      0x50000600, 21),
+    ("exc",       0x50000400, 16),
+    ("dbgtools",  0x50021000, 16),
+    ("vgicd",     0x50094000, 10),   # HVMAP_VGICD_BC, checked against hv_addrmap.h
+)
+
+
+def snapshot_evidence(verdict):
+    """Dump the diagnostic windows and the postmortem console to a file before a
+    reset wipes them. Never raises: recovery matters more than the dump."""
+    try:
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(EVIDENCE_DIR, f"{stamp}-{verdict}.txt")
+        nc = NetCon()
+        try:
+            with open(path, "w") as f:
+                f.write(f"# chimpd crash evidence, verdict={verdict}, {stamp}\n")
+                f.write("# Captured BEFORE the WDT reset. Slots reading 0xffffffff\n")
+                f.write("# were never written by this build -- not data.\n")
+                f.write("#\n")
+                f.write("# STALENESS: hv-scratch DRAM survives a reload. A window is\n")
+                f.write("# only zeroed by the instrument that owns it, at ITS init, so a\n")
+                f.write("# build that does not link that instrument leaves the PREVIOUS\n")
+                f.write("# build's values sitting there looking perfectly current.\n")
+                f.write("# Verified 2026-08-18: an hwbp record with 8 hits and a valid PC\n")
+                f.write("# read back on a build compiled with no breakpoint at all.\n")
+                f.write("# Cross-check the dbgtools build_id below before trusting any of\n")
+                f.write("# this, and for hwbp check the PC against the build's\n")
+                f.write("# GUEST_BP_ADDR (hwbp_window.py --expect-pc does it for you).\n\n")
+                for name, addr, n in EVIDENCE_WINDOWS:
+                    # NetCon speaks dbgmon's `r <addr> <n>` and parse_words()
+                    # decodes the reply -- it has no read_words() of its own, and
+                    # calling one would have made every snapshot fail silently
+                    # inside the outer except.
+                    try:
+                        # n as HEX: dbgmon parses the count with parse_hex(), so a
+                        # decimal 21 would be read as 0x21 = 33 words. Existing
+                        # call sites only ever pass 4 or 8, where the two agree,
+                        # which is why this was never noticed.
+                        w = parse_words(nc.cmd(f"r 0x{addr:x} 0x{n:x}", 1.5))
+                    except Exception as e:
+                        f.write(f"[{name} @{addr:#x}] unreadable: {e}\n\n")
+                        continue
+                    if not w:
+                        f.write(f"[{name} @{addr:#x}] no reply\n\n")
+                        continue
+                    f.write(f"[{name} @{addr:#x}]\n")
+                    for i, v in enumerate(w):
+                        mark = "  <- never written" if v == 0xFFFFFFFF else ""
+                        f.write(f"  [{i:2d}] {v:#010x}{mark}\n")
+                    f.write("\n")
+        finally:
+            try:
+                nc.close()
+            except Exception:
+                pass
+        slog(f"  [evidence] saved {path}")
+    except Exception as e:
+        slog(f"  [evidence] snapshot failed ({e}) — продолжаем с ресетом")
+
+
 def monitor(sess, nc, interval, hang_samples, no_reset):
     """Poll breadcrumbs until hang/panic/boot-complete or timeout.
     Returns a verdict string."""
@@ -737,6 +806,22 @@ def main():
         # under supervision. Reaching a boot marker and then falling silent is
         # success, not a hang.
         if verdict in ("HANG", "PANIC", "FIRSTFAULT") and not args.no_reset:
+            # PRESERVE THE EVIDENCE FIRST. The reset below reboots the board, and
+            # every diagnostic window lives in hv-scratch DRAM that the next boot
+            # re-initialises -- hwbp_init() zeroes its slots, each device zeroes
+            # its counters. So a crash that an instrument just captured is
+            # destroyed by the very recovery that makes the board usable again.
+            #
+            # Cost, measured 2026-08-18: a hardware breakpoint caught the call
+            # that panicked the guest, and chimpd reset the board before the
+            # window could be read. Reproducing it meant killing chimpd and
+            # babysitting the board by hand for the next attempt -- i.e. the
+            # supervisor and the investigation were in direct conflict.
+            #
+            # Dump before resetting. Best-effort by construction: if this fails
+            # the recovery must still happen, because a board stuck at a panic
+            # prompt with nobody watching is worse than a lost dump.
+            snapshot_evidence(verdict)
             if nc:
                 try:
                     nc2 = NetCon()
