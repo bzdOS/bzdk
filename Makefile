@@ -706,10 +706,23 @@ clean-holdtest:
 # headers it includes, so editing e.g. vblk_emmc.h rebuilds vblk_emmc.o. This
 # binary is flashed to live hardware — a stale object silently wrong against
 # its header is the most dangerous build failure mode, so track deps.
-%.o: %.c
+# FLAG STAMP. -MMD tracks header dependencies but nothing tracked the FLAGS, so
+# changing EXTRA_CFLAGS re-linked stale objects and silently produced a binary
+# built with the PREVIOUS flags. Hit on 2026-08-18: rebuilding with a new
+# -DGUEST_BP_ADDR left the old breakpoint address compiled in, one step away from
+# deploying an image whose instrument pointed somewhere else entirely. Every
+# object now depends on a stamp file that changes whenever the flags do.
+.flagstamp: FORCE
+	@printf '%s\n' '$(CFLAGS) $(ASFLAGS)' > $@.new
+	@if cmp -s $@.new $@; then rm -f $@.new; else mv $@.new $@; \
+	  echo "  [flags changed -> objects will rebuild]"; fi
+FORCE:
+.PHONY: FORCE
+
+%.o: %.c .flagstamp
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-%.o: %.S
+%.o: %.S .flagstamp
 	$(CC) $(ASFLAGS) -MMD -MP -c -o $@ $<
 
 # dbgtools.o embeds BUILD_ID (above), recomputed from `git` on EVERY `make`

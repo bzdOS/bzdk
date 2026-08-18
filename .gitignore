@@ -43,3 +43,4 @@ test_coredump_elf
 test_sd_bio_addr
 test_snapshot_fmt
 test_bmc_arm_gate
+.flagstamp
