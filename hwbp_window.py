@@ -104,9 +104,19 @@ def main():
     if unwritten(reasserts):
         print("re-arms [16]          = <never written> (no keep-alive in this build)")
     else:
-        print(f"re-arms [16]          = {reasserts}"
-              + ("   <- the guest really was clearing the slot"
-                 if reasserts else "   (guest never cleared it)"))
+        # CAREFUL: in a -DGUEST_BP_ADDR build the handler itself clears the E bit
+        # after every hit (sampling mode) and the keep-alive puts it back, so this
+        # counter tracks OUR OWN re-arms, not the guest's interference. It only
+        # says something about the guest when it EXCEEDS the hit count.
+        if reasserts > hits and not unwritten(hits):
+            extra = f"   <- {reasserts - hits} MORE than hits: something other " \
+                    f"than sampling cleared the slot"
+        elif reasserts:
+            extra = "   (== hits, i.e. just this build's own sampling re-arms)" \
+                    if reasserts == hits else "   (sampling re-arms)"
+        else:
+            extra = "   (slot never needed putting back)"
+        print(f"re-arms [16]          = {reasserts}{extra}")
 
     # Printed BEFORE the no-hit early return: "why did nothing fire" is exactly
     # the question these three answer, so they must not be reachable only on the
