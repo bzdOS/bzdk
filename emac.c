@@ -170,7 +170,19 @@
 #define PHY_ADDR        1              /* .config CONFIG_PHY_ADDR=1; DTS
                                         * ext_rgmii_phy reg = <1> (RTL8211E) */
 #define N_TX_DESC       8
-#define N_RX_DESC       8
+/* RX ring depth. WAS 8, which is 8 frames = ~12 KiB of buffering: at the
+ * ~170 KB/s this link actually achieves inbound, that is about 70 ms of slack
+ * before the DMA has nowhere to put a frame. Anything that keeps CPU1 out of
+ * emac_poll() for longer than that loses packets at the HARDWARE level -- and
+ * those losses are invisible to vnet_emac.c's rx_dropped counter, which only
+ * counts frames the HV received and then had to discard. That blind spot is why
+ * a paced sender could show rx_dropped pinned at 201 while a 68 MB inbound
+ * transfer still collapsed.
+ *
+ * Linux's sun8i-emac uses 256. 64 is 8x the buffering for 132 KiB of the 1 MiB
+ * non-cacheable scratch window, which was 96% unused. The ring is a linked list
+ * (each descriptor carries `next`), so depth is purely a memory question. */
+#define N_RX_DESC       64
 #define ETH_BUFSIZE     2048           /* per-descriptor buffer */
 #define ETH_RXSIZE      2044           /* sun8i_emac.c CFG_ETH_RXSIZE */
 
@@ -253,11 +265,30 @@ __attribute__((weak)) void dbgtools_rx_frame(const uint8_t *payload, uint16_t le
 /* neighbour.                                                              */
 /* ------------------------------------------------------------------ */
 #define SCRATCH_BASE    0x50100000UL
-#define TX_DESC_BASE    (SCRATCH_BASE + 0x0000UL)   /* 8 * 64 = 512 B */
-#define RX_DESC_BASE    (SCRATCH_BASE + 0x0200UL)   /* 8 * 64 = 512 B */
-#define TX_BUF_BASE     (SCRATCH_BASE + 0x1000UL)   /* 8 * 2048 = 16 KiB */
-#define RX_BUF_BASE     (SCRATCH_BASE + 0x5000UL)   /* 8 * 2048 = 16 KiB */
+/* The non-cacheable window el2_ncmap.c maps for DMA is 0x50100000..0x50200000
+ * (its own comment: "idx256..511"). Named here so the asserts below can prove
+ * the layout fits instead of assuming it. */
+#define SCRATCH_SIZE    0x00100000UL
 #define DESC_STRIDE     64u                          /* one cache line each */
+
+/* Re-laid out when N_RX_DESC went 8 -> 64: the RX ring alone is now 4 KiB, which
+ * would have run straight into the old TX_BUF_BASE at +0x1000. Each region gets
+ * room to grow again, and the asserts below make a future overlap a build
+ * failure rather than a DMA engine quietly writing over a neighbour. */
+#define TX_DESC_BASE    (SCRATCH_BASE + 0x00000UL)   /* 8 * 64   =   512 B */
+#define RX_DESC_BASE    (SCRATCH_BASE + 0x01000UL)   /* 64 * 64  =  4 KiB  */
+#define TX_BUF_BASE     (SCRATCH_BASE + 0x02000UL)   /* 8 * 2048 = 16 KiB  */
+#define RX_BUF_BASE     (SCRATCH_BASE + 0x08000UL)   /* 64 * 2048 = 128 KiB */
+#define SCRATCH_END     (RX_BUF_BASE + (unsigned long)N_RX_DESC * ETH_BUFSIZE)
+
+_Static_assert(TX_DESC_BASE + (unsigned long)N_TX_DESC * DESC_STRIDE <= RX_DESC_BASE,
+               "EMAC TX descriptor ring overlaps the RX descriptor ring");
+_Static_assert(RX_DESC_BASE + (unsigned long)N_RX_DESC * DESC_STRIDE <= TX_BUF_BASE,
+               "EMAC RX descriptor ring overlaps the TX buffers");
+_Static_assert(TX_BUF_BASE + (unsigned long)N_TX_DESC * ETH_BUFSIZE <= RX_BUF_BASE,
+               "EMAC TX buffers overlap the RX buffers");
+_Static_assert(SCRATCH_END <= SCRATCH_BASE + SCRATCH_SIZE,
+               "EMAC DMA scratch layout overflows the non-cacheable window");
 
 /* A single hardware DMA descriptor. Only the first 16 bytes are meaningful
  * to the EMAC; we access them at their absolute physical addresses. */
