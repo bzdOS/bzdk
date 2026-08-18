@@ -26,7 +26,8 @@
  * Breadcrumb window @ 0x50000600, magic "HWBP". Distinct from every other
  * instrument (MUSB 0x50000000, EMAC 0x50000100, REPL 0x50000300, EXC
  * 0x50000400, dbg 0x50000e00, vconsole 0x50000f00, gtrace 0x50002000, FFL1
- * 0x50002400, SST1 0x50002800, HDMI 0x50003000). 16 words -> ..0x50000640.
+ * 0x50002400, SST1 0x50002800, HDMI 0x50003000). 20 words -> ..0x50000650,
+ * still far below the next instrument (dbg 0x50000e00).
  *   [0]  magic 0x48574250 ("HWBP")
  *   [1]  hit count (total bp+wp hits seen)
  *   [2]  last kind: 0 = breakpoint, 1 = watchpoint
@@ -41,6 +42,10 @@
  *   [14] 64-bit word read from the guest at (x1 + HWBP_ARG1_PROBE_OFF),
  *        or 0xDEADBEEF if the guest VA could not be translated
  *                                       [15] that word's high 32
+ *   [16] re-arms performed by hwbp_reassert() -- see it for why this exists
+ *   [17] DBGBCR0_EL1 as actually read back from the hardware, so the [10]
+ *        bitmap (which is only this file's own bookkeeping) can be checked
+ *        against the PE instead of believed
  *
  * Slots [12..15] were reserved; they now carry the FIRST ARGUMENT of the
  * breakpointed function and one word dereferenced from it. Recording ESR/PC/FAR
@@ -102,6 +107,14 @@ static uint64_t bp_va[HWBP_MAX_BP];
 static uint8_t  bp_en[HWBP_MAX_BP];
 static uint64_t wp_va[HWBP_MAX_WP];
 static uint8_t  wp_en[HWBP_MAX_WP];
+/* The control value ACTUALLY programmed, so hwbp_reassert() can restore a slot
+ * byte-for-byte instead of guessing a constant. Not cosmetic: a watchpoint armed
+ * by hwbp_set_wp_el2() uses WCR_ARM_EL2 (PMC=0b10, matches EL2) while a guest
+ * watchpoint uses WCR_ARM (PMC=0b11) -- re-arming an EL2 self-watch with the
+ * guest constant would silently retarget it at the wrong EL and quietly stop
+ * answering the question it was armed to answer. */
+static uint32_t bp_bcr[HWBP_MAX_BP];
+static uint32_t wp_wcr[HWBP_MAX_WP];
 
 static int hwbp_inited;
 
@@ -111,6 +124,30 @@ static int hwbp_inited;
 
 #define WR(reg, v) __asm__ volatile("msr " reg ", %0" :: "r"((uint64_t)(v)) : "memory")
 #define RD(reg)    ({ uint64_t _v; __asm__ volatile("mrs %0, " reg : "=r"(_v)); _v; })
+
+static uint64_t rd_bcr(int n)
+{
+	switch (n) {
+	case 0:  return RD("dbgbcr0_el1");
+	case 1:  return RD("dbgbcr1_el1");
+	case 2:  return RD("dbgbcr2_el1");
+	case 3:  return RD("dbgbcr3_el1");
+	case 4:  return RD("dbgbcr4_el1");
+	case 5:  return RD("dbgbcr5_el1");
+	default: return 0;
+	}
+}
+
+static uint64_t rd_wcr(int n)
+{
+	switch (n) {
+	case 0:  return RD("dbgwcr0_el1");
+	case 1:  return RD("dbgwcr1_el1");
+	case 2:  return RD("dbgwcr2_el1");
+	case 3:  return RD("dbgwcr3_el1");
+	default: return 0;
+	}
+}
 
 static void wr_bvr(int n, uint64_t v)
 {
@@ -195,6 +232,66 @@ static void hwbp_probe(void)
 	if (wrps < n_wp) n_wp = wrps;
 }
 
+/* Re-arm every slot this file believes is armed, and publish what the hardware
+ * actually says.
+ *
+ * THE FIFTH BARRIER. The four documented ones (wrong core, MDSCR_EL1.MDE,
+ * MDCR_EL2.TDE, OSLSR_EL1.OSLK) are all necessary and none of them is this:
+ * FreeBSD's own dbg_monitor_init() zeroes DBGBCR/DBGBVR for every breakpoint
+ * and watchpoint slot as it brings each CPU up. It clears MDSCR_EL1.MDE too,
+ * which is why the keep-alive in el2_exc.c already re-asserts that -- but the
+ * SLOT REGISTERS were never re-asserted, so the guest quietly disarmed us while
+ * bc[10] went on reporting "armed" from this file's own bookkeeping.
+ *
+ * Measured 2026-08-18: a breakpoint on linux_dma_unmap_sg_attrs, address
+ * verified against the deployed kernel's symbol table, MDE=1 / TDE=1 / OSLK=0
+ * all confirmed live, bitmap 0x1 -- and ZERO hits across a run that
+ * demonstrably executed that function (the guest panicked at
+ * linux_dma_unmap_sg_attrs+0xac).
+ *
+ * bc[17] exists because of that: "armed" must be readable from the PE, not
+ * inferred from a variable that cannot know the guest overwrote the register.
+ * Runs on the guest's core only -- DBGB*_EL1 are banked, so doing this anywhere
+ * else would write somebody else's bank and prove nothing. */
+void hwbp_reassert(void)
+{
+	static uint32_t reasserts;
+	int did = 0;
+	int i;
+
+	/* Bound by BOTH: n_bp is derived at runtime from ID_AA64DFR0_EL1 and the
+	 * compiler cannot prove hwbp_probe() only ever lowers it, so indexing the
+	 * shadow arrays on n_bp alone is an out-of-bounds warning that is right to
+	 * fire -- a future probe change really could raise it. */
+	for (i = 0; i < n_bp && i < HWBP_MAX_BP; i++) {
+		if (!bp_en[i])
+			continue;
+		if ((rd_bcr(i) & 1u) == 0u) {      /* E bit gone: guest cleared it */
+			wr_bvr(i, bp_va[i]);
+			wr_bcr(i, bp_bcr[i]);
+			did = 1;
+		}
+	}
+	for (i = 0; i < n_wp && i < HWBP_MAX_WP; i++) {
+		if (!wp_en[i])
+			continue;
+		if ((rd_wcr(i) & 1u) == 0u) {
+			/* DBGWVR is doubleword-aligned and wp_va[] keeps the
+			 * caller's UNALIGNED va (bpl prints it), so re-apply the
+			 * same mask the arming path used. Writing the raw value
+			 * back would be CONSTRAINED UNPREDICTABLE. */
+			wr_wvr(i, wp_va[i] & ~7ull);
+			wr_wcr(i, wp_wcr[i]);
+			did = 1;
+		}
+	}
+	if (did) {
+		__asm__ volatile("isb" ::: "memory");
+		bc_wr(16, ++reasserts);
+	}
+	bc_wr(17, (uint32_t)rd_bcr(0));
+}
+
 static void bc_bitmaps(void)
 {
 	uint32_t bm = 0, wm = 0;
@@ -228,7 +325,7 @@ static void hwbp_init(void)
 	 * Same trap the vblk and EBIO lanes were fixed for: a reader cannot tell
 	 * "never happened" from "this build has no such field". A diagnostic that
 	 * can be misread as evidence is worse than no diagnostic. */
-	for (int z = 1; z <= 15; z++)
+	for (int z = 1; z <= 19; z++)
 		bc_wr(z, 0);
 	bc_bitmaps();
 	hwbp_inited = 1;
@@ -286,6 +383,7 @@ int hwbp_set(int idx, uint64_t va, int is_write_wp)
 		wr_wcr(idx, WCR_ARM(WCR_LSC_STORE));
 		__asm__ volatile("isb" ::: "memory");
 		wp_va[idx] = va;
+		wp_wcr[idx] = WCR_ARM(WCR_LSC_STORE);
 		wp_en[idx] = 1;
 	} else {
 		if (idx < 0 || idx >= n_bp)
@@ -296,6 +394,7 @@ int hwbp_set(int idx, uint64_t va, int is_write_wp)
 		wr_bcr(idx, BCR_ARM);
 		__asm__ volatile("isb" ::: "memory");
 		bp_va[idx] = va & ~3ull;
+		bp_bcr[idx] = BCR_ARM;
 		bp_en[idx] = 1;
 	}
 
@@ -324,6 +423,7 @@ int hwbp_set_wp_el2(int idx, uint64_t va)
 	__asm__ volatile("isb" ::: "memory");
 	wr_wvr(idx, base);
 	wr_wcr(idx, WCR_ARM_EL2(WCR_LSC_STORE));
+	wp_wcr[idx] = WCR_ARM_EL2(WCR_LSC_STORE);
 	__asm__ volatile("isb" ::: "memory");
 	wp_va[idx] = va;
 	wp_en[idx] = 1;

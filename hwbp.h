@@ -62,6 +62,12 @@ int hwbp_set_wp_el2(int idx, uint64_t va);
 /* Disable every breakpoint and watchpoint (used by the `bpc` command). */
 void hwbp_clear_all(void);
 
+/* Re-arm any slot the guest disarmed behind our back, and publish DBGBCR0 as
+ * the hardware actually reads it. Must run ON THE GUEST'S CORE -- DBGB*_EL1 are
+ * banked. See the comment on the definition for the measurement that made this
+ * necessary. */
+void hwbp_reassert(void);
+
 /* Called from el2_trap for a lower-EL synchronous debug exception. Inspects
  * ESR_EL2.EC: 0x30/0x31 = breakpoint, 0x34/0x35 = watchpoint. If it is one of
  * ours it records the breadcrumb, one-shot-disables the hitting slot, and
