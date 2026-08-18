@@ -564,6 +564,35 @@ _Static_assert(HVMAP_SCANOUT_BC + HVMAP_SCANOUT_BC_SIZE <= 0x50100000UL,
 
 _Static_assert(HVMAP_WXDYN_BC >= HVMAP_SCANOUT_BC + HVMAP_SCANOUT_BC_SIZE,
                "dynamic W^X breadcrumb lane overlaps the scanout breadcrumb lane");
+
+/* ---- GICD trap-and-police breadcrumb ("VGCD") ----------------------------
+ * vgicd.c's counters for the trapped GIC distributor. Placed one full 4 KiB
+ * step above HVMAP_WXDYN_BC, the spacing every lane in this region uses, and
+ * with slack per this file's own hygiene rule.
+ *
+ * The interesting word is [4]: a nonzero value means one guest wrote
+ * GICD_ITARGETSR trying to aim an interrupt at a core it does not own, and the
+ * affinity field was masked down to what it is entitled to. On a single-guest
+ * build that should stay 0 forever; on the dual build it is the measurement
+ * that says whether cross-partition interference is actually being attempted.
+ *
+ * Word layout (uint32_t):
+ *   [0] magic HVMAP_VGICD_MAGIC ("VGCD")
+ *   [1] total GICD accesses trapped
+ *   [2] reads passed through
+ *   [3] writes passed through unmodified
+ *   [4] ITARGETSR writes whose affinity field was MASKED
+ *   [5] SGIR writes whose target list was masked
+ *   [6] last faulting offset within the distributor page
+ *   [7] last value written (post-mask)
+ *   [8] accesses with ESR.ISV==0 (no register info; faked completion)
+ *   [9] last CPU id to fault here */
+#define HVMAP_VGICD_BC       0x50094000UL
+#define HVMAP_VGICD_BC_SIZE  0x40UL
+#define HVMAP_VGICD_MAGIC    0x56474344UL   /* "VGCD" */
+
+_Static_assert(HVMAP_VGICD_BC >= HVMAP_WXDYN_BC + HVMAP_WXDYN_BC_SIZE,
+               "GICD breadcrumb lane overlaps the dynamic W^X lane");
 _Static_assert(HVMAP_WXDYN_BC + HVMAP_WXDYN_BC_SIZE <= 0x50100000UL,
                "dynamic W^X breadcrumb lane runs into el2_ncmap.c's "
                "non-cacheable DMA scratch window (SCRATCH_BASE 0x50100000)");

@@ -10,6 +10,7 @@
  * (dc civac + dsb sy), same pattern as every other lane in this tree.
  */
 #include <stdint.h>
+#include "vgicd.h"   /* VGICD_BASE — the GICD trap L3 index is derived from it */
 #include "stage2.h"
 #include "vblk_emmc.h"   /* VBLK_MMIO_BASE — trapped virtio-mmio window */
 #include "vgic.h"        /* VGIC_GICV_BASE — GICC->GICV redirect target */
@@ -186,6 +187,22 @@ stage2_block_desc(uint64_t pa, unsigned memattr, unsigned sh, unsigned xn)
 #define UART_L2_IDX  ((unsigned)((UART0_BASE >> STAGE2_L2_BLOCK_SHIFT) % STAGE2_L2_ENTRIES))
 #define UART_L3_IDX  ((unsigned)((UART0_BASE & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT))
 
+/* GICD trap (vgicd.c). The distributor sits in the SAME 2 MiB block as UART0,
+ * so this is one more invalid entry in the SAME stage2_l3_uart[] table -- no
+ * new table, no new level, exactly as the GICC-redirect comment below predicted
+ * this file would be extended. Verified live before the change: index 129 held
+ * a valid identity page descriptor to 0x01c81000.
+ *
+ * WHY trap it at all: under IMO=0 the guest programs the GIC directly, which is
+ * correct and cheap for ONE guest. With two guests the distributor is shared,
+ * and nothing stopped one from writing GICD_ITARGETSR to aim its own SPI at the
+ * other's core. See vgicd.h. */
+#define VGICD_L3_IDX ((unsigned)((VGICD_BASE & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT))
+_Static_assert(VGICD_L3_IDX == 129u,
+               "GICD is not at L3 index 129 -- the live-verified assumption changed");
+_Static_assert((VGICD_BASE >> STAGE2_L2_BLOCK_SHIFT) == (UART0_BASE >> STAGE2_L2_BLOCK_SHIFT),
+               "GICD is no longer in the same 2 MiB block as UART0 -- needs its own L3 table");
+
 /* vGIC GICC->GICV redirect (internal task): VGIC_GICC_BASE (0x01c82000) sits in
  * the SAME 2 MiB MMIO block as UART0 (both are within 0x01c00000..0x01e00000,
  * block index UART_L2_IDX==14 — verified by the same >>21 arithmetic used
@@ -284,6 +301,16 @@ stage2_build_mmio_tables(void)
 	for (unsigned j = 0; j < STAGE2_L3_ENTRIES; j++) {
 		if (j == UART_L3_IDX) {
 			stage2_l3_uart[j] = 0;   /* INVALID: the trapped UART page */
+			continue;
+		}
+
+		if (j == VGICD_L3_IDX) {
+			/* INVALID: the trapped GICD page. Every guest access to the
+			 * distributor now faults to EL2 and is policed by
+			 * vgicd_handle_fault(). GICD is touched during interrupt
+			 * SETUP, not on the acknowledge/EOI hot path (that goes
+			 * through the CPU interface), so the cost is per-config. */
+			stage2_l3_uart[j] = 0;
 			continue;
 		}
 
