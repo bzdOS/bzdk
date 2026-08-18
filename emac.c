@@ -372,6 +372,16 @@ static inline void udelay_spin(uint32_t n)
  *  [18] wd_reinits   emac_link_watchdog() bounded self-heal attempt count —
  *                     nonzero means EMAC never saw an RX frame and CPU1 is
  *                     retrying the PHY/rings bring-up
+ *  [20] anar_rb      Auto-Negotiation Advertisement read back after we
+ *                     restrict it (expect EMAC_AN_ADVERT: full-duplex only,
+ *                     no gigabit). 0 in a forced-link build.
+ *  [21] gbcr_rb      1000BASE-T Control read back (expect 0 = gigabit NOT
+ *                     advertised). 0 in a forced-link build.
+ *  [22] an_fallback  1 if auto-negotiation failed to bring the link up within
+ *                     the bounded wait and we fell back to forced
+ *                     EMAC_FORCE_SPEED/full so the debug channel survives.
+ *                     Nonzero here means the far end would not negotiate the
+ *                     restricted advertisement -- read [20] and the switch.
  *  [19] first_rx     latches to 1 the FIRST time a frame is ever accepted
  *  [32] tx_lock_contended  sticky 1 if the cross-core TX lock (added for
  *                     vnet_emac.c, EMAC_TX_LOCK_PA) was ever seen already
@@ -596,6 +606,39 @@ static void mdio_write(int phy, int reg, uint16_t val)
 #define  BMCR_SPEED_LSB    0x2000   /* bit13 */
 #define  BMCR_SPEED_MSB    0x0040   /* bit6  */
 
+/* Auto-negotiation advertisement, clause 22 registers 4 and 9. Needed because
+ * the reset default advertises 10/100/1000 and we specifically do NOT want
+ * gigabit on this board (see the RGMII delay-strap discussion below). */
+#define MII_ANAR   0x04             /* Auto-Negotiation Advertisement */
+#define  ANAR_CSMA        0x0001    /* selector: IEEE 802.3 */
+#define  ANAR_10_HALF     0x0020
+#define  ANAR_10_FULL     0x0040
+#define  ANAR_100_HALF    0x0080
+#define  ANAR_100_FULL    0x0100
+#define  ANAR_PAUSE       0x0400    /* symmetric PAUSE capable */
+#define MII_GBCR   0x09             /* 1000BASE-T Control */
+#define  GBCR_1000_HALF   0x0100
+#define  GBCR_1000_FULL   0x0200
+
+/* What we advertise when autoneg is on.
+ *
+ * FULL DUPLEX ONLY, and no gigabit. Both halves matter:
+ *
+ *  - No gigabit, because this board's RGMII clock-to-data timing has no delay
+ *    configured on the SoC side and depends entirely on the PHY's strap pins
+ *    (the discussion below). Gigabit's skew budget is what made the link flap.
+ *    Negotiating 100 gets the tolerant rate WITHOUT giving up negotiation.
+ *
+ *  - Full duplex only, because advertising half as a fallback is how a silent
+ *    duplex mismatch happens, and a mismatch is far worse than no link: it
+ *    passes traffic while losing a large fraction of it, with no error counter
+ *    anywhere. A link that refuses to come up is loud and diagnosable.
+ *
+ *  - 10FULL is kept as a safety net purely so that SOMETHING links if the far
+ *    end cannot do 100: 10 Mbit is miserable but it keeps the EMAC debug
+ *    channel alive, and losing that channel is the expensive failure here. */
+#define EMAC_AN_ADVERT   (ANAR_CSMA | ANAR_100_FULL | ANAR_10_FULL | ANAR_PAUSE)
+
 /* ------------------------------------------------------------------ *
  * Forced link mode vs. autoneg — see the "flap" root-cause discussion
  * in the report. Root cause under investigation: the SYS_CON EMAC clock
@@ -624,8 +667,35 @@ static void mdio_write(int phy, int reg, uint16_t val)
  * hardware lane can confirm the RTL8211E's delay straps directly. Flip
  * EMAC_FORCE_LINK to 0 to go back to full autoneg (with the new debounce
  * logic below, occasional autoneg blips no longer read as permanent loss
- * either way). */
-#define EMAC_FORCE_LINK         1
+ * either way).
+ *
+ * UPDATE 2026-08-18 -- THE ACCEPTED RISK CAME TRUE, so the default is now 0.
+ *
+ * The paragraph above accepts exactly one risk: "a forced PHY on an autoneg-only
+ * partner may fail to link at all, or link in the wrong duplex under parallel
+ * detection -- this board's far end is a fixed switch port we control, so that
+ * risk is low here." That assumption about the far end appears to be wrong.
+ *
+ * Measured: inbound bulk transfers retransmit ~17% and collapse (cwnd 2, rto
+ * grown to 83 s) while the board reports ZERO loss at every layer -- RX ring
+ * idle with all 64 descriptors DMA-owned, no RX_BUF_UA/RX_OVERFLOW/RX_DMA_STOP,
+ * rx_dropped +4 over a whole transfer, tx_drops 0, guest window wide open,
+ * vtnet0 0 errors -- at 1.4% utilisation of a 100 Mbit link, where nothing can
+ * overflow. Outbound is byte-exact at ~900 KB/s.
+ *
+ * Heavy loss that neither endpoint counts, on a quiet link, in one direction
+ * more than the other, is the textbook signature of a duplex mismatch: with
+ * autoneg disabled on this side, the partner parallel-detects the SPEED but
+ * cannot negotiate duplex and falls back to HALF, while we drive FULL.
+ * Collisions then eat a large fraction of the traffic and are counted by the
+ * switch, which is the one place we cannot read.
+ *
+ * The fix is not "go back to autoneg" -- that would negotiate gigabit and bring
+ * the flap back. It is autoneg with the advertisement restricted to full-duplex
+ * and no gigabit (EMAC_AN_ADVERT above): duplex becomes AGREED rather than
+ * guessed, and gigabit's skew budget is never engaged. Set EMAC_FORCE_LINK back
+ * to 1 to return to the old forced behaviour. */
+#define EMAC_FORCE_LINK         0
 #define EMAC_FORCE_SPEED        100   /* 10, 100, or 1000 — only used if
                                        * EMAC_FORCE_LINK is 1 */
 #define EMAC_FORCE_FULL_DUPLEX  1
@@ -703,10 +773,19 @@ static int phy_startup(int *duplex_full)
         mdio_write(PHY_ADDR, MII_BMCR, bmcr);
     }
 #else
-    /* Explicitly enable + restart auto-negotiation (BMCR bit12 ANENABLE +
-     * bit9 ANRESTART). The BMCR_RESET above returns advertisement registers
-     * to their defaults (advertise 10/100/1000), so a plain restart is all
-     * that's needed. */
+    /* Restrict what we advertise BEFORE restarting negotiation. The BMCR_RESET
+     * above returns the advertisement registers to their defaults, which
+     * advertise 10/100/1000 half and full -- both of which we specifically do
+     * not want here (see EMAC_AN_ADVERT). Writing them after the reset and
+     * before ANRESTART is the whole point; a plain restart, which is what this
+     * used to do, negotiates gigabit. */
+    mdio_write(PHY_ADDR, MII_ANAR, EMAC_AN_ADVERT);
+    mdio_write(PHY_ADDR, MII_GBCR, 0);        /* advertise NO 1000BASE-T */
+    bc(20, (uint32_t)(mdio_read(PHY_ADDR, MII_ANAR) & 0xffff));
+    bc(21, (uint32_t)(mdio_read(PHY_ADDR, MII_GBCR) & 0xffff));
+
+    /* Now enable + restart auto-negotiation (BMCR bit12 ANENABLE + bit9
+     * ANRESTART). */
     mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
 #endif
     bmcr_rb = mdio_read(PHY_ADDR, MII_BMCR);
@@ -731,6 +810,45 @@ static int phy_startup(int *duplex_full)
         udelay_spin(2000);
     }
     bc(11, (uint32_t)(bmsr & 0xffff));               /* final BMSR */
+
+#if !EMAC_FORCE_LINK
+    /* SAFETY NET. Autoneg with a restricted advertisement is the right thing
+     * (see EMAC_AN_ADVERT), but if the far end will not negotiate any of what we
+     * offer, the result is no link at all -- and this link IS the debug channel.
+     * Losing it costs a full serial-console reload cycle to recover from.
+     *
+     * So: if negotiation produced nothing, fall back to the old forced
+     * speed/duplex rather than returning failure. That reinstates the duplex
+     * mismatch this change exists to avoid, which is exactly why [22] records
+     * that it happened -- a degraded-but-reachable board that says so is better
+     * than an unreachable one, and better than a silently degraded one. */
+    if (!g_link_up) {
+        uint16_t bmcr_f = BMCR_DUPLEX_FULL;
+        if (EMAC_FORCE_SPEED == 1000)     bmcr_f |= BMCR_SPEED_MSB;
+        else if (EMAC_FORCE_SPEED == 100) bmcr_f |= BMCR_SPEED_LSB;
+        bc(22, 1);
+        mdio_write(PHY_ADDR, MII_BMCR, bmcr_f);
+        udelay_spin(200000);
+        for (uint32_t t = 0; t < LINK_WAIT_PASSES; t++) {
+            wdt_pet();
+            (void)mdio_read(PHY_ADDR, MII_BMSR);
+            bmsr = mdio_read(PHY_ADDR, MII_BMSR);
+            if (bmsr >= 0 && (bmsr & BMSR_LSTATUS)) {
+                g_link_up = 1;
+                break;
+            }
+            udelay_spin(2000);
+        }
+        bc(11, (uint32_t)(bmsr & 0xffff));
+        if (g_link_up) {
+            g_speed = EMAC_FORCE_SPEED;
+            if (duplex_full) *duplex_full = 1;
+            bc(5, g_speed);
+            return 1;
+        }
+    }
+#endif
+
     if (!g_link_up)
         return 0;
 
