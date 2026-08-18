@@ -685,6 +685,22 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			uint64_t zero = 0;
 			__asm__ volatile("msr oslar_el1, %0\n\tisb" :: "r"(zero) : "memory");
 		}
+
+		/* THE FIFTH BARRIER, and the one that made this whole block still
+		 * not enough. MDE, TDE and the OS lock are all global gates; none of
+		 * them is the SLOT. FreeBSD's dbg_monitor_init() zeroes DBGBCR/DBGBVR
+		 * for every breakpoint and watchpoint as it brings a CPU up, so the
+		 * slot itself goes dark while hwbp's bc[10] bitmap -- which is only
+		 * its own bookkeeping variable, not a register read -- keeps
+		 * reporting "armed".
+		 *
+		 * Measured 2026-08-18: a breakpoint on linux_dma_unmap_sg_attrs with
+		 * all three gates verified open live and bitmap 0x1 recorded ZERO
+		 * hits across a run whose own panic backtrace proves that function
+		 * executed. That is what this call fixes; bc[17] now publishes
+		 * DBGBCR0 as the hardware reads it, so "armed" is checkable instead
+		 * of inferred. */
+		hwbp_reassert();
 	}
 #endif
 

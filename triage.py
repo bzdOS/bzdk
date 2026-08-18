@@ -473,7 +473,12 @@ def dump_fltr(hv, out, tail=40):
         a0 = (slots[o + 2] << 32) | slots[o + 1]
         a1 = (slots[o + 4] << 32) | slots[o + 3]
         key = (k, a0)
-        txt = f"    -{j + 1:<3d} {FLTR_KINDS.get(k, k):<8s} a0={a0:#018x} a1={a1:#018x}"
+        # Unknown kind codes must still PRINT -- an unrecognised record is
+        # exactly the kind of thing worth seeing, and falling back to the raw
+        # int crashed the formatter (":<8s" on an int) and took the whole
+        # mandatory-first-step triage down with it.
+        kname = FLTR_KINDS.get(k) or f"?{k}"
+        txt = f"    -{j + 1:<3d} {kname:<8s} a0={a0:#018x} a1={a1:#018x}"
         if k in (7, 10):                 # SYNC: a1=ELR | DABT: a1=faulting IPA
             # EC alone is nearly useless in a timeline (every guest fault is
             # 0x24); DFSC + WnR is what distinguishes "read InterruptStatus"
