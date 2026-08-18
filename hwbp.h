@@ -68,6 +68,11 @@ void hwbp_clear_all(void);
  * necessary. */
 void hwbp_reassert(void);
 
+/* Publish MDSCR_EL1 / MDCR_EL2 / OSLSR_EL1 into the hwbp breadcrumb window as
+ * owned slots [18..20]. Call from the guest's core -- all three are banked or
+ * guest-owned, so a reading taken anywhere else describes another core. */
+void hwbp_publish_preconditions(uint64_t mdscr, uint64_t mdcr, uint64_t oslsr);
+
 /* Called from el2_trap for a lower-EL synchronous debug exception. Inspects
  * ESR_EL2.EC: 0x30/0x31 = breakpoint, 0x34/0x35 = watchpoint. If it is one of
  * ours it records the breadcrumb, one-shot-disables the hitting slot, and
