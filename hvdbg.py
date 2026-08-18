@@ -498,10 +498,20 @@ class HV:
                                    else 0x50000800, 1):
                 return True          # stopped answering -> the reset landed
         print("wdt_reset: WDOG armed but the board is STILL ANSWERING after "
-              "25s -- the reset did NOT happen. Do not assume a fresh build is "
-              "running. Likely an EMAC write was dropped (this path uses "
-              "unverified write_word); retry, or reload via the serial path "
-              "after stopping any resident chimpd.py that holds the port lock.",
+              "25s -- the reset did NOT happen.\n"
+              "  CAUSE (measured 2026-08-18, not a guess): CPU1 pets the HW "
+              "WDOG unconditionally on every poll iteration (wdt_debug_kick(), "
+              "wdt.c), so arming the watchdog from OUTSIDE is futile -- CPU1 "
+              "restarts it before it can fire. wdt.c's own comment states the "
+              "supported procedure: set wdt_debug_hold != 0 so CPU1 STOPS "
+              "petting, and the WDOG then fires within its <=16s window.\n"
+              "  That flag is currently only READABLE from here (bmc.c exports "
+              "it); it has no fixed address in hv_addrmap.h, so setting it over "
+              "EMAC would need an nm-resolved address -- exactly the build-skew "
+              "trap this method's own docstring exists to avoid. Until it gets "
+              "a fixed window, reset via the serial path: stop the resident "
+              "chimpd.py BY PID (never pkill -f), run reliable_load.py "
+              "--cycles 1, restart chimpd.",
               file=sys.stderr)
         return False
 

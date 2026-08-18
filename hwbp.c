@@ -545,8 +545,44 @@ int hwbp_handle(struct el2_frame *frame, uint64_t esr)
 		for (i = 0; i < n_bp; i++)
 			if (bp_en[i] && bp_va[i] == pc) { slot = i; break; }
 		record_hit(frame, esr, 0, slot);
-		if (slot >= 0)
+		if (slot >= 0) {
+#if defined(GUEST_BP_ADDR) && (GUEST_BP_ADDR)
+			/* SAMPLING mode, for -DGUEST_BP_ADDR investigations only.
+			 *
+			 * A one-shot breakpoint answers "was this function ever
+			 * reached". It cannot answer "what were the arguments of the
+			 * call that CRASHED", because the crash is generally not the
+			 * first call: on 2026-08-18 the breakpoint on
+			 * linux_dma_unmap_sg_attrs caught call #1, which had a
+			 * perfectly valid sgl->dma_map, while the panic happens on a
+			 * later call with far=0x1.
+			 *
+			 * So clear only the HARDWARE enable -- letting the guest eret
+			 * past the instruction instead of re-faulting forever -- and
+			 * leave bp_en set, so hwbp_reassert() puts the slot back on
+			 * the next guest trap. record_hit() overwrites, so the window
+			 * ends up holding the MOST RECENT call, which is the one that
+			 * matters when the guest then dies.
+			 *
+			 * HONEST LIMITATION: this is sampling, not tracing. Re-arming
+			 * is deferred to the next lower-EL sync trap (it MUST be --
+			 * re-arming inside this handler would re-fault on the same
+			 * instruction immediately), so calls that happen before the
+			 * guest next traps are missed entirely. The hit count is
+			 * therefore a lower bound, never a call count. It is enough
+			 * for "what did the last call look like", which is the
+			 * question, and it is not enough for anything quantitative.
+			 *
+			 * Safe against the re-fault loop only because el2_exc.c runs
+			 * the keep-alive BEFORE hwbp_handle(): by the time the slot is
+			 * put back, this trap's clear has already happened. */
+			wr_bcr(slot, 0);
+			__asm__ volatile("isb" ::: "memory");
+			bc_wr(17, (uint32_t)rd_bcr(0));
+#else
 			hwbp_clear(slot, 0);
+#endif
+		}
 		return 1;
 	}
 
