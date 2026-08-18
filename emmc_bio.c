@@ -862,6 +862,27 @@ static void ebio_fail_settle_full(int stop_card)
 {
 	uint32_t i;
 
+	/* (0) STOP THE CARD FIRST, while the data transfer is still live on the bus.
+	 *
+	 * This used to sit after the FIFO/DMA reset, and there it failed 141 times
+	 * out of 268 (53%). The order was the problem: a FIFO+DMA reset takes the
+	 * controller's command engine through a reset pulse, after which the
+	 * transfer is over as far as the HOST is concerned -- but CMD12 has to reach
+	 * the CARD, which is still holding an open write. Issuing it first, before
+	 * anything is reset and before waiting on a card that is only "busy" because
+	 * it is waiting for the rest of the block, is what the sequence actually
+	 * needs.
+	 *
+	 * Also deliberately BEFORE the idle wait: waiting for CARD_BUSY to clear on
+	 * a card mid-receive either spins out the whole bound or returns with the
+	 * transfer still open. There is nothing to wait for until the abort is sent. */
+	if (stop_card) {
+		ebio_bc(29, ++g_stop_cmds);
+		if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0, CMDR_RESP_EXP,
+		                  NULL) != 0)
+			ebio_bc(30, ++g_stop_fails);
+	}
+
 	/* TIME-bounded, not iteration-bounded -- see g_settle_busy_ms. The caller's
 	 * next act after a settle is typically a RETRY, and a retry that lands on a
 	 * still-programming card is the corruption mechanism this file's history is
@@ -885,20 +906,9 @@ static void ebio_fail_settle_full(int stop_card)
 		if ((rreg(REG_GCTL) & GCTL_RESET_ALL) == 0)
 			break;
 
-	/* (2b) Tell the CARD to abandon the partial block. See g_stop_cmds: the
-	 * FIFO reset above only discards the HOST's undelivered words; without this
-	 * the card keeps the fragment it already accepted and the retry appends to
-	 * it. Measured: 267 injected mid-data-phase bails corrupted 267 sectors
-	 * without this, with everything else already in place. */
-	if (stop_card) {
-		ebio_bc(29, ++g_stop_cmds);
-		if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0, CMDR_RESP_EXP,
-		                  NULL) != 0)
-			ebio_bc(30, ++g_stop_fails);
-	}
-
-	/* (2c) The abort itself can leave the card busy retiring it. Same time
-	 * bound as above -- an iteration count is not a duration. */
+	/* (2b) The abort at step (0) can leave the card busy retiring it, and the
+	 * reset above can leave the controller settling. Same time bound as
+	 * everywhere else here -- an iteration count is not a duration. */
 	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
 
 	/* (3) Re-program the internal clock after the reset -- REMOVED, it broke
