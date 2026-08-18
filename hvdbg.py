@@ -479,6 +479,32 @@ class HV:
         for pa, val in B.WDOG_ARM_SEQUENCE:
             self.write_word(pa, val)
 
+        # CONFIRM IT ACTUALLY HAPPENED. This path used to arm the WDOG and
+        # return None -- no verification, no return value -- so a dropped EMAC
+        # write produced a silent no-op indistinguishable from success. That is
+        # precisely the failure mode this method's own docstring criticises the
+        # fast path for, and it cost a full reload cycle on 2026-08-18: uptime
+        # kept climbing from the same boot while the caller had been told
+        # nothing at all.
+        #
+        # "Did the reset happen" is directly observable: the WDOG fires within
+        # ~16s, after which the hypervisor stops answering EMAC entirely. So
+        # poll for it to GO AWAY. A board that is still answering after the
+        # window has demonstrably not reset.
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            time.sleep(2.0)
+            if not self.read_words(B.HVMAP_GICT_BC if hasattr(B, "HVMAP_GICT_BC")
+                                   else 0x50000800, 1):
+                return True          # stopped answering -> the reset landed
+        print("wdt_reset: WDOG armed but the board is STILL ANSWERING after "
+              "25s -- the reset did NOT happen. Do not assume a fresh build is "
+              "running. Likely an EMAC write was dropped (this path uses "
+              "unverified write_word); retry, or reload via the serial path "
+              "after stopping any resident chimpd.py that holds the port lock.",
+              file=sys.stderr)
+        return False
+
     # ── dbgtools: CPU1 heartbeat / build-id / entry-hold (2026-07-26) ───
     # See dbgtools.h/hv_addrmap.h (HVMAP_DBGTOOLS_*) for the firmware side.
     DBGRAW_ETHERTYPE = 0x88B7
