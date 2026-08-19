@@ -461,6 +461,19 @@ int main(void)
 		extern struct el2_frame g_last_guest_frame;  /* el2_exc.c, CPU0-authored */
 		hud_init();
 		hud_update(&g_last_guest_frame);   /* first frame (guest not yet running) */
+
+		/* GUEST WINDOW, composited by the DE2 mixer (hdmi.h HDMI_GUESTWIN_*).
+		 * UI1 layer 1 over the HUD's own guest-window rectangle, fetching from
+		 * guest DRAM. Zero copy: the mixer's DMA reads the guest's buffer
+		 * directly, so nothing is blitted per frame and the scanout buffers are
+		 * NOT shared with the guest -- the isolation boundary is untouched,
+		 * which is why this does not need HV_FB_GUEST at all.
+		 *
+		 * The guest reaches the same buffer through a `simple-framebuffer` node
+		 * in its DTB at the matching address and geometry. If the two ever
+		 * disagree the picture is skewed rather than absent, so they are
+		 * documented as one unit in docs/guest-display.md. */
+		hdmi_guestwin_enable();
 #else
 		/* HV_FB_GUEST: the GUEST owns the pixels. hdmi_init() has brought the
 		 * DE2 -> TCON -> PHY pipeline up and pointed the scanout at BUF0, which

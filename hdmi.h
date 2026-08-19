@@ -235,6 +235,56 @@ void hdmi_relock(void);
  * clobbered by guest console bytes, so the pipeline stage/PHY breadcrumb was
  * unreadable post-boot. 0x50011800 is in the free gap 0x50011100..0x50020000
  * (past el2_ncmap 0x50011000, before flightrec 0x50012000). */
+/* ── GUEST WINDOW: a second DE2 layer, composited by hardware ─────────────
+ *
+ * The HUD occupies UI1 layer 0 full-screen. The guest gets UI1 **layer 1**,
+ * positioned over the HUD's own guest-window rectangle, reading from a buffer in
+ * ORDINARY GUEST DRAM.
+ *
+ * Why a second layer and not a blit, and not a shared scanout buffer:
+ *
+ *   - ZERO COPY is a requirement. A per-frame memcpy of the window area is
+ *     ~1.2 MiB at 4 bpp on a Cortex-A53; the mixer fetches it for free.
+ *   - A WINDOW cannot be shared through stage-2 anyway. Stage-2 granularity is
+ *     4 KiB and contiguous; a rectangle's scanlines are 5120 B apart, so
+ *     "columns 16..1149 of rows 66..341" is not expressible as pages. Only
+ *     full-width horizontal bands are.
+ *   - And it does not need to be. The guest's buffer lives in its own DRAM,
+ *     which stage-2 already identity-maps, so NOTHING about the isolation
+ *     boundary changes: the guest never touches BUF0/BUF1, hv-image or
+ *     hv-scratch. The DE2 mixer's own DMA reads the guest buffer, and DE2 is
+ *     already a bus master with no IOMMU in front of it either way.
+ *
+ * A64 mixer1 is ui_num=1, vi_num=1 (Linux sun50i_a64_mixer1_cfg), and each UI
+ * channel has FOUR layer configs at 0x20 stride (sun8i_ui_layer.h). The HUD uses
+ * layer 0; layers 1..3 were sitting unused.
+ *
+ * GEOMETRY IS THE HUD'S TO DECIDE. These mirror hud.c's CON_* rectangle -- the
+ * area its own comment calls the guest surface -- and must move with it. The DTB's
+ * simple-framebuffer node must carry the SAME width/height/stride, or the guest
+ * will draw at one geometry while the mixer fetches at another and the result is
+ * skewed rather than obviously broken.
+ *
+ * The buffer address is guest DRAM chosen from a full-tree occupancy sweep:
+ * 0x4B000000 sits in the gap between the guest's modinfo (0x4A100000) and its
+ * SP_EL1 (0x4C000000), 14 MiB clear of that stack, which grows DOWN. It is
+ * reserved `no-map` in the guest DTB so FreeBSD's allocator stays off it while
+ * simplefb(4) maps it explicitly.
+ */
+#define HDMI_GUESTWIN_PA      0x4B000000UL   /* guest-fb@4b000000, DTB-reserved */
+#define HDMI_GUESTWIN_SIZE    0x00200000UL   /* 2 MiB reservation (1.19 MiB used) */
+#define HDMI_GUESTWIN_X       16             /* mirrors hud.c CON_X */
+#define HDMI_GUESTWIN_Y       66             /* mirrors hud.c CON_Y */
+#define HDMI_GUESTWIN_W       1134           /* mirrors hud.c CON_W */
+#define HDMI_GUESTWIN_H       276            /* mirrors hud.c CON_H */
+#define HDMI_GUESTWIN_STRIDE  (HDMI_GUESTWIN_W * 4)
+#define HDMI_GUESTWIN_LAYER   1              /* UI1 layer index (HUD owns 0) */
+
+/* Program the guest-window layer and commit it. Returns 0 on success, -1 if the
+ * display never came up (hdmi_init() failed), in which case nothing is touched.
+ * Idempotent: safe to call again to move/resize the window. */
+int hdmi_guestwin_enable(void);
+
 #define BC_HDMI_BASE   0x50011800UL
 #define BC_HDMI_MAGIC  0x48444D49u /* "HDMI" */
 
