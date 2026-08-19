@@ -1,8 +1,28 @@
 # Getting the guest's output onto the monitor
 
-Status 2026-08-19: **HV side done and hardware-verified. Guest side blocked.**
-The blocker is specific and in FreeBSD, not in this tree, so it is written down
-here rather than rediscovered.
+Status 2026-08-19: **WORKING.** The guest draws its console into the buffer the
+HDMI block scans out. Every link measured; the three obstacles below were real and
+are all cleared, so they are kept as the record of what to do again.
+
+Measured end to end, this configuration:
+
+    HV:     BC_HDMI_BASE stage = 6 (HDMI_STAGE_SCANOUT)  -- clocks -> DE2 ->
+            TCON -> HDMI ctrl -> PHY -> scanout all up, not a timeout
+    stage2: [10] BUF0 PAR.F = 0 shared, [11] BUF1 PAR.F = 1 private, [18] pass = 1
+    guest:  VT(simplefb): resolution 1280x720
+            kern.console = ttyv0,ttyu0,...   BOTH consoles active
+    pixels: non-zero words in the top 8 text rows, columns 0-199 --
+              baseline 87  ->  after the guest clears the screen 8
+                           ->  after the guest prints 8 rows of '#' 300
+
+The last line is the proof that matters: the count follows what the guest does, so
+the guest is driving the scanned-out DRAM and not something else.
+
+Whether the physical monitor lights up is the one thing that cannot be measured
+from here -- it needs eyes on the panel.
+
+Build: `make dbg EXTRA_CFLAGS="-DHV_HDMI -DHV_FB_GUEST"`, plus the DTB node
+described under obstacle 1/2, plus the kload.c howto fix under obstacle 3.
 
 ## What works
 
@@ -43,15 +63,16 @@ Worked around by rewriting those two nodes' `compatible` to `allwinner,pipeline`
 alone. They are NOT removable: both carry a `phandle` with live referrers
 elsewhere in the blob.
 
-**3. THE ACTUAL BLOCKER — vt becomes the system console and there is no keyboard.**
+**3. vt becomes the system console and there is no keyboard — SOLVED, and the fix
+was a bug in this tree.**
 With simplefb present, vt is the console; the guest then blocks in
 `vtterm_cngetc()` (`vt_core.c:2022`) waiting for a keypress that cannot come, and
 the serial console goes silent (`console bytes=4` for 21 minutes, versus ~27000 in
 a normal boot). Observed live, and the board had to be recovered.
 
-The fix would be `RB_MULTIPLE` (multiple consoles: vt draws on the monitor, the
-serial keeps input). **There is no way to set it from here.** Both routes are
-closed on this configuration:
+The fix is `RB_MULTIPLE` (multiple consoles: vt draws on the monitor, the serial
+keeps input). Two of the three ways to set it are closed here, which is worth
+knowing before trying them:
 
 - `boot_multicons` as a kenv goes through `boot_env_to_howto()`, which on FreeBSD
   is called from `x86/xen/pv.c` ONLY — never on arm64.
@@ -60,24 +81,34 @@ closed on this configuration:
   `MODINFOMD_ENVP` (kload.c), so `loader_envp` is non-NULL and the DTB's bootargs
   are never parsed.
 
-## What would actually work, in increasing order of effort
+The third works: **`MODINFOMD_HOWTO`**, fetched by `machdep_boot.c:210` in the very
+function that also fetches the `MODINFOMD_ENVP` this loader already depends on.
+kload.c was already emitting that record.
 
-1. **Pass `MODINFOMD_HOWTO` from kload.c** with `RB_MULTIPLE` set, if arm64's
-   metadata path honours it — this is the cheapest option and was NOT yet checked.
-   Start here.
-2. **Attach a USB keyboard.** Sidesteps the whole problem; vt gets input and the
-   console-takeover stops mattering. Cheapest physically, useless for headless.
-3. **A small guest KMS-less framebuffer driver** that claims the scanout doorbell
-   (`scanout.h`, already implemented HV-side) and exposes `/dev/fb0` WITHOUT
-   registering as a console. Then vt never takes over, X11/`scfb` or a direct
-   framebuffer client can draw, and lima's output can be blitted or flipped in
-   zero-copy via FLIP_REQUEST.
-4. **Port sun4i-drm** (DE2 + TCON + DWC-HDMI) as a real DRM/KMS driver. Months,
-   and it requires taking HDMI away from the HV — the opposite of this
-   architecture.
+And emitting it wrongly, which turned out to matter far beyond the display.
+`howto_val` was `0x800u | 0x1u` with a comment calling `0x1` "RB_SINGLE".
+**`RB_SINGLE` is `0x002`; `0x001` is `RB_ASKNAME` — "force prompt of device of root
+filesystem".** So this hypervisor had been asking the guest for the interactive
+root prompt on every boot (`vfs_mountroot.c:899`). That is where every
+`mountroot>` in every boot log came from — not a mount failure, not a GEOM race.
+Dropping that bit removed the prompt entirely (0 occurrences) and `/etc/rc` now
+completes on its own, network and sshd included, with no manual intervention.
 
-Option 3 is the one that fits: it uses the doorbell that already exists, keeps the
-HV owning the display hardware, and does not fight FreeBSD's console layer.
+Current value: `RB_VERBOSE | RB_MULTIPLE`.
+
+## What is left
+
+The console is on the monitor. Getting **lima's rendering** there is the next step
+and needs no new kernel work: `scanout.h`'s doorbell is implemented HV-side, so a
+guest client can render into BUF0 directly (zero-copy) or render elsewhere and blit.
+BUF1 stays private, so double-buffered flipping through FLIP_REQUEST needs BUF1
+shared too — a one-line change to the block classification in stage2.c, and the
+isolation selfcheck's expectation for `[11]` would have to move with it. Do not make
+that change silently.
+
+A `/dev/fb0` for ordinary framebuffer clients (X11 `scfb`, anything writing pixels
+without GL) still needs a small guest driver: simplefb is console-only and
+registers no `fbd`.
 
 ## Do not repeat
 
