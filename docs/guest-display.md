@@ -135,19 +135,41 @@ completes on its own, network and sshd included, with no manual intervention.
 
 Current value: `RB_VERBOSE | RB_MULTIPLE`.
 
-## What is left
+## GPU rendering into the window: working, and the bottleneck is measured
 
-The console is on the monitor. Getting **lima's rendering** there is the next step
-and needs no new kernel work: `scanout.h`'s doorbell is implemented HV-side, so a
-guest client can render into BUF0 directly (zero-copy) or render elsewhere and blit.
-BUF1 stays private, so double-buffered flipping through FLIP_REQUEST needs BUF1
-shared too — a one-line change to the block classification in stage2.c, and the
-isolation selfcheck's expectation for `[11]` would have to move with it. Do not make
-that change silently.
+`bsdOS/hal/bzfb/` — a small guest driver handing userspace a **write-combining**
+mapping of the window buffer (`/dev/bzfb0`), plus `tests/limashow.c`, a GL demo that
+renders an animated textured scene and presents into it.
 
-A `/dev/fb0` for ordinary framebuffer clients (X11 `scfb`, anything writing pixels
-without GL) still needs a small guest driver: simplefb is console-only and
-registers no `fbd`.
+The driver exists for a non-obvious reason. `/dev/mem` *can* reach the address —
+arm64's `memrw()` `CDEV_MINOR_MEM` path validates nothing — but **mmap of /dev/mem
+is CACHEABLE**: `memmmap()` declares `vm_memattr_t *memattr __unused` and never sets
+it. Writes sit in CPU cache, the mixer's DMA reads DRAM, and nothing appears, in a
+way that looks like a broken display rather than a wrong mapping. (Confirmed: a `dd`
+to /dev/mem landed nowhere EL2 could see.) simplefb(4) works over the same buffer
+precisely because it maps it `VM_MEMATTR_WRITE_COMBINING`.
+
+Measured on hardware:
+
+    render only                        476.1 frames/s   (9523 frames / 20.0 s)
+    render + readback + present         13.7 frames/s   (274 frames / 20.1 s)
+
+The GPU draws a frame in **~2.1 ms**. `glReadPixels` costs **~71 ms of a 73 ms
+frame — 97%**, a 35x factor. On a tile-based renderer that is a resolve, not a copy.
+
+So the path works end to end (verified from EL2: every sampled word in the window
+buffer non-zero and **all** of them changing between reads 2 s apart), and the
+number to quote for the platform's rendering is 476 fps, not 13.7 — 13.7 is the
+speed of *this present path*.
+
+**True zero-copy render-to-window** is therefore worth doing and its payoff is
+known: lima must render directly into the window buffer instead of into a BO that
+gets read back. That needs a GEM import of the reserved physical range (or the
+`scanout.h` doorbell extended to take a guest-supplied buffer address), and it would
+move the ceiling from 13.7 toward 476.
+
+Also still missing: a `/dev/fb0` for non-GL clients (X11 `scfb`). bzfb registers no
+`fb_info`/`fbd`, deliberately — that is a separate step.
 
 ## Do not repeat
 
