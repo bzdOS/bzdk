@@ -457,9 +457,22 @@ int main(void)
 	 * (smp_secondary_main), which owns the display just like it owns the debug
 	 * console — CPU0 enters the guest via kload_enter() and never returns. */
 	if (hdmi_init() == 0) {
+#if !defined(HV_FB_GUEST)
 		extern struct el2_frame g_last_guest_frame;  /* el2_exc.c, CPU0-authored */
 		hud_init();
 		hud_update(&g_last_guest_frame);   /* first frame (guest not yet running) */
+#else
+		/* HV_FB_GUEST: the GUEST owns the pixels. hdmi_init() has brought the
+		 * DE2 -> TCON -> PHY pipeline up and pointed the scanout at BUF0, which
+		 * stage2.c shares with the guest by page; FreeBSD's simplefb(4) then
+		 * draws the vt console straight into it.
+		 *
+		 * Deliberately NO hud_init()/hud_update() here. The HUD refreshes every
+		 * frame from CPU1, so it would overwrite whatever the guest just drew --
+		 * and the symptom would be "the guest's output never appears on the
+		 * monitor", which looks like a stage-2 or DTB problem and is not one.
+		 * Whoever draws the pixels has to be the only one drawing them. */
+#endif
 	}
 	/* Zero-copy GPU scanout (docs/zero-copy-scanout.md): populate the
 	 * guest-facing doorbell device's register file (buffer addresses,
