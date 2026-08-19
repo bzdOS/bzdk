@@ -1,28 +1,67 @@
 # Getting the guest's output onto the monitor
 
-Status 2026-08-19: **WORKING.** The guest draws its console into the buffer the
-HDMI block scans out. Every link measured; the three obstacles below were real and
-are all cleared, so they are kept as the record of what to do again.
+Status 2026-08-19: **WORKING, composited.** The HUD owns the screen; the guest's
+console appears in a window inside it. Zero copy, and the guest never touches the
+scanout buffers.
 
-Measured end to end, this configuration:
+## The design
 
-    HV:     BC_HDMI_BASE stage = 6 (HDMI_STAGE_SCANOUT)  -- clocks -> DE2 ->
-            TCON -> HDMI ctrl -> PHY -> scanout all up, not a timeout
-    stage2: [10] BUF0 PAR.F = 0 shared, [11] BUF1 PAR.F = 1 private, [18] pass = 1
-    guest:  VT(simplefb): resolution 1280x720
-            kern.console = ttyv0,ttyu0,...   BOTH consoles active
-    pixels: non-zero words in the top 8 text rows, columns 0-199 --
-              baseline 87  ->  after the guest clears the screen 8
-                           ->  after the guest prints 8 rows of '#' 300
+Two DE2 layers in the same UI channel, blended by the mixer:
 
-The last line is the proof that matters: the count follows what the guest does, so
-the guest is driving the scanned-out DRAM and not something else.
+    UI1 layer 0   full screen 1280x720   HV's HUD          buffer 0x4D000000
+    UI1 layer 1   1134x276 at (16,66)    guest's console   buffer 0x4B000000
 
-Whether the physical monitor lights up is the one thing that cannot be measured
-from here -- it needs eyes on the panel.
+The guest's buffer is ORDINARY GUEST DRAM, reserved `no-map` in its DTB and
+declared as a `simple-framebuffer` node. So:
 
-Build: `make dbg EXTRA_CFLAGS="-DHV_HDMI -DHV_FB_GUEST"`, plus the DTB node
-described under obstacle 1/2, plus the kload.c howto fix under obstacle 3.
+- **zero copy** -- the mixer's DMA reads the guest's buffer directly, nothing is
+  blitted per frame (~1.2 MiB/frame avoided);
+- **a window, not the screen** -- which stage-2 sharing could not express anyway:
+  pages are 4 KiB and contiguous while a rectangle's scanlines are 5120 B apart,
+  so only full-width bands are shareable;
+- **isolation untouched** -- the guest writes only its own DRAM, the scanout
+  buffers stay private, and `HV_FB_GUEST` is not needed for this path at all.
+
+A64 mixer1 has one UI channel with FOUR layer configs (0x20 stride); only layer 0
+was ever programmed. Layer 1 was chosen over the idle VI channel because layers
+within one channel composite inside it and feed the blend pipe the HUD already set
+up -- no blender changes, no second pipe.
+
+## Measured, both layers independently live
+
+    HUD    0x4D000000  1200 non-zero, UNCHANGED across everything the guest did
+    window 0x4B000000  113 baseline -> 8 after the guest clears -> 80 after it
+                       prints 10 rows of '#'
+    guest  VT(simplefb): resolution 1134x276      kern.console = ttyv0,ttyu0,...
+    HV     HDMI stage 6 (SCANOUT), layer PA 0x4b000000, size 1134x276
+
+The HUD count not moving is as important as the guest count moving: it shows the
+two buffers are genuinely separate and the guest cannot reach the HV's.
+
+Whether the panel lights up is the one thing that cannot be measured from here.
+
+## Geometry is one unit across three files
+
+`hdmi.h`'s `HDMI_GUESTWIN_*`, `hud.c`'s `CON_*` rectangle, and the DTB node's
+width/height/stride must agree. If they disagree the picture is skewed rather than
+absent, which is much harder to spot. hud.c's layout is the source of truth.
+
+Build: `make dbg EXTRA_CFLAGS="-DHV_HDMI"` (NOT `-DHV_FB_GUEST` -- unnecessary
+here), plus the DTB nodes below, plus the kload.c howto fix under obstacle 3.
+
+DTB, on top of the deployed blob with `fdtput` (see guest-dtb.md -- never `dtc`):
+
+    /reserved-memory/guest-fb@4b000000   reg = <0x4b000000 0x200000>, no-map
+    /chosen/framebuffer@4b000000         compatible = "simple-framebuffer"
+                                         reg = <0x4b000000 0x132fc0>
+                                         width=1134 height=276 stride=4536
+                                         format="x8r8g8b8" status="okay"
+    /chosen/framebuffer-lcd  compatible -> "allwinner,pipeline"   (see obstacle 2)
+    /chosen/framebuffer-hdmi compatible -> "allwinner,pipeline"
+
+0x4B000000 came from a full-tree occupancy sweep, not a guess: 0x4C000000 is the
+guest's SP_EL1 and 0x46000000..0x47146000 is its kernel image, so this is the gap --
+14 MiB below a stack that grows down.
 
 ## What works
 
