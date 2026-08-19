@@ -222,6 +222,14 @@ static uint64_t stage2_l2_mmio[STAGE2_L2_ENTRIES]
 static uint64_t stage2_l3_uart[STAGE2_L3_ENTRIES]
 	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
 
+#if defined(HV_HDMI) && defined(HV_FB_GUEST)
+/* L3 table for the one DRAM block that holds the BUF0/BUF1 boundary. Separate
+ * from stage2_l3_uart[] because that one lives under the MMIO L2 table and its
+ * pages are Device-nGnRE; these are Normal-WB guest DRAM. */
+static uint64_t stage2_l3_hvfb[STAGE2_L3_ENTRIES]
+	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
+#endif
+
 #define S2_DESC_VALID_TABLE   0x3ull   /* bits[1:0] = 11 (table, or page @L3) */
 
 /* Non-leaf table descriptor: valid + table (bits[1:0]=11), output address
@@ -478,7 +486,80 @@ static void stage2_tlb_flush(void);
 #define HVFB_SIZE       0x800000UL     /* 8 MiB */
 #define HVFB_L2_IDX     ((unsigned)((HVFB_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
 #define HVFB_L2_COUNT   ((unsigned)(HVFB_SIZE >> STAGE2_L2_BLOCK_SHIFT))
+
+/* HV_FB_GUEST: share ONLY the front scanout buffer with the guest.
+ *
+ * The default above is right when the HV owns the screen: it draws the HUD there
+ * and a guest write would corrupt it. For a paravirtual DISPLAY the guest has to
+ * produce the pixels -- FreeBSD's simplefb(4) binds a `simple-framebuffer` DTB
+ * node, maps the region pmap_mapdev_attr(VM_MEMATTR_WRITE_COMBINING) and draws
+ * the vt console straight into it, which cannot work against an invalid stage-2
+ * entry.
+ *
+ * Granularity matters here and is the reason this is not a one-line change.
+ * One buffer is 1280*720*4 = 0x384000 = 3.52 MiB, so it is NOT a multiple of the
+ * 2 MiB stage-2 L2 block: sharing "the front buffer" cannot be expressed in
+ * blocks at all. Sharing the whole 8 MiB window instead would hand the guest
+ * BUF1 as well -- the buffer the HV flips to -- for no reason. So:
+ *
+ *   block 104  0x4D000000..0x4D200000   entirely inside BUF0  -> shared, 2 MiB block
+ *   block 105  0x4D200000..0x4D400000   holds the BUF0/BUF1 boundary at
+ *                                       0x4D384000 -> split into 4 KiB pages,
+ *                                       L3[0..387] shared, L3[388..511] invalid
+ *   block 106  0x4D400000..0x4D600000   BUF1            -> invalid
+ *   block 107  0x4D600000..0x4D800000   BUF1 tail/spare -> invalid
+ *
+ * Exactly one block needs an L3 table, and every index above is DERIVED from
+ * hv_addrmap.h's constants below rather than written out, so a mode change that
+ * moves the geometry cannot silently leave these stale. The _Static_asserts
+ * pin the arithmetic to the numbers in this comment.
+ *
+ * The L3 split reuses the technique stage2_build_mmio_tables() already applies
+ * to the UART and GICD pages -- same helpers, same shape, one more table.
+ *
+ * The DTB reservation stays either way. `no-map` keeps FreeBSD's page allocator
+ * off this DRAM; the stage-2 mapping is what lets simplefb's own accesses
+ * complete. Separate mechanisms, and a shared framebuffer needs both -- without
+ * the reservation the guest could allocate its own pages on top of the buffer it
+ * is scanning out.
+ *
+ * Isolation posture, stated rather than left implicit: the guest CAN reach BUF0
+ * and CANNOT reach BUF1, hv-image or hv-scratch. stage2_isolation_selfcheck()
+ * checks both directions instead of dropping the check.
+ *
+ * HV_FB_GUEST also suppresses hud_init()/hud_update() in main_dbg.c: a per-frame
+ * HUD refresh on CPU1 would overwrite the guest's console every frame, which
+ * would look exactly like "the guest's output never appears".
+ */
+#ifdef HV_FB_GUEST
+#define HVFB_GUEST_SHARED 1
+
+#define HVFB_BUF0_END   (HVMAP_FB_BUF0_BASE + HVMAP_FB_BUF_SIZE)
+/* Last L2 block wholly contained in BUF0, and the block holding the boundary. */
+#define HVFB_SPLIT_L2_IDX \
+	((unsigned)((HVFB_BUF0_END - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
+#define HVFB_SPLIT_BLOCK_BASE \
+	(STAGE2_DRAM_BASE + ((uint64_t)HVFB_SPLIT_L2_IDX << STAGE2_L2_BLOCK_SHIFT))
+/* First L3 entry in that block that is NO LONGER BUF0. */
+#define HVFB_SPLIT_L3_IDX \
+	((unsigned)((HVFB_BUF0_END - HVFB_SPLIT_BLOCK_BASE) >> STAGE2_L3_PAGE_SHIFT))
+
+_Static_assert(HVFB_L2_IDX == 104u,
+               "hv-fb no longer starts at L2 block 104 -- the block map in the "
+               "comment above is stale");
+_Static_assert(HVFB_SPLIT_L2_IDX == 105u,
+               "the BUF0/BUF1 boundary moved out of L2 block 105");
+_Static_assert(HVFB_SPLIT_L3_IDX == 388u,
+               "the BUF0/BUF1 boundary moved off L3 page 388");
+_Static_assert(HVFB_SPLIT_L3_IDX <= STAGE2_L3_ENTRIES,
+               "BUF0 end lies outside the split block entirely");
+_Static_assert(HVMAP_FB_BUF1_BASE == HVFB_BUF0_END,
+               "BUF1 no longer begins exactly where BUF0 ends -- sharing BUF0 by "
+               "page would leak part of BUF1 or hide part of BUF0");
+#else
+#define HVFB_GUEST_SHARED 0
 #endif
+#endif  /* HV_HDMI */
 
 /* Default XN for a freshly-built guest-DRAM leaf: 0 (executable — today's
  * behavior, and what every target still gets since STAGE2_WX_DYNAMIC
@@ -504,13 +585,43 @@ stage2_build_dram_table(uint64_t block_base)
 	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
 		if (block_base == STAGE2_DRAM_BASE &&
 		    (i == HVIMG_L2_IDX || i == HVSCR_L2_IDX
-#ifdef HV_HDMI
+#if defined(HV_HDMI) && !HVFB_GUEST_SHARED
 		     || (i >= HVFB_L2_IDX && i < HVFB_L2_IDX + HVFB_L2_COUNT)
 #endif
 		    )) {
 			stage2_l2_dram[i] = 0;   /* INVALID: HV image / scratch / framebuffer */
 			continue;
 		}
+
+#if defined(HV_HDMI) && HVFB_GUEST_SHARED
+		/* Front buffer shared with the guest, back buffer NOT. Blocks past
+		 * the boundary block are BUF1 and stay invalid; the boundary block
+		 * itself becomes a table so the split lands on a 4 KiB page. Blocks
+		 * wholly inside BUF0 need no special case -- they fall through to
+		 * the ordinary Normal-WB mapping below, which is exactly what a
+		 * shared framebuffer wants. */
+		if (block_base == STAGE2_DRAM_BASE &&
+		    i > HVFB_SPLIT_L2_IDX && i < HVFB_L2_IDX + HVFB_L2_COUNT) {
+			stage2_l2_dram[i] = 0;   /* INVALID: BUF1 / spare */
+			continue;
+		}
+		if (block_base == STAGE2_DRAM_BASE && i == HVFB_SPLIT_L2_IDX) {
+			for (unsigned j = 0; j < STAGE2_L3_ENTRIES; j++) {
+				if (j >= HVFB_SPLIT_L3_IDX) {
+					stage2_l3_hvfb[j] = 0;   /* INVALID: BUF1 */
+					continue;
+				}
+				uint64_t ppa = HVFB_SPLIT_BLOCK_BASE +
+				               (uint64_t)j * STAGE2_L3_PAGE_SIZE;
+				stage2_l3_hvfb[j] = stage2_page_desc(ppa,
+					S2_MEMATTR_NORMAL_WB, S2_SH_INNER,
+					/*xn=*/1);   /* framebuffer: never executable */
+			}
+			stage2_l2_dram[i] = stage2_table_desc(
+				(uint64_t)(uintptr_t)&stage2_l3_hvfb[0]);
+			continue;
+		}
+#endif
 		uint64_t pa = block_base + (uint64_t)i * STAGE2_L2_BLOCK_SIZE;
 		stage2_l2_dram[i] = stage2_l2_block_desc(pa,
 			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
@@ -989,18 +1100,33 @@ stage2_isolation_selfcheck(void)
 	uint32_t hvimg_f   = (uint32_t)(stage2_at_s12e1w(HVIMG_BASE) & 1u);
 	uint32_t hvscr_f   = (uint32_t)(stage2_at_s12e1w(HVSCR_BASE) & 1u);
 	uint32_t control_f = (uint32_t)(stage2_at_s12e1w(STAGE2_SELFTEST_IPA) & 1u);
-#ifdef HV_HDMI
-	/* When the HV drives the display, the framebuffer window is a third
-	 * excluded region and must be equally unreachable from the guest. */
-	uint32_t hvfb_f    = (uint32_t)(stage2_at_s12e1w(HVFB_BASE) & 1u);
+#if defined(HV_HDMI) && HVFB_GUEST_SHARED
+	/* Paravirtual display (HV_FB_GUEST): the posture is DELIBERATELY split, so
+	 * check both halves rather than dropping the check. BUF0 is shared with the
+	 * guest and must translate; BUF1 is the HV's own flip target and must still
+	 * fault. Testing only one of those would let the sharing edit silently open
+	 * the back buffer too -- which is the mistake this check exists to catch. */
+	uint32_t hvfb_f     = (uint32_t)(stage2_at_s12e1w(HVMAP_FB_BUF0_BASE) & 1u);
+	uint32_t hvfb1_f    = (uint32_t)(stage2_at_s12e1w(HVMAP_FB_BUF1_BASE) & 1u);
+	uint32_t hvfb_want  = 0u;   /* BUF0 REACHABLE on purpose */
+#elif defined(HV_HDMI)
+	/* HV owns the display: the framebuffer window is a third excluded region and
+	 * must be equally unreachable from the guest. */
+	uint32_t hvfb_f     = (uint32_t)(stage2_at_s12e1w(HVFB_BASE) & 1u);
+	uint32_t hvfb1_f    = 1u;   /* whole window carved; nothing separate to test */
+	uint32_t hvfb_want  = 1u;
 #else
-	uint32_t hvfb_f    = 1u;   /* not carved in this build; treat as "held" */
+	uint32_t hvfb_f     = 1u;   /* not carved in this build; treat as "held" */
+	uint32_t hvfb1_f    = 1u;
+	uint32_t hvfb_want  = 1u;
 #endif
 
-	/* Boundary holds iff every HV window faults (F=1) and the control DRAM
-	 * address still translates (F=0 — proves the check itself isn't just
-	 * faulting on everything). */
-	uint32_t pass = (hvimg_f == 1u && hvscr_f == 1u && hvfb_f == 1u &&
+	/* Boundary holds iff every HV window behaves as this build intends and the
+	 * control DRAM address still translates (F=0 — proves the check itself isn't
+	 * just faulting on everything). hvfb_want is 1 in every build except the
+	 * shared-display one, where BUF0 reachability IS the intended state. */
+	uint32_t pass = (hvimg_f == 1u && hvscr_f == 1u &&
+	                 hvfb_f == hvfb_want && hvfb1_f == 1u &&
 	                 control_f == 0u) ? 1u : 0u;
 
 	stg2_bc(14, 0x49534f4c);   /* "ISOL" */
@@ -1008,7 +1134,8 @@ stage2_isolation_selfcheck(void)
 	stg2_bc(16, hvscr_f);
 	stg2_bc(17, control_f);
 	stg2_bc(18, pass);
-	stg2_bc(10, hvfb_f);       /* framebuffer window unreachable (HV_HDMI) */
+	stg2_bc(10, hvfb_f);       /* BUF0 PAR.F: 1 = carved, 0 = shared on purpose */
+	stg2_bc(11, hvfb1_f);      /* BUF1 PAR.F: must be 1 in every build */
 	return (int)pass;
 }
 
