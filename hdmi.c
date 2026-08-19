@@ -264,6 +264,23 @@ static int wait_bits(uintptr_t addr, uint32_t mask, uint32_t want, uint32_t time
 #define DE_UI1_CFG0_TOP_LADDR (DE_UI1_BASE + 0x10)
 #define DE_UI1_OVL_SIZE       (DE_UI1_BASE + 0x88)
 
+/* UI channel layer stride is 0x20 (sun8i_ui_layer.h:
+ * SUN8I_MIXER_CHAN_UI_LAYER_ATTR(base, layer) = base + 0x20*layer). The HUD uses
+ * layer 0; the guest window uses layer 1. Taken from the reference driver rather
+ * than inferred from the CFG0 offsets above, because guessing a register stride is
+ * how you silently program a neighbouring layer. */
+#define DE_UI1_LAYER(n, r)    (DE_UI1_BASE + 0x20u * (unsigned)(n) + (r))
+#define DE_UI1_L_ATTR(n)      DE_UI1_LAYER(n, 0x00)
+#define DE_UI1_L_SIZE(n)      DE_UI1_LAYER(n, 0x04)
+#define DE_UI1_L_COORD(n)     DE_UI1_LAYER(n, 0x08)
+#define DE_UI1_L_PITCH(n)     DE_UI1_LAYER(n, 0x0C)
+#define DE_UI1_L_TOP_LADDR(n) DE_UI1_LAYER(n, 0x10)
+
+_Static_assert(DE_UI1_L_ATTR(0) == DE_UI1_CFG0_ATTR,
+               "layer-0 macros disagree with the existing CFG0 offsets");
+_Static_assert(DE_UI1_L_TOP_LADDR(0) == DE_UI1_CFG0_TOP_LADDR,
+               "layer-0 TOP_LADDR macro disagrees with CFG0");
+
 #define DE_VSU_REGS   (DE2_MUX1_BASE + 0x20000)
 #define DE_GSU1_REGS  (DE2_MUX1_BASE + 0x30000)
 #define DE_GSU2_REGS  (DE2_MUX1_BASE + 0x40000)
@@ -1055,6 +1072,51 @@ void hdmi_set_scanout_addr(uint32_t pa)
 }
 
 uint32_t hdmi_scanout_addr(void) { return g_scanout_addr; }
+
+/* ==================================================================== *
+ * hdmi_guestwin_enable() -- the guest's window, composited by the mixer.
+ *
+ * Turns on UI1 layer 1 over the HUD's guest-window rectangle, fetching from
+ * HDMI_GUESTWIN_PA in ordinary guest DRAM. See hdmi.h for why this is a second
+ * DE2 layer rather than a per-frame blit or a shared scanout buffer: zero copy is
+ * required, a rectangle is not expressible in 4 KiB stage-2 pages anyway, and
+ * doing it this way leaves the isolation boundary completely untouched -- the
+ * guest writes only its own memory.
+ *
+ * Both layers live in the SAME UI channel, so they composite inside the channel
+ * and feed the one blend pipe the HUD already set up. No blender reprogramming,
+ * no second pipe, no DE_BLD_ROUTE change -- which is exactly why layer 1 was
+ * chosen over the idle VI channel.
+ *
+ * Layer order within a UI channel is by index: layer 1 draws OVER layer 0, so the
+ * guest's window sits on top of the HUD without the HUD needing to leave a hole.
+ * ==================================================================== */
+int hdmi_guestwin_enable(void)
+{
+	/* Refuse if the pipeline never came up -- programming a layer into a dead
+	 * mixer would report success and show nothing, which is worse than an
+	 * error. g_timeout_latched is set by whichever bring-up stage gave up. */
+	if (g_timeout_latched != 0)
+		return -1;
+
+	wr32(DE_UI1_L_ATTR(HDMI_GUESTWIN_LAYER),
+	     DE2_UI_ATTR_EN | DE2_UI_ATTR_FMT(DE2_FORMAT_XRGB8888));
+	wr32(DE_UI1_L_SIZE(HDMI_GUESTWIN_LAYER),
+	     DE2_WH(HDMI_GUESTWIN_W, HDMI_GUESTWIN_H));
+	/* COORD is (y << 16) | x -- sun8i_mixer.h SUN8I_MIXER_COORD, same packing
+	 * as DE2_WH but WITHOUT the -1 bias, which is a trap worth naming. */
+	wr32(DE_UI1_L_COORD(HDMI_GUESTWIN_LAYER),
+	     ((uint32_t)HDMI_GUESTWIN_Y << 16) | (uint32_t)HDMI_GUESTWIN_X);
+	wr32(DE_UI1_L_PITCH(HDMI_GUESTWIN_LAYER), HDMI_GUESTWIN_STRIDE);
+	wr32(DE_UI1_L_TOP_LADDR(HDMI_GUESTWIN_LAYER), (uint32_t)HDMI_GUESTWIN_PA);
+
+	/* Same commit strobe every other mode-set write in this file uses. */
+	wr32(DE_GLB_DBUFF, 1);
+
+	bc_write(9, (uint32_t)HDMI_GUESTWIN_PA);
+	bc_write(10, ((uint32_t)HDMI_GUESTWIN_W << 16) | (uint32_t)HDMI_GUESTWIN_H);
+	return 0;
+}
 
 /* ==================================================================== *
  * hdmi_demo() -- the HUD skeleton: dark-blue clear, title bar, a border
