@@ -758,15 +758,43 @@ kload_build_modinfo(uint64_t dtb_src_pa, uint64_t dtb_dst_pa, uint64_t scratch_p
 	 * as lastaddr. Now that the tag numbers are corrected in kload.h, HOWTO
 	 * and KERNEND are fetched from their own distinct records again and
 	 * this can go back to a normal howto value. */
-	howto_val   = 0x800u | 0x1u;                    /* RB_VERBOSE | RB_SINGLE — TEMPORARY, one boot:
-	                                                * the on-disk /etc/fstab still points at
-	                                                * mmcsd0pX (aw_mmc naming); under virtio the
-	                                                * devices are vtbd0pX, so rc's fsck fails and
-	                                                * init soft-reboots the guest (whose warm
-	                                                * re-entry then hangs early — separate bug).
-	                                                * Boot single-user, `mount -uw /`, sed the
-	                                                * fstab to vtbd0, exit to multi-user; then
-	                                                * drop the 0x1 again. */
+	/* RB_VERBOSE (0x800) | RB_MULTIPLE (0x20000000).
+	 *
+	 * TWO CORRECTIONS, both verified against sys/sys/reboot.h in the matching
+	 * checkout rather than from memory.
+	 *
+	 * 1. The old value was `0x800u | 0x1u` and its comment called 0x1
+	 *    "RB_SINGLE". It is not. RB_SINGLE is 0x002; **0x001 is RB_ASKNAME**,
+	 *    "force prompt of device of root filesystem". So this hypervisor was
+	 *    asking the guest kernel for the interactive root prompt on every
+	 *    single boot -- vfs_mountroot.c:899, `if (boothowto & RB_ASKNAME)`.
+	 *
+	 *    That is where the `mountroot>` prompt in every boot came from. It was
+	 *    not a mount failure and not a GEOM timing problem: the kernel was
+	 *    doing exactly what it was told. This tree has console-poking
+	 *    automation (auto_mount_root(), see docs and the "automount must poke,
+	 *    not listen" note) built to answer a prompt we were requesting.
+	 *
+	 *    It also explains the older note further up this file -- "FreeBSD arm64
+	 *    ignored the MODINFOMD_HOWTO RB_SINGLE bit, always booting multi-user".
+	 *    The bit was never RB_SINGLE, so of course single-user never happened.
+	 *    arm64 honours HOWTO fine: machdep_boot.c:210,
+	 *    boothowto = MD_FETCH(preload_kmdp, MODINFOMD_HOWTO, int), in the same
+	 *    function that fetches the MODINFOMD_ENVP this loader already relies on.
+	 *
+	 * 2. RB_MULTIPLE (0x20000000) is now set, and is needed the moment anything
+	 *    gives the guest a second console. With a `simple-framebuffer` DTB node
+	 *    FreeBSD's simplefb(4) becomes the vt console; on a board with no
+	 *    keyboard the guest then blocks in vtterm_cngetc() forever and the
+	 *    serial console goes silent. RB_MULTIPLE keeps every console active, so
+	 *    vt draws on the monitor while the serial keeps input.
+	 *
+	 *    This is the ONLY route to RB_MULTIPLE on this configuration:
+	 *    `boot_multicons` as a kenv reaches boothowto only via
+	 *    boot_env_to_howto(), which FreeBSD calls from x86/xen/pv.c alone, and
+	 *    /chosen bootargs is parsed only `if (loader_envp == NULL)` -- and this
+	 *    loader always passes MODINFOMD_ENVP. See docs/guest-display.md. */
+	howto_val   = 0x800u | 0x20000000u;
 
 	if (!kload_put_rec(base, cap, &off, MODINFO_NAME, mod_name, (uint32_t)sizeof(mod_name)))
 		return 0;
@@ -808,6 +836,12 @@ uint64_t
 kload_kernel_end_pa(void)
 {
 	return kls.placed ? kls.kernel_end_pa : 0;
+}
+
+uint64_t
+kload_pa_base(void)
+{
+	return kls.placed ? kls.pa_base : 0;
 }
 
 /* ROADMAP B3 (crash forensics) accessors — see the big comment block above
