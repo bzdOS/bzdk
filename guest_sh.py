@@ -21,7 +21,14 @@ import sys
 import termios
 import time
 
-TTY = "/dev/ttyACM0"
+# The STABLE udev symlink, not /dev/ttyACM0. The board's CDC-ACM node renumbers
+# whenever USB re-enumerates -- observed live 2026-08-19 landing on ttyACM1 while
+# this module still opened ttyACM0 and failed with a bare
+# `OSError: [Errno 5] Input/output error`, which reads like a dead board or a
+# hardware fault rather than a wrong filename. loady_over_acm.py has always used
+# B.CHIMP_TTY for exactly this reason; this file was the last one hardcoding it.
+import bzd_board as _B
+TTY = _B.CHIMP_TTY
 PROMPT = b"# "
 
 
