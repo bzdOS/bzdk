@@ -94,7 +94,18 @@ void wdt_debug_kick(void)
 {
 }
 
-volatile uint32_t wdt_debug_hold;
+/* wdt_debug_hold used to need a stand-in definition here too (this file
+ * links instead of the real wdt.o, which owned the only linked instance of
+ * the symbol). It no longer does: wdt.h now #defines wdt_debug_hold as a
+ * macro over a fixed hv-scratch address (HVMAP_WDT_DEBUG_HOLD, hv_addrmap.h)
+ * rather than a plain global, so there is no linked symbol left to stand in
+ * for -- every reference (including smp.c's, which is why this file exists)
+ * resolves at compile time to a direct MMIO dereference, dead code on this
+ * target exactly like wdt_debug_kick() above (dbg_core_enable=0 means
+ * smp.c's debug-core branch that touches it never runs), and declaring
+ * storage for it here now would be a compile error: the name is a macro
+ * expanding to a pointer dereference, not an identifier a declaration can
+ * bind to. */
 
 /* --- dbgmon.c's board debugger tick-path service ---------------------------
  * Real dbgmon_service() answers the EMAC-attached `dbgmon.py`/hvdbg.py

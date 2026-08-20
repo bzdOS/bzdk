@@ -597,4 +597,55 @@ _Static_assert(HVMAP_WXDYN_BC + HVMAP_WXDYN_BC_SIZE <= 0x50100000UL,
                "dynamic W^X breadcrumb lane runs into el2_ncmap.c's "
                "non-cacheable DMA scratch window (SCRATCH_BASE 0x50100000)");
 
+/* ---- wdt.c debug-core reset gate (`wdt_debug_hold`) ----------------------
+ * wdt.c's SMP debug-core watchdog owner (see that file's "SMP debug-core
+ * watchdog ownership" section) has CPU1 unconditionally pet the HW WDOG
+ * every poll iteration UNLESS this word is nonzero -- the one documented way
+ * to force a clean reset over the network (CPU1 stops petting, the HW WDOG
+ * fires within its <=16 s window, board lands back at U-Boot).
+ *
+ * Used to be a plain BSS global (`extern volatile uint32_t wdt_debug_hold`),
+ * which meant setting it from off-board required `nm`-resolving its address
+ * out of the microkernel-dbg.elf file ON DISK -- exactly the build-vs-
+ * running-image skew trap hvdbg.py's wdt_reset() docstring already warns
+ * about for reboot_clean() (see that function). This flag had the identical
+ * exposure and simply hadn't been given a fixed address yet; fixed here so a
+ * host tool can set it with one `w <addr> <val>` MMIO poke, no ELF symbol
+ * table involved -- the same "fixed address, not a linked symbol" discipline
+ * HVMAP_DBGTOOLS_HOLD already established for the pause-before-entry gate
+ * above.
+ *
+ * wdt.h now #defines wdt_debug_hold as a macro over this address (see that
+ * header), so every existing call site (`wdt_debug_hold = 1;` /
+ * `if (wdt_debug_hold)` in wdt.c, bmc.c, usbacm.c, el2_exc.c, smp.c) keeps
+ * working completely unchanged -- no plain BSS storage backs the name
+ * anymore, so smp_qemu_stub.c no longer needs (or can have) its own
+ * definition of it either.
+ *
+ * Cross-core visibility needs no explicit cache maintenance here: CPU1
+ * writes this in response to a `w`/`bmc wdt hold` command and CPU0's
+ * wdt_pet() reads it on every EL2 trap, which is exactly the ordinary
+ * "cross-core-coherent... storage" this whole file's header already promises
+ * for a normal load/store within the ARM coherency domain. The `dc civac`
+ * convention used by the breadcrumb lanes elsewhere in this file is a WARM-
+ * RESET-survivability concern (surviving a reload with caches cold), not a
+ * cross-core one -- irrelevant here, since nothing needs this flag's value
+ * to survive the very reset it exists to trigger.
+ *
+ * No magic word: every caller only ever tests zero/nonzero (this is a
+ * control flag, not a breadcrumb lane a human inspects via `bc`/`md.l` for
+ * self-description). Placed a full 4 KiB page above HVMAP_VGICD_BC's end
+ * (0x50094040) per this file's own hygiene rule; confirmed clear by
+ * grepping the whole tree for `0x5009[0-9a-f]{4}` / `0x500a[0-9a-f]{4}`
+ * before picking it -- only HVMAP_SCANOUT_BC/HVMAP_WXDYN_BC/HVMAP_VGICD_BC
+ * matched, all below it. */
+#define HVMAP_WDT_DEBUG_HOLD       0x50095000UL
+#define HVMAP_WDT_DEBUG_HOLD_SIZE  0x10UL   /* one word used, room to grow */
+
+_Static_assert(HVMAP_WDT_DEBUG_HOLD >= HVMAP_VGICD_BC + HVMAP_VGICD_BC_SIZE,
+               "wdt debug-hold flag overlaps the GICD breadcrumb lane");
+_Static_assert(HVMAP_WDT_DEBUG_HOLD + HVMAP_WDT_DEBUG_HOLD_SIZE <= 0x50100000UL,
+               "wdt debug-hold flag runs into el2_ncmap.c's non-cacheable "
+               "DMA scratch window (SCRATCH_BASE 0x50100000)");
+
 #endif /* HV_ADDRMAP_H */

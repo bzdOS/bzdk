@@ -10,6 +10,9 @@
 #ifndef BZDOS_WDT_H
 #define BZDOS_WDT_H
 
+#include <stdint.h>
+#include "hv_addrmap.h"   /* HVMAP_WDT_DEBUG_HOLD: fixed address for wdt_debug_hold */
+
 /* Arm the watchdog for a full-system reset after ~16 s (verified working on
  * this board). Starts the countdown immediately. */
 void wdt_arm(void);
@@ -33,6 +36,15 @@ void wdt_disarm(void);
  * stays resident/inspectable while CPU1 lives. Set wdt_debug_hold != 0 over
  * EMAC to release the pet and let the HW WDOG reset the board. See wdt.c. */
 void wdt_debug_kick(void);
-extern volatile uint32_t wdt_debug_hold;
+
+/* Fixed-address flag, NOT a linked symbol: a host tool sets this with a
+ * single `w <addr> <val>` MMIO poke (HVMAP_WDT_DEBUG_HOLD, hv_addrmap.h) --
+ * no `nm`-resolved symbol address, and therefore no build-vs-running-image
+ * skew risk (see hv_addrmap.h's HVMAP_WDT_DEBUG_HOLD comment for the full
+ * rationale, which mirrors HVMAP_DBGTOOLS_HOLD's existing precedent). The
+ * macro name matches the old plain-global identifier exactly so every
+ * existing call site (`wdt_debug_hold = 1;` / `if (wdt_debug_hold)`) keeps
+ * compiling completely unchanged; no BSS storage backs the name anymore. */
+#define wdt_debug_hold (*(volatile uint32_t *)HVMAP_WDT_DEBUG_HOLD)
 
 #endif /* BZDOS_WDT_H */

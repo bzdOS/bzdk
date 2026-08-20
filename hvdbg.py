@@ -479,6 +479,31 @@ class HV:
         for pa, val in B.WDOG_ARM_SEQUENCE:
             self.write_word(pa, val)
 
+        # Arming the WDOG from outside used to be FUTILE on its own: CPU1's
+        # debug-core loop pets it unconditionally every poll iteration
+        # (wdt_debug_kick(), wdt.c) and restarts it before the window above
+        # can ever elapse -- confirmed live 2026-08-18 (see the failure
+        # message below, kept as documentation of that measurement). wdt.c's
+        # own comment names the supported fix: set wdt_debug_hold != 0 so
+        # CPU1 stops petting (wdt_pet() on CPU0's side honors it too), and
+        # the HW WDOG then fires within its own <=16s window on its own,
+        # with no further help needed from the sequence above.
+        #
+        # That flag now has a FIXED address (HVMAP_WDT_DEBUG_HOLD,
+        # hv_addrmap.h / WDT_DEBUG_HOLD_PA, bzd_board.py) instead of being a
+        # plain linked global -- exactly the same "no nm-resolved symbol, no
+        # build-vs-running-image skew" property this method's fast path
+        # lacked and its MMIO default path exists to route around. Written
+        # LAST, after the disconnect + arm sequence above, so a WDOG that
+        # fires the instant CPU1 stops petting can never race ahead of the
+        # USB pull-up drop (see this method's own docstring on why that
+        # order is load-bearing).
+        #
+        # UNTESTED ON HARDWARE: this write could not be exercised on the
+        # real board for this change (no access to the live session) --
+        # verify on the next real reset attempt.
+        self.write_word(B.WDT_DEBUG_HOLD_PA, 1)
+
         # CONFIRM IT ACTUALLY HAPPENED. This path used to arm the WDOG and
         # return None -- no verification, no return value -- so a dropped EMAC
         # write produced a silent no-op indistinguishable from success. That is
@@ -497,21 +522,27 @@ class HV:
             if not self.read_words(B.HVMAP_GICT_BC if hasattr(B, "HVMAP_GICT_BC")
                                    else 0x50000800, 1):
                 return True          # stopped answering -> the reset landed
-        print("wdt_reset: WDOG armed but the board is STILL ANSWERING after "
-              "25s -- the reset did NOT happen.\n"
-              "  CAUSE (measured 2026-08-18, not a guess): CPU1 pets the HW "
-              "WDOG unconditionally on every poll iteration (wdt_debug_kick(), "
-              "wdt.c), so arming the watchdog from OUTSIDE is futile -- CPU1 "
-              "restarts it before it can fire. wdt.c's own comment states the "
-              "supported procedure: set wdt_debug_hold != 0 so CPU1 STOPS "
-              "petting, and the WDOG then fires within its <=16s window.\n"
-              "  That flag is currently only READABLE from here (bmc.c exports "
-              "it); it has no fixed address in hv_addrmap.h, so setting it over "
-              "EMAC would need an nm-resolved address -- exactly the build-skew "
-              "trap this method's own docstring exists to avoid. Until it gets "
-              "a fixed window, reset via the serial path: stop the resident "
-              "chimpd.py BY PID (never pkill -f), run reliable_load.py "
-              "--cycles 1, restart chimpd.",
+        print("wdt_reset: WDOG armed AND wdt_debug_hold=1 written to "
+              f"0x{B.WDT_DEBUG_HOLD_PA:x}, but the board is STILL ANSWERING "
+              "after 25s -- the reset did NOT happen.\n"
+              "  BACKGROUND (measured 2026-08-18): CPU1 pets the HW WDOG "
+              "unconditionally on every poll iteration (wdt_debug_kick(), "
+              "wdt.c), so arming the watchdog from OUTSIDE is futile by "
+              "itself -- CPU1 restarts it before it can fire. wdt.c's own "
+              "comment states the supported procedure: set wdt_debug_hold "
+              "!= 0 so CPU1 STOPS petting, and the WDOG then fires within "
+              "its <=16s window. That flag now HAS a fixed address "
+              "(HVMAP_WDT_DEBUG_HOLD) and this method writes it -- so if "
+              "you're seeing this message, either the write itself was "
+              "dropped (retry), or CPU1 is not reading it for some other "
+              "reason (e.g. CPU1 itself is wedged and not polling at all, "
+              "in which case its own dead-man fallback -- wdt.c: if CPU1 "
+              "stops calling wdt_debug_kick() at all, nothing re-arms the "
+              "HW WDOG either, so it should still fire on its own -- may "
+              "simply need more time than this 25s window allows).\n"
+              "  If this keeps failing, fall back to the serial path: stop "
+              "the resident chimpd.py BY PID (never pkill -f), run "
+              "reliable_load.py --cycles 1, restart chimpd.",
               file=sys.stderr)
         return False
 

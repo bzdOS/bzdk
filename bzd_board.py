@@ -140,6 +140,15 @@ VBLK_BC_PA = 0x50020000          # virtio-blk breadcrumbs (== hv_addrmap.h's
                                   # (0x56424b31) once the virtio-blk build ran
 VBLK_MAGIC = 0x56424b31           # "VBK1" little-endian
 
+WDT_DEBUG_HOLD_PA = 0x50095000   # wdt.c's debug-core reset gate (== hv_addrmap.h's
+                                  # HVMAP_WDT_DEBUG_HOLD). A single `w` to this
+                                  # address stops CPU1's unconditional WDOG pet
+                                  # (wdt_debug_kick()/wdt_pet(), see wdt.c) so the
+                                  # HW WDOG fires within its <=16s window --
+                                  # fixed address on purpose, so hvdbg.py's
+                                  # wdt_reset() never needs an nm-resolved symbol
+                                  # (see that function's docstring).
+
 # ── low-SRAM breadcrumb block (0x00018xxx) — chimpd.py-only today ─────────
 # Distinct from the DRAM hv-scratch block above. See the discrepancy note at
 # the top of this file: chimpd.py actually polls GICT_BC_SRAM_PA (not

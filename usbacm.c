@@ -8,6 +8,7 @@
 #include "usbacm.h"
 #include "musb.h"
 #include "vconsole.h"
+#include "wdt.h"        /* wdt_debug_hold -- fixed-address macro, see wdt.h */
 
 /* Bounded per-poll drain limits, so a single usbacm_poll() call can never
  * spin unboundedly even if one side is producing faster than the other can
@@ -43,7 +44,6 @@
  * machine over the RX byte stream, byte-at-a-time, O(1) per byte. */
 static const uint8_t bg_seq[] = { 0x00, '~', 'B', 'Z', 'R', 'S', 'T', 0x00 };
 static uint32_t bg_pos;
-extern volatile uint32_t wdt_debug_hold;   /* wdt.c */
 
 static void usbacm_breakglass(uint8_t b)
 {

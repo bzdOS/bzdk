@@ -39,10 +39,14 @@ extern void console_flush(void);
 /* reboot.c — clean USB-gadget disconnect + WDOG reboot to U-Boot (noreturn). */
 extern void reboot_clean(void);
 
-/* wdt.c — dead-man watchdog controls + the debug-core reset gate. */
+/* wdt.c — dead-man watchdog controls + the debug-core reset gate.
+ * wdt_debug_hold is a fixed-address macro (HVMAP_WDT_DEBUG_HOLD, see
+ * wdt.h/hv_addrmap.h), not a plain linked global anymore -- pulling in
+ * wdt.h (rather than a local `extern volatile uint32_t wdt_debug_hold;`)
+ * is what makes that macro visible here. */
+#include "wdt.h"
 extern void wdt_arm(void);
 extern void wdt_disarm(void);
-extern volatile uint32_t wdt_debug_hold;   /* set !=0 => CPU1 stops petting => HW WDOG fires */
 
 /* vconsole.c — guest virtual-UART bridge rings. */
 extern void vconsole_rx_push(uint8_t c);        /* host -> guest keystroke     */
