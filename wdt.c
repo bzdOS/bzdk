@@ -78,6 +78,25 @@ wdt_arm(void)
     wdt_window_ticks  = f * (uint64_t)WDT_TIMEOUT_S;
     wdt_last_progress = rd_cntpct();   /* treat arm time as fresh progress */
 
+    /* CLEAR THE HOLD FLAG. It lives at a FIXED ADDRESS in hv-scratch DRAM
+     * (HVMAP_WDT_DEBUG_HOLD), and DRAM survives the warm reset the WDOG
+     * performs -- so a hold, whose entire purpose is "stop petting so the
+     * watchdog fires once", used to survive the very reset it asked for. Every
+     * generation after it then read hold=1, never petted, and died at the 16 s
+     * window: a self-sustaining reset loop that no reload could break, because
+     * nothing in any build cleared this word.
+     *
+     * That is not hypothetical -- el2_exc.c's reboot_clean/dbg_clean_reset paths
+     * SET this flag deliberately on their way out, so an ordinary
+     * reliable_load.py cycle armed the trap. Observed 2026-08-20: after one such
+     * reload the board reset every 15-16 s for over an hour, across four
+     * different images, looking exactly like a hypervisor regression.
+     *
+     * A hold is a statement about the CURRENTLY RUNNING generation, so honouring
+     * it past the reset it caused is wrong on its own terms. Set it again over
+     * the net (bmc `wdt hold`) whenever a fresh one is wanted. */
+    wdt_debug_hold = 0u;
+
     WDOG_CFG  = WDOG_CFG_RESET_SYS;
     WDOG_MODE = WDOG_MODE_16S_EN;
     WDOG_CTRL = WDOG_CTRL_RESTART;      /* start counting from full 16 s interval */
