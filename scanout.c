@@ -64,6 +64,8 @@ struct scanout_dev {
 	uint32_t front_index;
 	uint32_t flip_count;
 	uint32_t reject_count;
+	uint32_t guestwin_count;
+	uint32_t guestwin_reject;
 };
 
 static struct scanout_dev g_scan;
@@ -120,6 +122,8 @@ static uint32_t scanout_reg_read(const struct scanout_dev *d, uint32_t off)
 	case SCANOUT_R_FRONT_INDEX:  return d->front_index;
 	case SCANOUT_R_FLIP_COUNT:   return d->flip_count;
 	case SCANOUT_R_REJECT_COUNT: return d->reject_count;
+	case SCANOUT_R_GUESTWIN_COUNT:  return d->guestwin_count;
+	case SCANOUT_R_GUESTWIN_REJECT: return d->guestwin_reject;
 	default:                     return 0u;
 	}
 }
@@ -151,12 +155,104 @@ static int scanout_decide_flip(struct scanout_dev *d, uint32_t requested,
 	return 1;
 }
 
-/* Register WRITE. Only FLIP_REQUEST does anything; every other offset
+/* Is `pa` a physical base the guest is ALLOWED to put on the screen?
+ *
+ * The display engine is a DMA reader with no IOMMU in front of it, so an address
+ * accepted here is displayed verbatim -- an unchecked value would let the guest
+ * read hypervisor memory out through the monitor. That is an information leak
+ * rather than a crash, which is the sort that goes unnoticed, so this is a
+ * whitelist and not a blacklist of the obvious mistakes.
+ *
+ * Requirements, all of them:
+ *   - the WHOLE extent (stride * height, the bytes the mixer will fetch) lies
+ *     inside guest DRAM. Checking only the base would let the guest place a
+ *     buffer so that it runs off the end into whatever follows.
+ *   - it overlaps none of the HV's three carve-outs: hv-image, hv-scratch, and
+ *     hv-fb (the HV's own scanout buffers -- BUF1 in particular is private, and
+ *     stage2.c's isolation self-check asserts it stays that way).
+ *   - 8-byte aligned, which DE2 requires of a layer base anyway.
+ *
+ * Pure arithmetic on the passed values, no MMIO and no globals, so
+ * test_scanout_regs.c can mirror it the way it already mirrors
+ * scanout_decide_flip().
+ */
+/* Guest DRAM and the HV's carve-outs, mirrored here rather than #included:
+ * stage2.c defines HVIMG_BASE/HVSCR_BASE as file-local macros, and hv_addrmap.h
+ * documents the same numbers. Mirroring is this tree's convention for exactly
+ * this situation, so the _Static_asserts below tie the copies to the header's
+ * values and a divergence fails the build instead of silently opening a hole. */
+#define SCANOUT_GUEST_DRAM_BASE  0x40000000ULL
+#define SCANOUT_GUEST_DRAM_END   0x80000000ULL   /* 1 GiB DRAM */
+#define SCANOUT_HVIMG_BASE       0x42000000ULL   /* DTB hv-image@42000000  */
+#define SCANOUT_HVIMG_SIZE       0x00200000ULL   /* 2 MiB */
+#define SCANOUT_HVSCR_BASE       0x50000000ULL   /* DTB hv-scratch@50000000 */
+#define SCANOUT_HVSCR_SIZE       0x00200000ULL   /* 2 MiB */
+/* hv_addrmap.h has no symbol for the scratch window's base (it is documented in
+ * that file's map comment only), so tie the mirror to a real lane INSIDE it: if
+ * HVMAP_VGICD_BC ever stops falling within the range this validates against, the
+ * range is wrong and the guest could be handed an address inside hv-scratch. */
+_Static_assert((uint64_t)HVMAP_VGICD_BC >= SCANOUT_HVSCR_BASE &&
+               (uint64_t)HVMAP_VGICD_BC <  SCANOUT_HVSCR_BASE + SCANOUT_HVSCR_SIZE,
+               "a known hv-scratch lane falls outside the hv-scratch range this "
+               "file rejects -- the range is stale");
+_Static_assert(SCANOUT_GUEST_DRAM_BASE <= (uint64_t)HVMAP_FB_BASE &&
+               (uint64_t)HVMAP_FB_BASE < SCANOUT_GUEST_DRAM_END,
+               "hv-fb is not inside the guest DRAM window this validates against");
+
+int scanout_addr_allowed(uint32_t pa, uint32_t stride, uint32_t height)
+{
+	uint64_t base = (uint64_t)pa;
+	uint64_t len  = (uint64_t)stride * (uint64_t)height;
+	uint64_t end;
+
+	if (stride == 0u || height == 0u)
+		return 0;
+	if ((base & 7u) != 0u)
+		return 0;
+
+	end = base + len;
+	if (end <= base)                       /* wrapped */
+		return 0;
+	if (base < SCANOUT_GUEST_DRAM_BASE || end > SCANOUT_GUEST_DRAM_END)
+		return 0;
+
+	/* Overlap test against each HV region: [base,end) vs [r,r+size). */
+#define SCANOUT_OVERLAPS(r, sz) \
+	(base < ((uint64_t)(r) + (uint64_t)(sz)) && ((uint64_t)(r)) < end)
+	if (SCANOUT_OVERLAPS(SCANOUT_HVIMG_BASE, SCANOUT_HVIMG_SIZE))
+		return 0;
+	if (SCANOUT_OVERLAPS(SCANOUT_HVSCR_BASE, SCANOUT_HVSCR_SIZE))
+		return 0;
+	if (SCANOUT_OVERLAPS(HVMAP_FB_BASE, HVMAP_FB_WINDOW_SIZE))
+		return 0;
+#undef SCANOUT_OVERLAPS
+	return 1;
+}
+
+/* Register WRITE. Only FLIP_REQUEST and GUESTWIN_ADDR do anything; every other offset
  * (including unknown ones) is silently ignored — matches vblk/vnet's own
  * "write to a read-only/unknown register is a no-op, not a fault" policy. */
 static void scanout_reg_write(struct scanout_dev *d, uint32_t off, uint32_t val)
 {
 	uint32_t new_pa;
+
+	if (off == SCANOUT_R_GUESTWIN_ADDR) {
+		/* The GUEST WINDOW's geometry, not d->stride/d->height -- those
+		 * describe the HUD framebuffer this device scans out, which is a
+		 * different and much larger surface. Validating the wrong extent
+		 * would reject perfectly good buffers that sit near the top of
+		 * guest DRAM. */
+		if (scanout_addr_allowed(val, HDMI_GUESTWIN_STRIDE,
+		    HDMI_GUESTWIN_H)) {
+			hdmi_guestwin_set_addr(val);
+			d->guestwin_count++;
+			scan_bc(9, d->guestwin_count);
+		} else {
+			d->guestwin_reject++;
+			scan_bc(10, d->guestwin_reject);
+		}
+		return;
+	}
 
 	if (off != SCANOUT_R_FLIP_REQUEST)
 		return;

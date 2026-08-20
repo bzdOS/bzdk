@@ -344,6 +344,21 @@ _Static_assert(HDMI_GUESTWIN_STRIDE % 64u == 0u,
  * Idempotent: safe to call again to move/resize the window. */
 int hdmi_guestwin_enable(void);
 
+/* Repoint the guest-window layer at a different physical buffer, and commit.
+ *
+ * This is what makes zero-copy presentation possible: the guest renders into a BO
+ * that lima allocated (the path lima is actually designed for -- render to a
+ * gbm_surface, eglSwapBuffers, lock the front buffer) and then tells the HV where
+ * that buffer is, instead of trying to render into a buffer the HV allocated,
+ * which lima writes exactly once and then ignores (see
+ * bsdOS/hal/bzfb/tests/README-zerocopy.md for the nine experiments that
+ * established that).
+ *
+ * `pa` is NOT trusted. The caller (scanout.c) validates it against guest DRAM and
+ * the HV's own carve-outs before calling; this function only programs the layer.
+ * Returns 0 on success, -1 if the display never came up. */
+int hdmi_guestwin_set_addr(uint32_t pa);
+
 #define BC_HDMI_BASE   0x50011800UL
 #define BC_HDMI_MAGIC  0x48444D49u /* "HDMI" */
 

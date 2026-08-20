@@ -1109,6 +1109,22 @@ uint32_t hdmi_scanout_addr(void) { return g_scanout_addr; }
  * Layer order within a UI channel is by index: layer 1 draws OVER layer 0, so the
  * guest's window sits on top of the HUD without the HUD needing to leave a hole.
  * ==================================================================== */
+int hdmi_guestwin_set_addr(uint32_t pa)
+{
+	if (g_timeout_latched != 0)
+		return -1;
+
+	/* Only TOP_LADDR moves. Geometry, pitch, format and position stay as
+	 * hdmi_guestwin_enable() set them, because the guest is presenting a
+	 * buffer of the SAME dimensions -- it queried them from the same DTB node
+	 * the mixer layer was configured from. Reprogramming the whole layer here
+	 * would be a second place for that geometry to drift. */
+	wr32(DE_UI1_L_TOP_LADDR(HDMI_GUESTWIN_LAYER), pa);
+	wr32(DE_GLB_DBUFF, 1);   /* same commit strobe as every mode-set here */
+	bc_write(11, pa);
+	return 0;
+}
+
 int hdmi_guestwin_enable(void)
 {
 	/* Refuse if the pipeline never came up -- programming a layer into a dead
