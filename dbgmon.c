@@ -84,6 +84,12 @@ extern void bmc_dispatch(char **argv, int argc, struct el2_frame *frame);
 extern void dbgtools_hold_set(void);
 extern void dbgtools_release_set(void);
 
+/* fbdump.c — raw-Ethernet framebuffer streamer (ethertype 0x88B9). Extern
+ * decl only, per this file's self-contained discipline (no fbdump.h
+ * include). See fbdump.h for the framing and why this exists instead of `d`
+ * or netcon. */
+extern int fbdump_send(uint32_t pa, uint32_t len);
+
 /* ------------------------------------------------------------------ *
  * Tiny freestanding I/O + string helpers (mirrors repl.c's style, but is
  * an independent copy -- dbgmon.c does not include or call repl.c).
@@ -1160,6 +1166,30 @@ static void exec_line(char *line, struct el2_frame *frame)
 			return;
 		}
 		cmd_dump(a0, (uint32_t)a1);
+		return;
+	}
+	if (streq(cmd, "fbdump")) {
+		/* Stream a raw region out over ethertype 0x88B9 for the host to
+		 * reassemble -- see fbdump.h for why neither `d`, netcon nor
+		 * coredump can carry a framebuffer. Fire-and-forget: gaps are
+		 * the host's problem, and it re-requests them as narrower
+		 * ranges. */
+		int r;
+
+		if (nt < 3 || !parse_hex(tok[1], &a0) || !parse_hex(tok[2], &a1)) {
+			err("usage: fbdump <addr> <len>");
+			return;
+		}
+		r = fbdump_send((uint32_t)a0, (uint32_t)a1);
+		if (r < 0) {
+			cputs(r == -1 ? "fbdump: outside guest DRAM\r\n" :
+			      r == -2 ? "fbdump: too large\r\n" :
+					"fbdump: zero length\r\n");
+			return;
+		}
+		cputs("fbdump: frames=");
+		print_hex64((uint64_t)r);
+		cputs("\r\n");
 		return;
 	}
 	if (streq(cmd, "gva")) {
