@@ -55,10 +55,6 @@
 static uint64_t wdt_last_progress;   /* CNTPCT at the last observed progress   */
 static uint64_t wdt_window_ticks;    /* WDT_TIMEOUT_S expressed in counter ticks */
 
-/* Defined further down (SMP debug-core watchdog ownership section); wdt_pet()
- * below now honors it too, so it must be visible here. */
-extern volatile uint32_t wdt_debug_hold;
-
 static inline uint64_t rd_cntpct(void)
 {
     uint64_t v;
@@ -128,8 +124,15 @@ wdt_disarm(void)
  * net): CPU1 then stops petting and the HW WDOG fires within its ≤16 s window,
  * resetting to U-Boot (chimpd reloads). If CPU1 itself ever dies, petting stops
  * on its own and the same ≤16 s HW fire recovers the board — so the catastrophic
- * case is still covered automatically. */
-volatile uint32_t wdt_debug_hold;    /* set !=0 over EMAC to allow a reset */
+ * case is still covered automatically.
+ *
+ * wdt_debug_hold is a FIXED-ADDRESS flag (HVMAP_WDT_DEBUG_HOLD, hv_addrmap.h),
+ * #defined as a macro in wdt.h — not a plain BSS global anymore. That is what
+ * makes "a single memory write over the net" literally true: a host tool can
+ * `w <addr> <val>` it directly, with no `nm`-resolved symbol address and
+ * therefore no risk of writing to where a stale on-disk ELF THINKS the symbol
+ * lives while a different build is actually running (see hv_addrmap.h's
+ * HVMAP_WDT_DEBUG_HOLD comment and hvdbg.py's wdt_reset()). */
 
 void
 wdt_debug_kick(void)

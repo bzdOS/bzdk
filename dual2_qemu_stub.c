@@ -14,12 +14,15 @@
  * why wdt.o is safe and already-proven portable under QEMU: only
  * wdt_note_progress() is ever reachable, a plain CNTPCT timestamp write,
  * never wdt_pet()/wdt_init(), which are the parts that poke the real A64
- * WDOG). smp_qemu_stub.c ALSO defines wdt_debug_kick()/wdt_debug_hold --
- * linking both would be a duplicate-symbol error. This file therefore
- * provides every symbol smp_qemu_stub.c does EXCEPT those two, which the
- * REAL wdt.o already supplies (dead code on this target either way,
- * dbg_core_enable=0 -- see main_dual2_qemu.c -- means CPU1's debug-core
- * branch that would call wdt_debug_kick() never runs).
+ * WDOG). smp_qemu_stub.c ALSO defines wdt_debug_kick() -- linking both would
+ * be a duplicate-symbol error. This file therefore provides every symbol
+ * smp_qemu_stub.c does EXCEPT that one, which the REAL wdt.o already
+ * supplies (dead code on this target either way, dbg_core_enable=0 -- see
+ * main_dual2_qemu.c -- means CPU1's debug-core branch that would call
+ * wdt_debug_kick() never runs). wdt_debug_hold itself is no longer a linked
+ * symbol at all (wdt.h #defines it as a fixed hv-scratch-address macro, see
+ * hv_addrmap.h's HVMAP_WDT_DEBUG_HOLD), so it was never a third thing either
+ * file needed to provide.
  *
  * Freestanding: <stdint.h> + the real project headers whose prototypes
  * these bodies must match exactly (musb.h, emac.h, dbgmon.h, usbacm.h,
