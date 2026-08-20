@@ -881,6 +881,24 @@ static void stage_phy(int phy_div)
 	phy_init();
 	phy_set(HDMI_MODE_PIXEL_CLOCK_HZ, phy_div);
 
+	/* Confirm PHY_STATUS bit7 (lock) actually comes up for THIS mode's
+	 * real PLL config, instead of only ever snapshotting it for the
+	 * breadcrumb. Before this, the only bounded wait_bits() on bit7 in
+	 * the whole file ran inside phy_init() -- BEFORE phy_set() reprograms
+	 * PHY_PLL/PHY_CLK for the actual target pixel clock -- so "hdmi_init()
+	 * reached stage 5" and "the PHY never locked at the mode we asked for"
+	 * were indistinguishable in the breadcrumb (word[1] would read 5/PHY
+	 * either way; only a live PHY_STATUS re-read after the fact caught the
+	 * 720p->1080p PHY lock failure that motivated this file's own historical
+	 * note, see hdmi.h). Bounded the same way every other wait in this file
+	 * is (timer.h, never iteration-based); a miss latches the existing
+	 * HDMI_STAGE_TIMEOUT/word[4]=HDMI_STAGE_PHY path, it does not add a new
+	 * failure mode. 50ms is generous slack on top of phy_set()'s own
+	 * internal settle delays (already up to 100-200ms per branch above), so
+	 * this costs ~0 extra time in the confirmed-working 720p case. */
+	if (!wait_bits(PHY_STATUS, 0x80u, 0x80u, 50000))
+		bc_timeout(HDMI_STAGE_PHY);
+
 	/* hdmi_enable_video_path() (dw_hdmi.c:701-744): control-period
 	 * durations, TMDS channel preambles, flow control = CSC bypass, then
 	 * enable pixel clock + TMDS clock (no CSC, no audio in v1). */
@@ -1162,7 +1180,22 @@ void hdmi_demo(void)
 		fb_str(x, y, "HDMI_BC.timeout = 0x", 0xFFFFFF00u, 0xFF001030u);
 		fb_hex(x + 168, y, bc[4], 8, 0xFFFFFF00u, 0xFF001030u);
 		y += 16;
-		fb_str(x, y, "mode: 1920x1080@60  pixclk=148.5MHz", 0xFFA0FFA0u, 0xFF001030u);
+		/* Built from the ACTUAL compiled-in mode constants (not a hardcoded
+		 * string) so this line can never go stale again the way the old
+		 * fixed "1920x1080@60 pixclk=148.5MHz" text did after the mode was
+		 * reverted to 720p -- it kept claiming a 1080p signal that was
+		 * never actually on the wire. */
+		fb_str(x, y, "mode: ", 0xFFA0FFA0u, 0xFF001030u);
+		x = fb_dec(x + 48, y, (uint64_t)w, 0xFFA0FFA0u, 0xFF001030u);
+		fb_str(x, y, "x", 0xFFA0FFA0u, 0xFF001030u);
+		x = fb_dec(x + 8, y, (uint64_t)h, 0xFFA0FFA0u, 0xFF001030u);
+		fb_str(x, y, "@60  pixclk=", 0xFFA0FFA0u, 0xFF001030u);
+		x = fb_dec(x + 96, y, (uint64_t)(HDMI_MODE_PIXEL_CLOCK_HZ / 1000000u),
+			   0xFFA0FFA0u, 0xFF001030u);
+		fb_str(x, y, ".", 0xFFA0FFA0u, 0xFF001030u);
+		x = fb_dec(x + 8, y, (uint64_t)((HDMI_MODE_PIXEL_CLOCK_HZ / 100000u) % 10u),
+			   0xFFA0FFA0u, 0xFF001030u);
+		fb_str(x, y, "MHz", 0xFFA0FFA0u, 0xFF001030u);
 	}
 
 	fb_flush();

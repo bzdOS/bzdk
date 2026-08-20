@@ -63,9 +63,9 @@
 #define HDMI_FB_BASE     0x4D000000UL
 
 /* ------------------------------------------------------------------ *
- * Fixed video mode: 1280x720@60, CEA-861 mode 4 (VIC 4). Pixel clock
- * 74.25 MHz (TMDS 742.5 Mbps). Sync polarities both POSITIVE (active-high)
- * per the CEA-861 mode-4 spec.
+ * Fixed video mode: 1280x720@60, CEA-861 mode 4 (VIC 4) by default. Pixel
+ * clock 74.25 MHz (TMDS 742.5 Mbps). Sync polarities both POSITIVE
+ * (active-high) per the CEA-861 mode-4 spec.
  *
  * WHY 720p not 1080p (2026-07-25): the 1080p bump (148.5 MHz, PHY PLL
  * divider path "2") never locked the DWC-HDMI PHY on real hardware — read
@@ -73,10 +73,55 @@
  * up, i.e. hdmi_init() timed out at the PHY stage and NO signal reached the
  * monitor. 720p (74.25 MHz, divider path "4") is the timing this driver was
  * actually "confirmed working to scanout stage 6 on the physical monitor".
- * Re-fixing the 1080p PHY PLL config is a separate follow-up; 720p is the
- * mode that produces a real signal today. Framebuffer 1280x720x4 = 3.7 MiB
- * still fits the 8 MiB hv-fb reservation.
+ *
+ * 2026-08-20 follow-up (docs/hdmi-1080p-phy.md has the full writeup): a
+ * register-level audit of stage_phy()/phy_set()'s "case 2" branch (the
+ * bucket 74.25 < pixclk <= 148.5 MHz selects) against the mainline Linux
+ * sun4i DRM driver (drivers/gpu/drm/sun4i/sun8i_hdmi_phy.c, same PHY
+ * register block, symbolic field names) found the ported magic constants
+ * decode to an EXACT, bit-for-bit match of upstream's validated 148.5 MHz
+ * analog-tuning table — if anything, a closer match than "case 4"'s own
+ * numbers (the ones 720p already uses successfully) get to *their* bucket.
+ * That is evidence AGAINST a fixable register-recipe bug in this file for
+ * 1080p specifically; the doc lays out what was checked and why a real
+ * hardware/board-level bandwidth limit at the doubled 1.485 Gbps TMDS rate
+ * remains the leading open explanation. NOT re-verified on real hardware
+ * since — this file cannot touch the board itself.
+ *
+ * Given that, the correct CEA-861 mode-16 (1920x1080@60) timing is wired up
+ * here as an EXPLICIT OPT-IN: build with `-DHDMI_MODE_1080P` to select it.
+ * Building WITHOUT that define (the default, and every existing build
+ * target) reproduces the 720p constants below byte-for-byte — this block
+ * is not a behavioural change to the hardware-verified path. Framebuffer
+ * 1280x720x4 = 3.7 MiB fits the 8 MiB hv-fb reservation in both cases
+ * (1920x1080x4 = 7.9 MiB also still fits, see HDMI_FB_BASE's own comment).
  * ------------------------------------------------------------------ */
+#if defined(HDMI_MODE_1080P)
+
+/* CEA-861 mode 16 (VIC 16): 1920x1080@60. Pixel clock 148.5 MHz (TMDS
+ * 1.485 Gbps). Sync polarities both POSITIVE, same as the 720p mode.
+ * UNTESTED on real hardware — see docs/hdmi-1080p-phy.md before enabling
+ * this on the board; hdmi_init() will latch HDMI_STAGE_TIMEOUT at
+ * HDMI_STAGE_PHY in the breadcrumb (BC_HDMI_BASE, word[4]) if the PHY
+ * still doesn't lock. */
+#define HDMI_MODE_HACTIVE      1920
+#define HDMI_MODE_HFRONT_PORCH   88
+#define HDMI_MODE_HSYNC_LEN      44
+#define HDMI_MODE_HBACK_PORCH   148
+#define HDMI_MODE_HTOTAL       2200  /* 1920+88+44+148 */
+
+#define HDMI_MODE_VACTIVE      1080
+#define HDMI_MODE_VFRONT_PORCH    4
+#define HDMI_MODE_VSYNC_LEN       5
+#define HDMI_MODE_VBACK_PORCH    36
+#define HDMI_MODE_VTOTAL       1125  /* 1080+4+5+36 */
+
+#define HDMI_MODE_PIXEL_CLOCK_HZ 148500000UL /* 2200*1125*60 = 148,500,000 */
+#define HDMI_MODE_HSYNC_ACTIVE_HIGH 1
+#define HDMI_MODE_VSYNC_ACTIVE_HIGH 1
+
+#else /* !HDMI_MODE_1080P -- the default, hardware-verified path */
+
 #define HDMI_MODE_HACTIVE      1280
 #define HDMI_MODE_HFRONT_PORCH  110
 #define HDMI_MODE_HSYNC_LEN      40
@@ -92,6 +137,8 @@
 #define HDMI_MODE_PIXEL_CLOCK_HZ 74250000UL /* 1650 * 750 * 60 = 74,250,000 */
 #define HDMI_MODE_HSYNC_ACTIVE_HIGH 1
 #define HDMI_MODE_VSYNC_ACTIVE_HIGH 1
+
+#endif /* HDMI_MODE_1080P */
 
 /* Bring up the full display pipeline (CCU clocks/PLL_VIDEO -> DE2 mixer ->
  * TCON1 -> DW HDMI controller -> Allwinner HDMI PHY -> scanout enable) and
@@ -275,9 +322,21 @@ void hdmi_relock(void);
 #define HDMI_GUESTWIN_SIZE    0x00200000UL   /* 2 MiB reservation (1.19 MiB used) */
 #define HDMI_GUESTWIN_X       16             /* mirrors hud.c CON_X */
 #define HDMI_GUESTWIN_Y       66             /* mirrors hud.c CON_Y */
-#define HDMI_GUESTWIN_W       1134           /* mirrors hud.c CON_W */
+/* hud.c's CON_W is 1134, but this is 1120 ON PURPOSE: lima refuses to import a
+ * linear dma-buf whose stride is not 64-byte aligned --
+ *   "linear imported buffer stride is smaller than minimal: 4536 (BO) < 4544 (min)"
+ * followed by eglCreateImageKHR -> EGL_BAD_ALLOC. 1134*4 = 4536 is not a multiple
+ * of 64; 1120*4 = 4480 is (70*64). Rounding DOWN keeps the window inside the HUD's
+ * box, where rounding up to 1136 would overhang it by two pixels. */
+#define HDMI_GUESTWIN_W       1120           /* <= hud.c CON_W (1134), 16px-aligned */
 #define HDMI_GUESTWIN_H       276            /* mirrors hud.c CON_H */
 #define HDMI_GUESTWIN_STRIDE  (HDMI_GUESTWIN_W * 4)
+/* The constraint above, enforced rather than trusted to a comment. If the window
+ * width changes to something whose stride is not 64-byte aligned, the build fails
+ * here instead of the guest failing at eglCreateImageKHR with EGL_BAD_ALLOC. */
+_Static_assert(HDMI_GUESTWIN_STRIDE % 64u == 0u,
+               "guest-window stride must be 64-byte aligned or lima will refuse "
+               "to import it as a linear dma-buf");
 #define HDMI_GUESTWIN_LAYER   1              /* UI1 layer index (HUD owns 0) */
 
 /* Program the guest-window layer and commit it. Returns 0 on success, -1 if the
