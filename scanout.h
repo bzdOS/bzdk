@@ -118,6 +118,22 @@
 #define SCANOUT_R_FLIP_REQUEST  0x24u   /* W */
 #define SCANOUT_R_FLIP_COUNT    0x28u   /* R */
 #define SCANOUT_R_REJECT_COUNT  0x2Cu   /* R */
+/* ---- guest-window presentation (v1 addition) -------------------------- *
+ * The guest renders into a buffer IT allocated (a gbm_surface front buffer, the
+ * path lima is designed for) and writes that buffer's physical address here; the
+ * HV repoints the DE2 guest-window layer at it. Zero copy, and it sidesteps the
+ * dead end of rendering into an HV-allocated buffer, which lima writes exactly
+ * once and then ignores -- see bsdOS/hal/bzfb/tests/README-zerocopy.md.
+ *
+ * THE ADDRESS IS NOT TRUSTED. A display engine is a DMA reader with no IOMMU in
+ * front of it, so an unchecked address here would let the guest put hypervisor
+ * memory on the screen -- an information leak, not a crash, which is the kind
+ * that goes unnoticed. scanout.c validates that the WHOLE extent
+ * (stride * height) lies inside guest DRAM and touches none of hv-image,
+ * hv-scratch or hv-fb, and rejects anything else into GUESTWIN_REJECT. */
+#define SCANOUT_R_GUESTWIN_ADDR   0x30u  /* W: physical base to display */
+#define SCANOUT_R_GUESTWIN_COUNT  0x34u  /* R: accepted presents */
+#define SCANOUT_R_GUESTWIN_REJECT 0x38u  /* R: rejected addresses */
 
 #define SCANOUT_MAGIC          0x53434e41u   /* "SCAN", MSB-first, same
                                                * spelling convention as every

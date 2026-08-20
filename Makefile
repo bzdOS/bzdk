@@ -251,6 +251,30 @@ $(HDMI_ELF): $(HDMI_OBJS) link.ld
 $(HDMI_BIN): $(HDMI_ELF)
 	$(OBJCOPY) -O binary $< $@
 
+# HV_HDMI belongs to the target, not to whoever remembers the command line.
+# `dbg` is the only image that links hdmi.o/fb.o/hud.o/scanout.o, and EVERY one
+# of their call sites -- main_dbg.c's display bring-up, smp.c's PHY re-lock,
+# el2_exc.c's flip-doorbell dispatch, stage2.c's framebuffer carve-out -- is
+# #ifdef'd on this flag. Built without it, the binary CONTAINS all the display
+# code and CALLS none of it: no HUD, no guest window, and a doorbell register the
+# guest can write forever with nothing on the other end. That cost a full board
+# cycle to notice on 2026-08-20, because the symbols were all present in the ELF.
+# Target-specific, so the other targets link exactly as before; .flagstamp is a
+# prerequisite of every object and sees the changed CFLAGS, so switching between
+# `dbg` and any other target rebuilds instead of reusing objects compiled with
+# the other target's flags.
+# ...but it is OPT-IN (`make dbg HV_HDMI=1`), because turning it on by default
+# on 2026-08-20 made the board reset by itself: one generation reached
+# `start_init: trying /sbin/init` and died some minutes later, the next lived 20
+# seconds, both returning to U-Boot with nothing in the console ring after the
+# guest's own boot log. CPU1 owns both the watchdog and (in this build) the HUD
+# refresh and HDMI PHY re-lock, so a stall there stops the petting and the WDOG
+# does exactly what it is designed to do. Undiagnosed; do not flip this default
+# back until it is.
+HV_HDMI ?= 0
+ifeq ($(HV_HDMI),1)
+dbg: CFLAGS += -DHV_HDMI
+endif
 dbg: $(DBG_BIN)
 
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
