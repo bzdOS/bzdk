@@ -281,7 +281,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o g
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
-            netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o \
+            netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
@@ -319,7 +319,7 @@ DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o 
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
              emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o flightrec.o coredump.o \
-             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o \
+             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o fbdump.o \
              gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o \
              zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o zstage.o
 $(DUAL_ELF): $(DUAL_OBJS) link.ld

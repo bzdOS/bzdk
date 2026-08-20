@@ -171,6 +171,54 @@ move the ceiling from 13.7 toward 476.
 Also still missing: a `/dev/fb0` for non-GL clients (X11 `scfb`). bzfb registers no
 `fb_info`/`fbd`, deliberately — that is a separate step.
 
+## RAW screenshots straight out of EL2 (fbdump)
+
+Everything above this section was verified either by asking the user to look
+at the monitor, or by sampling a handful of words from EL2 and reasoning
+about the numbers ("all sampled words changed between two reads" is not the
+same claim as "here is the picture"). `screenshot.py` closes that gap: it
+reads the pixels themselves, straight out of guest DRAM, from EL2. Nothing in
+the guest is involved, so a screenshot is obtainable while the guest is
+wedged, panicked, or actively lying about what it drew — a capability no
+in-guest tool (`fbcon`, a GL readback, a userspace screen-grabber) can ever
+have, because all of those trust the guest kernel to still be scheduling and
+its userspace to still be honest.
+
+`--what hud|window|both` (HUD = the hypervisor's own framebuffer at
+`HDMI_FB_BASE`; window = the guest's DE2 layer at whatever address it is
+*currently* fetching, read from the HDMI breadcrumb so a page-flipping client
+is followed rather than frozen at its startup buffer; `both` pastes window
+into HUD at the mixer's coordinates, since the hardware composes the two on
+the fly and no single buffer ever holds the result).
+
+Transport: `fbdump.c`/`fbdump.h` on the board stream a raw memory region out
+over a dedicated raw-Ethernet channel (ethertype `0x88B9`), fire-and-forget —
+no per-chunk ACK, no round trip per row. `fbdump_recv.py` on the host opens
+the raw socket and starts draining it *before* issuing the `fbdump` command
+(anything sent before that is unrecoverable, same as a UDP packet arriving
+before a socket is bound), reassembles the stream, and re-requests whatever
+byte ranges did not arrive, up to 4 rounds, reporting honestly what is still
+missing rather than pretending a gap is real data. This exists because the
+three previously-available paths are all wrong for a framebuffer: the debug
+channel's hex `r`/`d` commands pay a full round trip per 512 words (~33 KB/s,
+minutes for 1080p); `netcon_send()` ACKs every chunk, same order of latency;
+`coredump.c` streams regions too but wraps them in `ET_CORE` and caps the
+total at 384 KiB, twenty times too small for a frame. Expected throughput
+(not yet clocked against the real board on this exact path — see
+`fbdump_recv.py`'s docstring) is on the order of the ~915 KB/s this EMAC link
+has been measured at elsewhere on this board, i.e. seconds instead of
+minutes: ~1.5 s for the 1.2 MiB guest window, ~9 s for a full 8 MiB 1080p HUD
+frame.
+
+`screenshot.py --slow` keeps the original `hvdbg.read_words()` transport as
+an explicit fallback for a host that cannot open an `AF_PACKET` raw socket
+(no `CAP_NET_RAW`) — the one case where the fast path is not merely slower
+but genuinely unavailable.
+
+Pixel format is x8r8g8b8 (`0x00RRGGBB`, red at bits 23:16) — verified against
+a known clear colour rather than assumed from the register name (0.04, 0.05,
+0.10 read back as `0xff0a0d1a` = R 10, G 13, B 26).
+
 ## Do not repeat
 
 - The DTB node alone is not enough, and its absence is not the reason a picture
