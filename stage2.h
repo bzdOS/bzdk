@@ -266,18 +266,29 @@ int stage2_wx_selfcheck(void);
  * read-execute (and revokes write on it); a LATER write to a page currently
  * in that state flips it back. Needs no guest cooperation and no hypercall.
  *
- * STAGE2_WX_DYNAMIC defaults to 0 (off): every existing target continues to
- * build, and — per every hardware-verified boot to date — boot EXACTLY as
- * before. This header default is what makes that true without editing a
- * single Makefile target. Override with `-DSTAGE2_WX_DYNAMIC=1` on a
- * dedicated build to exercise the mechanism; nothing in this tree does that
- * yet, so IT HAS NEVER RUN ON HARDWARE — see the doc for exactly what that
- * does and does not leave proven (the flip logic is proven board-free, in
- * test_stage2_tables.c; whether the pool below is big enough for a REAL
- * kldload's physical-page fragmentation is not, and cannot be answered
- * without the board this task was expressly forbidden from touching). */
+ * STAGE2_WX_DYNAMIC now defaults to 1 (ON), because the one question that kept
+ * it off has been answered ON HARDWARE (2026-08-20). The doubt was never the
+ * flip logic — that was proven board-free in test_stage2_tables.c — it was
+ * whether the bounded L3 pool below survives a REAL guest's kldload
+ * fragmentation, which cannot be answered without the board.
+ *
+ * Measured, with the full workload this guest actually runs (boot to
+ * multiuser, kld_list loading drm.ko + lima.ko + bzfb.ko, then limabench's
+ * 2421-draw GL workload and 12052 zero-copy presented frames), read from
+ * HVMAP_WXDYN_BC:
+ *
+ *     pool_used      = 27 of 64      (2.4x headroom)
+ *     pool_exhausted = 0
+ *     flip_count     = 4045          (the mechanism is doing real work, not idling)
+ *
+ * The guest booted, rendered and presented normally throughout, so W+X on
+ * guest DRAM — the last open item of the v1 isolation gate — is no longer the
+ * standing state. Exhaustion still fails OPEN (degrades that one 2 MiB block to
+ * W+X rather than hanging the guest), so a workload heavier than the measured
+ * one loses enforcement on a block instead of breaking. Build with
+ * `-DSTAGE2_WX_DYNAMIC=0` for the old behaviour. */
 #ifndef STAGE2_WX_DYNAMIC
-#define STAGE2_WX_DYNAMIC 0
+#define STAGE2_WX_DYNAMIC 1
 #endif
 
 #if STAGE2_WX_DYNAMIC
@@ -294,8 +305,9 @@ int stage2_wx_selfcheck(void);
  * free as of the commit that added this (see the doc for the exact
  * `size microkernel-dbg.elf` numbers). This is NOT a validated capacity for
  * any real kldload workload — just a conservative starting point that
- * leaves headroom for everything else in this tree. One #define to retune
- * once someone actually runs a hardware experiment. */
+ * leaves headroom for everything else in this tree. The hardware experiment
+ * has now been run: 27 of these 64 were used by the real workload (see
+ * STAGE2_WX_DYNAMIC above), so 64 stands with 2.4x headroom. */
 #ifndef STAGE2_WX_POOL_TABLES
 #define STAGE2_WX_POOL_TABLES 64u
 #endif
