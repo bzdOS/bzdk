@@ -17,8 +17,10 @@ WHAT CAN BE CAPTURED
 
   --what hud      the hypervisor's own framebuffer (the HUD), HDMI_FB_BASE
   --what window   the guest window layer, at whatever address the DE2 layer is
-                  CURRENTLY fetching (read from the HDMI breadcrumb, not
-                  assumed) -- so this follows a client's page flips
+                  CURRENTLY fetching -- read from the mixer's own layer
+                  register, NOT from a breadcrumb (see live_layer_addr() for
+                  why that distinction cost a wrong screenshot) -- so this
+                  follows a client's page flips
   --what both     the composition: the HUD with the window pasted at the
                   coordinates the mixer places it, which is what the panel shows
 
@@ -168,6 +170,57 @@ def grab(hv, iface, base, width, height, stride, step, label, use_slow):
     return grab_fast(hv, iface, base, width, height, stride, step, label)
 
 
+"""The DE2 mixer's own layer registers -- the authoritative answer to "what is
+the display engine fetching RIGHT NOW".
+
+Derived from hdmi.c's own #defines: DE2_BASE 0x01000000, DE2_MUX1_BASE = +0x200000,
+DE_CHAN_REGS_BASE = +0x2000, DE_CHAN_SZ = 0x1000, UI1 is channel 1, and layer n's
+TOP_LADDR sits at +0x20*n + 0x10 (DE_UI1_L_TOP_LADDR).
+
+This replaced trusting the HDMI breadcrumb, which cost a wrong screenshot the
+first time this tool ran: hv-scratch DRAM survives a warm reset, so word 11 still
+held a page-flip address from the PREVIOUS boot generation while the layer had
+been re-pointed at the hypervisor's own buffer. The capture succeeded, reported
+"100% non-black" and was of unrelated memory. A breadcrumb says what somebody
+wrote once; a device register says what the device is doing.
+"""
+DE_UI1_LAYER0_LADDR = 0x01203010
+DE_LAYER_STRIDE = 0x20
+
+
+def live_layer_addr(hv, fb_base, guestwin_default, layer):
+    """Return (address, provenance, stale_breadcrumb_or_None).
+
+    SELF-CHECKING: layer 0 of the same channel is the HUD, so its TOP_LADDR must
+    read back as HDMI_FB_BASE. If it does not, the register map above is wrong
+    for this build and every other value read through it is worthless -- so say
+    so and fall back rather than screenshot a guess.
+    """
+    bc = hv.read_words(HDMI_BC, 14) or []
+    bc11 = bc[11] if len(bc) > 11 and bc[11] not in (0, 0xFFFFFFFF) else None
+
+    l0 = hv.read_words(DE_UI1_LAYER0_LADDR, 1)
+    if not l0 or l0[0] != fb_base:
+        got = ("%#x" % l0[0]) if l0 else "no reply"
+        print("  WARNING: DE2 layer 0 reads %s, expected the HUD at %#x -- the "
+              "register map does not fit this build, not trusting it" %
+              (got, fb_base))
+        if bc11:
+            return (bc11, "breadcrumb fallback, register map rejected", None)
+        return (guestwin_default, "hdmi.h default, register map rejected", None)
+
+    lv = hv.read_words(DE_UI1_LAYER0_LADDR + DE_LAYER_STRIDE * layer, 1)
+    if not lv or not (0x40000000 <= lv[0] < 0x80000000):
+        got = ("%#x" % lv[0]) if lv else "no reply"
+        print("  WARNING: DE2 layer %d reads %s, which is not guest DRAM" %
+              (layer, got))
+        return (guestwin_default, "hdmi.h default, layer register implausible",
+                None)
+
+    stale = bc11 if (bc11 is not None and bc11 != lv[0]) else None
+    return (lv[0], "live, from the DE2 layer %d register" % layer, stale)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--what", default="window",
@@ -186,7 +239,7 @@ def main():
     d = defines(HDMI_H, ("HDMI_FB_BASE", "HDMI_MODE_HACTIVE", "HDMI_MODE_VACTIVE",
                          "HDMI_GUESTWIN_PA", "HDMI_GUESTWIN_W", "HDMI_GUESTWIN_H",
                          "HDMI_GUESTWIN_STRIDE", "HDMI_GUESTWIN_X",
-                         "HDMI_GUESTWIN_Y"))
+                         "HDMI_GUESTWIN_Y", "HDMI_GUESTWIN_LAYER"))
     missing = [k for k in ("HDMI_FB_BASE", "HDMI_GUESTWIN_W") if k not in d]
     if missing:
         print("could not parse %s from hdmi.h" % ", ".join(missing))
@@ -198,16 +251,16 @@ def main():
     gx, gy = d.get("HDMI_GUESTWIN_X", 0), d.get("HDMI_GUESTWIN_Y", 0)
 
     hv = hvdbg.HV()
-    # The address the layer is ACTUALLY fetching. A client that page-flips has
-    # moved this away from HDMI_GUESTWIN_PA, and capturing the stale constant
-    # would silently screenshot the wrong buffer.
-    bc = hv.read_words(HDMI_BC, 14) or []
-    live = bc[11] if len(bc) > 11 and bc[11] not in (0, 0xFFFFFFFF) else None
-    win_pa = live if live else d["HDMI_GUESTWIN_PA"]
-    print("guest window: %dx%d stride %d at %#x%s" %
-          (gw, gh, gstride, win_pa,
-           "  (live, from the HDMI breadcrumb)" if live else
-           "  (hdmi.h default -- no flip has happened)"))
+    win_pa, src, bc_stale = live_layer_addr(hv, d["HDMI_FB_BASE"],
+                                            d["HDMI_GUESTWIN_PA"],
+                                            d.get("HDMI_GUESTWIN_LAYER", 1))
+    print("guest window: %dx%d stride %d at %#x  (%s)" %
+          (gw, gh, gstride, win_pa, src))
+    if bc_stale is not None:
+        print("  NOTE: the HDMI breadcrumb still says %#x -- STALE, left in "
+              "hv-scratch DRAM by a previous boot generation (that memory "
+              "survives a warm reset). Trusting the DE2 register instead."
+              % bc_stale)
     print("HUD         : %dx%d at %#x" % (scr_w, scr_h, d["HDMI_FB_BASE"]))
 
     step = max(1, a.step)
