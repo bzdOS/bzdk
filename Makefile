@@ -263,15 +263,15 @@ $(HDMI_BIN): $(HDMI_ELF)
 # prerequisite of every object and sees the changed CFLAGS, so switching between
 # `dbg` and any other target rebuilds instead of reusing objects compiled with
 # the other target's flags.
-# ...but it is OPT-IN (`make dbg HV_HDMI=1`), because turning it on by default
-# on 2026-08-20 made the board reset by itself: one generation reached
-# `start_init: trying /sbin/init` and died some minutes later, the next lived 20
-# seconds, both returning to U-Boot with nothing in the console ring after the
-# guest's own boot log. CPU1 owns both the watchdog and (in this build) the HUD
-# refresh and HDMI PHY re-lock, so a stall there stops the petting and the WDOG
-# does exactly what it is designed to do. Undiagnosed; do not flip this default
-# back until it is.
-HV_HDMI ?= 0
+# DEFAULT ON. It was briefly made opt-in because turning it on appeared to make
+# the board reset itself every few minutes -- that was wrong: the resets were
+# `wdt_debug_hold` left set in hv-scratch DRAM by a previous reboot_clean,
+# surviving the very reset it asked for and stopping CPU1's petting on every
+# subsequent generation, on EVERY image (fixed in wdt_arm(), see wdt.c). With
+# that fixed, this configuration has run for six hours with the guest at a login
+# prompt and 887364 accepted scanout flips. Set HV_HDMI=0 for a display-less
+# build.
+HV_HDMI ?= 1
 ifeq ($(HV_HDMI),1)
 dbg: CFLAGS += -DHV_HDMI
 endif

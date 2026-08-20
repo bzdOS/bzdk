@@ -643,6 +643,21 @@ kload_build_modinfo(uint64_t dtb_src_pa, uint64_t dtb_dst_pa, uint64_t scratch_p
 	     * Multiple whitespace-separated fs:dev directives ARE a valid way to
 	     * list fallbacks (vfs_mountroot_conf0 emits one line per token), but a
 	     * single clean device is simplest and sufficient here. */
+	    /* RECOVERY TECHNIQUE, recorded because it is the only one that worked
+	     * (2026-08-20): a guest module in rc.conf's kld_list that panics at
+	     * load is a boot loop with no shell to break it, and RB_SINGLE is NOT
+	     * an escape here -- the single-user prompt goes to the video console
+	     * only and serial input never reaches it. Adding
+	     *
+	     *     "module_path=/boot/kernel\0"
+	     *
+	     * to this environment makes `kldload <name>` fail to FIND the module
+	     * instead of loading it (kern_linker.c's TUNABLE_STR("module_path")
+	     * reads it exactly as the real loader's would), so the guest boots to
+	     * a login prompt and the file can be replaced over ssh. Note it also
+	     * blocks DEPENDENCY lookup, so even an absolute-path kldload fails
+	     * while it is in force; widen it back at runtime with
+	     * `sysctl kern.module_path="/boot/kernel;/boot/modules"` (CTLFLAG_RWTUN). */
 	    "vfs.root.mountfrom=ufs:/dev/vtbd0p3\0"
 	    "vfs.mountroot.timeout=20\0"              /* RETESTED (2026-07-25), hypothesis REFUTED: this
 	                                               * session's vGIC Group0 fix made device-SPI
