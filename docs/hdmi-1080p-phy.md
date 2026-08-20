@@ -1,5 +1,23 @@
 # Why 1080p (148.5 MHz) doesn't lock the HDMI PHY, and what this patch does about it
 
+## HARDWARE-VERIFIED 2026-08-20: 1080p locks
+
+Built with `make dbg EXTRA_CFLAGS="-DHDMI_MODE_1080P"` and loaded on the board:
+
+    hdmi_bc[1]   = 6            HDMI_STAGE_SCANOUT, i.e. NOT 99/TIMEOUT --
+                                the whole bring-up completed
+    PHY_STATUS   = 0x000ac0f4   bit7 LOCK = 1, pll_code = 0x18
+    DE_GLB_SIZE  = 0x0437077f   1920x1080 programmed into the mixer
+
+The guest booted to a login prompt on the same image and the zero-copy demo
+presented 6089 frames with 0 refusals, so the scanout path is unaffected by the
+mode change.
+
+**This withdraws the "probably an analog limit at 1.485 Gbps" expectation** that
+the rest of this document was written around: the PHY does lock at 1080p on this
+board. What is still open is only whether a monitor shows a stable picture --
+register state cannot answer that.
+
 Status: **UNTESTED on real hardware.** Everything below comes from static
 register-level analysis and host-side builds only — no board, no tty, no
 `bzdctl.py`. The `HDMI_MODE_1080P` opt-in this patch adds has never been
