@@ -204,9 +204,16 @@ instrument produce it on a healthy system.**
   counter — the register file has room.
 - **A desktop.** X11 and Wayland can talk to the KMS device now; neither is
   installed yet. The catch is packaging, not code: the guest's Mesa is hand-built
-  with the Mali driver, and FreeBSD's packaged `mesa-dri` ships no gallium
-  drivers at all, so an unguarded `pkg install` would replace a working stack
-  with one that cannot drive this GPU.
+  with the Mali driver, and FreeBSD's packaged Mesa **cannot drive this GPU** —
+  `mesa-dri` does ship 49 `*_dri.so` entries, but they are all symlinks to one
+  loader, and the `libgallium` behind it contains the string
+  `lima: driver missing` with no lima/gpir/ppir symbols in it at all. lima is in
+  the loader's device table and simply not compiled in, where `panfrost` is. So
+  an unguarded `pkg install` that pulls `mesa-libs` swaps a working stack for one
+  that loads and then cannot find a driver. Note `pkg lock` does **not** protect
+  us here: it locks an installed *package*, and our Mesa is not one — the real
+  mitigations are a separate prefix, or committing a manifest of the files it
+  installed.
 - **Video decode.** The SoC's VPU is untouched. FreeBSD has neither a driver nor
   the framework Linux's is built on, so it is a project, not a finishing touch.
 - **Upstreaming.** Eight patches are written and ready to submit.
