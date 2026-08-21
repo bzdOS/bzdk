@@ -1,4 +1,9 @@
-# bzdOS / Chimp — a from-scratch EL2 hypervisor for the Banana Pi M64
+# bzdk — a from-scratch EL2 hypervisor for the Banana Pi M64
+
+> **bzdk** is this: the hypervisor. **bzdOS** is a different project — the
+> operating system ([bzdOS/bsdos](https://github.com/bzdOS/bsdos)). Earlier
+> revisions of this file called the hypervisor "bzdOS / Chimp" and conflated the
+> two. *Chimp* is the board bring-up codename for the Banana Pi M64 target.
 
 A bare-metal, hand-written type-1 hypervisor (no KVM/Xen/Jailhouse ancestry, no
 vendor SDK) that runs **FreeBSD 15.1 arm64 as an EL1 guest** on a **Banana Pi
@@ -580,3 +585,38 @@ patching anything on disk), `BRING-UP.md`, `TOOLCHAIN.md`,
 ## License
 
 BSD 2-Clause — see `LICENSE`.
+
+## Related projects
+
+These four are separate repositories that were built together, and each is
+useful without the others:
+
+- **[bzdOS/bsdos](https://github.com/bzdOS/bsdos)** — the operating system.
+  Privacy-first FreeBSD for ARM64: jailed apps, a Zenoh mesh, zero-copy Wayland
+  streaming. A different project from this one; bzdk is what it can run on, not
+  what it is.
+- **[bzdOS/lima-freebsd](https://github.com/bzdOS/lima-freebsd)** — the Mali-400
+  DRM driver for FreeBSD/arm64, extracted from this work so anyone with Utgard
+  silicon can use it. Ships the ten upstream patches that bring-up required, and
+  the reason it exists at all is that the GPU work here happened inside this
+  hypervisor's guest.
+- **[bzdOS/hubd](https://github.com/bzdOS/hubd)** — the tracker this project was
+  run through. It mattered for a concrete reason: **the build machine and the
+  board were never the same machine.** Toolchain and source trees lived on one
+  host; the Banana Pi arrived at another, on a different network, with the serial
+  console and debug Ethernet physically attached there. Several agents worked the
+  same board in parallel. hubd is what made "the board is busy", "that patch is
+  already applied to that tree" and "this number was measured" shared facts
+  instead of things each agent rediscovered.
+- **[bzdOS/jailrun](https://github.com/bzdOS/jailrun)**,
+  **[bzdOS/WLStream](https://github.com/bzdOS/WLStream)**,
+  **[bzdOS/SeMa](https://github.com/bzdOS/SeMa)** — sibling pieces of the same
+  effort: an OCI runtime backed by FreeBSD jails, the Wayland streaming wire
+  format, and the semantic-markup convention these sources' function contracts
+  are written in.
+
+## Status
+
+See `RELEASE-0.0.1.md` — measured numbers, and an explicit list of what is known
+broken. Short version: it runs on one board, it is pre-alpha, and the
+instrumentation is the point.
