@@ -66,9 +66,21 @@ struct scanout_dev {
 	uint32_t reject_count;
 	uint32_t guestwin_count;
 	uint32_t guestwin_reject;
+	/* Mirrored from hdmi.c by the fault wrapper just before a read is
+	 * served, so scanout_reg_read() stays a pure function of this struct
+	 * and test_scanout_regs.c can keep mirroring it without knowing
+	 * anything about TCON. */
+	uint32_t vblank_count;
+	uint32_t vblank_stamp_lo;
+	uint32_t vblank_stamp_hi;
 };
 
 static struct scanout_dev g_scan;
+
+/* Weak fallbacks: the QEMU CI targets link scanout.o without hdmi.o. Same
+ * idiom el2_exc.c uses for gic_timer_irq()/trace_emit(). */
+__attribute__((weak)) uint32_t hdmi_vblank_count(void) { return 0u; }
+__attribute__((weak)) uint64_t hdmi_vblank_stamp(void) { return 0ull; }
 
 void scanout_init(void)
 {
@@ -124,6 +136,9 @@ static uint32_t scanout_reg_read(const struct scanout_dev *d, uint32_t off)
 	case SCANOUT_R_REJECT_COUNT: return d->reject_count;
 	case SCANOUT_R_GUESTWIN_COUNT:  return d->guestwin_count;
 	case SCANOUT_R_GUESTWIN_REJECT: return d->guestwin_reject;
+	case SCANOUT_R_VBLANK_COUNT:    return d->vblank_count;
+	case SCANOUT_R_VBLANK_STAMP_LO: return d->vblank_stamp_lo;
+	case SCANOUT_R_VBLANK_STAMP_HI: return d->vblank_stamp_hi;
 	default:                     return 0u;
 	}
 }
@@ -319,7 +334,22 @@ int scanout_mmio_fault(struct el2_frame *frame)
 		uint64_t val = (srt == SRT_XZR) ? 0 : frame->x[srt];
 		scanout_reg_write(&g_scan, off, (uint32_t)val);
 	} else {
-		uint32_t val = scanout_reg_read(&g_scan, off);
+		uint32_t val;
+
+		/* Refresh the vblank mirror from the live poller before serving
+		 * any read. Done here rather than inside scanout_reg_read()
+		 * because that function is deliberately pure -- the same reason
+		 * every other value in the struct is pushed in from outside.
+		 * Weak, so builds without hdmi.o (the QEMU CI targets) link and
+		 * simply report zero. */
+		{
+			uint64_t st = hdmi_vblank_stamp();
+
+			g_scan.vblank_count    = hdmi_vblank_count();
+			g_scan.vblank_stamp_lo = (uint32_t)st;
+			g_scan.vblank_stamp_hi = (uint32_t)(st >> 32);
+		}
+		val = scanout_reg_read(&g_scan, off);
 		if (srt != SRT_XZR)
 			frame->x[srt] = (uint64_t)val;
 	}

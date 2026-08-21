@@ -73,6 +73,7 @@
  * with U-Boot's flat device mapping, same contract as musb.c/emac.c).
  */
 #include <stdint.h>
+#include "cntpct.h"
 #include "hdmi.h"
 #include "timer.h"
 #include "rsb.h"    /* re-enable the PHY's dldo1 supply FreeBSD gates off */
@@ -1125,6 +1126,62 @@ int hdmi_guestwin_set_addr(uint32_t pa)
 	return 0;
 }
 
+/* ── real vblank observation (ROADMAP: bzkms's vblank was a callout) ──────
+ *
+ * TCON_INT0 (SUN4I_TCON_GINT0_REG) carries a vblank STATUS bit per channel,
+ * write-1-to-clear, and it latches whether or not the interrupt is enabled. So
+ * EL2 can observe the real panel vblank by POLLING that bit -- no interrupt
+ * handler, which matters: taking a device interrupt in EL2 on this board is how
+ * the EHCI SPI-106 storm happened, and a display interrupt is not worth
+ * re-opening that door.
+ *
+ * Polling is sufficient rather than approximate. CPU1's service loop runs this
+ * far faster than 60 Hz (it is one MMIO read per pass, alongside the PHY
+ * lock-loss check that already lives there), and the bit LATCHES, so every
+ * vblank is seen exactly once as long as the poller clears it. Two vblanks
+ * cannot be missed between passes at any plausible loop rate.
+ *
+ * Both channel bits are polled (15 and 14): only one channel is driving the
+ * panel, so there is no ambiguity, and hardcoding a guess about which one TCON1
+ * reports on would be exactly the sort of undocumented assumption this file's
+ * header warns about. The guest owns no TCON registers -- the display belongs
+ * to EL2 -- so clearing the bit here cannot disturb it.
+ */
+#define TCON_INT0_VBLANK_MASK  0x0000C000u   /* BIT(15) | BIT(14) */
+
+static volatile uint32_t g_vblank_count;
+static volatile uint64_t g_vblank_stamp;
+
+void hdmi_vblank_poll(void)
+{
+	uint32_t v = rd32(TCON_INT0);
+
+	if ((v & TCON_INT0_VBLANK_MASK) == 0u)
+		return;
+	/* ACKNOWLEDGE BY WRITING ZERO to those bits, not one. This register is
+	 * not write-1-to-clear, and assuming it was is a mistake that costs a
+	 * whole debugging cycle: the bit stayed set on every pass, so the
+	 * "vblank" count ran at the CPU1 loop rate (measured 93 kHz) instead of
+	 * the panel rate. Linux's sun4i_tcon_handler() acknowledges with
+	 * regmap_update_bits(GINT0, mask, 0) -- a read-modify-write that CLEARS
+	 * the bits -- which is what this line now does, preserving every other
+	 * bit in the register. */
+	wr32(TCON_INT0, v & ~TCON_INT0_VBLANK_MASK);
+	g_vblank_stamp = cntpct_read();
+	g_vblank_count++;
+	bc_write(12, g_vblank_count);
+}
+
+uint32_t hdmi_vblank_count(void)
+{
+	return g_vblank_count;
+}
+
+uint64_t hdmi_vblank_stamp(void)
+{
+	return g_vblank_stamp;
+}
+
 int hdmi_guestwin_enable(void)
 {
 	/* Refuse if the pipeline never came up -- programming a layer into a dead
@@ -1149,6 +1206,17 @@ int hdmi_guestwin_enable(void)
 
 	bc_write(9, (uint32_t)HDMI_GUESTWIN_PA);
 	bc_write(10, ((uint32_t)HDMI_GUESTWIN_W << 16) | (uint32_t)HDMI_GUESTWIN_H);
+	/* Word 11 is "address of the last guest flip". It lives in hv-scratch
+	 * DRAM, which SURVIVES A WARM RESET, so until the guest flips at least
+	 * once this boot it still holds whatever address the PREVIOUS generation
+	 * was presenting -- a value that describes memory this generation may
+	 * never touch. screenshot.py caught exactly that (it read 0x57a00000 on a
+	 * boot whose window is 0x4b000000) and had to add a stale-breadcrumb
+	 * heuristic to work around it. Same defect, same fix, as wdt_arm()
+	 * clearing wdt_debug_hold: the publisher overwrites its own word at
+	 * bring-up, so a reader can never be handed a dead generation's value.
+	 * Set to what we just programmed, which is the truth right now. */
+	bc_write(11, (uint32_t)HDMI_GUESTWIN_PA);
 	return 0;
 }
 

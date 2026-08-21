@@ -2,7 +2,7 @@
 
 /* trace.c — event-trace ring (ftrace-lite) for the bzdOS EL2 hypervisor.
  *
- * See trace.h for the fixed DRAM layout contract (base 0x50004000, "TRC1").
+ * See trace.h for the DRAM layout contract (base HVMAP_TRACE_RING, "TRC1").
  * Freestanding, no libc. Single global ring, lock-free/wait-free across the 4
  * A53 cores: a producer claims a unique slot with one exclusive fetch-add on
  * the header's total_events word (the "ticket"), writes its 16-byte entry, and
@@ -12,11 +12,18 @@
 #include <stdint.h>
 #include "trace.h"
 #include "timer.h"
+#include "hv_addrmap.h"
 
-#define TRACE_BASE   0x50004000UL
+/* Base comes from hv_addrmap.h, which is where window collisions are
+ * checked. It used to be a local 0x50004000 that ran into the BMC block. */
+#define TRACE_BASE   HVMAP_TRACE_RING
 #define TRACE_MAGIC  0x54524331u        /* "TRC1" */
 #define TRACE_CAP    512u               /* number of ring slots */
 #define TRACE_HDR    0x40UL             /* header stride: entries start +0x40 */
+
+_Static_assert(TRACE_HDR + (unsigned long)TRACE_CAP * 16UL
+               <= HVMAP_TRACE_RING_SIZE,
+               "TRACE_CAP outgrew the window reserved in hv_addrmap.h");
 
 /* Header word indices. */
 #define H_MAGIC   0u

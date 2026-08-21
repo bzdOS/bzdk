@@ -2,7 +2,7 @@
 
 /* profiler.c — non-halting sampling profiler for the bzdOS EL2 hypervisor.
  *
- * See profiler.h for the fixed DRAM layout (base 0x50006800, "PROF"). Each
+ * See profiler.h for the DRAM layout (base HVMAP_PROF_HIST, "PROF"). Each
  * tick's interrupted PC is bucketed by PC & ~0xF into an open-addressed hash
  * table (linear probe, fixed bound) and also emitted as a TRACE_PROFILE event.
  * Everything here is wait-free and bounded: the bucket-claim CAS and the
@@ -11,13 +11,21 @@
  */
 #include <stdint.h>
 #include "profiler.h"
+#include "hv_addrmap.h"
 #include "trace.h"
 #include "timer.h"
 
-#define PROF_BASE     0x50006800UL
+/* From hv_addrmap.h: the old local 0x50006800 sat inside the software-BMC
+ * block, and hud.c read a different address again (0x50004800, 2 KiB into
+ * the trace ring). One definition now, checked there. */
+#define PROF_BASE     HVMAP_PROF_HIST
 #define PROF_MAGIC    0x50524F46u        /* "PROF" */
 #define PROF_BUCKETS  1024u              /* must be a power of two (mask below) */
-#define PROF_HDR      0x20UL             /* 8 header words; buckets start +0x20 */
+#define PROF_HDR      ((unsigned long)PROF_HDR_BYTES)  /* from profiler.h */
+
+_Static_assert(PROF_HDR + (unsigned long)PROF_BUCKETS * 8UL
+               <= HVMAP_PROF_HIST_SIZE,
+               "PROF_BUCKETS outgrew the window reserved in hv_addrmap.h");
 #define PROF_PROBE    8u                 /* max linear-probe steps (bounded) */
 #define PC_MASK       (~0xFULL)          /* bucket granularity: 16-byte PCs */
 

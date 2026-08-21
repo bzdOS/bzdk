@@ -47,6 +47,7 @@
 #ifndef BZDOS_HDMI_H
 #define BZDOS_HDMI_H
 #include <stdint.h>
+#include "hv_addrmap.h"
 
 /* ------------------------------------------------------------------ *
  * Fixed framebuffer location (DRAM), 32bpp XRGB8888.
@@ -342,6 +343,15 @@ _Static_assert(HDMI_GUESTWIN_STRIDE % 64u == 0u,
 /* Program the guest-window layer and commit it. Returns 0 on success, -1 if the
  * display never came up (hdmi_init() failed), in which case nothing is touched.
  * Idempotent: safe to call again to move/resize the window. */
+/* Real vblank, observed by polling TCON_INT0's latching status bit from CPU1's
+ * service loop -- see the long comment in hdmi.c. hdmi_vblank_poll() must be
+ * called often (it is one MMIO read); the count and its CNTPCT timestamp are
+ * published to the guest through the scanout register file so a guest KMS
+ * driver can pace on the real panel instead of a local timer. */
+void     hdmi_vblank_poll(void);
+uint32_t hdmi_vblank_count(void);
+uint64_t hdmi_vblank_stamp(void);
+
 int hdmi_guestwin_enable(void);
 
 /* Repoint the guest-window layer at a different physical buffer, and commit.
@@ -360,6 +370,8 @@ int hdmi_guestwin_enable(void);
 int hdmi_guestwin_set_addr(uint32_t pa);
 
 #define BC_HDMI_BASE   0x50011800UL
+_Static_assert(BC_HDMI_BASE == HVMAP_LOW_HDMI_BC,
+               "BC_HDMI_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define BC_HDMI_MAGIC  0x48444D49u /* "HDMI" */
 
 #define HDMI_STAGE_CLOCKS   1
