@@ -77,6 +77,7 @@
  * (dc civac + dsb sy), same convention as every other lane in this tree.
  */
 #include <stdint.h>
+#include "hv_addrmap.h"
 #include "vgic.h"
 #include "guest.h"   /* guest_config(), guest_enter() for the self-test */
 #include "flightrec.h"  /* B4: flightrec_log(FLTR_K_IRQ, ...) on every injected LR */
@@ -240,6 +241,8 @@ static inline void write_cntvoff_el2(uint64_t v)
  * reverted), so this never fired, but it would have clobbered/been-clobbered
  * the instant vgic is revisited. */
 #define VGIC_BC_BASE   0x50001c00UL
+_Static_assert(VGIC_BC_BASE == HVMAP_LOW_VGIC_BC,
+               "VGIC_BC_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define VGIC_BC_MAGIC  0x56474943u   /* "VGIC" */
 
 static inline void vg_bc(int i, uint32_t v)
@@ -835,6 +838,8 @@ int vgic_gicd_fault(struct el2_frame *frame)
  * payload RELOCATED into guest-accessible DRAM, not just its breadcrumbs. */
 #ifndef VGST_BC_BASE
 #define VGST_BC_BASE   0x50001d00UL
+_Static_assert(VGST_BC_BASE == HVMAP_LOW_VGST_BC,
+               "VGST_BC_BASE drifted from hv_addrmap.h -- the map owns this address");
 #endif
 #define VGST_BC_MAGIC  0x56475354u   /* "VGST" */
 

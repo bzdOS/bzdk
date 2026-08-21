@@ -21,8 +21,12 @@
  *   [8]  x0(lo) [9] x1(lo) [10] x30(lo)  (a few regs for context)
  */
 #include <stdint.h>
+#include "hv_addrmap.h"
 #include "vgicd.h"   /* vgicd_handle_fault() -- trapped GIC distributor */
 #include "exceptions.h"
+#include "trace.h"
+#include "vcpu2.h"
+#include "profiler.h"
 #include "guest.h"
 #include "sched.h"
 #include "vconsole.h"
@@ -249,6 +253,36 @@ __attribute__((weak)) void gic_timer_irq(struct el2_frame *f)
 	(void)f;
 }
 
+/* Second guest vCPU (vcpu2.c), linked only into the `dbg` target. Weak
+ * fallbacks, same pattern as the stubs below, so every other target links
+ * unchanged: the gate reads 0 and the request is always refused, which is
+ * exactly the pre-existing behaviour (a guest CPU_ON for affinity 2 gets
+ * ALREADY_ON). Defined here rather than in dbgmon.c because el2_exc.o is in
+ * every target's object list, so one definition covers them all. */
+__attribute__((weak)) volatile uint32_t dbg_vcpu2;
+
+__attribute__((weak)) int vcpu2_request(uint64_t entry_pa, uint64_t context_id)
+{
+	(void)entry_pa; (void)context_id;
+	return 0;
+}
+
+/* Event-trace ring (trace.c) and PC-sample profiler (profiler.c), linked only
+ * into the `dbg` target. Weak fallbacks, same pattern as gic_timer_irq above,
+ * so every other target links unchanged and pays one call to an empty
+ * function. These feed the HUD's SCHED GANTT and PROFILE panels; without
+ * trace.o/profiler.o those panels correctly report their windows as absent. */
+__attribute__((weak)) void trace_emit(uint8_t type, uint8_t cpu, uint16_t arg,
+                                      uint32_t ctx)
+{
+	(void)type; (void)cpu; (void)arg; (void)ctx;
+}
+
+__attribute__((weak)) void profiler_sample(uint64_t pc, int is_guest)
+{
+	(void)pc; (void)is_guest;
+}
+
 /* Live debug monitor, provided by dbgmon.c in the debugger build. Weak
  * fallback so the REPL/fbsd builds (no dbgmon.o) still link — called only on
  * a guest tick to service the network debugger against the live guest frame. */
@@ -331,6 +365,8 @@ __attribute__((weak)) void coredump_send(struct el2_frame *frame, uint64_t *regi
  * Enabled via the dbgmon `ss` command (el2_ss_toggle) right before/while the
  * guest runs; OFF by default. */
 #define SS_BASE    0x50002800UL
+_Static_assert(SS_BASE == HVMAP_LOW_SST1,
+               "SS_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define SS_MAGIC   0x53535431u   /* "SST1" */
 #define SS_SLOTS   256u
 #define SS_HDR     8u            /* header words before the slot array */
@@ -548,7 +584,12 @@ int el2_ss_toggle(struct el2_frame *frame)
 #define PSCI_RET_DENIED          (-3)
 #define PSCI_RET_ALREADY_ON      (-4)
 
-static int psci_guest_filter(uint64_t fnid, uint64_t x1, int64_t *ret)
+/* x2/x3 are needed only by the CPU_ON case: DEN0022 gives x2 =
+ * entry_point_address and x3 = context_id. They are passed in rather than read
+ * from the frame so this function stays a pure decision over its arguments and
+ * can be reasoned about (and tested) without a frame. */
+static int psci_guest_filter(uint64_t fnid, uint64_t x1, uint64_t x2,
+                             uint64_t x3, int64_t *ret)
 {
 	switch (fnid) {
 	/* ---- informational / query-only: no address arg, no state change */
@@ -578,12 +619,28 @@ static int psci_guest_filter(uint64_t fnid, uint64_t x1, int64_t *ret)
 			*ret = PSCI_RET_INVALID_PARAMS;
 			return 1;
 		}
-		/* Cores 0..3 are ALL already up (0 = this guest's own vCPU,
-		 * running this very call right now; 1..3 = HV-owned, brought
-		 * up by smp_init() at boot) — ALREADY_ON is the spec-correct
-		 * AND truthful answer for every one of them. This never
-		 * reaches EL3, so the guest's entry_point_address (x2) is
-		 * never even read, let alone executed. */
+		/* Affinity 2 is the ONE core the guest may be given, and only
+		 * when vcpu2.c is armed (dbg_vcpu2). vcpu2_request() decides:
+		 * it returns 1 having recorded the guest's entry point and
+		 * context ID and woken the parked core, and 0 to mean "no,
+		 * behave exactly as before".
+		 *
+		 * This does NOT reopen finding H3. EL3 is still never asked,
+		 * and the entry point is entered by kload_enter(), i.e. an
+		 * `eret` to EL1 under this core's own stage-2 regime -- not
+		 * warm-booted at EL2 the way a forwarded PSCI CPU_ON would be.
+		 * The guest chooses where its own vCPU starts, at its own
+		 * exception level, which is what PSCI is for. */
+		if (aff0 == 2ull && vcpu2_request(x2, x3)) {
+			*ret = PSCI_RET_SUCCESS;
+			return 1;
+		}
+
+		/* Everything else: cores 0..3 really are all up (0 = this
+		 * guest's own vCPU, running this very call; 1..3 = HV-owned,
+		 * brought up by smp_init() at boot) — ALREADY_ON is the
+		 * spec-correct AND truthful answer. This never reaches EL3, so
+		 * the guest's entry_point_address (x2) is never executed. */
 		*ret = PSCI_RET_ALREADY_ON;
 		return 1;
 	}
@@ -714,7 +771,16 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		 * a concurrent CPU1 reader retries instead of seeing a torn frame. */
 		g_last_guest_frame_seq++;                        /* -> odd */
 		__asm__ volatile("dsb ish" ::: "memory");
-		g_last_guest_frame = *frame;
+		/* CPU0 only. With a second guest vCPU on CPU2 (vcpu2.c) both cores
+		 * take lower-EL traps, and this snapshot is what dbgmon's `gr`, the
+		 * GDB stub's register reads and triage.py all present as "the
+		 * guest". Letting CPU2 overwrite it would silently mix two vCPUs'
+		 * register state into one report -- the same class of confusion as
+		 * reading a banked register over the debug channel and getting
+		 * CPU1's copy, which has produced several confidently wrong
+		 * diagnoses in this project. */
+		if (smp_cpu_id() == 0)
+			g_last_guest_frame = *frame;
 		__asm__ volatile("dsb ish" ::: "memory");
 		g_last_guest_frame_seq++;                        /* -> even */
 		__asm__ volatile("dsb ish" ::: "memory");
@@ -746,6 +812,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		if ((kind >> 2) == 2u)
 			guest_note_preempt();
 		gic_timer_irq(frame);      /* ACK/EOI + jitter first (must EOI) */
+		/* Trace/profile AFTER the EOI, never before: the ACK/EOI pair is
+		 * the part with a deadline. One ring slot and one histogram
+		 * bucket per tick, at the tick rate -- not per guest trap, which
+		 * is the rate that would matter. group 2 == taken from the guest,
+		 * so ELR_EL2 is a guest PC and the sample is attributed to the
+		 * guest rather than to EL2's own idle loop. */
+		trace_tick();
+		profiler_sample(frame->elr, (kind >> 2) != 2u);
 		if ((kind >> 2) == 2u && !dbg_core_active)
 			dbgmon_service(frame); /* live debugger (only if the SMP debug core
 			                        * isn't the one owning EMAC) */
@@ -761,6 +835,13 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	 * fault path. */
 	if ((kind >> 2) == 2u && (kind & 3u) == EL2_KIND_SYNC) {
 		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
+
+		/* Every guest sync trap, into the event ring, next to the
+		 * flight-recorder entry below that already records the same
+		 * thing for the post-mortem dump. Rate is the guest's own MMIO
+		 * rate, which is measured in tens of thousands over a whole
+		 * session -- not per instruction. */
+		trace_trap((uint16_t)ec, (uint32_t)frame->elr);
 
 		/* Flight-recorder sync-trap ring (E, 2026-07-25 vgic deep-dive): log
 		 * EVERY guest sync trap — EC folded into a0's high bits so one glance
@@ -924,7 +1005,9 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			{
 				int64_t psci_ret;
 
-				if (psci_guest_filter(fnid, frame->x[1], &psci_ret)) {
+				if (psci_guest_filter(fnid, frame->x[1],
+				                      frame->x[2], frame->x[3],
+				                      &psci_ret)) {
 					frame->x[0] = (uint64_t)psci_ret;
 					frame->elr += 4u;
 					return;

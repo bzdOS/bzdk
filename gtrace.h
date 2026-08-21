@@ -35,6 +35,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"
+#include "hv_addrmap.h"
 
 /* ---------------------------------------------------------------------
  * Trace ring — fixed DRAM window at 0x50001000, magic "GTRC".
@@ -98,6 +99,8 @@
  *                       abort vectors; ignore for e.g. SError/undef)
  * --------------------------------------------------------------------- */
 #define GTRACE_BASE        0x50002000UL
+_Static_assert(GTRACE_BASE == HVMAP_LOW_GTRACE,
+               "GTRACE_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define GTRACE_MAGIC       0x47545243u   /* "GTRC" */
 #define GTRACE_MAX_EVENTS  64u
 
@@ -128,6 +131,8 @@
  *   [14 + i*2, +1] x[i] (lo, hi) for i = 0..30  (GPRs at the first fault)
  * --------------------------------------------------------------------- */
 #define GTRACE_FF_BASE   0x50002400UL
+_Static_assert(GTRACE_FF_BASE == HVMAP_LOW_FFL1,
+               "GTRACE_FF_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define GTRACE_FF_MAGIC  0x46464C31u   /* "FFL1" */
 
 /* GTRACE_REG_* — ids for the ~11 registers HCR_EL2.TVM traps to EL2 as

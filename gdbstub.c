@@ -65,6 +65,7 @@
 #include "exceptions.h"
 #include "gdbstub.h"
 #include "gdbstub_hw.h"
+#include "kload.h"
 
 /* Byte transport — provided by main_dbg.c (wired to emac). gdb_getc() MUST
  * pump the EMAC RX ring (e.g. { emac_poll(); return emac_getc(); }) so bytes
@@ -153,31 +154,67 @@ static void isync_patch(unsigned long pa)
 		:: "r"(pa) : "memory");
 }
 
-/* Translate a guest VA through the guest's own stage-1 (AT S1E1R, exactly as
- * dbgmon's `gva`). On success writes the output PA and returns 1; on a
- * translation fault returns 0. Stage-2 is identity for this guest (IPA==PA),
- * so the stage-1 output is directly addressable under our flat EL2 map. */
-static int gva_to_pa(uint64_t va, unsigned long *pa)
+/* CONFIRMED LIVE BUG (2026-07-26, see gdbstub-breakpoint-resolve-broken
+ * memory): this file's dispatch()/bp_insert()/'m'/'M' handlers are ONLY EVER
+ * invoked from smp.c's CPU1 debug-service loop (both gdbstub_on_debug_event()
+ * and gdbstub_poll() call sites) — CPU1 never hosts the FreeBSD guest. An
+ * `AT S1E1R` translate-instruction reflects the CURRENTLY EXECUTING core's
+ * own banked TTBR0/TTBR1_EL1 + SCTLR_EL1, so running it here would translate
+ * through CPU1's own (invalid/garbage) EL1 context, not the guest's — live
+ * evidence: a `Z0` breakpoint at a guest kernel VA faulted CPU1 itself inside
+ * bp_insert()'s dereference (EXC breadcrumb esr=0x96000144, far = the exact
+ * VA requested). The old fallback ("if AT S1E1R faults, treat the VA as a
+ * raw PA") made it worse: a high guest KVA (e.g. 0xffff0000_00632080) is
+ * nowhere near this board's real DRAM range, so that fallback dereferenced
+ * garbage instead of failing cleanly.
+ *
+ * Fix: NEVER do a live stage-1 walk from here — only core-independent, static
+ * arithmetic:
+ *   1. A KVA inside the loaded FreeBSD kernel image's own range (the common
+ *      case: `break`/`hbreak` on a kernel function) is resolved via kload.c's
+ *      pa_base/kernbase bookkeeping — pa = pa_base + (va - kernbase). This is
+ *      pure arithmetic over values already recorded when the kernel ELF was
+ *      placed (kload_place_segments()); valid on ANY core, no live TTBR
+ *      needed, no risk of faulting.
+ *   2. An address that doesn't even look like a high KVA (< the canonical
+ *      0xffff000000000000 line) is treated as a flat physical address, same
+ *      as the original fallback for that class of address (our own EL2
+ *      structures / low guest-physical peeks) — never a guest KVA, so no
+ *      live-context ambiguity.
+ *   3. Anything else (a high KVA outside the loaded kernel image — dynamic
+ *      KVA, the direct map, etc.) cannot be resolved correctly from CPU1 at
+ *      all; return failure so the caller refuses the request instead of
+ *      silently faulting or corrupting memory. */
+static int kload_va_to_pa(uint64_t va, unsigned long *pa)
 {
-	uint64_t par;
-	__asm__ volatile("at s1e1r, %0" :: "r"(va) : "memory");
-	__asm__ volatile("isb" ::: "memory");
-	__asm__ volatile("mrs %0, par_el1" : "=r"(par));
-	if (par & 1ull)
-		return 0;
-	*pa = (unsigned long)((par & 0x000ffffffffff000ull) | (va & 0xfffull));
+	uint64_t kb  = kload_kernbase();
+	uint64_t end = kload_kernel_end_va();
+	uint64_t pb  = kload_pa_base();
+
+	if (!kb || !end || !pb)
+		return 0;                 /* no kernel placed this boot yet */
+	if (va < kb || va >= end)
+		return 0;                 /* outside the loaded image's KVA range */
+	*pa = (unsigned long)(pb + (va - kb));
 	return 1;
 }
 
-/* Map an address GDB gave us to a directly-addressable PA: try the guest
- * stage-1 first (guest VAs / high-KVA pointers); if that faults, treat the
- * address as a flat physical address (our EL2 kernel, or guest phys). */
-static unsigned long resolve(uint64_t addr)
+#define GDB_HIGH_KVA_LINE 0xffff000000000000ull
+
+/* Resolve an address GDB gave us to a directly-addressable PA. Returns 1 and
+ * writes *pa on success; returns 0 if the address cannot be safely resolved
+ * from whichever core is running this code (see the block comment above) —
+ * callers MUST treat that as a hard failure (E01 / no memory touched), never
+ * guess. */
+static int resolve(uint64_t addr, unsigned long *pa)
 {
-	unsigned long pa;
-	if (gva_to_pa(addr, &pa))
-		return pa;
-	return (unsigned long)addr;   /* direct PA fallback */
+	if (kload_va_to_pa(addr, pa))
+		return 1;
+	if (addr < GDB_HIGH_KVA_LINE) {
+		*pa = (unsigned long)addr;   /* flat PA — not a guest KVA at all */
+		return 1;
+	}
+	return 0;                        /* unresolvable high KVA */
 }
 
 /* ------------------------------------------------------------------ *
@@ -417,8 +454,12 @@ static int bp_insert(uint64_t addr)
 		return 0;
 
 	{
-		unsigned long pa = resolve(addr);
-		volatile uint32_t *p = (volatile uint32_t *)pa;
+		unsigned long pa;
+		volatile uint32_t *p;
+
+		if (!resolve(addr, &pa))
+			return 0;      /* unresolvable from CPU1 -- refuse, touch nothing */
+		p = (volatile uint32_t *)pa;
 		bp_tab[free].orig = *p;
 		*p = BRK_INSTR;
 		isync_patch(pa);
@@ -646,8 +687,15 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 		if (l > (GDB_BUF - 8) / 2)
 			l = (GDB_BUF - 8) / 2;
 		for (i = 0; i < l; i++) {
-			unsigned long pa = resolve(addr + i);
-			uint8_t b = *(volatile uint8_t *)pa;
+			unsigned long pa;
+			uint8_t b;
+			if (!resolve(addr + i, &pa)) {
+				/* Unresolvable address (see resolve()'s block comment) --
+				 * fail the WHOLE read rather than guess/fault. */
+				gdb_send("E01");
+				return GDB_RUN_NONE;
+			}
+			b = *(volatile uint8_t *)pa;
 			out[n++] = nyb(b >> 4);
 			out[n++] = nyb(b);
 		}
@@ -665,12 +713,22 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 		l = parse_num(&p);
 		if (*p == ':') p++;
 		d = p;
+		/* Validate the WHOLE range resolves before writing any byte -- a
+		 * failure partway through would otherwise leave the write half
+		 * applied. Two cheap passes over a small, GDB_BUF-bounded range. */
+		for (i = 0; i < l; i++) {
+			unsigned long pa;
+			if (!resolve(addr + i, &pa)) {
+				gdb_send("E01");
+				return GDB_RUN_NONE;
+			}
+		}
 		for (i = 0; i < l; i++) {
 			int hi = unhex(d[i * 2]);
 			int lo = unhex(d[i * 2 + 1]);
 			unsigned long pa;
 			if (hi < 0 || lo < 0) break;
-			pa = resolve(addr + i);
+			resolve(addr + i, &pa);    /* re-validated above; can't fail here */
 			*(volatile uint8_t *)pa = (uint8_t)((hi << 4) | lo);
 			isync_patch(pa);           /* in case of code writes */
 		}
@@ -717,6 +775,14 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 				int r = gdbstub_hw_insert(type, addr, kind, g);
 				if      (r == 1)  gdb_send_ok();
 				else if (r == -1) gdb_send("E01"); /* refused: CPSR.D=1 */
+				else if (r == -2) gdb_send("E01"); /* refused: CPU0 not parked
+				                                     * right now -- arming a
+				                                     * real HW slot from CPU1
+				                                     * would hit the wrong
+				                                     * core (see gdbstub_hw.c);
+				                                     * use `break` (Z0)
+				                                     * instead for a bp ahead
+				                                     * of where the guest is */
 				else              gdb_send_empty(); /* full -> GDB uses SW bp */
 			}
 		}
@@ -729,9 +795,14 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 		if (*p == ',') p++;
 		{
 			uint64_t addr = parse_num(&p);
-			if (type == 0) bp_remove(addr);
-			else           gdbstub_hw_remove(type, addr);
-			gdb_send_ok();
+			int ok;
+			if (type == 0) ok = bp_remove(addr);
+			else           ok = gdbstub_hw_remove(type, addr);
+			/* gdbstub_hw_remove() can genuinely fail now (0 = a real armed
+			 * slot exists but CPU0 isn't parked to clear it right now, see
+			 * gdbstub_hw.c) -- report that honestly instead of always OK. */
+			if (ok) gdb_send_ok();
+			else    gdb_send("E01");
 		}
 		return GDB_RUN_NONE;
 	}
@@ -742,6 +813,7 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 
 	case 'D':                                  /* detach */
 		bp_remove_all();
+		gdbstub_hw_clear_all();
 		disarm_step(g);
 		gdb_attached = 0;
 		gdb_send_ok();
@@ -749,6 +821,7 @@ static int dispatch(char *pkt, int len, struct el2_frame *g)
 
 	case 'k':                                  /* kill — nothing to kill; resume */
 		bp_remove_all();
+		gdbstub_hw_clear_all();
 		disarm_step(g);
 		gdb_attached = 0;
 		return GDB_RUN_DETACH;

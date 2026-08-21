@@ -49,6 +49,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"
+#include "hv_addrmap.h"
 
 /* ------------------------------------------------------------------ *
  * Capture ring, fixed at physical/virtual (identity-mapped, MMU-off guest)
@@ -132,6 +133,8 @@
  *   drained; the TX tee is actively consumed and must stay small/bounded.
  * ------------------------------------------------------------------------ */
 #define VCONSOLE_RING_BASE   0x50000f00UL
+_Static_assert(VCONSOLE_RING_BASE == HVMAP_LOW_VCONSOLE_HDR,
+               "VCONSOLE_RING_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define VCONSOLE_MAGIC       0x55415254u   /* "UART" */
 
 #define VCONSOLE_HDR_WORDS   8u                       /* see layout above       */
@@ -159,6 +162,8 @@
  * BASE+HDR_SIZE, so growing the header can never march the buffer into a
  * neighbour again — which is exactly how this happened. */
 #define VCONSOLE_BUF_BASE    0x50040000UL              /* explicit, NOT adjacent */
+_Static_assert(VCONSOLE_BUF_BASE == HVMAP_LOW_VCONSOLE_BUF,
+               "VCONSOLE_BUF_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define VCONSOLE_BUF_SIZE    0x10000u                  /* 64 KiB capture window  */
 
 /* Bumped whenever the header layout or the buffer's location/size changes, so a

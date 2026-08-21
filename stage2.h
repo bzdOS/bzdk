@@ -171,6 +171,16 @@ void stage2_init(void);
  * VTCR_EL2/VTTBR_EL2 — turning VM on before the tables/VTCR exist is
  * undefined. Writes breadcrumb word 3 (HCR_EL2 readback).
  */
+/* Program THIS PE's banked VTCR_EL2/VTTBR_EL2 against the already-built global
+ * tables. stage2_init() calls it for the boot core; a secondary guest vCPU
+ * needs it because those two registers are per-PE while the tables are not. */
+void stage2_program_this_pe(void);
+
+/* Bring a secondary guest vCPU's stage-2 regime up on the calling core:
+ * program this PE's registers, then enable. Builds no tables -- one guest, one
+ * set of descriptors, one VMID. See vcpu2.c. */
+void stage2_arm_secondary(void);
+
 void stage2_enable(void);
 
 /* Turn stage-2 translation back off: HCR_EL2.VM = 0 (read-modify-write,

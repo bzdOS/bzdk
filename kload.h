@@ -310,6 +310,20 @@ uint64_t kload_entry_pa(void);
  * scratch_pa/dtb_pa above the kernel. */
 uint64_t kload_kernel_end_pa(void);
 
+/* Physical load base as given to the last successful kload_place_segments()
+ * call (kls.pa_base). Together with kload_kernbase(), this is the static
+ * delta (pa_base - kernbase) that maps ANY KVA inside [kernbase,
+ * kload_kernel_end_va()) to its physical address with plain arithmetic —
+ * NO live stage-1 page-table walk needed. Added for gdbstub.c's resolve():
+ * an `AT S1E1R` translate-instruction only ever reflects the CURRENTLY
+ * EXECUTING core's own banked TTBR0/TTBR1_EL1, which is wrong for the GDB
+ * stub (its dispatch() always runs on CPU1, the debug-service core, which
+ * never hosts the FreeBSD guest and has no valid EL1 translation context at
+ * all) — this accessor lets a core-independent caller resolve a guest
+ * kernel-image VA correctly regardless of which core asks. Returns 0 if no
+ * successful placement has run. */
+uint64_t kload_pa_base(void);
+
 /* Drop the CPU from EL2 to EL1 at physical address `entry` (see
  * kload_entry_pa()), with x0 = modinfo_pa (the FreeBSD loader's x0
  * convention — see the protocol comment above) and SP_EL1 = sp.
