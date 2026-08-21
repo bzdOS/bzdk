@@ -89,18 +89,36 @@
 #define SCANOUT_R_FLIP_REQUEST  0x24u
 #define SCANOUT_R_FLIP_COUNT    0x28u
 #define SCANOUT_R_REJECT_COUNT  0x2Cu
+#define SCANOUT_R_GUESTWIN_ADDR   0x30u
+#define SCANOUT_R_GUESTWIN_COUNT  0x34u
+#define SCANOUT_R_GUESTWIN_REJECT 0x38u
+#define SCANOUT_R_VBLANK_COUNT    0x40u
+#define SCANOUT_R_VBLANK_STAMP_LO 0x44u
+#define SCANOUT_R_VBLANK_STAMP_HI 0x48u
 
 #define SCANOUT_MAGIC           0x53434e41u
 #define SCANOUT_VERSION         1u
 #define SCANOUT_FORMAT_XRGB8888 0u
 
-/* Mirror of scanout.c's `struct scanout_dev` (scanout.c:61-67). */
+/* Mirror of scanout.c's `struct scanout_dev`.
+ *
+ * This mirror had drifted: it was missing guestwin_count/guestwin_reject
+ * entirely, so the guest-window registers added later were never covered here
+ * at all. Re-synced 2026-08-21 together with the new vblank registers. The
+ * vblank fields are pushed in from outside in the real code too (the fault
+ * wrapper mirrors them from hdmi.c), which is exactly why they can be tested
+ * here without any notion of TCON. */
 struct scanout_dev {
 	uint32_t buf_pa[2];
 	uint32_t width, height, stride, format;
 	uint32_t front_index;
 	uint32_t flip_count;
 	uint32_t reject_count;
+	uint32_t guestwin_count;
+	uint32_t guestwin_reject;
+	uint32_t vblank_count;
+	uint32_t vblank_stamp_lo;
+	uint32_t vblank_stamp_hi;
 };
 
 /* Scripted recorder standing in for hdmi_set_scanout_addr() + scan_bc() —
@@ -127,6 +145,11 @@ static uint32_t scanout_reg_read(const struct scanout_dev *d, uint32_t off)
 	case SCANOUT_R_FRONT_INDEX:  return d->front_index;
 	case SCANOUT_R_FLIP_COUNT:   return d->flip_count;
 	case SCANOUT_R_REJECT_COUNT: return d->reject_count;
+	case SCANOUT_R_GUESTWIN_COUNT:  return d->guestwin_count;
+	case SCANOUT_R_GUESTWIN_REJECT: return d->guestwin_reject;
+	case SCANOUT_R_VBLANK_COUNT:    return d->vblank_count;
+	case SCANOUT_R_VBLANK_STAMP_LO: return d->vblank_stamp_lo;
+	case SCANOUT_R_VBLANK_STAMP_HI: return d->vblank_stamp_hi;
 	default:                     return 0u;
 	}
 }
@@ -349,6 +372,36 @@ static void test_reg_write_other_offsets_are_noop(void)
 	      "...and never touches the real hardware either");
 }
 
+/*
+ * The vblank registers report EL2's observation of the real panel, mirrored into
+ * the device struct by the fault wrapper. Two things worth pinning: the 64-bit
+ * timestamp really is split LO/HI the way the header describes (a driver reading
+ * only LO must not silently get a truncated 64-bit value from somewhere else),
+ * and the gap at 0x3C between the guest-window block and this one still reads 0
+ * like every other unknown offset.
+ */
+static void test_vblank_registers(void)
+{
+	struct scanout_dev d;
+
+	memset(&d, 0, sizeof(d));
+	d.vblank_count    = 0x0001E240u;              /* 123456 vblanks */
+	d.vblank_stamp_lo = 0xFEDCBA98u;
+	d.vblank_stamp_hi = 0x00000123u;
+
+	CHECK(scanout_reg_read(&d, SCANOUT_R_VBLANK_COUNT) == 0x0001E240u,
+	    "VBLANK_COUNT reads back the observed count");
+	CHECK(scanout_reg_read(&d, SCANOUT_R_VBLANK_STAMP_LO) == 0xFEDCBA98u,
+	    "VBLANK_STAMP_LO is the low half of the CNTPCT stamp");
+	CHECK(scanout_reg_read(&d, SCANOUT_R_VBLANK_STAMP_HI) == 0x00000123u,
+	    "VBLANK_STAMP_HI is the high half, not a duplicate of LO");
+	CHECK(scanout_reg_read(&d, 0x3Cu) == 0u,
+	    "the hole between the guest-window and vblank blocks still reads 0");
+	CHECK(scanout_reg_read(&d, SCANOUT_R_GUESTWIN_COUNT) == 0u &&
+	      scanout_reg_read(&d, SCANOUT_R_GUESTWIN_REJECT) == 0u,
+	    "the guest-window counters are mirrored too (they were missing here)");
+}
+
 int main(void)
 {
 	test_reg_read_table();
@@ -359,6 +412,7 @@ int main(void)
 	test_reg_write_flip_request_drives_hw();
 	test_reg_write_flip_request_rejected_skips_hw();
 	test_reg_write_other_offsets_are_noop();
+	test_vblank_registers();
 
 	if (g_failed) {
 		printf("---- scanout register tests: FAILED ----\n");

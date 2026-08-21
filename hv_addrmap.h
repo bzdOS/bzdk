@@ -640,6 +640,60 @@ _Static_assert(HVMAP_WXDYN_BC + HVMAP_WXDYN_BC_SIZE <= 0x50100000UL,
  * before picking it -- only HVMAP_SCANOUT_BC/HVMAP_WXDYN_BC/HVMAP_VGICD_BC
  * matched, all below it. */
 #define HVMAP_WDT_DEBUG_HOLD       0x50095000UL
+
+/* ---- Event-trace ring ("TRC1") and profiler histogram ("PROF") -----------
+ * RELOCATED 2026-08-20, and the relocation is the whole point of this entry.
+ *
+ * trace.c and profiler.c were written, complete, and linked into NO build
+ * target, so their addresses had never been reconciled with this map. Both
+ * were wrong:
+ *
+ *   - trace.c's ring at 0x50004000 with TRACE_CAP=512 spans
+ *     0x50004000..0x50006040, and bmc.h puts BMC_HEALTH_BASE at 0x50006000.
+ *     Enabling the ring as written would have had its last two slots write
+ *     through the software-BMC health block -- and bmc.h's own comment
+ *     claims 0x50006000 is "clear of every existing window", which was true
+ *     only because the ring was dead code.
+ *   - profiler.c's table at 0x50006800 (1024 buckets ->
+ *     0x50006800..0x50008820) also lands inside the BMC block, and hud.c
+ *     read it at 0x50004800 instead -- i.e. 2 KiB INTO the trace ring. That
+ *     is why the HUD's PROFILE panel could only ever print "PROF magic not
+ *     found": it was reading another subsystem's ring.
+ *
+ * Both now live above every other window, in the 0x50096000..0x50100000 gap
+ * (emac.c's SCRATCH_BASE is 0x50100000 and is the next thing up), sized from
+ * their own capacity constants rather than from a neighbour -- the rule this
+ * file exists to enforce. hud.c reads THESE defines; it no longer keeps its
+ * own copies, which is how it drifted 2 KiB into the ring in the first
+ * place. */
+#define HVMAP_TRACE_RING       0x50096000UL
+#define HVMAP_TRACE_RING_SIZE  0x00002100UL   /* 0x40 hdr + 512 * 16 B */
+#define HVMAP_TRACE_RING_END   (HVMAP_TRACE_RING + HVMAP_TRACE_RING_SIZE)
+
+#define HVMAP_PROF_HIST        0x5009A000UL
+#define HVMAP_PROF_HIST_SIZE   0x00002020UL   /* 0x20 hdr + 1024 * 8 B */
+#define HVMAP_PROF_HIST_END    (HVMAP_PROF_HIST + HVMAP_PROF_HIST_SIZE)
+
+_Static_assert(HVMAP_TRACE_RING >= HVMAP_WDT_DEBUG_HOLD + 0x1000UL,
+               "trace ring overlaps the watchdog debug-hold word");
+_Static_assert(HVMAP_TRACE_RING_END <= HVMAP_PROF_HIST,
+               "trace ring runs into the profiler histogram");
+_Static_assert(HVMAP_PROF_HIST_END <= 0x50100000UL,
+               "profiler histogram runs into emac.c's DMA scratch (0x50100000)");
+
+/* ---- second guest vCPU on CPU2 (vcpu2.c) -------------------------------
+ * Breadcrumbs for the core that stops being an HV worker and becomes a guest
+ * CPU. Placed past the profiler histogram, which is the current top of this
+ * block, and asserted against BOTH neighbours rather than eyeballed -- the
+ * mistake this file exists to prevent. */
+#define HVMAP_VCPU2_BC        0x5009D000UL
+#define HVMAP_VCPU2_BC_SIZE   0x00000100UL
+#define HVMAP_VCPU2_BC_END    (HVMAP_VCPU2_BC + HVMAP_VCPU2_BC_SIZE)
+
+_Static_assert(HVMAP_VCPU2_BC >= HVMAP_PROF_HIST_END,
+               "vcpu2 breadcrumbs overlap the profiler histogram");
+_Static_assert(HVMAP_VCPU2_BC_END <= 0x50100000UL,
+               "vcpu2 breadcrumbs run into emac.c's DMA scratch (0x50100000)");
 #define HVMAP_WDT_DEBUG_HOLD_SIZE  0x10UL   /* one word used, room to grow */
 
 _Static_assert(HVMAP_WDT_DEBUG_HOLD >= HVMAP_VGICD_BC + HVMAP_VGICD_BC_SIZE,

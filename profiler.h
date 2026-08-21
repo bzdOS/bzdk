@@ -37,6 +37,14 @@
 #include <stdint.h>
 
 /* Initialize (zero + stamp header) the PROF histogram. Call once, early. */
+/* Byte offset of bucket 0 from PROF_BASE == the header size (8 words).
+ * Exported because hud.c needs it: it used to hardcode 16 (a 4-word header),
+ * so its PROFILE panel read words 6 and 7 of the HEADER as its first bucket
+ * and displayed CNTFRQ (0x016E3600) as the hottest "PC" with a count of
+ * 0xFFFFFFF0. The panel had never been live, so the mismatch had never been
+ * visible. One definition now. */
+#define PROF_HDR_BYTES  0x20u
+
 void profiler_init(void);
 
 /* Record one PC sample: fold into the histogram and emit a TRACE_PROFILE

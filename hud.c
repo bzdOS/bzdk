@@ -22,9 +22,11 @@
  */
 #include <stdint.h>
 #include "hud.h"
+#include "profiler.h"
 #include "hdmi.h"
 #include "fb.h"
 #include "exceptions.h"
+#include "hv_addrmap.h"
 
 /* ------------------------------------------------------------------ *
  * Palette — dark background, cyan headers, green/amber values, red for
@@ -91,6 +93,21 @@
 #define RC_X (GW_X + GW_W + MARGIN)
 #define RC_W (SCR_W - RC_X - MARGIN)
 
+/* The right column's width is whatever the mode leaves over after the fixed
+ * 1150-px GUEST window, so a narrower mode silently squeezes it: 746 px at
+ * 1920 but only 106 px at 1280, which is less than the panel titles need. That
+ * is not a clip by fb.c -- the column really is that narrow, and it showed up as
+ * "TIMING / JITTE", "GUEST TRACE /", "MEMORY / BREAK" cut off mid-word in a
+ * screenshot taken from EL2 (screenshot.py). The guest window is
+ * HDMI_GUESTWIN_W (1120) wide and has to fit inside the left panel, so the fix
+ * is a wider mode, not a narrower column -- hence 1080p is the default build
+ * (see the Makefile). This assert exists so the next mode change fails HERE,
+ * at compile time, instead of quietly truncating the panels again. 300 px is
+ * the measured minimum: the widest label plus its value column. */
+_Static_assert(RC_W >= 300,
+    "display mode too narrow for the HUD's right column -- widen the mode or "
+    "shrink GW_W and HDMI_GUESTWIN_W together");
+
 #define TIMING_Y GW_Y
 #define TIMING_H 180
 
@@ -125,7 +142,11 @@
  * track — read-only here; both are validated by magic and rendered as a dim
  * placeholder when absent, and every loop is hard-capped).
  * ------------------------------------------------------------------ */
-#define TRC_BASE     0x50004000UL   /* event-trace ring header */
+/* From hv_addrmap.h. This was a local 0x50004000 copy, and PROF_BASE below
+ * was a local 0x50004800 -- 2 KiB INSIDE this ring, not the profiler at
+ * all, which is the entire reason the PROFILE panel never found its
+ * magic. Same failure this file already had once with HDMI_BC_BASE. */
+#define TRC_BASE     HVMAP_TRACE_RING
 #define TRC_ENTRIES  0x50004040UL   /* 16-byte entries start here */
 #define TRC_ENTSZ    16u
 #define TRC_MAGIC    0x54524331u    /* "TRC1" */
@@ -135,13 +156,17 @@
 #define EV_CTX_SWITCH 1u
 
 /* Profiler histogram: "PROF" magic, then buckets of {u32 pc, u32 count}.
- * The exact header size the producer reserves before the first bucket is not
- * pinned down by the shared spec beyond "header then N buckets"; we assume a
- * 16-byte (4-word) header. If the producer differs, adjust PROF_BUCKET_OFF —
- * it is the single knob that has to match. */
-#define PROF_BASE       0x50004800UL
+ * The header size is NOT guessed here any more. It used to be "we assume a
+ * 16-byte (4-word) header ... if the producer differs, adjust
+ * PROF_BUCKET_OFF" -- the producer did differ (8 words), nobody adjusted it,
+ * and because this panel had never been linked into a build the error was
+ * invisible until the first live render showed CNTFRQ as the hottest PC.
+ * PROF_HDR_BYTES now comes from profiler.h, so producer and reader cannot
+ * disagree. */
+#define PROF_BASE       HVMAP_PROF_HIST
 #define PROF_MAGIC      0x50524F46u /* "PROF" (MSB-first, matching TRC1) */
-#define PROF_BUCKET_OFF 16u
+#define PROF_BUCKET_OFF PROF_HDR_BYTES   /* from profiler.h -- was a
+                                          * hardcoded 16, i.e. wrong */
 #define PROF_MAXBKT     24u         /* buckets scanned */
 #define PROF_TOPN       12u         /* bars rendered */
 
@@ -208,9 +233,13 @@ static inline uint32_t mmio32(uint32_t addr)
 #define TIMR_BC_BASE 0x50000500UL
 #define GICT_BC_BASE 0x50000800UL
 #define VCON_RING    0x50000f00UL   /* "UART" — vconsole.c */
+_Static_assert(VCON_RING == HVMAP_LOW_VCONSOLE_HDR,
+               "VCON_RING drifted from hv_addrmap.h -- the map owns this address");
 #define VCON_BUF     0x50000f10UL   /* captured console bytes */
 #define VCON_SIZE    3072u
 #define GTRC_BC_BASE 0x50002000UL   /* "GTRC" — gtrace.c */
+_Static_assert(GTRC_BC_BASE == HVMAP_LOW_GTRACE,
+               "GTRC_BC_BASE drifted from hv_addrmap.h -- the map owns this address");
 /* FIXED (found while adding zero-copy-scanout support, see
  * docs/zero-copy-scanout.md): hdmi.c's breadcrumb moved from 0x50003000 to
  * 0x50011800 on 2026-07-25 (hdmi.h's own "Relocated 2026-07-25" comment —
@@ -220,6 +249,8 @@ static inline uint32_t mmio32(uint32_t addr)
  * — whatever was last written there before the move, never hdmi.c's real,
  * live pipeline state — in every HV_HDMI build since. */
 #define HDMI_BC_BASE 0x50011800UL
+_Static_assert(HDMI_BC_BASE == HVMAP_LOW_HDMI_BC,
+               "HDMI_BC_BASE drifted from hv_addrmap.h -- the map owns this address");
 
 #define VCON_MAGIC   0x55415254u    /* "UART" */
 #define EXC_MAGIC    0x45584331u    /* "EXC1" */
@@ -294,7 +325,11 @@ hud_init(void)
 	/* Title bar. */
 	fb_fillrect(0, 0, SCR_W, TITLE_H, HUD_TITLE_BG);
 	fb_rect(0, 0, SCR_W, TITLE_H, HUD_BORDER);
-	fb_str(MARGIN, 10, "bzdOS hypervisor -- Chimp BPI-M64", HUD_TITLE_FG, HUD_TITLE_BG);
+	/* "bzdk", not "bzdOS": bzdk is THIS -- the EL2 hypervisor. bzdOS is the
+	 * operating system, a separate project. The title said "bzdOS
+	 * hypervisor" and conflated the two, which matters because this line
+	 * ends up in every screenshot. */
+	fb_str(MARGIN, 10, "bzdk hypervisor -- Chimp BPI-M64", HUD_TITLE_FG, HUD_TITLE_BG);
 
 	/* GUEST window frame + header. */
 	fb_fillrect(GW_X, GW_Y, GW_W, GW_H, HUD_PANEL_BG);
@@ -715,7 +750,7 @@ update_regmap_panel(void)
 /* ================================================================== *
  * SCHED GANTT / CPU TIMELINE panel.
  *
- * Reads the event-trace ring (0x50004000, "TRC1") and, for each of the four
+ * Reads the event-trace ring (HVMAP_TRACE_RING, "TRC1") and, for each of the four
  * CPUs, draws a horizontal lane showing which task ran when over the most
  * recent window of events. CTX_SWITCH events (type 1) carry the new task id
  * (word2 arg16) and CPU (word2 bits[15:8]); each switch starts a colored
@@ -883,6 +918,14 @@ update_gantt_panel(void)
 		have[c] = 1;
 	}
 
+	/* An empty lane set has two very different causes, and saying which one
+	 * is the whole value of this branch. "TRC1 magic not found" (above) means
+	 * the ring is not being produced at all. Reaching here with events in the
+	 * ring but zero CTX_SWITCH means the ring IS live and EL2 simply never
+	 * multiplexes tasks on this build -- which is the normal, correct state
+	 * for the FreeBSD guest target, where the guest owns CPU0 outright and
+	 * EL2's scheduler is the no-op fallback. Without this line the panel looks
+	 * identical to a broken one. */
 	/* Final segment on each CPU: from its last switch to the window end. */
 	for (cpu = 0; cpu < NCPU; cpu++) {
 		if (have[cpu]) {
@@ -923,13 +966,25 @@ update_gantt_panel(void)
 		       HUD_LABEL_FG, HUD_PANEL_BG);
 		fb_dec(ix + (7 + n + 2 + 8) * FB_FONT_W, iy, win_ms,
 		       HUD_VAL_AMBER, HUD_PANEL_BG);
+
+		/* Why the lanes are empty, on the same row and AFTER the
+		 * fb_fillrect above -- drawn earlier it was erased by it, and
+		 * drawn two rows down it landed on top of the CPU0 label. An
+		 * empty lane set from "ring not produced" (handled far above,
+		 * where the magic check bails out) and from "ring fine, EL2
+		 * simply never switches tasks on this build" look identical
+		 * otherwise, and only the second one is normal. */
+		if (ctx_count == 0u)
+			fb_str(ix + (7 + n + 2 + 8 + 4) * FB_FONT_W, iy,
+			       "(ring live, 0 ctx switches: EL2 runs no tasks "
+			       "on this build)", HUD_VAL_DIM, HUD_PANEL_BG);
 	}
 }
 
 /* ================================================================== *
  * PROFILE / HOT PCs panel (flamegraph-ish Top-functions histogram).
  *
- * Reads the profiler histogram (0x50004800, "PROF"): buckets of {pc,count}.
+ * Reads the profiler histogram (HVMAP_PROF_HIST, "PROF"): buckets of {pc,count}.
  * We scan up to PROF_MAXBKT buckets, select the top PROF_TOPN by count, and
  * draw a labeled horizontal bar per PC (length proportional to count),
  * colored hot->cold by rank. Symbol resolution is host-side, so we show the

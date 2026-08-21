@@ -135,6 +135,23 @@
 #define SCANOUT_R_GUESTWIN_COUNT  0x34u  /* R: accepted presents */
 #define SCANOUT_R_GUESTWIN_REJECT 0x38u  /* R: rejected addresses */
 
+/* ---- real vblank, observed by EL2 (v1 addition) ------------------------ *
+ * A guest KMS driver has no vblank interrupt: the panel belongs to EL2. Before
+ * these registers existed, bzkms invented its own vblank from a periodic
+ * callout at a hardcoded 60 Hz -- which, at hz=1000, is 16 ticks = 62.5 Hz, and
+ * whose phase has no relationship to the panel at all. Reporting a real count
+ * lets the guest OBSERVE vblanks instead of GENERATING them, so both the rate
+ * error and the phase error go away.
+ *
+ * COUNT is monotonic and wraps at 2^32 (~2 years at 60 Hz). STAMP is the
+ * CNTPCT_EL0 value read at that vblank, split into two registers because the
+ * register file is 32-bit; read LO then HI then LO again and retry if the first
+ * LO differs, the standard split-counter dance -- or just ignore the stamp,
+ * which is what a driver that only needs "did it advance?" should do. */
+#define SCANOUT_R_VBLANK_COUNT    0x40u  /* R: real panel vblanks seen by EL2 */
+#define SCANOUT_R_VBLANK_STAMP_LO 0x44u  /* R: CNTPCT at that vblank, low 32  */
+#define SCANOUT_R_VBLANK_STAMP_HI 0x48u  /* R: ... high 32                    */
+
 #define SCANOUT_MAGIC          0x53434e41u   /* "SCAN", MSB-first, same
                                                * spelling convention as every
                                                * other magic in this tree
