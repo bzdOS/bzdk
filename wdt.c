@@ -38,6 +38,7 @@
  */
 #include <stdint.h>
 #include "wdt.h"
+#include "cntpct.h"
 
 #define WDOG_CTRL (*(volatile uint32_t *)0x01C20CB0UL)
 #define WDOG_CFG  (*(volatile uint32_t *)0x01C20CB4UL)
@@ -58,7 +59,7 @@ static uint64_t wdt_window_ticks;    /* WDT_TIMEOUT_S expressed in counter ticks
 static inline uint64_t rd_cntpct(void)
 {
     uint64_t v;
-    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+    v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
     return v;
 }
 

@@ -32,6 +32,7 @@
 #include <stddef.h>
 #include "sd_bio.h"
 #include "hv_addrmap.h"     /* HVMAP_SD_BC */
+#include "cntpct.h"
 
 /* ------------------------------------------------------------------ */
 /* Physical bases (SD-specific)                                        */
@@ -133,7 +134,7 @@ static inline void wreg(uint32_t off, uint32_t v) { wr32(SD_BASE + off, v); }
 static inline uint64_t rd_cntpct(void)
 {
 	uint64_t v;
-	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+	v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 

@@ -18,8 +18,9 @@
 #include <stdint.h>
 #include "exceptions.h"
 #include "bmc.h"
-#include "vconsole.h"   /* VCONSOLE_BUF_BASE/SIZE -- never copy them, see below */
-#include "hv_addrmap.h" /* HVMAP_VCPM_* -- the postmortem carry-over lane      */
+#include "vconsole.h"   /* VCONSOLE_BUF_BASE/SIZE -- never copy them, see below */ /* HVMAP_VCPM_* -- the postmortem carry-over lane      */
+#include "hv_addrmap.h"
+#include "cntpct.h"
 
 /* ------------------------------------------------------------------ *
  * Console hooks — identical extern contract dbgmon.c/repl.c use. main_dbg.c
@@ -113,6 +114,15 @@ extern void axp803_read_health(struct axp803_health *out);
  * So there is currently no trustworthy tick source to point this at without
  * an address-map fix that is out of this file's scope (and needs board
  * verification this session cannot do). bmc_health_snapshot() below reports
+ * NOTE 2026-08-20: the reason for retirement was the ALIASED address, not the
+ * idea of publishing a tick. A collision-checked tick source now exists --
+ * HVMAP_TRACE_RING (hv_addrmap.h, with _Static_asserts against its
+ * neighbours), whose header carries total_events and the 24 MHz counter
+ * frequency. Reviving a timer line here would mean bumping HEALTH_WORDS on
+ * both sides (bmc.c and bmc_client.py) AND being careful that the ring counts
+ * ALL events, not only ticks -- so it is left undone deliberately rather than
+ * forgotten. The sentinel below stays the honest answer until then.
+ *
  * the honest "no data" sentinel for tick_lo/tick_hi/tick_delta instead of
  * silently forwarding someone else's memory. Use hb_cpu0/hb_cpu1 (SMP1,
  * 0x50000900 -- unaffected by any of the above) for liveness; bzdctl.py
@@ -120,6 +130,8 @@ extern void axp803_read_health(struct axp803_health *out);
 #define BMC_EXC_BASE    0x50000400UL   /* el2_exc.c  "EXC1": [1]=count [2]=kind [3]=esr */
 #define BMC_SMP_BASE    0x50000900UL   /* smp.c      "SMP1": [1]=online [6..9]=heartbeats */
 #define BMC_UART_BASE   0x50000f00UL   /* vconsole.h "UART": [1]=total_bytes [2]=faults */
+_Static_assert(BMC_UART_BASE == HVMAP_LOW_VCONSOLE_HDR,
+               "BMC_UART_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define BMC_FFV_BASE    0x50005800UL   /* firstfault.c "FF1V": [1]=count            */
 /* The captured-console byte buffer. Deliberately taken from vconsole.h rather
  * than hard-coded here: this line USED to read 0x50000f10 -- the address the
@@ -196,7 +208,7 @@ static uint32_t rd32(unsigned long pa) { return *(volatile uint32_t *)pa; }
 
 static inline uint64_t rd_cntpct(void)
 {
-	uint64_t v; __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v)); return v;
+	uint64_t v; v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */ return v;
 }
 
 /* ------------------------------------------------------------------ *

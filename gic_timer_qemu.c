@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include "gic_timer_qemu.h"
 #include "timer.h"
+#include "cntpct.h"
 
 #define GICD_BASE 0x08000000UL
 #define GICC_BASE 0x08010000UL
@@ -61,7 +62,7 @@ read_cntpct(void)
 {
 	uint64_t v;
 	__asm__ volatile("isb sy" ::: "memory");
-	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+	v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 

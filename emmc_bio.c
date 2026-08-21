@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include "emmc_bio.h"
 #include "hv_addrmap.h"     /* HVMAP_EBIO_BC / HVMAP_EMMC_HS_TESTBUF */
+#include "cntpct.h"
 
 /* ------------------------------------------------------------------ */
 /* Physical bases                                                      */
@@ -100,6 +101,7 @@
 #define CMDR_PRG_CLK        0x00200000u  /* bit21: program-clock cmd */
 #define CMDR_SEND_INIT      0x00008000u  /* bit15: send init sequence (CMD0) */
 #define CMDR_WAIT_PRE_OVER  0x00002000u  /* bit13 */
+#define CMDR_STOP_ABORT     0x00004000u  /* bit14: this is an ABORT command */
 #define CMDR_DATA_EXP       0x00000200u  /* bit9: data transfer expected */
 #define CMDR_CHK_CRC        0x00000100u  /* bit8 */
 #define CMDR_WRITE          0x00000400u  /* bit10: data direction = write */
@@ -210,7 +212,7 @@ static inline void wreg(uint32_t off, uint32_t v) { wr32(EMMC_BASE + off, v); }
 static inline uint64_t rd_cntpct(void)
 {
 	uint64_t v;
-	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+	v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 
@@ -245,6 +247,19 @@ static inline uint64_t ms_to_ticks(uint32_t ms)
  *     added here — this file runs on CPU0, CPU1 *and* CPU2, and the per-
  *     sector feed already happens one layer up, in vblk_emmc.c's
  *     serve_data(), after this call returns). */
+/* Per-STALL budget for the read drain loop, not a whole-transfer budget: it
+ * resets every time a word is drained. Generous on purpose -- an eMMC may pause
+ * a read for tens of milliseconds of internal housekeeping, and failing such a
+ * read costs the guest an EIO on a disk that is working. CPU1 owns the hardware
+ * watchdog and pets it independently of this core, so a long stall here cannot
+ * reset the board. */
+#define EMMC_READ_STALL_TIMEOUT_MS   500u
+/* Deadline for the FIFO tail AFTER DATA_OVER has latched with a short count.
+ * The card has stopped sending by then, so the outstanding words are already in
+ * flight inside the controller: they show up in microseconds, or the transfer
+ * really is short and waiting longer is pointless. Deliberately much tighter
+ * than the stall budget above. */
+#define EMMC_READ_DRAIN_TAIL_MS      20u
 #define EMMC_WRITE_DATA_TIMEOUT_MS   1000u
 #define EMMC_WRITE_BUSY_TIMEOUT_MS   4000u
 
@@ -555,6 +570,16 @@ static uint32_t g_gctl_rst_timeouts; /* [22] resets that never self-cleared   */
  * path's missing check, and it is still open. It is not being closed in the same
  * change that closed the read side, because the write path currently produces
  * ZERO corrupt sectors in a 68 MB round trip and making a mask fatal there could
+ * MEASURED 2026-08-20, which was the whole point of recording it: after 512 MiB
+ * of raw reads and 64 MiB of file writes on this board, [23] and [24] are BOTH
+ * ZERO -- not one error bit has ever been observed latched at the moment
+ * DATA_OVER was seen. So on this part the hole is theoretical, and closing it by
+ * failing the write would trade a real (retry-storm) risk for no measured
+ * benefit. Leave it observational. The READ path's version of the same hole was
+ * closed at the same time, and there it was NOT theoretical: the read loop now
+ * tests RINT_READ_ERR_MASK before the DATA_OVER check, so a genuine error ends
+ * the wait immediately instead of being outlived by it.
+ *
  * only regress that. Record which bits actually co-occur with DATA_OVER first;
  * make it fatal when the data says which bits are safe to fail on. */
 static uint32_t g_write_dataover_errs; /* [23] err bits seen with DATA_OVER   */
@@ -878,8 +903,25 @@ static void ebio_fail_settle_full(int stop_card)
 	 * transfer still open. There is nothing to wait for until the abort is sent. */
 	if (stop_card) {
 		ebio_bc(29, ++g_stop_cmds);
-		if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0, CMDR_RESP_EXP,
-		                  NULL) != 0)
+		/* CMDR_STOP_ABORT is the bit that makes this an ABORT rather than
+		 * an ordinary command, and it was missing. Without bit 14 the
+		 * controller's command engine queues CMD12 behind the transfer it
+		 * is supposed to be aborting -- which is a coherent explanation
+		 * for the measured 141-of-268 (53%) failure rate, and for the two
+		 * damaged sectors whose signature was "the abort did not take".
+		 *
+		 * PROVENANCE, because this file's header insists on it: Linux
+		 * sunxi-mmc.c's sunxi_mmc_send_manual_stop() (6.12, lines
+		 * 451-452) composes exactly
+		 *     SDXC_START | SDXC_RESP_EXPIRE | SDXC_STOP_ABORT_CMD |
+		 *     SDXC_CHECK_RESPONSE_CRC | MMC_STOP_TRANSMISSION
+		 * and this driver was sending RESP_EXPIRE alone. CHK_CRC is added
+		 * for the same reason: CMD12 answers R1b, a CRC-protected
+		 * response, and every other R1 command in this file already asks
+		 * the controller to check it. */
+		if (emmc_cmd_done(CMD12_STOP_TRANSMISSION, 0,
+		                  CMDR_RESP_EXP | CMDR_CHK_CRC |
+		                  CMDR_STOP_ABORT, NULL) != 0)
 			ebio_bc(30, ++g_stop_fails);
 	}
 
@@ -972,25 +1014,117 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 	wreg(REG_CAGR, lba);
 	wreg(REG_CMDR, CMD17_READ_CMDR);
 
-	for (i = 0; i < EMMC_POLL_CAP && nwords < 128; i++) {
-		uint32_t st = rreg(REG_STAR);
-		if (st & STAR_FIFO_EMPTY) {
-			if (rreg(REG_RINT) & RINT_DATA_OVER)
-				break; /* DATA_OVER + FIFO empty -> transfer done */
-			continue;
+	/* ROOT-CAUSE FIX (found live 2026-08-20, from the diagnostics this very
+	 * loop records). The bound used to be a single iteration count shared
+	 * between two different waits: waiting for the FIFO to refill, and
+	 * draining it. A card that pauses mid-block -- eMMC parts do internal
+	 * housekeeping whenever they like, for tens of milliseconds -- spends the
+	 * whole budget waiting, and the read then fails a few words short WITH NO
+	 * ERROR BIT SET ANYWHERE.
+	 *
+	 * That is exactly what was captured: nwords=127 of 128, RINT=0xC
+	 * (CMD_DONE|DATA_OVER, not one error bit), STAR bit2 clear -- i.e. the
+	 * missing word had ALREADY ARRIVED by the time the failure was recorded.
+	 * The guest saw `vtbd0: hard error cmd=read`, g_vfs_done error=5, and a
+	 * module failed to load off a disk that was working perfectly.
+	 *
+	 * The bound is now a STALL deadline: patience resets every time a word is
+	 * drained, so a slow card is waited out while a genuinely dead transfer
+	 * still ends in bounded time. Elapsed time uses the same backwards-safe
+	 * form and two-read confirmation as the write path's loops (rd_cntpct()
+	 * has been observed going backwards on this part -- see slot [18]).
+	 * EMMC_POLL_CAP survives only as a backstop for a broken counter, which is
+	 * why it is multiplied out: it must not be the binding constraint again. */
+	{
+		uint64_t patience = ms_to_ticks(EMMC_READ_STALL_TIMEOUT_MS);
+		uint64_t last = rd_cntpct();
+		unsigned over = 0;
+		unsigned over_done = 0;   /* DATA_OVER seen with a short count */
+		uint64_t guard = (uint64_t)EMMC_POLL_CAP * 64ull;
+
+		for (i = 0; (uint64_t)i < guard && nwords < 128; i++) {
+			uint32_t st = rreg(REG_STAR);
+			uint32_t ri;
+
+			if (!(st & STAR_FIFO_EMPTY)) {
+				buf[nwords++] = rreg(REG_FIFO);
+				last = rd_cntpct();   /* progress: reset the patience */
+				over = 0;
+				continue;
+			}
+
+			ri = rreg(REG_RINT);
+			/* A real error ends the wait immediately -- no point spending the
+			 * stall budget on a transfer the controller has already failed. */
+			if (ri & RINT_READ_ERR_MASK)
+				break;
+			if (ri & RINT_DATA_OVER) {
+				/* DATA_OVER means the CARD has no more data to send. It
+				 * does NOT mean the FIFO has already made the last word
+				 * visible: the controller latches DATA_OVER while the
+				 * final word is still being pushed in, so a read of
+				 * STAR taken in that window shows FIFO_EMPTY with a word
+				 * about to appear.
+				 *
+				 * Breaking out here on a SHORT count is what actually
+				 * produced `vtbd0: hard error cmd=read`. The captured
+				 * evidence is unambiguous: nwords=127, RINT=0xC (no
+				 * error bit anywhere), and STAR at the failure showing
+				 * FIFO_LEVEL=1 -- the 128th word was sitting in the FIFO
+				 * we had just declared empty. Widening the earlier
+				 * iteration bound did not help, and could not: the loop
+				 * was not running out of time, it was concluding early.
+				 *
+				 * So DATA_OVER ends the wait only once the block is
+				 * complete. Short of that, keep draining under a tight
+				 * post-DATA_OVER deadline -- the remaining words are
+				 * already in flight, so they arrive in microseconds or
+				 * they are never coming. */
+				if (nwords >= 128)
+					break;
+				if (!over_done) {
+					over_done = 1;
+					last = rd_cntpct();
+					patience = ms_to_ticks(
+					    EMMC_READ_DRAIN_TAIL_MS);
+				}
+			}
+
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el  = (now >= last) ? (now - last) : 0ull;
+
+				if (el > patience) {
+					if (++over < 2)
+						continue;      /* re-read before believing it */
+					break;
+				}
+				if (over) {
+					ebio_bc(18, ++g_cnt_anom);
+					over = 0;
+				}
+			}
 		}
-		buf[nwords++] = rreg(REG_FIFO);
 	}
 
 	if (nwords < 128) {
+		uint32_t ri = rreg(REG_RINT);
+
 		ebio_bc(1, lba);
-		ebio_bc(2, rreg(REG_RINT));
+		ebio_bc(2, ri);
 		ebio_bc(3, rreg(REG_STAR));
-		ebio_bc(4, nwords);
+		/* Tag 0x50000 means "short block with NOT ONE error bit set" -- the
+		 * signature of the 2026-08-20 bug fixed above (the bound expired while
+		 * the transfer was merely slow). Distinguishing it matters: a short
+		 * block WITH an error bit is the card or the bus, and a short block
+		 * WITHOUT one is us giving up too early. If this tag ever appears
+		 * again, EMMC_READ_STALL_TIMEOUT_MS is too small -- do not go looking
+		 * at the hardware. */
+		ebio_bc(4, ((ri & RINT_READ_ERR_MASK) ? 0u : 0x50000u) | nwords);
 		ebio_bc(5, rreg(REG_GCTL));
 		ebio_bc(0, ++g_ebio_fails);
 		ebio_fail_settle();
-		return -1; /* timed out before draining a full 512B block */
+		return -1; /* short block: see the tag in slot [4] for which kind */
 	}
 
 	/* ROOT-CAUSE FIX (found live 2026-07-20, virtio-blk "hard error" hunt):

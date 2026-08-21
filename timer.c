@@ -26,6 +26,7 @@
  */
 #include <stdint.h>
 #include "timer.h"
+#include "cntpct.h"
 
 static inline uint64_t
 read_cntfrq(void)
@@ -40,7 +41,7 @@ read_cntpct(void)
 {
 	uint64_t v;
 	__asm__ volatile("isb sy" ::: "memory");
-	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+	v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 
