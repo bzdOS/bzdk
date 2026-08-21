@@ -80,9 +80,44 @@ class BMC(HV):
     def health_text(self):
         return self.bmc("health", 3)
 
+    def health_fresh(self):
+        """(health_dict, fresh) — the record, plus whether it was just rebuilt.
+
+        USE THIS, not health_raw(), for anything that decides whether the
+        board is alive or advancing.
+
+        The BMC1 window in DRAM is a *snapshot*: CPU1 recomputes and
+        republishes it when the `health` verb is serviced, and at no other
+        time. health_raw() is a plain memory read, so on a board nobody is
+        talking to it returns the same bytes forever — including the same
+        uptime and the same per-core heartbeats. Any "did it advance?" loop
+        built on health_raw() alone therefore concludes "dead" about a
+        perfectly healthy board, every time.
+
+        That is not hypothetical: `bzdctl boot-watch` was written that way and
+        reported "TIMED OUT with no advancing heartbeat" against a board whose
+        independent CPU1 counter was visibly climbing (2026-08-20). Verified
+        both ways -- three health_raw() reads 3 s apart returned a byte-identical
+        record; three health_text()+health_raw() pairs advanced uptime,
+        hb_cpu0 and hb_cpu1 every time.
+
+        `fresh` is False when the refresh verb did not answer. That case is
+        still useful -- after a crash the verb dies but the last snapshot
+        survives, which is exactly why health_raw() exists -- so this returns
+        the stale record rather than None, and lets the caller say so.
+        """
+        try:
+            fresh = "BMC" in (self.health_text() or "")
+        except Exception:
+            fresh = False
+        return self.health_raw(), fresh
+
     def health_raw(self):
         """Read + decode the BMC1 breadcrumb straight out of DRAM (works even
-        if the console text path is flaky — it's just a memory read)."""
+        if the console text path is flaky — it's just a memory read).
+
+        NOTE: this does NOT refresh the record; see health_fresh() above
+        before using it to judge liveness."""
         words = self.read_words(BMC_HEALTH_BASE, len(HEALTH_WORDS))
         if len(words) < len(HEALTH_WORDS):
             return None
@@ -170,7 +205,16 @@ def _fmt(v, unit=""):
     return "n/a" if v is None else f"{v}{unit}"
 
 
-def print_health(d):
+def print_health(d, motion=None):
+    """motion: optional {'exc': bool, 'console': bool} from TWO samples.
+
+    Without it, a frozen counter and a live one print identically -- and these
+    breadcrumbs live in DRAM that SURVIVES A WARM RESET, so a scary
+    last_esr/FAR can easily belong to a previous boot generation. That has
+    caused real misdiagnosis in this project (2026-08-21: a second guest vCPU
+    was read as being in a 22-million-exception fault storm; the counter had
+    not moved in five seconds and the record was from the boot before). When
+    the caller has sampled twice, say which it is."""
     if not d:
         print("no BMC1 record (board down, or magic mismatch)")
         return
@@ -199,8 +243,15 @@ def print_health(d):
         # instead of 0xffffffff.
         print("  exceptions  none recorded")
     else:
+        adv = None if motion is None else motion.get("exc")
+        if adv is None:
+            tag = ""
+        elif adv:
+            tag = "  [CLIMBING -- live]"
+        else:
+            tag = "  [frozen -- HISTORICAL, may predate this boot]"
         print(f"  exceptions  count={exc}  last_kind=0x{d['last_exc_kind']:x}"
-              f"  last_esr=0x{d['last_exc_esr']:08x}")
+              f"  last_esr=0x{d['last_exc_esr']:08x}{tag}")
     hb = [_avail(d[f"hb_cpu{i}"]) for i in range(4)]
     # A core with no heartbeat is not necessarily faulty: CPU3 parks in WFI by
     # design and never posts one. Mark it "idle" rather than as a dead number.

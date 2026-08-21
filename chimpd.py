@@ -58,7 +58,11 @@ import loady_over_acm as L
 # ── constants ───────────────────────────────────────────────────────────────
 HYP_ELF   = os.path.join(HERE, "microkernel-dbg.elf")
 KERNEL    = "/opt/bzdos/tftpboot/kernel"
-DTB       = "/opt/bzdos/tftpboot/bananapi-min.dtb"
+# Overridable so a one-off experiment (e.g. a device tree that advertises a
+# second guest core) does not require editing this file and does not change
+# the default for every other run: CHIMPD_DTB=/path/to.dtb python3 chimpd.py
+DTB       = os.environ.get("CHIMPD_DTB",
+                           "/opt/bzdos/tftpboot/bananapi-min.dtb")
 KADDR     = 0x44000000
 DTBADDR   = 0x4a000000
 STAGE     = 0x48000000
@@ -406,7 +410,7 @@ def serial_load(sess):
     # enough to starve/drop the USB gadget; many quick tries give the PHY time
     # to negotiate without any single long stall.
     slog(f"  [serial] TFTP DTB → 0x{DTBADDR:x} (маленький, прогрев линка, короткие попытки)")
-    if not tftp_retry(DTBADDR, "bananapi-min.dtb", 6, tries=15):
+    if not tftp_retry(DTBADDR, os.path.basename(DTB), 6, tries=15):
         slog("  [serial] ⛔ TFTP DTB failed после ретраев")
         try: os.close(fd)
         except: pass

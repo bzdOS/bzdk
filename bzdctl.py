@@ -109,11 +109,8 @@ def collect_status(iface="br0"):
         samples of something nobody is updating. triage.py carries the same
         warning; so does project memory (breadcrumb-window-hygiene)."""
         fresh = False
-        try:
-            fresh = "BMC" in (b.health_text() or "")
-        except Exception:
-            fresh = False
-        return b.health_raw(), fresh
+        # This is what health_fresh() now encapsulates for every caller.
+        return b.health_fresh()
 
     try:
         h1, f1 = sample()
@@ -132,6 +129,8 @@ def collect_status(iface="br0"):
                     if h1[f"hb_cpu{i}"] != 0xffffffff
                 }
                 out["console_advancing"] = h1["cons_bytes"] != h2["cons_bytes"]
+                # two samples already exist here -- use them for the fault record too
+                out["exc_advancing"] = h1["exc_count"] != h2["exc_count"]
             else:
                 # Latch readable but not refreshable: show the values, refuse to
                 # claim anything about motion.
@@ -151,7 +150,11 @@ def cmd_status(args):
         print(f"  UNREACHABLE over EMAC: {s['error']}")
         print("  Board may be in U-Boot or off. Next: bzdctl.py power uboot")
         return 1
-    bmc_client.print_health(s["health"])
+    # Pass the two-sample motion through, so a frozen fault record is labelled
+    # HISTORICAL instead of reading like a live storm. These breadcrumbs live in
+    # DRAM that survives a warm reset.
+    bmc_client.print_health(s["health"],
+                            motion={"exc": s.get("exc_advancing")})
     mv = s.get("moving")
     if mv is None:
         print("  liveness    unknown (health verb unreachable; the record read "
@@ -190,7 +193,11 @@ def _ledger_line(st):
 def cmd_health(args):
     b = _bmc(args.iface)
     if args.raw:
-        bmc_client.print_health(b.health_raw())
+        hd, fresh = b.health_fresh()
+        bmc_client.print_health(hd)
+        if hd is not None and not fresh:
+            print("  NOTE: the refresh verb did not answer -- the values above "
+                  "are the LAST SNAPSHOT, not live")
     else:
         print(b.health_text())
     return 0
@@ -319,16 +326,32 @@ def cmd_boot_watch(args):
         try:
             if b is None:
                 b = _bmc(args.iface)
-            h = b.health_raw()
+            # health_fresh(), NOT health_raw(): the DRAM record only advances
+            # when the `health` verb rebuilds it, so a raw-read loop watches a
+            # frozen snapshot and always times out. That bug is what this call
+            # fixes; the long version is in bmc_client.health_fresh().
+            h, fresh = b.health_fresh()
         except Exception:
             h = None
+            fresh = False
             b = None
+        if h and not fresh:
+            # A stale snapshot cannot show motion. Say so instead of counting
+            # it as evidence of death -- see bmc_client.health_fresh().
+            print("  (health record not refreshable yet; still waiting)")
+            h = None
         if h:
             if last is not None and h["hb_cpu1"] != last:
                 el = time.time() - t0
+                # temp_mc == 0 means the sensor has not produced a reading
+                # yet, which is the normal state seconds after a reset. Printing
+                # "0.0 C" states a measurement that was never taken -- and it is
+                # the one line people read right after a boot. print_health()
+                # already renders this case as n/a; match it.
+                tmc = h["temp_mc"]
+                tstr = "n/a" if tmc == 0 else f"{tmc / 1000:.1f} C"
                 print(f"ALIVE after {el:.1f}s  "
-                      f"(cpu1 heartbeat advancing, temp "
-                      f"{h['temp_mc'] / 1000:.1f} C)")
+                      f"(cpu1 heartbeat advancing, temp {tstr})")
                 try:
                     boot_ledger.record(True, source="bzdctl-boot-watch",
                                        note=f"liveness at {el:.1f}s")
@@ -665,6 +688,13 @@ class _FakeBMC:
         if not self._raw:
             raise AssertionError("fake BMC: health_raw() called more than scripted")
         return self._raw.pop(0)
+
+    # The REAL implementation, borrowed rather than reimplemented: sample()
+    # calls health_fresh(), and a hand-written fake copy of it would be free to
+    # drift from the production one -- which is precisely the class of bug this
+    # suite exists to pin down. It only touches self.health_text/health_raw,
+    # both scripted above.
+    health_fresh = bmc_client.BMC.health_fresh
 
 
 def _mkhealth(**overrides):
@@ -1007,7 +1037,39 @@ def case_cmd_crash_bundle_contains_report_txt():
             assert f.read() == "FAKE REPORT BODY\n"
 
 
+def case_health_fresh_reports_staleness_and_still_returns_the_record():
+    """The bug this pins: an unrefreshed record must be reported as stale, not
+    as evidence the board is dead.
+
+    `bzdctl boot-watch` judged liveness from health_raw() alone. That window is
+    a snapshot -- CPU1 rewrites it only while the `health` verb runs -- so the
+    loop compared a frozen record against itself and printed "TIMED OUT with no
+    advancing heartbeat" about a board whose independent CPU1 counter was
+    climbing. health_fresh() is the fix, and both halves of its contract matter:
+    fresh=False when the verb does not answer, AND the record still comes back
+    (after a crash the verb dies but the last snapshot is the only evidence
+    left)."""
+    rec = _mkhealth(hb_cpu1=1234)
+
+    # verb answers -> fresh
+    d, fresh = _FakeBMC([rec], ["BMC health v1.1 ..."]).health_fresh()
+    assert fresh is True, "a record refreshed by the verb must be fresh"
+    assert d["hb_cpu1"] == 1234
+
+    # verb raises -> NOT fresh, but the record survives
+    d, fresh = _FakeBMC([rec], [RuntimeError]).health_fresh()
+    assert fresh is False, "an unrefreshed record must not be reported fresh"
+    assert d is not None and d["hb_cpu1"] == 1234, \
+        "the stale record is still the caller's only evidence -- do not drop it"
+
+    # verb answers with something that is not the health text -> not fresh
+    d, fresh = _FakeBMC([rec], ["timeout"]).health_fresh()
+    assert fresh is False
+
+
 _ST_CASES = [
+    ("health_fresh_reports_staleness_and_still_returns_the_record",
+     case_health_fresh_reports_staleness_and_still_returns_the_record),
     ("collect_status_moving_from_two_fresh_reads",
      case_collect_status_moving_from_two_fresh_reads),
     ("collect_status_stale_latch_is_unknown_not_frozen",
