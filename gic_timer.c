@@ -189,6 +189,7 @@
  * rest of this codebase, bounded (fixed store count), no unbounded loops.
  */
 #include <stdint.h>
+#include "cntpct.h"
 #include "gic_timer.h"
 #include "exceptions.h"
 #include "timer.h"
@@ -325,7 +326,7 @@ static inline uint64_t
 read_cntvct(void)
 {
 	uint64_t v;
-	__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v));
+	v = cntvct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 

@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "vblk_async.h"
 #include "vblk_emmc.h"   /* vblk_async_poll(), g_vblk_async_ready */
+#include "cntpct.h"
 
 /* Tiny breadcrumb, distinct from every other window in the tree (see
  * smp.h's map comment + flightrec.h's note on the same free gap): VBK1's
@@ -43,7 +44,7 @@ static inline void async_bc(uint32_t idx, uint32_t v)
 static inline uint64_t read_cntpct(void)
 {
 	uint64_t v;
-	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+	v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 

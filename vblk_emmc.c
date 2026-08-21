@@ -34,6 +34,7 @@
 #include "emmc_bio.h"       /* emmc_bio_init / emmc_bio_read / emmc_bio_write */
 #include "wdt.h"            /* wdt_note_progress / wdt_pet — keep the HW WDOG fed */
 #include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO/FLTR_K_IRQ, ...) */
+#include "cntpct.h"
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -467,7 +468,7 @@ static void vblk_used_lock_acquire(void)
 static inline uint64_t read_cntpct(void)
 {
 	uint64_t v;
-	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(v));
+	v = cntpct_read();   /* cntpct.h: Allwinner counter erratum */
 	return v;
 }
 
