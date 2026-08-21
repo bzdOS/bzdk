@@ -379,7 +379,10 @@ def sample_health(n, report):
     try:
         bmc = BMC()
         try:
-            d = bmc.health_raw()
+            # health_fresh(), not health_raw(): a soak that samples the raw
+            # DRAM record reads one frozen snapshot for its whole run and
+            # would score a dead board and a healthy one identically.
+            d, d_fresh = bmc.health_fresh()
         finally:
             bmc.close()
     except Exception as e:
@@ -388,6 +391,14 @@ def sample_health(n, report):
     if d is None:
         report.add_anomaly(n, "health-magic-mismatch", "no BMC1 record (board down or build has no BMC)")
         return None
+    if not d_fresh:
+        # The record read fine but the refresh verb did not answer, so these
+        # numbers are the last snapshot, not this sample. Recording it as a
+        # normal data point is how a soak scores a wedged board as healthy --
+        # every counter simply stops changing and nothing looks wrong.
+        report.add_anomaly(n, "health-record-stale",
+                           "the `health` verb did not answer; values are a "
+                           "previous snapshot, not a live sample")
 
     # Build-model detection: the vGIC / IMO=1 trunk runs NO EL2 periodic tick
     # (gic_timer_init() isn't called — EL2 only forwards the guest's own IRQs),

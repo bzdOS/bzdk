@@ -21,6 +21,7 @@ State machine per cycle:
   On any failure -> reboot_clean and retry, up to max_cycles.
 
 Usage: python3 reliable_load.py [--expect-vbk] [--cycles N]
+       --cycles defaults to 1 (one reload+verify). N>1 is a soak.
 Exit 0 on verified load, 1 on exhaustion.
 """
 import os, sys, time, argparse, termios, tty, re
@@ -407,7 +408,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--expect-vbk", action="store_true",
                     help="require the VBK1 breadcrumb (virtio-blk build)")
-    ap.add_argument("--cycles", type=int, default=5)
+    # Default 1, not 5. A bare `python3 reliable_load.py` used to mean FIVE
+    # full reload+verify cycles -- each one a board reset that can take
+    # minutes -- so the obvious invocation was the expensive one, and the
+    # cheap one needed a flag nobody remembered. N>1 is a soak; ask for it.
+    ap.add_argument("--cycles", type=int, default=1,
+                    help="reload+verify cycles to run (default 1; N>1 is a "
+                         "soak and each cycle resets the board)")
     ap.add_argument("--boot-to-shell", action="store_true",
                     help="after verify, auto-answer the guest's mountroot> "
                          "prompt over /dev/ttyACM0 so it reaches a real "

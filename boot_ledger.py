@@ -50,6 +50,24 @@ SUMMARY = os.path.join(HERE, "boot-ledger.txt")
 # summary says so rather than leaving a reader to trust a clean-looking ✅.
 SUPERVISOR_FIX_TS = 1785886000.0   # 2026-08-05, commit df611e3
 
+# ── a second instrument that scored healthy boots as failures ──────────────
+# `bzdctl boot-watch` judged liveness from bmc_client.health_raw(), a plain
+# read of the BMC1 window in DRAM. That window is a SNAPSHOT: CPU1 rebuilds it
+# only while servicing the `health` verb, so a raw-read loop compares a frozen
+# record against itself and can never see an advancing heartbeat. Every
+# boot-watch run therefore ended in "TIMED OUT with no advancing heartbeat"
+# and wrote ok=False -- about boards that were demonstrably alive (the
+# independent CPU1 counter at HVMAP_DBGTOOLS_BASE was climbing throughout).
+# Fixed 2026-08-20 by routing every liveness consumer through the new
+# bmc_client.health_fresh(); the same run then reported ALIVE in 2.5 s.
+#
+# Only two records carry this defect (both 2026-08-20, both mine), so unlike
+# the chimpd case above this barely moves the gate number -- but the same rule
+# applies: a boot-watch ok=False older than this timestamp says nothing about
+# the board.
+BOOTWATCH_FIX_TS = 1787254200.0    # 2026-08-20
+BOOTWATCH_SOURCE = "bzdctl-boot-watch"
+
 # ── the second gate that lives in this same ledger ─────────────────────────
 # ROADMAP §2 also wants "20 survived break-glass resets in a row, auto-
 # recovered". breakglass_cycle.py records one entry here per ATTEMPT (source
@@ -115,10 +133,18 @@ def stats():
         else:
             cur = 0
     pre_fix = sum(1 for r in recs if r.get("ts", 0) < SUPERVISOR_FIX_TS)
+    # Failures written by the pre-fix boot-watch: not board events. Counted
+    # separately rather than filtered out, so the raw file stays the record and
+    # the summary stays honest about what is in it.
+    bw_false = sum(1 for r in recs
+                   if r.get("source") == BOOTWATCH_SOURCE
+                   and not r.get("ok")
+                   and r.get("ts", 0) < BOOTWATCH_FIX_TS)
     return dict(total=total, passes=passes, fails=total - passes,
                 isol_ok=isol_ok, isol_seen=isol_seen,
                 current_streak=cur, best_streak=best,
                 pre_supervisor_fix=pre_fix,
+                bootwatch_false_fails=bw_false,
                 first_ts=recs[0]["ts"] if recs else None,
                 last_ts=recs[-1]["ts"] if recs else None)
 
@@ -193,6 +219,16 @@ def _rewrite_summary():
             "  streaks truncated), so treat this gate number as pessimistic but",
             "  not trustworthy. Re-run the streak with the fixed supervisor before",
             "  citing it in a release claim.",
+        ]
+    if s["bootwatch_false_fails"]:
+        lines += [
+            "",
+            f"⚠ {s['bootwatch_false_fails']} failure(s) above were written by "
+            f"`bzdctl boot-watch` BEFORE its 2026-08-20 fix and are",
+            "  instrument error, not board events: it judged liveness from an",
+            "  unrefreshed DRAM snapshot, so it could never observe motion and",
+            "  always timed out. Same direction of error as the chimpd case --",
+            "  reliability understated, streaks truncated.",
         ]
     with open(SUMMARY, "w") as f:
         f.write("\n".join(lines) + "\n")

@@ -186,6 +186,27 @@ wrote once; a device register says what the device is doing.
 """
 DE_UI1_LAYER0_LADDR = 0x01203010
 DE_LAYER_STRIDE = 0x20
+# DE2_MUX1_BASE + 0x0C -- the mixer's global size, ((h-1) << 16) | (w-1).
+DE_GLB_SIZE = 0x0120000C
+
+
+def live_mode(hv, fallback_w, fallback_h):
+    """Return (width, height, provenance) for the screen, read from the MIXER.
+
+    Do NOT trust hdmi.h for this. Its HDMI_MODE_HACTIVE/VACTIVE are defined
+    TWICE -- once under `#if defined(HDMI_MODE_1080P)` and once in the `#else` --
+    so a text scrape cannot tell which branch the running image was built with.
+    It silently returned 1280x720 for a 1080p build, which is not a cosmetic
+    error: the row stride would be wrong by 2560 bytes and every row after the
+    first would be read from the middle of its predecessor.
+    """
+    v = hv.read_words(DE_GLB_SIZE, 1)
+    if v and v[0] not in (0, 0xFFFFFFFF):
+        w = (v[0] & 0xFFFF) + 1
+        h = ((v[0] >> 16) & 0xFFFF) + 1
+        if 320 <= w <= 4096 and 240 <= h <= 2160:
+            return (w, h, "live, from DE_GLB_SIZE")
+    return (fallback_w, fallback_h, "hdmi.h fallback -- mixer read failed")
 
 
 def live_layer_addr(hv, fb_base, guestwin_default, layer):
@@ -251,17 +272,26 @@ def main():
     gx, gy = d.get("HDMI_GUESTWIN_X", 0), d.get("HDMI_GUESTWIN_Y", 0)
 
     hv = hvdbg.HV()
+    scr_w, scr_h, mode_src = live_mode(hv, scr_w, scr_h)
     win_pa, src, bc_stale = live_layer_addr(hv, d["HDMI_FB_BASE"],
                                             d["HDMI_GUESTWIN_PA"],
                                             d.get("HDMI_GUESTWIN_LAYER", 1))
-    print("guest window: %dx%d stride %d at %#x  (%s)" %
-          (gw, gh, gstride, win_pa, src))
+    # Mark which target is actually being captured. Printing both lines
+    # unconditionally made a `--what window` run announce "HUD : 1920x1080"
+    # and then write a 1120x276 guest-window PNG -- the banner described a
+    # capture that never happened.
+    def _tag(which):
+        return "  <== CAPTURING" if a.what in (which, "both") else ""
+
+    print("guest window: %dx%d stride %d at %#x  (%s)%s" %
+          (gw, gh, gstride, win_pa, src, _tag("window")))
     if bc_stale is not None:
         print("  NOTE: the HDMI breadcrumb still says %#x -- STALE, left in "
               "hv-scratch DRAM by a previous boot generation (that memory "
               "survives a warm reset). Trusting the DE2 register instead."
               % bc_stale)
-    print("HUD         : %dx%d at %#x" % (scr_w, scr_h, d["HDMI_FB_BASE"]))
+    print("HUD         : %dx%d at %#x  (%s)%s" %
+          (scr_w, scr_h, d["HDMI_FB_BASE"], mode_src, _tag("hud")))
 
     step = max(1, a.step)
     out = a.out or ("/tmp/bzdos-%s-%s.png" % (a.what, time.strftime("%H%M%S")))
@@ -305,8 +335,8 @@ def main():
             total += 1
             if r[i] or r[i + 1] or r[i + 2]:
                 nz += 1
-    print("wrote %s  %dx%d  (%d of %d sampled pixels non-black, %.1f%%)"
-          % (out, w, h, nz, total, 100.0 * nz / max(1, total)))
+    print("wrote %s  [%s]  %dx%d  (%d of %d sampled pixels non-black, %.1f%%)"
+          % (out, a.what, w, h, nz, total, 100.0 * nz / max(1, total)))
     if step > 1:
         print("NOTE: --step %d, so this is every %dth row and column -- a "
               "preview, not a faithful capture." % (step, step))

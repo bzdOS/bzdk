@@ -30,7 +30,8 @@ bug-fixes (e.g. the fake-chardev mknod fix), same style. Kept standalone
 here (no import of supervisor.py) so this script also works stand-alone,
 off the dev-stand box, for manual iteration.
 """
-import os, sys, time, select, re, stat as _st, argparse, subprocess
+import os
+import sys, time, select, re, stat as _st, argparse, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bzd_board as B
 
@@ -53,7 +54,27 @@ DEFAULT_ADDR = 0x42000000
 _PORT_LOCK_PATH = "/tmp/chimp-acm.lock"
 _port_lock_fd = None
 
-def acquire_port_lock(settle=0.5):
+
+def _lock_holder_desc():
+    """Best-effort "pid 1234 (reliable_load.py)" for whoever holds the lock.
+
+    Reads the note the holder wrote into the lock file; falls back to the
+    kernel's own view via /proc/locks if the file is empty (a holder from
+    before this bookkeeping existed, or one that died mid-write)."""
+    try:
+        with open(_PORT_LOCK_PATH) as f:
+            txt = f.read().strip()
+        if txt:
+            pid, _, cmd = txt.partition(" ")
+            alive = os.path.exists("/proc/%s" % pid)
+            return "pid %s (%s)%s" % (pid, cmd or "?",
+                                      "" if alive else " -- NOT RUNNING, stale note")
+    except Exception:
+        pass
+    return "another process (holder did not identify itself)"
+
+
+def acquire_port_lock(settle=0.5, timeout=None):
     """Block until we're the only process touching the ACM port, then wait
     `settle` seconds before returning (lets the USB stack settle if the
     previous holder just closed the fd) -- call this before open_tty().
@@ -67,7 +88,45 @@ def acquire_port_lock(settle=0.5):
         return   # already held by this process
     import fcntl
     _port_lock_fd = os.open(_PORT_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
-    fcntl.flock(_port_lock_fd, fcntl.LOCK_EX)
+
+    # Try without blocking FIRST, purely so that blocking can be announced.
+    # A bare flock(LOCK_EX) here waits silently and forever, so a run that is
+    # merely queued behind another process is indistinguishable from a hung
+    # one -- that cost real debugging time (the classic symptom: the script
+    # stops dead right after printing "TFTP preflight" and never says why).
+    # Now the waiter names the holder and keeps saying it is still waiting.
+    try:
+        fcntl.flock(_port_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        who = _lock_holder_desc()
+        print("ACM port busy -- waiting for the lock held by %s" % who,
+              flush=True)
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(_port_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                el = time.time() - t0
+                if timeout is not None and el >= timeout:
+                    os.close(_port_lock_fd)
+                    _port_lock_fd = None
+                    raise TimeoutError(
+                        "ACM port still locked by %s after %.0fs" % (who, el))
+                if int(el) % 15 == 0 and el >= 15:
+                    print("  ... still waiting (%.0fs) on %s" % (el, who),
+                          flush=True)
+                time.sleep(1.0)
+        print("ACM port acquired after %.1fs" % (time.time() - t0), flush=True)
+
+    # Record who holds it, so the next waiter can name us instead of guessing.
+    try:
+        os.ftruncate(_port_lock_fd, 0)
+        os.pwrite(_port_lock_fd,
+                  ("%d %s\n" % (os.getpid(),
+                                " ".join(sys.argv[:3]))).encode(), 0)
+    except Exception:
+        pass
     time.sleep(settle)
 
 def release_port_lock():

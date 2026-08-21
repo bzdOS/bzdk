@@ -401,6 +401,33 @@ def dump_exc(hv, out):
     if not w:
         out.append("  READ FAILED")
         return
+    # Is this record from THIS boot, or left over from a previous one?
+    #
+    # These breadcrumbs live in hv-scratch DRAM, which SURVIVES A WARM RESET, so
+    # a frightening ESR/FAR can belong to a boot generation that is already
+    # over. Sample the count twice: frozen means historical. This is the
+    # project's own "sample twice" rule, applied by the tool instead of relying
+    # on the reader to remember it -- on 2026-08-21 a healthy second guest vCPU
+    # was read as a 22-million-exception fault storm from exactly this record,
+    # which had not moved in five seconds.
+    fresh = None
+    try:
+        import time as _t
+        c0 = w[1]
+        _t.sleep(1.5)
+        w2 = rd(hv, EXC_BC, 20)
+        if w2:
+            fresh = (w2[1] != c0)
+            w = w2
+    except Exception:
+        pass
+    if fresh is True:
+        out.append("  [LIVE] the count is still climbing -- this is happening now")
+    elif fresh is False:
+        out.append("  [HISTORICAL] the count did not move in 1.5 s. This record")
+        out.append("  may predate this boot: hv-scratch survives a warm reset.")
+        out.append("  Do NOT diagnose a current problem from the ESR/FAR below")
+        out.append("  without an independent live signal.")
     if w[0] != 0x45584331:
         out.append(f"  magic = 0x{w[0]:08x} -- not 'EXC1'.")
         out.append("  This build does not write EXC breadcrumbs (they were")
