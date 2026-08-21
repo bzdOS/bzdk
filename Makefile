@@ -252,7 +252,8 @@ $(HDMI_BIN): $(HDMI_ELF)
 	$(OBJCOPY) -O binary $< $@
 
 # HV_HDMI belongs to the target, not to whoever remembers the command line.
-# `dbg` is the only image that links hdmi.o/fb.o/hud.o/scanout.o, and EVERY one
+# `dbg` links hdmi.o/fb.o/hud.o/scanout.o -- and so do the repl and fbsd
+# lists for hdmi.o/fb.o/hud.o (scanout.o is dbg-only). EVERY one
 # of their call sites -- main_dbg.c's display bring-up, smp.c's PHY re-lock,
 # el2_exc.c's flip-doorbell dispatch, stage2.c's framebuffer carve-out -- is
 # #ifdef'd on this flag. Built without it, the binary CONTAINS all the display
@@ -275,6 +276,49 @@ HV_HDMI ?= 1
 ifeq ($(HV_HDMI),1)
 dbg: CFLAGS += -DHV_HDMI
 endif
+
+# 1080p is the DEFAULT display mode as of 2026-08-20, and this is a correctness
+# fix rather than a preference. The HUD layout in hud.c is sized for a
+# 1920-wide screen: GW_W is 1150, so RC_W (the right-hand column) works out to
+# `SCR_W - 1166 - MARGIN` -- 746 px at 1920, but only 106 px at 1280. At 720p the
+# TIMING / GUEST TRACE / MEMORY panels are therefore drawn into a column too
+# narrow to hold their own labels, which a screenshot from EL2 showed as titles
+# cut off mid-word. The guest window is 1120 px wide and must fit inside the left
+# panel, so the column cannot simply be narrowed -- the screen has to be wider.
+#
+# 1080p is hardware-verified: bring-up reaches HDMI_STAGE_SCANOUT (not the
+# timeout stage), PHY_STATUS reads 0x000ac0f4 with bit 7 LOCK set,
+# DE_GLB_SIZE reads 0x0437077f = 1920x1080, and the guest booted to a login
+# prompt with the zero-copy scanout path unaffected. See
+# docs/hdmi-1080p-phy.md.
+#
+# HDMI_MODE_1080P=0 does NOT currently build, deliberately: hud.c has a
+# _Static_assert(RC_W >= 300) that fails at 720p, because that mode leaves the
+# right column 106 px wide. Going back to 720p means narrowing the GUEST window
+# too -- GW_W in hud.c, HDMI_GUESTWIN_W in hdmi.h, and the width/stride in the
+# DTB's /chosen framebuffer node, which must all agree -- so it is a real change
+# and not a flag flip. A failing build says that; a clipped HUD did not.
+# Second guest vCPU on CPU2 (vcpu2.c), pre-armed at boot. Off by default: the
+# feature is linked into `dbg` either way, but the guest's PSCI CPU_ON happens
+# during its early boot, before dbgmon is reachable, so arming it has to be a
+# build choice for the request that matters. Use `make dbg VCPU2=1`.
+VCPU2 ?= 0
+ifeq ($(VCPU2),1)
+CFLAGS += -DVCPU2_DEFAULT_ON=1
+endif
+
+HDMI_MODE_1080P ?= 1
+ifeq ($(HDMI_MODE_1080P),1)
+# Global, not `dbg:`-scoped. Three targets link hud.o (DBG_OBJS, the repl list
+# and the fbsd list -- the comment further up claiming dbg is the only one is
+# wrong), and hud.c has a load-bearing _Static_assert that the display mode be
+# wide enough for its right-hand column. Scoped to dbg alone, every OTHER
+# target that links hud.o compiled it at 720p and hit that assert, so `make
+# repl` stopped building the moment the assert was added. One mode for every
+# target is also simply correct: the HUD's geometry is a property of the
+# display, not of which image happens to be built.
+CFLAGS += -DHDMI_MODE_1080P
+endif
 dbg: $(DBG_BIN)
 
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
@@ -282,7 +326,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o g
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
             netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
-            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o
+            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
@@ -321,7 +365,8 @@ DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o 
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o el2_ncmap.o flightrec.o coredump.o \
              netcon.o rsb.o axp803.o hdmi.o fb.o hud.o fbdump.o \
              gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o \
-             zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o zstage.o
+             zguest_cpu3.o zload2.o stage2_zephyr.o mmio_absorb.o zstage.o \
+             trace.o profiler.o
 $(DUAL_ELF): $(DUAL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DUAL_OBJS)
 	$(SIZE) $@

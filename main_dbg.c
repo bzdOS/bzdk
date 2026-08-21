@@ -29,6 +29,8 @@
 #include "wdt.h"
 #include "smp.h"
 #include "dbgmon.h"
+#include "profiler.h"
+#include "trace.h"
 #include "reboot.h"
 #include "hwbp.h"
 #ifdef HV_HDMI
@@ -189,6 +191,11 @@ int main(void)
 #ifndef DBG_NO_TVM
 	gtrace_init();
 #endif
+	/* Event ring + PC histogram: lay down their headers before the first
+	 * tick can emit into them. trace_emit() self-guards until trace_init()
+	 * has run, so ordering here is belt-and-braces, not load-bearing. */
+	trace_init();
+	profiler_init();
 	dbgmon_init();
 	bmc_init();                /* lay down BMC1 breadcrumb + first health record */
 	DBG_BC(1, 3);

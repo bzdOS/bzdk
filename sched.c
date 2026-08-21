@@ -73,6 +73,7 @@
  */
 #include <stdint.h>
 #include "sched.h"
+#include "trace.h"
 #include "exceptions.h"
 #include "timer.h"
 #include "smp.h"
@@ -391,6 +392,13 @@ sched_tick(struct el2_frame *frame)
 		g_cpu_current[cpu] = next;
 
 	bc_update(next);
+
+	/* Feed the HUD's SCHED GANTT lane. Emitted only on a real switch, while
+	 * still holding the lock, so the ring's order matches the switch order
+	 * exactly. trace_emit() is weak: in builds without trace.o this is a call
+	 * to an empty function, which is why no target needs a new object. */
+	if (next != cur)
+		trace_ctx_switch(cur, next);
 
 	/* Release the lock BEFORE the eret (sched_resume never returns). We remain
 	 * IRQ-masked until the eret restores this task's SPSR, so no nested tick

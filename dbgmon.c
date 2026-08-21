@@ -15,10 +15,55 @@
  * call into repl.c -- this file is fully self-contained, per the assignment
  * (dbgmon.c/.h are the only two files this module owns).
  */
-#include <stdint.h>
-#include "hv_addrmap.h"   /* HVMAP_SD_BC, HVMAP_SD_TESTBUF */
+#include <stdint.h>   /* HVMAP_SD_BC, HVMAP_SD_TESTBUF */
 #include "exceptions.h"
 #include "dbgmon.h"
+#include "vcpu2.h"
+#include "hv_addrmap.h"
+
+/* ── weak fallbacks for optional providers ──────────────────────────────────
+ * dbgmon.c is linked into targets that do NOT link fbdump.o, sd_bio.o or the
+ * fault-injection half of emmc_bio.o -- `zephyr` is one, and it had not linked
+ * for some time as a result (five undefined references at final link, all from
+ * commands in this file). Rather than delete the commands or fork the file,
+ * provide weak definitions: a target that links the real object overrides
+ * these, and one that does not gets a command that reports "unavailable in
+ * this build" instead of a build failure. Same idiom as el2_exc.c's weak
+ * gic_timer_irq()/dbgmon_service().
+ *
+ * Verified: `make dbg` still resolves all five to the real implementations
+ * (they are in DBG_OBJS), so no behaviour changes in the build people use. */
+__attribute__((weak)) int fbdump_send(uint32_t pa, uint32_t len)
+{
+	(void)pa; (void)len;
+	return -1;
+}
+
+__attribute__((weak)) int sd_bio_init(void)
+{
+	return -1;
+}
+
+__attribute__((weak)) int sd_bio_read(uint32_t lba, uint64_t buf_pa)
+{
+	(void)lba; (void)buf_pa;
+	return -1;
+}
+
+__attribute__((weak)) int sd_bio_write(uint32_t lba, uint64_t buf_pa)
+{
+	(void)lba; (void)buf_pa;
+	return -1;
+}
+
+__attribute__((weak)) void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba,
+                                                 uint32_t point,
+                                                 uint32_t legacy_wait)
+{
+	(void)every; (void)min_lba; (void)point; (void)legacy_wait;
+}
+
+
 
 /* ------------------------------------------------------------------ *
  * Console hooks -- same extern contract repl.c uses. main_dbg.c (owned by
@@ -638,7 +683,11 @@ static void cmd_gva(unsigned long va)
  * include those headers (keeps this file self-contained per the
  * assignment), it just knows the fixed addresses and word offsets. */
 #define DBGMON_GTRC_BASE  0x50002000UL   /* gtrace.h: magic/event_count/last_sctlr/fault_count */
+_Static_assert(DBGMON_GTRC_BASE == HVMAP_LOW_GTRACE,
+               "DBGMON_GTRC_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define DBGMON_UART_BASE  0x50000f00UL   /* vconsole.h: magic/total_bytes/fault_count/reserved */
+_Static_assert(DBGMON_UART_BASE == HVMAP_LOW_VCONSOLE_HDR,
+               "DBGMON_UART_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define DBGMON_EXC_BASE   0x50000400UL   /* el2_exc.c: magic/count/kind/esr/... */
 
 static void cmd_t(void)
@@ -718,6 +767,8 @@ static const char *ec_name(uint32_t ec)
  * This is the ORIGINAL guest EL1 fault frozen before the recursive-exception
  * storm masked it — EC name, ELR(PC), FAR, SP, SPSR, ESR + all GPRs. */
 #define DBGMON_FF_BASE  0x50002400UL
+_Static_assert(DBGMON_FF_BASE == HVMAP_LOW_FFL1,
+               "DBGMON_FF_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define DBGMON_FF_MAGIC 0x46464C31u   /* "FFL1" */
 
 static void cmd_ff(void)
@@ -1232,6 +1283,53 @@ static void exec_line(char *line, struct el2_frame *frame)
 		 * kload_enter(). No-op if nothing is currently held. */
 		dbgtools_release_set();
 		cputs("release signaled (HVMAP_DBGTOOLS_RELEASE=1)\r\n");
+		return;
+	}
+	if (streq(cmd, "vcpu2")) {
+		/* Arm/disarm the SECOND GUEST vCPU on CPU2 (vcpu2.c). Off by
+		 * default: with the gate clear, CPU2 keeps doing async eMMC I/O
+		 * and a guest PSCI CPU_ON for affinity 2 is answered
+		 * ALREADY_ON exactly as before.
+		 *
+		 * Arming this alone changes nothing visible -- the guest also
+		 * has to ASK, which means booting it with a device tree that
+		 * advertises cpu@2. The shipped bananapi-min.dtb lists only
+		 * cpu@0, which is why hw.ncpu has always read 1. */
+		if (nt > 1 && streq(tok[1], "on")) {
+			dbg_vcpu2 = 1u;
+			cputs("vcpu2: ARMED -- CPU2 will become a guest vCPU on "
+			      "the next guest CPU_ON for affinity 2\r\n");
+		} else if (nt > 1 && streq(tok[1], "off")) {
+			dbg_vcpu2 = 0u;
+			cputs("vcpu2: disarmed (CPU2 stays an HV async-I/O "
+			      "worker)\r\n");
+		} else {
+			volatile uint32_t *bc =
+			    (volatile uint32_t *)HVMAP_VCPU2_BC;
+			static const char *const st[] = {
+				"not reached", "parked", "request accepted",
+				"entering EL1"
+			};
+			static const char *const why[] = {
+				"accepted", "gate off", "already handed over",
+				"not parked yet"
+			};
+			uint32_t sv = bc[1], wv = bc[7];
+
+			cputs("vcpu2: gate=");
+			cputs(dbg_vcpu2 ? "ARMED" : "off");
+			cputs("  state=");
+			cputs(bc[0] == VCPU2_MAGIC
+			      ? (sv < 4u ? st[sv] : "?")
+			      : "window not published");
+			cputs("  requests=");
+			print_hex32(bc[2]);
+			cputs(" refused=");
+			print_hex32(bc[6]);
+			cputs(" last=");
+			cputs(wv < 4u ? why[wv] : "?");
+			cputs("\r\n  usage: vcpu2 [on|off]\r\n");
+		}
 		return;
 	}
 	if (streq(cmd, "zboot")) {

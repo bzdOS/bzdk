@@ -57,6 +57,7 @@
 #include "vgic.h"
 #include "vblk_emmc.h"
 #include "el2_ncmap.h"
+#include "dbgtools.h"    /* CPU1 heartbeat / build-id / entry-hold (2026-07-26) */
 
 #define K_ELF     0x44000000UL
 #define K_PABASE  0x46000000UL
@@ -91,6 +92,9 @@ volatile int dbgmon_call_active = 0;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory"); \
 } while (0)
 
+extern volatile uint32_t gdb_channel;   /* gdbstub.c -- see below for why this
+                                          * build must force it to 1 itself. */
+
 int main(void)
 {
 	uint64_t mi, entry, i;
@@ -108,6 +112,11 @@ int main(void)
 	el2_install();
 	vconsole_init();
 
+	/* CPU1 heartbeat / build-id / entry-hold breadcrumb lane (dbgtools.h,
+	 * dbgtools.c) — see main_dbg.c's fuller comment. Same ordering
+	 * constraint: before smp_init() brings CPU1 up. */
+	dbgtools_init();
+
 	/* eMMC-backed virtio-blk (see main_dbg.c's fuller comment on why this
 	 * runs before stage2_init()/stage2_enable() below). */
 	vblk_init();
@@ -123,6 +132,24 @@ int main(void)
 	gdbstub_init();          /* replaces dbgmon_init(): emits NOTHING on the
 	                          * wire (RSP channel, no human banner). */
 	DBG_BC(1, 3);
+
+	/* This build has no dbgmon.o (see this file's own GDB_OBJS) — the ONLY
+	 * mode is RSP debugging. gdb_channel (gdbstub.c) normally flips from 0
+	 * to 1 via dbgmon's `gdb` text command; that command doesn't exist
+	 * here, so it would otherwise stay 0 forever. smp.c's CPU1 loop gates
+	 * the ENTIRE gdb_stop_pending/gdb_resume_act stop-reply handshake on
+	 * `if (gdb_channel)` -- with it stuck at 0, CPU1 never checks
+	 * gdb_stop_pending and never sets gdb_resume_act, so a real BRK divert
+	 * (el2_exc.c) parks CPU0 in `while (gdb_resume_act == 0xffffffff) wfe;`
+	 * FOREVER. CONFIRMED this session (2026-07-26/27, see memory
+	 * hold-gate-plus-breakpoint-crashes-board.md): once gdbstub.c's
+	 * resolve()/bp_insert() bug was fixed and a software breakpoint could
+	 * finally fire for real in THIS build, the board hung exactly this way
+	 * -- independent of the (separately added, unrelated) pause-before-
+	 * entry gate, which merely made a real BRK hit reachable for the first
+	 * time. Must be set before smp_init() (right below) so CPU1 sees the
+	 * correct value from its very first loop iteration. */
+	gdb_channel = 1;
 
 	/* Arm the dead-man's-switch watchdog EARLY (see main_dbg.c). */
 	wdt_arm();
@@ -178,6 +205,36 @@ int main(void)
 		v = (v & ~(0xFu << 20)) | (3u << 20);
 		*pc_cfg0 = v;
 		__asm__ volatile("dsb sy" ::: "memory");
+	}
+
+	/* PAUSE-BEFORE-ENTRY GATE — see main_dbg.c's fuller comment. Default
+	 * OFF (both words start 0 on a cold boot); only takes effect across a
+	 * WARM hv.wdt_reset()-style reload where a host tool armed HOLD=1
+	 * beforehand.
+	 *
+	 * NOTE this build has neither dbgmon.o's text console nor its `w`
+	 * word-write command (GDB_OBJS swaps dbgmon.o out for gdbstub.o) — but
+	 * gdbstub_poll() (smp.c) already answers standard GDB RSP 'M' (write
+	 * memory) packets on every CPU1 loop pass once smp_init() has run,
+	 * WITHOUT requiring the guest to have trapped/stopped first. So the
+	 * realistic way to arm this in the gdb build is: connect
+	 * (gdb-bridge.py / `target remote`) after triggering a warm
+	 * hv.wdt_reset()-style reload, and send a plain 'M' packet (or
+	 * `set *(int*)HVMAP_DBGTOOLS_HOLD = 1` from a real gdb prompt) for
+	 * HVMAP_DBGTOOLS_HOLD BEFORE this point runs. This is exactly the
+	 * "plant a breakpoint before the guest's first instruction" use case
+	 * that motivated this feature -- RSP debugging is where it matters
+	 * most, since gdbstub (unlike dbgmon) has no other way to stop the
+	 * guest before it has already run. */
+	if (dbgtools_hold_get()) {
+		DBG_BC(1, 0x60008);
+		for (;;) {
+			wdt_pet();
+			if (dbgtools_release_get())
+				break;
+			__asm__ volatile("wfe" ::: "memory");
+		}
+		DBG_BC(1, 0x60009);
 	}
 
 	kload_enter(entry, mi, SP_EL1);   /* noreturn -> FreeBSD at EL1, gdb attaches live */

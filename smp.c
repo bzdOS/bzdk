@@ -458,6 +458,10 @@ void smp_heartbeat(uint32_t cpu, int current_task)
  * g_vblk_async_ready, which THIS function sets, on the same "who's actually
  * running" logic. See vblk_async.h / vblk_emmc.h for why there must not be
  * an independent toggle for one half without the other. */
+__attribute__((weak)) void vcpu2_run(void)
+{
+}
+
 __attribute__((weak)) void vblk_async_cpu2_run(void)
 {
 	for (;;)
@@ -644,6 +648,20 @@ void smp_secondary_main(uint64_t cpuid)
 				hud_update(&hud_snap);
 			}
 
+			/* Real vblank, one MMIO read per pass. CPU1 owns the display,
+			 * so it is also the right core to observe the panel: the
+			 * latching TCON status bit means every vblank is counted
+			 * exactly once, and the count + timestamp are published to
+			 * the guest through the scanout register file so a guest KMS
+			 * driver can stop inventing its own 60 Hz. See
+			 * hdmi_vblank_poll(). Deliberately NOT gated on the
+			 * 500000-iteration warm-up below: unlike the HUD repaint and
+			 * the relock sequence, this neither draws nor reprograms
+			 * anything, so there is nothing for it to fight during
+			 * bring-up -- and the count is more useful the earlier it
+			 * starts. */
+			hdmi_vblank_poll();
+
 			/* HDMI PHY lock-loss defense: CPU1 owns the display, so it also
 			 * defends it. Live-board-confirmed (see hdmi_relock()'s comment)
 			 * the guest never actually touches the CCU/DE2/TCON bits
@@ -689,6 +707,12 @@ void smp_secondary_main(uint64_t cpuid)
 	 * in which case this call runs the mailbox-draining loop and never
 	 * returns. */
 	if (cpu == 2) {
+		/* Second guest vCPU, if armed. vcpu2_run() returns immediately
+		 * when dbg_vcpu2 is 0, so the async-I/O worker below stays the
+		 * default and this core behaves exactly as it always has until
+		 * the feature is deliberately switched on. Weak, so targets
+		 * that do not link vcpu2.o are unaffected. */
+		vcpu2_run();
 		vblk_async_cpu2_run();
 		/* NOTREACHED — both the weak and strong definitions loop forever —
 		 * but fall through to the shared park below defensively in case

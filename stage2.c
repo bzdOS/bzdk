@@ -913,28 +913,14 @@ stage2_init(void)
 		}
 	}
 
-	/* VTCR_EL2: every field derived/explained in the big comment above.
-	 * PS comes from this core's actual PARange, read at runtime. */
-	uint64_t parange = read_id_aa64mmfr0_el1() & 0xFull; /* bits[3:0] */
-	uint64_t vtcr = 0;
-	vtcr |= VTCR_T0SZ_VAL  << VTCR_T0SZ_SHIFT;
-	vtcr |= VTCR_SL0_VAL   << VTCR_SL0_SHIFT;
-	vtcr |= VTCR_IRGN0_VAL << VTCR_IRGN0_SHIFT;
-	vtcr |= VTCR_ORGN0_VAL << VTCR_ORGN0_SHIFT;
-	vtcr |= VTCR_SH0_VAL   << VTCR_SH0_SHIFT;
-	vtcr |= VTCR_TG0_VAL   << VTCR_TG0_SHIFT;
-	vtcr |= parange        << VTCR_PS_SHIFT;
-	vtcr |= VTCR_RES1_BIT;
-	write_vtcr_el2(vtcr);
-	stg2_bc(STG2_VTCR_IDX, (uint32_t)read_vtcr_el2());
-
-	/* VTTBR_EL2: VMID = 0 (bits[63:48] left zero) + table base address
-	 * of the concatenated level-1 tables (BADDR field). Table 0's
-	 * address is the base of the whole 8 KiB concatenated set. */
-	uint64_t table_base = (uint64_t)(uintptr_t)&stage2_l1[0][0];
-	write_vttbr_el2(table_base);
-	stg2_bc(STG2_VTTBR_IDX, (uint32_t)read_vttbr_el2());
-	stg2_bc(STG2_TABLE_BASE_IDX, (uint32_t)table_base);
+	/* VTCR_EL2 + VTTBR_EL2 are BANKED PER-PE, so programming them is a
+	 * per-core act even though the tables they point at are global. Factored
+	 * into stage2_program_this_pe() so a second guest vCPU can arm the same
+	 * tables on its own copies -- see stage2_arm_secondary() and vcpu2.c.
+	 * Leaving this inline was a real bug: CPU2 entered EL1 with VM=1 but a
+	 * ZERO VTTBR/VTCR, so its very first instruction fetch took a stage-2
+	 * translation fault at level 0 (ESR 0x82000004), 5.7 million times. */
+	stage2_program_this_pe();
 	stg2_bc(STG2_NDESC_IDX, ndesc);
 
 	/* Self-check: walk our own top-level table in software for
@@ -981,6 +967,65 @@ stage2_init(void)
 
 	/* HCR_EL2.VM is deliberately untouched here — stage2_enable() is a
 	 * separate, explicit step. */
+}
+
+/*
+ * purpose:     Program THIS PE's banked stage-2 control registers (VTCR_EL2,
+ *              VTTBR_EL2) to point at the already-built global tables.
+ * input:       none (reads stage2_l1[][] and this core's ID_AA64MMFR0_EL1)
+ * output:      none
+ * sideEffects: writes VTCR_EL2/VTTBR_EL2 on the calling core; publishes both
+ *              readbacks to the stage-2 breadcrumb window
+ *
+ * Called by stage2_init() for the boot core and by stage2_arm_secondary() for
+ * any further guest vCPU. Builds no tables -- the descriptors are global and
+ * shared; only the pointers to them are per-PE.
+ */
+void
+stage2_program_this_pe(void)
+{
+	/* PS comes from THIS core's actual PARange, read at runtime. */
+	uint64_t parange = read_id_aa64mmfr0_el1() & 0xFull; /* bits[3:0] */
+	uint64_t vtcr = 0;
+	uint64_t table_base;
+
+	vtcr |= VTCR_T0SZ_VAL  << VTCR_T0SZ_SHIFT;
+	vtcr |= VTCR_SL0_VAL   << VTCR_SL0_SHIFT;
+	vtcr |= VTCR_IRGN0_VAL << VTCR_IRGN0_SHIFT;
+	vtcr |= VTCR_ORGN0_VAL << VTCR_ORGN0_SHIFT;
+	vtcr |= VTCR_SH0_VAL   << VTCR_SH0_SHIFT;
+	vtcr |= VTCR_TG0_VAL   << VTCR_TG0_SHIFT;
+	vtcr |= parange        << VTCR_PS_SHIFT;
+	vtcr |= VTCR_RES1_BIT;
+	write_vtcr_el2(vtcr);
+	stg2_bc(STG2_VTCR_IDX, (uint32_t)read_vtcr_el2());
+
+	/* VMID = 0 (bits[63:48] left zero) + the base of the concatenated
+	 * level-1 tables. One VMID: both vCPUs are the same guest. */
+	table_base = (uint64_t)(uintptr_t)&stage2_l1[0][0];
+	write_vttbr_el2(table_base);
+	stg2_bc(STG2_VTTBR_IDX, (uint32_t)read_vttbr_el2());
+	stg2_bc(STG2_TABLE_BASE_IDX, (uint32_t)table_base);
+}
+
+/*
+ * purpose:     Bring a SECONDARY guest vCPU's stage-2 regime up on the calling
+ *              core, against the tables stage2_init() already built.
+ * input:       none
+ * output:      none
+ * sideEffects: programs this core's VTCR_EL2/VTTBR_EL2, sets HCR_EL2.VM,
+ *              flushes this core's stage-2 TLBs
+ *
+ * stage2_init() must already have run (on the boot core) -- this deliberately
+ * builds nothing, so two vCPUs of one guest cannot end up with two different
+ * views of memory. Not idempotent-checked: calling it twice on one core simply
+ * reprograms the same values.
+ */
+void
+stage2_arm_secondary(void)
+{
+	stage2_program_this_pe();
+	stage2_enable();
 }
 
 void

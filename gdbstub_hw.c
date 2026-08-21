@@ -21,7 +21,39 @@
  * already left DBGWCR<slot> enabled with BAS=0xff; we only flip bits[4:3]. If a
  * future hwbp.c changes the WCR field layout this must track it. Marked TODO
  * where the exact A64 watchpoint length/BAS semantics need a live check.
- */
+ *
+ * ------------------------------------------------------------------------
+ * CONFIRMED BUG (2026-07-26, see gdbstub-hwbp-wrong-core memory) + FIX.
+ * ------------------------------------------------------------------------
+ * DBGBVR/DBGBCR/DBGWVR/DBGWCR are per-PE BANKED registers. gdbstub_hw_insert()
+ * / _remove() are only ever called from gdbstub.c's dispatch(), which is only
+ * ever called from smp.c's CPU1 debug-service loop (both call sites:
+ * gdbstub_on_debug_event() and gdbstub_poll()) — CPU1 never hosts the FreeBSD
+ * guest. This module used to call hwbp_set()/hwbp_clear()/patch_wp_lsc()
+ * DIRECTLY, i.e. on CPU1 — arming CPU1's own debug unit, which never executes
+ * guest code, so the guest could never trip it. Every hbreak/watch/rwatch/
+ * awatch silently never fired.
+ *
+ * Fix: route every real DBG*-register write through the SAME cross-core
+ * handshake style already proven for the CPU0-stop/CPU1-resume direction
+ * (gdb_stop_pending/gdb_resume_act, el2_exc.c/smp.c) — but in the OPPOSITE
+ * direction (CPU1 asks CPU0 to do something). This only works while CPU0 is
+ * ALREADY PARKED in el2_exc.c's `while (gdb_resume_act == 0xffffffffu) wfe;`
+ * loop (a real GDB stop is active), because that is the only place CPU0 is
+ * guaranteed to be sitting in EL2 code we can safely extend to run one more
+ * op before it resumes — see hwop_run() below and el2_exc.c's gdb_hw_op_*
+ * block comment. When CPU0 is instead running the guest freely (the common
+ * "set a breakpoint ahead of time" case), transparently interrupting it would
+ * need a new SGI/IPI path (this board's GIC has none today) — DELIBERATELY
+ * NOT built this pass (real bare-metal EL2 code, no OS safety net; a
+ * mis-built async-IRQ-into-guest path risks hanging or corrupting the guest,
+ * which is worse than "hbreak silently doesn't fire"). hwop_run() detects
+ * that case (gdb_stop_pending == 0) and refuses cleanly (-2) instead of
+ * arming the wrong core or guessing. Callers needing a breakpoint that fires
+ * on a NOT-yet-reached kernel address should use software `break` (Z0, fixed
+ * separately — see gdbstub.c's resolve()) — hbreak/watch set while CPU0 is
+ * already parked at a prior stop (e.g. "stop here, then also watch this
+ * address, then continue") DOES work correctly with this fix. */
 #include <stdint.h>
 #include "exceptions.h"
 #include "gdbstub_hw.h"
@@ -30,6 +62,69 @@
  * the whole header set; signatures MUST match hwbp.h). */
 extern int  hwbp_set(int idx, uint64_t va, int is_write_wp);
 extern int  hwbp_clear(int idx, int is_write_wp);
+
+/* Cross-core hw-op request globals, defined in el2_exc.c (always linked) —
+ * see its block comment for the full handshake contract. Plain (non-weak)
+ * extern: this file is only ever linked together with el2_exc.o. */
+extern volatile uint32_t gdb_stop_pending;   /* 1 while CPU0 is parked      */
+extern volatile uint32_t gdb_hw_op_pending;
+extern volatile int32_t  gdb_hw_op_kind;
+extern volatile int32_t  gdb_hw_op_slot;
+extern volatile uint64_t gdb_hw_op_va;
+extern volatile uint32_t gdb_hw_op_lsc;
+extern volatile int32_t  gdb_hw_op_result;
+
+enum {
+	HWOP_BP_SET   = 0,
+	HWOP_BP_CLEAR = 1,
+	HWOP_WP_SET   = 2,
+	HWOP_WP_CLEAR = 3,
+};
+
+/* Bounded spin guard for hwop_run()'s wait below. CPU0, once parked, services
+ * a queued op within a handful of instructions after its very next `wfe`
+ * wake — this cap is generous headroom, not a tuned timing budget, and exists
+ * only so a CPU1 caller can never hang forever if something is wrong (per the
+ * task's own "never spin forever" requirement). */
+#define HWOP_SPIN_GUARD 10000000L
+
+/* Post a hw-op request to CPU0 and wait (bounded) for it to complete — but
+ * ONLY if CPU0 is actually parked right now (gdb_stop_pending != 0): that is
+ * the ONLY state in which CPU0 is guaranteed to be sitting in the wfe loop
+ * that services gdb_hw_op_*, per this file's header comment. If CPU0 is
+ * running the guest instead, there is no safe way to reach it from here today
+ * — refuse with -2 rather than touch its banked debug registers from the
+ * wrong core (the original bug) or silently do nothing while claiming
+ * success. Returns: gdb_hw_op_result (>= 0, hwbp_set/hwbp_clear's own
+ * 0=success/-1=bad-index convention) on a serviced request, or -2 if CPU0
+ * wasn't parked / the request timed out. */
+static int hwop_run(int kind, int slot, uint64_t va, uint32_t lsc)
+{
+	long guard;
+
+	if (!gdb_stop_pending)
+		return -2;                      /* CPU0 not parked -- refuse cleanly */
+
+	gdb_hw_op_slot   = slot;
+	gdb_hw_op_va     = va;
+	gdb_hw_op_lsc    = lsc;
+	gdb_hw_op_result = -2;
+	__asm__ volatile("dsb sy" ::: "memory");
+	gdb_hw_op_kind = kind;
+	__asm__ volatile("dsb sy" ::: "memory");
+	gdb_hw_op_pending = 1u;
+	__asm__ volatile("dsb sy\n\tsev" ::: "memory");   /* poke CPU0's wfe */
+
+	for (guard = 0; guard < HWOP_SPIN_GUARD; guard++) {
+		if (!gdb_hw_op_pending)
+			break;
+		__asm__ volatile("wfe" ::: "memory");
+	}
+	if (gdb_hw_op_pending)
+		return -2;                      /* timed out: never touched HW state */
+
+	return gdb_hw_op_result;
+}
 
 /* A64 slot maxima (hwbp.c clamps the live count from ID_AA64DFR0_EL1; we use
  * the architectural maxima for our shadow arrays and let hwbp_set return -1 for
@@ -119,7 +214,7 @@ static uint32_t lsc_for_type(int type)
  * ------------------------------------------------------------------ */
 int gdbstub_hw_insert(int type, uint64_t addr, int kind, struct el2_frame *frame)
 {
-	int i, slot;
+	int i, slot, r;
 
 	/* Debug exceptions are masked while the guest runs with PSTATE.D=1 (early
 	 * FreeBSD locore). Arming a slot then would silently never fire — refuse so
@@ -137,7 +232,13 @@ int gdbstub_hw_insert(int type, uint64_t addr, int kind, struct el2_frame *frame
 			if (!bp_slot[i].used) { slot = i; break; }
 		if (slot < 0)
 			return 0;                       /* full -> GDB falls back to SW bp */
-		if (hwbp_set(slot, addr, 0) != 0)
+		/* Arm the REAL DBGBVR/DBGBCR on CPU0 (see this file's header comment
+		 * for why never here on CPU1). r==-2 means CPU0 isn't parked right
+		 * now -- refuse cleanly rather than arm the wrong core. */
+		r = hwop_run(HWOP_BP_SET, slot, addr, 0);
+		if (r == -2)
+			return -2;
+		if (r != 0)
 			return 0;                       /* slot not implemented on this core */
 		bp_slot[slot].used = 1;
 		bp_slot[slot].type = type;
@@ -155,9 +256,13 @@ int gdbstub_hw_insert(int type, uint64_t addr, int kind, struct el2_frame *frame
 			if (!wp_slot[i].used) { slot = i; break; }
 		if (slot < 0)
 			return 0;
-		if (hwbp_set(slot, addr, 1) != 0)   /* baseline store-watch + MDE/TDE */
+		/* CPU0-side applies hwbp_set(slot,addr,1) THEN the LSC patch, as one
+		 * op (HWOP_WP_SET) -- see gdbstub_hw_apply_op() below. */
+		r = hwop_run(HWOP_WP_SET, slot, addr, lsc_for_type(type));
+		if (r == -2)
+			return -2;
+		if (r != 0)
 			return 0;
-		patch_wp_lsc(slot, lsc_for_type(type));   /* select read/write/access */
 		wp_slot[slot].used = 1;
 		wp_slot[slot].type = type;
 		wp_slot[slot].addr = addr;
@@ -169,7 +274,12 @@ int gdbstub_hw_insert(int type, uint64_t addr, int kind, struct el2_frame *frame
 }
 
 /* ------------------------------------------------------------------ *
- * Public: remove.
+ * Public: remove. Returns 1 on success (or "never armed" no-op), 0 if a
+ * REAL armed slot exists but couldn't be safely cleared right now (CPU0 not
+ * parked) -- the caller (gdbstub.c dispatch()) must report an error rather
+ * than claim OK, since the shadow table is deliberately left `used` in that
+ * case (the real hardware slot is still armed; state stays consistent so a
+ * later retry, once CPU0 is parked again, can still find and clear it).
  * ------------------------------------------------------------------ */
 int gdbstub_hw_remove(int type, uint64_t addr)
 {
@@ -178,7 +288,8 @@ int gdbstub_hw_remove(int type, uint64_t addr)
 	if (type == GDB_BP_HW) {
 		for (i = 0; i < HW_MAX_BP; i++)
 			if (bp_slot[i].used && bp_slot[i].addr == addr) {
-				hwbp_clear(i, 0);
+				if (hwop_run(HWOP_BP_CLEAR, i, 0, 0) != 0)
+					return 0;       /* CPU0 not parked -- leave armed+tracked */
 				bp_slot[i].used = 0;
 				return 1;
 			}
@@ -187,20 +298,69 @@ int gdbstub_hw_remove(int type, uint64_t addr)
 	/* any watch type */
 	for (i = 0; i < HW_MAX_WP; i++)
 		if (wp_slot[i].used && wp_slot[i].addr == addr) {
-			hwbp_clear(i, 1);
+			if (hwop_run(HWOP_WP_CLEAR, i, 0, 0) != 0)
+				return 0;
 			wp_slot[i].used = 0;
 			return 1;
 		}
 	return 1;
 }
 
+/* Best-effort: clears every real armed slot IF CPU0 happens to be parked
+ * right now (the normal case when this runs from GDB's D/k, inside the same
+ * command_loop() as a live stop). If CPU0 is NOT parked (e.g. a detach
+ * issued from the Ctrl-C "fake stop" path in gdbstub_poll(), where CPU0 never
+ * actually halted), a real hw slot cannot be safely cleared from here today
+ * (same restriction as gdbstub_hw_remove()) and is left armed on CPU0 — it
+ * will keep firing hwbp.c's own one-shot handler on the guest until the next
+ * board reset. Still zeroes the shadow table either way (this is a
+ * terminal detach/kill; nothing will ask "is it still armed?" again through
+ * this module after this call), so at least gdbstub's OWN bookkeeping never
+ * goes stale even in that edge case. */
 void gdbstub_hw_clear_all(void)
 {
 	int i;
 	for (i = 0; i < HW_MAX_BP; i++)
-		if (bp_slot[i].used) { hwbp_clear(i, 0); bp_slot[i].used = 0; }
+		if (bp_slot[i].used) { hwop_run(HWOP_BP_CLEAR, i, 0, 0); bp_slot[i].used = 0; }
 	for (i = 0; i < HW_MAX_WP; i++)
-		if (wp_slot[i].used) { hwbp_clear(i, 1); wp_slot[i].used = 0; }
+		if (wp_slot[i].used) { hwop_run(HWOP_WP_CLEAR, i, 0, 0); wp_slot[i].used = 0; }
+}
+
+/* ------------------------------------------------------------------ *
+ * CPU0-side executor: called from INSIDE el2_exc.c's parked wfe loop, i.e.
+ * this runs on CPU0, the core that actually owns the guest's live debug
+ * register bank -- the entire point of this module's fix (see the header
+ * comment). Reads the gdb_hw_op_* request CPU1's hwop_run() just posted and
+ * performs the exact same hwbp_set()/hwbp_clear()/patch_wp_lsc() sequence
+ * this module used to run directly (on the wrong core). Writes
+ * gdb_hw_op_result; does NOT touch gdb_hw_op_pending (el2_exc.c owns
+ * clearing that, symmetric with how CPU1 owns clearing gdb_stop_pending in
+ * the opposite-direction handshake).
+ * ------------------------------------------------------------------ */
+void gdbstub_hw_apply_op(void)
+{
+	int r;
+
+	switch (gdb_hw_op_kind) {
+	case HWOP_BP_SET:
+		gdb_hw_op_result = hwbp_set(gdb_hw_op_slot, gdb_hw_op_va, 0);
+		break;
+	case HWOP_BP_CLEAR:
+		gdb_hw_op_result = hwbp_clear(gdb_hw_op_slot, 0);
+		break;
+	case HWOP_WP_SET:
+		r = hwbp_set(gdb_hw_op_slot, gdb_hw_op_va, 1);
+		if (r == 0)
+			patch_wp_lsc(gdb_hw_op_slot, gdb_hw_op_lsc);
+		gdb_hw_op_result = r;
+		break;
+	case HWOP_WP_CLEAR:
+		gdb_hw_op_result = hwbp_clear(gdb_hw_op_slot, 1);
+		break;
+	default:
+		gdb_hw_op_result = -1;
+		break;
+	}
 }
 
 int gdbstub_hw_active(void)
