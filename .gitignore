@@ -44,3 +44,15 @@ test_sd_bio_addr
 test_snapshot_fmt
 test_bmc_arm_gate
 .flagstamp
+# Runtime evidence directories: per-run logs and captured crash artefacts. They
+# accrue on disk during live board work and are not part of the source tree, for
+# the same reason the soak/breakglass logs above are not.
+a2-logs/
+crash-evidence/
+backups/
+
+# Host-side unit-test binaries built by `make test` -- same class as the ones
+# already listed above, missed when this one was added.
+test_scanout_regs
+test_vconsole_pm
+test_zstage
