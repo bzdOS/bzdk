@@ -64,9 +64,21 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
 
 ## Core layout
 
+> **CHANGED 2026-08-26 (v0.0.2-prealpha).** CPU1 is a GUEST vCPU in the default
+> build now, not the debug plane. The description below is the pre-0.0.2 layout
+> and is kept only because most of the tree's comments still assume it. Read
+> `RELEASE-0.0.2.md` and `vcpu1.h` before reasoning about core roles.
+
 - **CPU0** — runs the guest, takes its traps.
-- **CPU1** — EMAC/debug core; survives guest wedges, hosts `dbgmon` and the
-  GDB stub, owns the hardware watchdog.
+- **CPU1** — **now the guest's second vCPU** (`vcpu1.c`, armed by default via
+  `board-config.xml`): FreeBSD reports `hw.ncpu=2` and gets real parallel
+  throughput. It STILL owns the EMAC/dbgmon channel, the GDB stub and the
+  hardware-watchdog kick — but from an unmaskable 10 ms EL2 tick instead of a
+  tight loop, so a *software* hang of the guest on it cannot starve the
+  watchdog, while a *hardware* wedge of that core no longer self-recovers.
+  That tradeoff is now live by default; `vcpu1.h` states it in full, and
+  flipping one attribute in `board-config.xml` (plus `gen_config.py`) restores
+  the old dedicated-debug-core behaviour.
 - **CPU2** — async eMMC I/O offload.
 - **CPU3** — idle (WFI) in the default `dbg`/`gdb`/`fbsd` builds. In the
   `dual` build it runs a genuine second guest (Zephyr) concurrently with
