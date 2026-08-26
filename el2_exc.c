@@ -72,6 +72,41 @@ struct el2_frame g_last_guest_frame;
  * atomicity. */
 volatile uint32_t g_last_guest_frame_seq;
 
+/* CPU1's OWN guest frame (vcpu1.c's experimental third vCPU, see vcpu1.h) --
+ * a SEPARATE slot from g_last_guest_frame above, on purpose. vcpu1.h names
+ * this exact gap as a real limitation ("CPU1's own vCPU register state is
+ * not yet exposed through any command") and asks for a core-selecting
+ * gr1/sr1 as the natural follow-up; this pair of globals plus
+ * el2_snapshot_guest_frame_cpu1() below is that follow-up's storage.
+ *
+ * Deliberately NOT a second element of an array indexed by core, and
+ * deliberately NOT folded into g_last_guest_frame: every existing reader of
+ * g_last_guest_frame (dbgmon's gr/sr, the GDB stub, bmc telemetry) is
+ * written to mean "CPU0's FreeBSD guest", full stop -- see the gate comment
+ * a few dozen lines below this one for exactly why letting a second core
+ * overwrite that slot would silently mix two vCPUs' register state into one
+ * report. An array or a shared slot would make that mixing one refactor
+ * away from happening by accident; a second, explicitly-named variable that
+ * nothing existing reads cannot regress gr/sr no matter what future code
+ * does with it. Only dbgmon's new gr1/sr1 (dbgmon.c) ever read this one. */
+struct el2_frame g_cpu1_guest_frame;
+/* Same seqlock shape as g_last_guest_frame_seq, same reason: CPU1 (sole
+ * writer of this slot) bumps it odd before the struct copy, even after;
+ * el2_snapshot_guest_frame_cpu1() retries across a stable EVEN interval.
+ * Coherency across cores is guaranteed (SMPEN); this adds the atomicity a
+ * plain struct copy doesn't have.
+ *
+ * Also doubles as the "ever captured" flag dbgmon.c's gr1/sr1 need (see the
+ * capture site's comment below for why that's safe): it starts at 0 on boot
+ * and this file's capture block is the ONLY place that ever advances it, so
+ * g_cpu1_guest_frame_seq == 0 means CPU1 has not taken a single lower-EL
+ * trap since boot -- either dbg_vcpu1 is off (CPU1 runs no guest code, so it
+ * physically cannot fault into here) or it's armed but simply hasn't
+ * trapped yet. Either way, a reader must not mistake that state for "the
+ * frame really is all zero" (see the breadcrumb-window "publish real zeros"
+ * discipline this project already applies elsewhere for the same reason). */
+volatile uint32_t g_cpu1_guest_frame_seq;
+
 /* ------------------------------------------------------------------ *
  * GDB-stub cross-core stop/resume handshake (ROADMAP B2, see
  * docs/gdbstub-integration.md §3/§4). A guest debug trap (SW BRK / completed
@@ -152,6 +187,26 @@ void el2_snapshot_guest_frame(struct el2_frame *out)
 		/* Bounded: writes are per-guest-trap, never a continuous stream, so
 		 * a stable even interval is reached almost immediately; the cap only
 		 * guarantees a CPU1 reader can never spin forever. */
+	} while (((s1 & 1u) || s1 != s2) && ++tries < 1000u);
+}
+
+/* Same seqlock-retry shape as el2_snapshot_guest_frame() above, copied
+ * rather than parameterized (see g_cpu1_guest_frame's own comment for why
+ * this whole pair stays a separate, explicit second copy instead of a
+ * core-indexed variant of the CPU0 one). Callers that care whether anything
+ * has EVER been captured must check g_cpu1_guest_frame_seq == 0 themselves
+ * (dbgmon.c's gr1/sr1 do) -- this function only guarantees the copy it
+ * returns is torn-free, not that it is non-empty. */
+void el2_snapshot_guest_frame_cpu1(struct el2_frame *out)
+{
+	uint32_t s1, s2;
+	unsigned tries = 0;
+	do {
+		s1 = g_cpu1_guest_frame_seq;
+		__asm__ volatile("dsb ish" ::: "memory");
+		*out = g_cpu1_guest_frame;
+		__asm__ volatile("dsb ish" ::: "memory");
+		s2 = g_cpu1_guest_frame_seq;
 	} while (((s1 & 1u) || s1 != s2) && ++tries < 1000u);
 }
 /* Set to 1 by the debug core (smp_secondary_main, CPU1) once it owns the
@@ -825,6 +880,38 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			g_last_guest_frame = *frame;
 		__asm__ volatile("dsb ish" ::: "memory");
 		g_last_guest_frame_seq++;                        /* -> even */
+		__asm__ volatile("dsb ish" ::: "memory");
+	}
+
+	/* Mirror-image snapshot for CPU1's OWN guest frame (vcpu1.c's
+	 * experimental third vCPU, see vcpu1.h) -- the gr1/sr1 follow-up vcpu1.h
+	 * asks for. Same trap-group test as the CPU0 block above, opposite core.
+	 *
+	 * No dbg_core_active check here, unlike the CPU0 block -- not an
+	 * oversight, a consequence of a fix already made once (see vcpu1.h's
+	 * "THAT WAS TRUE ONLY AFTER ONE MORE FIX" section): vcpu1_run() now
+	 * claims dbg_core_active for itself BEFORE it ever enters EL1, so CPU1
+	 * cannot reach a lower-EL trap at all while dbg_core_active is still 0.
+	 * Adding the check here would be redundant, not wrong; leaving it off
+	 * keeps this gate a pure "which core, which trap group" mirror of the
+	 * block above rather than growing a clause whose truth depends on
+	 * knowing that ordering fix happened.
+	 *
+	 * Deliberately a second, explicitly-named global (g_cpu1_guest_frame /
+	 * _seq) rather than a second slot of g_last_guest_frame or an array
+	 * indexed by core -- see that variable's own comment. The inner
+	 * `if (smp_cpu_id() == 1u)` mirrors the CPU0 block's inner
+	 * `if (smp_cpu_id() == 0)` re-check: belt-and-suspenders against exactly
+	 * the "two vCPUs' register state mixed into one report" class of bug the
+	 * CPU0 block's comment describes -- CPU2's vcpu2 traps (or CPU3's Zephyr
+	 * traps) must never be able to land in EITHER slot. */
+	if (smp_cpu_id() == 1u && (kind >> 2) == 2u) {
+		g_cpu1_guest_frame_seq++;                         /* -> odd */
+		__asm__ volatile("dsb ish" ::: "memory");
+		if (smp_cpu_id() == 1u)
+			g_cpu1_guest_frame = *frame;
+		__asm__ volatile("dsb ish" ::: "memory");
+		g_cpu1_guest_frame_seq++;                         /* -> even */
 		__asm__ volatile("dsb ish" ::: "memory");
 	}
 

@@ -213,9 +213,14 @@ holdtest_claim_brk(struct el2_frame *frame, uint32_t ec)
  *     (holdtest_guest.c) uses none of them.
  *
  * The shared chain still does its one unconditional thing -- dynamic W^X
- * promotion -- which this file used to call directly via
- * stage2_wx_qemu_try(frame, ec); that call is now folded into
- * qemu_guest_sync() below instead of being duplicated here. */
+ * promotion -- via qemu_guest_sync() below.
+ *
+ * CORRECTED 2026-08-26: an earlier draft said this file "used to call
+ * stage2_wx_qemu_try(frame, ec) directly". It never did. No QEMU handler in
+ * this tree had a dynamic W^X hook before stage2_wx_qemu.h existed — that
+ * absence is exactly the defect which left every board-free gate red. (For
+ * this target the promotion is a no-op anyway: `holdtest` links no stage2.o,
+ * so the weak stage2_wx_fault reference resolves to 0.) */
 static const struct qemu_guest_sync_ops holdtest_ops = {
 	.claim_first = holdtest_claim_brk,
 };

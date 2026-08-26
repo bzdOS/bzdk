@@ -1130,22 +1130,36 @@ int hdmi_guestwin_set_addr(uint32_t pa)
  *
  * TCON_INT0 (SUN4I_TCON_GINT0_REG) carries a vblank STATUS bit per channel,
  * write-1-to-clear, and it latches whether or not the interrupt is enabled. So
- * EL2 can observe the real panel vblank by POLLING that bit -- no interrupt
- * handler, which matters: taking a device interrupt in EL2 on this board is how
- * the EHCI SPI-106 storm happened, and a display interrupt is not worth
- * re-opening that door.
+ * EL2 can observe the real panel vblank by POLLING that bit -- no per-call
+ * interrupt-handling logic needed here at all; hdmi_vblank_poll() below just
+ * does one MMIO read-modify-write.
  *
- * Polling is sufficient rather than approximate. CPU1's service loop runs this
- * far faster than 60 Hz (it is one MMIO read per pass, alongside the PHY
- * lock-loss check that already lives there), and the bit LATCHES, so every
- * vblank is seen exactly once as long as the poller clears it. Two vblanks
- * cannot be missed between passes at any plausible loop rate.
+ * TWO CALLERS use this same function today, and that is deliberate:
+ *   - smp.c's old tight debug-core loop still polls it directly, many times
+ *     faster than 60 Hz, whenever CPU1 is NOT running as a third vCPU
+ *     (dbg_vcpu1 off) -- see this function's own bit-clearing note below for
+ *     why the LATCHING status bit makes that safe at any poll rate.
+ *   - gic_timer.c's gic_timer_irq() calls it as the SERVICE step for a real
+ *     GIC interrupt (HDMI_TCON1_IRQ_INTID, hdmi.h) when dbg_vcpu1 IS armed
+ *     and hdmi_irq_arm_cpu1() has targeted that SPI at CPU1 alone -- the
+ *     event-driven MUSB_IRQ_INTID precedent (musb.h/gic_timer.c), not a
+ *     fixed-period tick, because a 10 ms tick is the wrong fit for a ~16.7 ms
+ *     vblank period (see vcpu1.h). This file previously argued against ANY
+ *     display interrupt, citing the EHCI SPI-106 storm (war-stories.md #1):
+ *     that concern was real but was about an UNBOUNDED handler, not
+ *     interrupts as a class -- gic_timer.c's dispatch for this INTID carries
+ *     the exact same per-tick budget/throttle MUSB_IRQ_BUDGET_PER_TICK
+ *     proved necessary, so a stuck/storming line degrades to a bounded rate
+ *     instead of starving CPU1's watchdog kick the way the unbounded EHCI
+ *     path once did. CPU0 is never involved either way: HDMI_TCON1_IRQ_INTID
+ *     is targeted at CPU1's GIC interface alone, exactly like MUSB.
  *
- * Both channel bits are polled (15 and 14): only one channel is driving the
- * panel, so there is no ambiguity, and hardcoding a guess about which one TCON1
- * reports on would be exactly the sort of undocumented assumption this file's
- * header warns about. The guest owns no TCON registers -- the display belongs
- * to EL2 -- so clearing the bit here cannot disturb it.
+ * Both channel bits are polled/cleared (15 and 14): only one channel is
+ * driving the panel, so there is no ambiguity, and hardcoding a guess about
+ * which one TCON1 reports on would be exactly the sort of undocumented
+ * assumption this file's header warns about. The guest owns no TCON
+ * registers -- the display belongs to EL2 -- so clearing the bit here cannot
+ * disturb it.
  */
 #define TCON_INT0_VBLANK_MASK  0x0000C000u   /* BIT(15) | BIT(14) */
 
@@ -1180,6 +1194,28 @@ uint32_t hdmi_vblank_count(void)
 uint64_t hdmi_vblank_stamp(void)
 {
 	return g_vblank_stamp;
+}
+
+/* TCON_INT0's enable half mirrors its status half 1:1, offset by 16 bits --
+ * BIT(31)/BIT(30) enable the same TCON0/TCON1 vblank latches that
+ * BIT(15)/BIT(14) (TCON_INT0_VBLANK_MASK above) report. This is the standard
+ * Allwinner GINT0 layout across the whole SoC family, the same one this
+ * file already trusted for the status-bit pairing above: Linux's
+ * sun4i_tcon.c defines SUN4I_TCON_GINT0_VBLANK_ENABLE(pipe) as
+ * BIT(31 - pipe) immediately next to VBLANK_INT(pipe) = BIT(15 - pipe).
+ * TCON1 is pipe 1, so its enable bit is BIT(30).
+ *
+ * stage_tcon() (hdmi_init()) writes TCON_INT0 = 0 during bring-up -- "mask
+ * interrupts", ported straight from lcdc_init(), which never used
+ * interrupts itself -- so vblank generates no real GIC event until this is
+ * called. Safe to call any time after hdmi_init(): a plain read-modify-
+ * write that only sets the enable bit, leaving every other bit (including
+ * any already-latched status bit) exactly as read. Idempotent. */
+#define TCON_INT0_TCON1_VBLANK_ENABLE  0x40000000u   /* BIT(30) */
+
+void hdmi_vblank_irq_enable(void)
+{
+	wr32(TCON_INT0, rd32(TCON_INT0) | TCON_INT0_TCON1_VBLANK_ENABLE);
 }
 
 int hdmi_guestwin_enable(void)

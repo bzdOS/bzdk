@@ -111,6 +111,26 @@ void gic_timer_cpuif_init(void);
  * unmasking IRQs on CPU1. */
 void musb_irq_arm_cpu1(void);
 
+#ifdef HV_HDMI
+/* Target the real TCON1 vblank SPI (HDMI_TCON1_IRQ_INTID, hdmi.h) at CPU1's
+ * GIC CPU interface alone, enable it at the distributor, AND turn on the
+ * device-level interrupt enable bit (hdmi_vblank_irq_enable(), hdmi.c) so it
+ * actually asserts -- so gic_timer_irq() can service hdmi_vblank_poll()
+ * (the HUD repaint / real-vblank duty vcpu1.h documents as otherwise lost
+ * when CPU1 becomes a third vCPU) straight from that IRQ instead of a
+ * fixed-period tick, mirroring musb_irq_arm_cpu1() exactly. See
+ * gic_timer.c's own header comment above this function's definition for the
+ * full rationale and the same UNVERIFIED hardware assumptions
+ * musb_irq_arm_cpu1() carries (ITARGETSR bit-to-core mapping, ICFGR level
+ * config) -- this function has NOT been exercised on real hardware yet.
+ * Call once, from vcpu1_run(), after gic_timer_cpuif_init() and before
+ * unmasking IRQs on CPU1 -- same call site as musb_irq_arm_cpu1(), see
+ * vcpu1.h for exactly where. Guarded by HV_HDMI (target-scoped CFLAGS, see
+ * gic_timer.c) because HDMI_TCON1_IRQ_INTID is declared in hdmi.h, which
+ * this header does not otherwise depend on. */
+void hdmi_irq_arm_cpu1(void);
+#endif
+
 /* Call this from el2_trap()'s IRQ case (kind & 3 == EL2_KIND_IRQ). Reads
  * GICC_IAR (acknowledges), confirms the INTID is ours, samples the jitter
  * meter, re-arms the next interval, writes GICC_EOIR, and increments the
