@@ -36,10 +36,7 @@
 #include "exceptions.h"
 #include "vconsole.h"
 #include "pl011_qemu.h"
-
-#define EC_HVC64      0x16u
-#define EC_SMC64      0x17u
-#define EC_DABT_LOWER 0x24u
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header */
 
 /* "Linux version" — the substring of init/main.c's start_kernel() banner
  * line (`pr_notice("%s", linux_banner)`, format string "Linux version %s
@@ -49,17 +46,15 @@
  * this target's console ever shows — see main_linux_qemu.c's banner. */
 static const char PASS_MARKER[] = "Linux version";
 
-static void qemu_poweroff(void) __attribute__((noreturn));
-
-static void
-qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+/* qemu_poweroff()/report_fault() used to be defined here, verbatim-duplicated
+ * across every QEMU CI handler; qemu_poweroff() now lives in
+ * el2_exc_qemu_common.c as qemu_psci_poweroff() (same SYSTEM_OFF SMC, same
+ * fallback wfi loop for the case QEMU doesn't terminate). This target's own
+ * report_fault() is kept below — see its definition for why (it prints extra
+ * guest-console-byte-count lines the shared qemu_report_fault() does not know
+ * about) — but now delegates the actual FAULT line + terminal behaviour to
+ * qemu_report_fault(). */
+#define qemu_poweroff qemu_psci_poweroff
 
 /* ------------------------------------------------------------------ *
  * PSCI SMC passthrough — see file header.
@@ -146,6 +141,26 @@ drain_guest_console(void)
 	}
 }
 
+/* report_fault() is kept LOCAL rather than folded entirely into
+ * qemu_report_fault(): this target's original fault report printed two extra
+ * things qemu_report_fault() knows nothing about — the guest console bytes
+ * drained/echoed one last time, and a "guest console bytes emulated before
+ * the fault" counter line — so those are still produced here, then the
+ * standard "<marker>: FAULT kind=.. ESR=.. ELR=.. FAR=.." line and the
+ * terminal behaviour (this target powers off, like the original did) come
+ * from the shared qemu_report_fault(). Per el2_exc_qemu_common.h's contract,
+ * the extras are printed BEFORE calling it, so on a real FAIL run the console
+ * drain/byte-count line now appears just above the FAULT line rather than
+ * just below it as before — a cosmetic reordering of a diagnostic-only path
+ * that no CI script parses (linux-qemu-ci.sh greps only for the PASS marker;
+ * a run that never prints it is caught by the wrapping timeout instead).
+ *
+ * The EC field the original FAIL line carried is KEPT, printed here among the
+ * extras rather than dropped. Yes, ESR bits[31:26] already encode it — but the
+ * whole value of this line is being readable at a glance by whoever is staring
+ * at a broken CI log, and "EC=0x24" is the single most diagnostic field in it.
+ * Making a human decode it out of a hex ESR every time is a real loss for a
+ * refactor that is supposed to change nothing. */
 static void report_fault(struct el2_frame *frame, unsigned long kind) __attribute__((noreturn));
 
 static void
@@ -158,29 +173,65 @@ report_fault(struct el2_frame *frame, unsigned long kind)
 	if (!at_line_start)
 		pl011_putc('\n');
 
-	pl011_puts("LINUX-QEMU-CI: FAIL — unhandled exception kind=0x");
-	pl011_put_hex32((uint32_t)kind);
-	pl011_puts(" EC=0x");
-	pl011_put_hex32(((uint32_t)(frame->esr >> 26)) & 0x3fu);
-	pl011_puts(" ESR=0x");
-	pl011_put_hex32((uint32_t)frame->esr);
-	pl011_puts(" ELR=0x");
-	pl011_put_hex64(frame->elr);
-	pl011_puts(" FAR=0x");
-	pl011_put_hex64(frame->far);
-	pl011_puts("\n");
 	pl011_puts("LINUX-QEMU-CI: guest console bytes emulated before the fault: ");
 	pl011_put_udec(guest_bytes);
 	pl011_puts("\n");
-	qemu_poweroff();
+
+	pl011_puts("LINUX-QEMU-CI: EC=0x");
+	pl011_put_hex32(((uint32_t)(frame->esr >> 26)) & 0x3fu);
+	pl011_puts("\n");
+
+	qemu_report_fault(frame, kind, "LINUX-QEMU-CI", /*poweroff=*/1);
 }
+
+/* This target's own scenario config for the shared guest-sync chain — see
+ * el2_exc_qemu_common.h for the chain's fixed order (console, then dynamic
+ * W^X, then HVC, then SMC, then MMIO-absorb). That order differs textually
+ * from this file's old hand-written chain (which checked SMC before W^X and
+ * HVC after), but is NOT a behaviour change: EC_SMC64/EC_HVC64 are disjoint
+ * from the EC_DABT_LOWER/EC_IABT_LOWER foursome stage2_wx_qemu_try() acts on
+ * (see stage2_wx_qemu.h), so no two of these branches ever compete for the
+ * same fault — only their relative ORDER in the source changed, not which
+ * one claims a given ec. The one EC that two branches both look at,
+ * EC_DABT_LOWER (console vs. W^X), is tried console-first in the shared
+ * chain exactly as it was here, so that fallthrough (console misses ->
+ * W^X gets a shot, e.g. a real stage-2 hole or the guest touching an address
+ * this map doesn't cover) is unchanged too.
+ *
+ * want_console + console_chan(0) + after_console: this target's UART0 trap ->
+ * vconsole.c path. after_console runs drain_guest_console() only when
+ * vconsole actually claimed the fault, same as the original's inline
+ * `if (vconsole_handle_fault(...)) { drain_guest_console(); return; }`.
+ *
+ * want_hvc_ack + hvc_advance_elr: this DTB advertises method="smc", so
+ * Linux's PSCI client should never issue HVC here — kept for parity with
+ * el2_exc_zephyr_qemu.c/guest.c's documented optional-hypercall contract, in
+ * case anything else in the guest ever does. hvc_advance_elr=1 reproduces
+ * this file's original `frame->elr += 4u;` verbatim.
+ *
+ * on_smc = forward_psci_smc: see this file's header for the PSCI passthrough
+ * rationale. forward_psci_smc() already advances frame->elr itself, so no
+ * extra ELR handling is needed here (unlike the HVC ack above).
+ *
+ * No claim_first, no want_mmio_absorb: this target has no mechanism under
+ * test ahead of the shared chain, and its DTB describes no absent devices to
+ * absorb. Dynamic W^X promotion is unconditional in the shared chain (see
+ * el2_exc_qemu_common.h) and needs no flag here — it used to be this file's
+ * own `stage2_wx_qemu_try(frame, ec)` call, guarded by the same header. */
+static const struct qemu_guest_sync_ops linux_qemu_ops = {
+	.want_console    = 1u,
+	.console_chan    = 0u,
+	.after_console   = drain_guest_console,
+	.want_hvc_ack    = 1u,
+	.hvc_advance_elr = 1u,
+	.on_smc          = forward_psci_smc,
+};
 
 void
 el2_trap(struct el2_frame *frame, unsigned long kind)
 {
 	unsigned t = (unsigned)(kind & 3u);
 	unsigned group = (unsigned)(kind >> 2);
-	uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
 
 	/* This build arms no timer/vgic; an async exception here is not
 	 * expected but is also not evidence of a bug in what this target is
@@ -190,30 +241,14 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 		return;
 
 	if (group == 2u) {   /* from a lower EL: the guest */
-		if (ec == EC_DABT_LOWER) {
-			if (vconsole_handle_fault(frame, 0)) {
-				drain_guest_console();
-				return;
-			}
-			/* Not UART0 — a real bug (stage-2 hole, or the guest
-			 * touching an address this map does not cover). Fall
-			 * through to report_fault(). */
-		}
+		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
 
-		if (ec == EC_SMC64) {
-			forward_psci_smc(frame);
+		/* The shared chain handles the UART0 console trap, dynamic W^X
+		 * promotion, the HVC ack, and the PSCI SMC passthrough this
+		 * file's header documents. See el2_exc_qemu_common.h for what
+		 * is shared and why. */
+		if (qemu_guest_sync(frame, ec, &linux_qemu_ops))
 			return;
-		}
-
-		if (ec == EC_HVC64) {
-			/* This DTB advertises method="smc", so Linux's PSCI
-			 * client should never issue HVC here — kept for
-			 * parity with el2_exc_zephyr_qemu.c/guest.c's documented
-			 * optional-hypercall contract, in case anything else
-			 * in the guest ever does. */
-			frame->elr += 4u;
-			return;
-		}
 	}
 
 	report_fault(frame, kind);

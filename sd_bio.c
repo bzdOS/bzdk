@@ -57,6 +57,9 @@
 #define REG_CMDR   0x18u
 #define REG_CAGR   0x1Cu
 #define REG_RESP0  0x20u
+#define REG_RESP1  0x24u
+#define REG_RESP2  0x28u
+#define REG_RESP3  0x2Cu
 #define REG_IMKR   0x30u
 #define REG_RINT   0x38u
 #define REG_STAR   0x3Cu
@@ -166,6 +169,14 @@ static void sdbc(int i, uint32_t v)
 /* Card type detected by sd_bio_init(); 1 = SDHC/SDXC (block addressing). */
 static int g_sd_block_addressed;
 static int g_sd_inited;
+
+/* Real capacity, parsed from CSD (sd_bio_init()'s CMD9) when the card is a
+ * CSD-2.0 (SDHC/SDXC) card -- see sd_bio_capacity_sectors()'s own comment.
+ * Defaults to the same conservative 1 GiB stub vblk_sd.h used to hardcode
+ * unconditionally, so a parse failure degrades to the old, always-safe
+ * behavior rather than an unbounded/wrong guess. */
+#define SD_CAPACITY_FALLBACK_SECTORS  ((uint64_t)1024 * 1024 * 1024 / 512u)
+static uint64_t g_sd_capacity_sectors = SD_CAPACITY_FALLBACK_SECTORS;
 
 /* Translate a 512-byte sector index to the controller command argument. */
 static inline uint32_t sd_addr(uint32_t lba)
@@ -314,9 +325,45 @@ int sd_bio_init(void)
 	rca = resp0 >> 16;
 	sdbc(6, rca);
 
-	/* CMD9 SEND_CSD (R2, long), rca<<16. */
+	/* CMD9 SEND_CSD (R2, long), rca<<16. sd_cmd_done()'s resp0_out param only
+	 * captures RESP0; a long (136-bit) response spans RESP0..RESP3, so read
+	 * the other three directly -- same register block, no extra command. */
 	if (sd_cmd_done(9, rca << 16, CMDR_LONG_RESP | CMDR_RESP_EXP, NULL) != 0) {
 		sdbc(0, (uint32_t)-8); return -8;
+	}
+	{
+		/* CORRECTED 2026-08-25 (live): first attempt assumed resp[0] was
+		 * CSD bits[127:96] (MSB) — SANITY-CHECKED WRONG on a real card
+		 * (csd_structure decoded as 0, impossible for a confirmed SDHC/
+		 * SDXC card whose OCR CCS bit already read 1). This SMHC IP
+		 * instead follows the SDHCI-standard convention: resp[0] = bits
+		 * [31:0] (LSB, ascending significance with register number), so
+		 * resp[3] = bits[127:96] (MSB) and CSD_STRUCTURE lives there, not
+		 * in resp[0]. C_SIZE (bits[69:48]) spans resp[2] bits[5:0] (its
+		 * high 6 bits) and resp[1] bits[31:16] (its low 16 bits) under
+		 * this corrected mapping. CSD_STRUCTURE must be 1 (version 2.0)
+		 * for this C_SIZE-only formula to apply -- true for every real
+		 * SDHC/SDXC card by spec, and independently corroborated by the
+		 * OCR CCS bit already read via ACMD41 above. Fall back to the
+		 * conservative 1 GiB stub (g_sd_capacity_sectors' static
+		 * initializer) rather than trust a v1.0 CSD's different
+		 * encoding. */
+		uint32_t r1 = rreg(REG_RESP1);
+		uint32_t r2 = rreg(REG_RESP2);
+		uint32_t r3 = rreg(REG_RESP3);
+		uint32_t csd_structure = (r3 >> 30) & 0x3u;
+		/* idx 10..15: distinct from idx 8/9 (SD_BC_HS_STATE/STEP, written
+		 * later in this same function by sd_bio_set_highspeed()) and from
+		 * idx 0..6 already used above in this function. */
+		sdbc(10, r1); sdbc(11, r2); sdbc(12, r3);
+		sdbc(13, csd_structure);
+		if (csd_structure == 1u) {
+			uint32_t c_size = ((r2 & 0x3Fu) << 16) | ((r1 >> 16) & 0xFFFFu);
+			uint64_t sectors = ((uint64_t)c_size + 1u) * 1024u;
+			g_sd_capacity_sectors = sectors;
+			sdbc(14, (uint32_t)sectors);
+			sdbc(15, (uint32_t)(sectors >> 32));
+		}
 	}
 
 	/* CMD7 SELECT_CARD (R1b), rca<<16. */
@@ -327,7 +374,99 @@ int sd_bio_init(void)
 
 	g_sd_inited = 1;
 	sdbc(0, 0);
+	(void)sd_bio_set_highspeed();   /* best-effort; see its own header comment */
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* sd_bio_set_highspeed() — best-effort 25 MHz reclock, FAIL-SAFE.     */
+/*                                                                      */
+/* WHY: sd_bio_write() was confirmed live (2026-08-24) to either time  */
+/* out on RINT_DATA_OVER outright, or -- worse -- report rc==0 while   */
+/* the data never actually landed on the card (read-back showed the    */
+/* card's pre-write content, not what was written). Isolated via      */
+/* direct EL2 sd_bio_read()/sd_bio_write() calls, bypassing vblk_sd.c  */
+/* and the guest entirely, so the bug is in THIS file, not the virtio  */
+/* plumbing above it. The one thing this controller has NEVER been run */
+/* at is anything other than the 400 kHz identification clock -- see   */
+/* the module header's own "no high-speed reclock ... deliberately     */
+/* omitted from this first cut" note -- and 400 kHz is far below what  */
+/* real SDHC/SDXC cards are designed/tested against, which is a        */
+/* plausible and cheap-to-try explanation before suspecting the FIFO/  */
+/* DATA_OVER timing logic itself (ported verbatim from the ALREADY     */
+/* hardware-verified emmc_bio.c read path).                            */
+/*                                                                      */
+/* UNLIKE eMMC: raising an SD card to its Default Speed range (0-25    */
+/* MHz) needs NO CMD6 SWITCH_FUNC negotiation at all -- every SD card   */
+/* supports the whole range unconditionally by spec. (SD's own         */
+/* High-Speed mode, 50 MHz, DOES need a CMD6 SWITCH_FUNC handshake,     */
+/* structurally different from eMMC's byte-indexed EXT_CSD CMD6 SWITCH  */
+/* -- not attempted here; 25 MHz is the safe, negotiation-free step.)  */
+/* So this is JUST emmc_bio.c's emmc_reclock() (CCU divider math is the */
+/* same CCU IP, same field layout, only the mod-clock register address  */
+/* differs: CCU_MMC0_CLK here vs CCU_MMC2_CLK there) plus a mandatory   */
+/* post-reclock test read, with the same fail-safe-back-to-400kHz       */
+/* contract: this function can only ever leave the card at a WORKING    */
+/* clock, never a broken one, no matter how the PLL6=600MHz assumption  */
+/* below turns out. */
+#define CCU_MMC0_CLK_400K  0x8002000eu   /* == sd_bio_init()'s own literal */
+#define CCU_MMC0_CLK_HS25  0x8101000Bu   /* PLL6(600MHz) | N=1 | M=11 -> 25.000 MHz, same math as emmc_bio.c's CCU_MMC2_CLK_HS25 */
+
+#define SD_BC_HS_STATE  8   /* 0=never run, 1=25MHz active, 2=fell back */
+#define SD_BC_HS_STEP   9   /* which step failed when [8]==2, 0 otherwise */
+#define SD_HS_FAIL_RECLOCK   1
+#define SD_HS_FAIL_TESTREAD  2
+
+static int sd_reclock(uint32_t ccu_val)
+{
+	wreg(REG_CKCR, 0);
+	if (clk_update() != 0)
+		return -1;
+	wr32(CCU_MMC0_CLK, ccu_val);
+	wreg(REG_NTSR, rreg(REG_NTSR) | NTSR_MODE_SEL_NEW);
+	wreg(REG_SAMP_DL, SAMP_DL_CAL_SW_EN);
+	wreg(REG_CKCR, CKCR_CARD_CLK_EN);
+	if (clk_update() != 0)
+		return -1;
+	return 0;
+}
+
+static int sd_hs_fallback(int fail_step)
+{
+	(void)sd_reclock(CCU_MMC0_CLK_400K);
+	sdbc(SD_BC_HS_STATE, 2);
+	sdbc(SD_BC_HS_STEP, (uint32_t)fail_step);
+	return -1;
+}
+
+int sd_bio_set_highspeed(void)
+{
+	if (sd_reclock(CCU_MMC0_CLK_HS25) != 0)
+		return sd_hs_fallback(SD_HS_FAIL_RECLOCK);
+
+	/* Mandatory post-reclock test read of LBA 0 -- rc==0 is all that
+	 * matters here (content is whatever a prior test left there); a bad
+	 * sample point at the new clock shows up as sd_bio_read()'s own
+	 * already-verified drain/DATA_OVER timeout, same as any other
+	 * failure of that path. */
+	if (sd_bio_read(0, (uint64_t)HVMAP_SD_TESTBUF) != 0)
+		return sd_hs_fallback(SD_HS_FAIL_TESTREAD);
+
+	sdbc(SD_BC_HS_STATE, 1);
+	sdbc(SD_BC_HS_STEP, 0);
+	return 0;
+}
+
+/* Real capacity in 512-byte sectors, parsed from the card's own CSD during
+ * sd_bio_init() (CSD version 2.0 / SDHC-SDXC C_SIZE formula: (C_SIZE+1) *
+ * 1024 sectors). Falls back to the old conservative 1 GiB stub if parsing
+ * never ran (sd_bio_init() not yet called / failed) or the card reported a
+ * CSD version other than 2.0 -- see the parse site's own comment for why
+ * that should never happen for a real SDHC/SDXC card. Callers must not
+ * call this before a successful sd_bio_init(). */
+uint64_t sd_bio_capacity_sectors(void)
+{
+	return g_sd_capacity_sectors;
 }
 
 /* ------------------------------------------------------------------ */
@@ -386,7 +525,13 @@ int sd_bio_read(uint32_t lba, uint64_t buf_pa)
 
 /* ------------------------------------------------------------------ */
 /* sd_bio_write() — CMD24 single-block write (mirrors emmc_bio_write()).*/
-/* Structurally correct; verify with a read-back compare.              */
+/* CONFIRMED on silicon 2026-08-24 at 25 MHz (post sd_bio_set_highspeed()):*/
+/* 45/45 direct write/read-back round trips matched, plus a guest-level   */
+/* virtio dd write/read/md5 round trip. At the 400 kHz identification    */
+/* clock this same function either timed out outright or reported rc==0 */
+/* while the data never actually landed -- see sd_bio_set_highspeed()'s  */
+/* own comment. Do not remove the reclock call thinking this comment     */
+/* means the 400 kHz path was ever made reliable; it was not tried again.*/
 /* ------------------------------------------------------------------ */
 int sd_bio_write(uint32_t lba, uint64_t buf_pa)
 {

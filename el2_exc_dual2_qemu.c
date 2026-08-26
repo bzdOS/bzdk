@@ -55,6 +55,7 @@
 #include "smp.h"
 #include "vconsole.h"
 #include "hv_addrmap.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header */
 
 /* CPU0's guest.c breadcrumb window (GUEST_BC_BASE, "GST1") -- word[1] is
  * guest_demo_el1()'s own loop counter, bumped every iteration at EL1. See
@@ -89,36 +90,66 @@ read_u32(uint64_t pa)
 	return *(volatile uint32_t *)pa;
 }
 
-static void
-dual2_qemu_poweroff(void) __attribute__((noreturn));
+/* This target's own scenario config for the shared guest-sync chain (see
+ * el2_exc_qemu_common.h for the chain's fixed order: claim_first, console,
+ * then the unconditional dynamic W^X promotion, then HVC ack, SMC, MMIO
+ * absorb). No console, no SMC forward, no MMIO absorb: CPU0's guest_demo_el1
+ * payload runs with stage-2 disabled / flat physical and uses none of them
+ * (CPU3's UART0-THR console traffic is a wholly separate path, routed by the
+ * per-core branch near the top of el2_trap() below, which this refactor
+ * leaves untouched). Dynamic W^X promotion is unconditional in the shared
+ * chain and needs no flag here either.
+ *
+ * hvc_advance_elr = 0 IS THE POINT OF THIS FILE'S HEADER COMMENT IN
+ * el2_exc_qemu_common.h: for an HVC trap, ARM's architecture already sets
+ * ELR_EL2 to the instruction AFTER the HVC (it is a "return from call"
+ * address, not a "faulting PC"), so no further adjustment is needed OR
+ * correct. An earlier version of this file copied el2_exc_qemu.c's own
+ * `frame->elr += 4u;` for this branch verbatim; that line is a latent bug in
+ * this tree — dead code in el2_exc_qemu.c, since that target's own guest
+ * payload never issues hvc — but LIVE and guest-derailing here, where
+ * guest_demo_el1() genuinely does issue an hvc every GUEST_HVC_PERIOD
+ * iterations: it double-advanced ELR past the following unconditional branch
+ * and landed the guest's PC inside guest_config()'s body, which promptly
+ * wrote an EL2-only sysreg from EL1 and wedged. Confirmed live via a
+ * temporary debug print of ESR/ELR around this branch before removing the
+ * extra `+= 4`. DO NOT set this to 1 to "harmonise" with el2_exc_qemu.c —
+ * that would reintroduce the exact bug this comment documents. */
+static const struct qemu_guest_sync_ops dual2_qemu_ops = {
+	.want_hvc_ack    = 1u,
+	.hvc_advance_elr = 0u,
+};
 
-static void
-dual2_qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
+/* dual2_qemu_poweroff()/report_fault() used to be defined here,
+ * verbatim-duplicated across every QEMU CI handler (see
+ * el2_exc_qemu_common.h's header for the full "nine copies" rationale); the
+ * PSCI SYSTEM_OFF half now lives in el2_exc_qemu_common.c as
+ * qemu_psci_poweroff(), unchanged in behaviour (identical SMC #0x84000008
+ * SYSTEM_OFF, wfi fallback loop). Kept as a #define under the old name so the
+ * call site below reads the same as before this refactor. */
+#define dual2_qemu_poweroff qemu_psci_poweroff
 
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
-
+/* report_fault() is kept LOCAL rather than folded entirely into the shared
+ * qemu_report_fault(): this target's original FAULT line carries one extra
+ * field qemu_report_fault()'s fixed "<marker>: FAULT kind=.. ESR=.. ELR=..
+ * FAR=.." format has no hook for — cpu=<id>, which matters here specifically
+ * because this handler is reached from multiple cores (see the CPU3 routing
+ * branch in el2_trap() below) and a FAULT line without it would leave a
+ * reader guessing which core actually died. Per el2_exc_qemu_common.h's
+ * contract for this situation, the extra is printed as its own line
+ * immediately before calling the shared helper — same pattern
+ * el2_exc_linux_qemu.c/el2_exc_zephyr_qemu.c already use for their own kept
+ * extras. */
 static void report_fault(struct el2_frame *frame, unsigned long kind) __attribute__((noreturn));
 
 static void
 report_fault(struct el2_frame *frame, unsigned long kind)
 {
-	pl011_puts("DUAL-QEMU-CI2: FAULT cpu=");
+	pl011_puts("DUAL-QEMU-CI2: cpu=");
 	pl011_put_udec(smp_cpu_id());
-	pl011_puts(" kind=0x");
-	pl011_put_hex32((uint32_t)kind);
-	pl011_puts(" ESR=0x");
-	pl011_put_hex32((uint32_t)frame->esr);
-	pl011_puts(" ELR=0x");
-	pl011_put_hex64(frame->elr);
-	pl011_puts(" FAR=0x");
-	pl011_put_hex64(frame->far);
 	pl011_puts("\n");
-	dual2_qemu_poweroff();
+
+	qemu_report_fault(frame, kind, "DUAL-QEMU-CI2", /*poweroff=*/1);
 }
 
 void
@@ -233,29 +264,17 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 		return;   /* never advance ELR/SPSR for an async exception */
 	}
 
-	/* Guest (lower-EL) synchronous HVC -- acknowledge and resume, matching
-	 * guest.c's documented optional hypercall path (guest_demo_el1() issues
-	 * one periodically). */
+	/* Guest (lower-EL) synchronous exception: the shared chain handles the
+	 * dynamic W^X promotion (without which the guest cannot execute its
+	 * first instruction under STAGE2_WX_DYNAMIC's default XN mapping) and
+	 * the HVC acknowledgement guest_demo_el1() periodically exercises --
+	 * with hvc_advance_elr=0, see the big comment on dual2_qemu_ops above
+	 * (and el2_exc_qemu_common.h) for why NOT advancing ELR here is the
+	 * correct, hard-won behaviour for this file specifically. */
 	if ((kind >> 2) == 2u && t == EL2_KIND_SYNC) {
 		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
 
-		/* HVC from AArch64: unlike a data/instruction abort (where ELR_EL2
-		 * is the address of the FAULTING instruction and must be advanced
-		 * past it manually), the ARM architecture already sets ELR_EL2 to
-		 * the instruction AFTER the HVC for an HVC trap -- it is the
-		 * "return from call" address, not a "faulting PC" -- so no
-		 * adjustment is needed or correct here. (An earlier version of
-		 * this file copied el2_exc_qemu.c's own `frame->elr += 4u;` for
-		 * this branch verbatim; that line is a latent bug in this tree --
-		 * dead code there, since that target's own guest payload never
-		 * issues hvc -- but live and guest-derailing here, where
-		 * guest_demo_el1() genuinely does every GUEST_HVC_PERIOD
-		 * iterations: it double-advanced ELR past the following
-		 * unconditional branch and landed the guest's PC inside
-		 * guest_config()'s body, which promptly wrote an EL2-only sysreg
-		 * from EL1 and wedged. Confirmed live via a temporary debug print
-		 * of ESR/ELR around this branch before removing the extra `+= 4`.) */
-		if (ec == 0x16u)
+		if (qemu_guest_sync(frame, ec, &dual2_qemu_ops))
 			return;
 	}
 

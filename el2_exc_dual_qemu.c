@@ -26,42 +26,57 @@
  */
 #include <stdint.h>
 #include "exceptions.h"
-#include "pl011_qemu.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header */
 
-static void
-dual_qemu_poweroff(void) __attribute__((noreturn));
+/* dual_qemu_poweroff() used to be defined here (PSCI SYSTEM_OFF 0x84000008 via
+ * SMC, verbatim-duplicated across every QEMU CI handler); it now lives in
+ * el2_exc_qemu_common.c as qemu_psci_poweroff() — same mechanism, same "QEMU's
+ * `virt` machine answers PSCI itself, no real EL3 firmware needed" rationale,
+ * see that file's own comment. Behaviour is unchanged: this target still
+ * powers off (rather than halting in wfi) after the fault report below. */
 
-/* PSCI SYSTEM_OFF (0x84000008) via SMC — same mechanism every other QEMU
- * target in this tree uses to exit cleanly (see el2_exc_qemu.c's
- * qemu_poweroff()); QEMU's `virt` machine answers PSCI itself with no real
- * EL3 firmware needed. */
-static void
-dual_qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+/* This target's own scenario config for the shared guest-sync chain: a fully
+ * zeroed struct, because this proof needs nothing beyond what qemu_guest_sync()
+ * already does unconditionally — dynamic W^X promotion. No console, no HVC
+ * ack, no SMC forward, no MMIO absorb: this target never enters a guest at
+ * all (see this file's header), so none of those can ever fire; the struct
+ * exists only so the "guest's first instruction fetch traps here and that is
+ * normal" case below shares the same chain every other QEMU target uses. */
+static const struct qemu_guest_sync_ops dual_qemu_sync_ops = { 0 };
 
 void
 el2_trap(struct el2_frame *frame, unsigned long kind)
 {
+	/* Dynamic W^X promotion, checked BEFORE the "any trap here is a failure"
+	 * report below — because since stage2.h made STAGE2_WX_DYNAMIC's XN
+	 * mapping the default, a guest's FIRST INSTRUCTION FETCH legitimately
+	 * traps here and is normal progress, not a bring-up failure. Without
+	 * this, this target's own payloads cannot execute at all. Everything
+	 * genuinely unexpected still falls through unchanged — qemu_guest_sync()
+	 * (via stage2_wx_qemu_try()) only claims guest-DRAM permission faults.
+	 * See el2_exc_qemu_common.h. */
+	if ((kind >> 2) == 2u && (kind & 3u) == EL2_KIND_SYNC) {
+		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
+
+		if (qemu_guest_sync(frame, ec, &dual_qemu_sync_ops))
+			return;
+	}
+
 	/* Whichever core (primary or secondary) took this, it means something
 	 * unexpected happened during the SMP bring-up proof. Report and stop —
 	 * the wrapping CI script's `timeout` (or, if we get here after
 	 * main_dual_qemu.c already printed a verdict, the missing PASS grep)
 	 * turns this into an unambiguous FAIL, same convention every other QEMU
-	 * target's fault path uses. */
-	pl011_puts("DUAL-QEMU-CI: UNEXPECTED TRAP kind=0x");
-	pl011_put_hex32((uint32_t)kind);
-	pl011_puts(" ESR=0x");
-	pl011_put_hex32((uint32_t)frame->esr);
-	pl011_puts(" ELR=0x");
-	pl011_put_hex64(frame->elr);
-	pl011_puts(" FAR=0x");
-	pl011_put_hex64(frame->far);
-	pl011_puts("\n");
-	dual_qemu_poweroff();
+	 * target's fault path uses.
+	 *
+	 * The marker passed to qemu_report_fault() is this file's ENTIRE original
+	 * "DUAL-QEMU-CI: UNEXPECTED TRAP" prefix, not just "DUAL-QEMU-CI" — smp-
+	 * qemu-ci.sh greps for the literal substring "UNEXPECTED TRAP" as one of
+	 * its immediate-FAIL triggers (see that script), so that exact wording has
+	 * to survive this refactor even though qemu_report_fault()'s own wording
+	 * for everything after the marker is "FAULT kind=..." rather than this
+	 * file's original "UNEXPECTED TRAP kind=...". poweroff=1 preserves this
+	 * target's original terminal behaviour (dual_qemu_poweroff(), not a wfi
+	 * halt). */
+	qemu_report_fault(frame, kind, "DUAL-QEMU-CI: UNEXPECTED TRAP", /*poweroff=*/1);
 }

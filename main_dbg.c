@@ -44,6 +44,8 @@
 #include "vblk_emmc.h"
 #include "vblk_async.h"
 #include "vnet_emac.h"   /* ROADMAP C1: virtio-net multiplexed onto this EMAC */
+#include "vinput.h"      /* virtual keyboard, multiplexed onto the same trap block */
+#include "vblk_sd.h"     /* virtio-blk over the microSD card */
 #include "el2_ncmap.h"
 #include "dbgtools.h"    /* CPU1 heartbeat / build-id / entry-hold (2026-07-26) */
 
@@ -166,6 +168,26 @@ int main(void)
 	 * own EMAC console traffic is provided by emac.c's EMAC_TX_LOCK_PA
 	 * (see the "TX CROSS-CORE MUTUAL EXCLUSION" block in emac.c). */
 	vnet_init();
+
+	/* Virtual keyboard (vinput.c): registers the virtio-input device at
+	 * 0x0A003000, inside the same already-trapped 2 MiB stage-2 block as
+	 * vblk/vnet/scanout -- no stage2.c change needed. Must run before
+	 * stage2_init()/stage2_enable() below, same as vblk_init()/vnet_init()
+	 * above. The device has nothing to attach to until the guest's own
+	 * virtio-input driver probes it (needs a matching DTB node -- see
+	 * docs/virtio-blk-dtb.md's sibling entry for this device); until then
+	 * this is a harmless, idle MMIO window. */
+	vinput_init();
+
+	/* virtio-blk over the microSD card (vblk_sd.c): a SECOND, independent
+	 * disk for the guest, so /var can move off the boot-critical eMMC once
+	 * root goes read-only. Brings the card up itself (sd_bio_init()) --
+	 * safe to call before the guest can possibly touch it, and registers
+	 * the device even if the card init fails (every request then completes
+	 * S_IOERR, same "always register, report failure per-request" contract
+	 * as vblk_init() above). Must run before stage2_init()/stage2_enable(),
+	 * same ordering as every other virtio-mmio device here. */
+	vblk_sd_init();
 
 	/* USB-OTG CDC-ACM interactive console bridge (usbacm.c): brings up the
 	 * MUSB gadget (musb_init()) so the CPU1 debug core's usbacm_poll()

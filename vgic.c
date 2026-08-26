@@ -245,9 +245,44 @@ _Static_assert(VGIC_BC_BASE == HVMAP_LOW_VGIC_BC,
                "VGIC_BC_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define VGIC_BC_MAGIC  0x56474943u   /* "VGIC" */
 
+/* PER-CORE BREADCRUMB LANES (added 2026-08-26, when vcpu1.c started calling
+ * vgic_init() on CPU1 -- see the state-inventory comment below, which
+ * REQUIRED exactly this before a second core was allowed to run the vGIC:
+ * "Whichever later Phase-2 step actually runs the vGIC on a second core MUST
+ * give it its own breadcrumb lane first -- allocated in hv_addrmap.h's
+ * _Static_assert chain, never squeezed into a neighbour's space."
+ *
+ * The window hv_addrmap.h reserves is 0x100 bytes (see its
+ * `HVMAP_LOW_VGIC_BC + 0x100UL <= HVMAP_LOW_VGST_BC` assert) and the highest
+ * index this file writes is 19, so two lanes of 0x80 fit EXACTLY inside the
+ * already-reserved space -- no neighbour is touched and the assert chain
+ * needs no change. Deliberately NOT four lanes: 4 * 0x80 would be 0x200 and
+ * would march into HVMAP_LOW_VGST_BC, which is precisely the derive-from-
+ * your-neighbour failure this project already paid for once (see
+ * breadcrumb-window-hygiene / hv_addrmap.h's own header). Only CPU0 and CPU1
+ * ever run a vGIC (CPU2 is async I/O, CPU3 is idle or a separate guest whose
+ * own vGIC would need its own lane allocated the same explicit way), so two
+ * is the real requirement, not a shortcut.
+ *
+ * CPU0 KEEPS LANE 0 at the unchanged base address, so every existing host-
+ * side reader (triage.py, hvdbg, vgic_qemu_ci.h) keeps working byte-for-byte
+ * without knowing this split happened. */
+#define VGIC_BC_STRIDE 0x80UL
+#define VGIC_BC_MAXIDX 19
+_Static_assert((VGIC_BC_MAXIDX + 1) * 4UL <= VGIC_BC_STRIDE,
+               "vgic.c writes past its per-core breadcrumb lane into the next core's");
+_Static_assert(2UL * VGIC_BC_STRIDE <= 0x100UL,
+               "vgic breadcrumb lanes overflow the window hv_addrmap.h reserves");
+
 static inline void vg_bc(int i, uint32_t v)
 {
-	volatile uint32_t *p = (volatile uint32_t *)(VGIC_BC_BASE + (uint32_t)i * 4u);
+	/* Lane by core, clamped: only CPU1 gets lane 1: everything else shares
+	 * lane 0. CPU2/CPU3 never call into this file at all today (see the
+	 * state inventory), so the clamp is defensive, not a real case -- same
+	 * posture as vg_self()'s own out-of-range clamp just below. */
+	uint32_t lane = (smp_cpu_id() == 1u) ? 1u : 0u;
+	volatile uint32_t *p = (volatile uint32_t *)(VGIC_BC_BASE +
+	    lane * VGIC_BC_STRIDE + (uint32_t)i * 4u);
 	*p = v;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
@@ -330,25 +365,37 @@ struct vgic_pend {
  * All the PER-CORE state above moves into struct vg_percpu below, one
  * instance per core, indexed by smp_cpu_id() via vg_self().
  *
- * On CPU0 alone — every board target today; vgic_init() is called only once,
- * from main_dbg.c's single-core boot path, before smp_init() ever starts a
- * secondary (grepped before this change) — the index is always 0, so this
- * is a pure storage-layout change with byte-identical behaviour. Cache-line-
- * padded (64 B) exactly like smp.c's own per-core pattern (struct
- * smp_percpu, smp.c:183-188) and gic_timer.c's new struct gt_percpu (this
- * same P1 change), so a future second core running vgic_init() never shares
- * a cache line with CPU0's copy.
+ * Cache-line-padded (64 B) exactly like smp.c's own per-core pattern (struct
+ * smp_percpu, smp.c:183-188) and gic_timer.c's struct gt_percpu (this same P1
+ * change), so the second core running vgic_init() never shares a cache line
+ * with CPU0's copy.
+ *
+ * NO LONGER CPU0-ONLY (2026-08-26). This comment used to say "on CPU0 alone —
+ * every board target today; vgic_init() is called only once, from main_dbg.c's
+ * single-core boot path". That stopped being true when vcpu1.c started calling
+ * vgic_init() on CPU1, and the reason it had to is worth recording HERE, next
+ * to the state it explains, because it was mis-diagnosed twice:
+ *
+ *   Under the live IMO=1/FMO=1 policy (main_dbg.c) EL2 owns EVERY physical
+ *   interrupt and the ONLY way one reaches the guest is this file forwarding
+ *   it into a List Register. GICH is per-PE-banked and vg_active is per-core,
+ *   so a core that never called its own vgic_init() has GICH_HCR.En == 0 and
+ *   vgic_active() == false — meaning gic_timer_irq() skips the forwarding
+ *   block entirely and that core's guest receives ZERO interrupts: no timer,
+ *   and no IPI. A second vCPU in that state boots FINE (FreeBSD's AP-release
+ *   rendezvous is a pure shared-memory handshake — "Release APs...done." even
+ *   prints) and then wedges the WHOLE guest at the first smp_rendezvous(),
+ *   whose IPI is delivered to a disabled virtual interface. That was chased
+ *   as a GICD_SGIR masking bug (vgicd.c) and then as a cache-coherency bug
+ *   before being traced here; the tell that exonerates both is that CPU1's
+ *   EL2 side — dbgmon, the watchdog kick — stays perfectly alive throughout.
  *
  * BREADCRUMB NOTE (hv_addrmap.h / the breadcrumb-window-hygiene discipline).
- * VGIC_BC_BASE (0x50001c00) stays a SINGLE, file-scope window — NOT split
- * per core — for the same reason as gic_timer.c's GICT/IRQ_COUNTER windows:
- * nothing in the current tree ever calls vgic_init()/vgic_inject_hw()/etc.
- * from any core but CPU0, so there is exactly one writer today, and
- * splitting the window now would be speculative complexity with no way to
- * exercise it. Whichever later Phase-2 step actually runs the vGIC on a
- * second core MUST give it its own breadcrumb lane first — allocated in
- * hv_addrmap.h's _Static_assert chain, never squeezed into a neighbour's
- * space. Flagged here, not fixed here.
+ * VGIC_BC_BASE (0x50001c00) is now SPLIT into per-core lanes, which is what
+ * the previous revision of this comment demanded of "whichever later Phase-2
+ * step actually runs the vGIC on a second core" — see VGIC_BC_STRIDE above
+ * for the layout and why it fits inside the already-reserved window without
+ * touching a neighbour. CPU0 keeps lane 0 at the unchanged base address.
  * ------------------------------------------------------------------ */
 struct vg_percpu {
 	uint32_t nr_lr;               /* refined from GICH_VTR in vgic_init */

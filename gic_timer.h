@@ -100,6 +100,17 @@ void gic_timer_arm_preserving_cntvoff(uint32_t period_us);
  * this one. Idempotent, safe to call once before IRQs are unmasked. */
 void gic_timer_cpuif_init(void);
 
+/* Target the real MUSB "mc" SPI (MUSB_IRQ_INTID, musb.h) at CPU1's GIC CPU
+ * interface alone and enable it at the distributor, so gic_timer_irq() can
+ * service usbacm_poll() straight from that IRQ instead of a fixed-period
+ * tick. Part of the CPU1-as-vCPU1 design (vcpu1.c, EXPERIMENTAL) — see
+ * gic_timer.c's own header comment above this function's definition for
+ * the full rationale and the UNVERIFIED hardware assumptions (ITARGETSR
+ * bit-to-core mapping, ICFGR level config) a board session must confirm.
+ * Call once, from vcpu1_run(), after gic_timer_cpuif_init() and before
+ * unmasking IRQs on CPU1. */
+void musb_irq_arm_cpu1(void);
+
 /* Call this from el2_trap()'s IRQ case (kind & 3 == EL2_KIND_IRQ). Reads
  * GICC_IAR (acknowledges), confirms the INTID is ours, samples the jitter
  * meter, re-arms the next interval, writes GICC_EOIR, and increments the

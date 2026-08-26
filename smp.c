@@ -462,6 +462,15 @@ __attribute__((weak)) void vcpu2_run(void)
 {
 }
 
+/* Third guest vCPU, EXPERIMENTAL — see vcpu1.h. Weak default: a no-op
+ * return, so the caller (smp_secondary_main(), below) falls straight
+ * through into the existing SMP_DEBUG_CPU tight loop, byte-for-byte
+ * unchanged, on every target that doesn't link vcpu1.o. Same pattern as
+ * vcpu2_run() immediately above. */
+__attribute__((weak)) void vcpu1_run(void)
+{
+}
+
 __attribute__((weak)) void vblk_async_cpu2_run(void)
 {
 	for (;;)
@@ -539,6 +548,13 @@ void smp_secondary_main(uint64_t cpuid)
 	 * CPU0 is stuck spinning in the guest, this core keeps the board fully
 	 * inspectable over the network. CPU0 sees dbg_core_active=1 and stops
 	 * touching EMAC itself, so the two never race the MAC. */
+	/* Third guest vCPU, EXPERIMENTAL (vcpu1.h) — checked BEFORE the debug-
+	 * core branch below, same ordering vcpu2_run() already uses for CPU2.
+	 * Returns immediately (falling through unchanged) unless dbg_vcpu1 is
+	 * armed AND vcpu1.o is linked; noreturn once a request is accepted. */
+	if (cpu == SMP_DEBUG_CPU)
+		vcpu1_run();
+
 	if (cpu == SMP_DEBUG_CPU && dbg_core_enable) {
 		uint32_t iters = 0;
 #ifdef HV_HDMI

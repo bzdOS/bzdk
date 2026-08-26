@@ -55,6 +55,7 @@
 #include "gic_timer_qemu.h"
 #include "pl011_qemu.h"
 #include "snapshot.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header */
 
 /* Tick schedule. 100 ms period (main_snapshot_qemu.c) so this whole run is
  * ~1.3 s of guest time even before accounting for however long the 1 GiB
@@ -80,21 +81,23 @@ static uint32_t s_loop_after_restore    = 0xFFFFFFFFu;
 static int      s_save_rc               = 1;   /* not-yet-called sentinel */
 static int      s_restore_rc            = 1;   /* not-yet-called sentinel */
 
-static void qemu_poweroff(void) __attribute__((noreturn));
+/* qemu_poweroff()/report_fault() used to be defined here, verbatim-duplicated
+ * across every QEMU CI handler; they now live in el2_exc_qemu_common.c as
+ * qemu_psci_poweroff()/qemu_report_fault(). Behaviour is unchanged, including
+ * this target's choice to HALT in wfi rather than power off after a fault
+ * (this exercise wants FAIL to look exactly like a hang under the wrapping
+ * `timeout`, same as el2_exc_qemu.c's QEMU-CI target). */
+#define qemu_poweroff qemu_psci_poweroff
 
-/* PSCI SYSTEM_OFF via SMC — identical to every other _qemu.c trap handler in
- * this tree (el2_exc_qemu.c, el2_exc_vgic_qemu.c, el2_exc_zephyr_qemu.c);
- * duplicated rather than shared, matching their own established convention
- * of each QEMU trap handler being fully self-contained. */
-static void
-qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+/* This target's own scenario config for the shared guest-sync chain: a
+ * zeroed struct, because this payload (guest_snapshot_payload.c) issues no
+ * HVC, has no trap-emulated console, forwards no SMC, and probes no
+ * non-DRAM MMIO — the ONLY thing the lower-EL sync path here has ever needed
+ * to handle is the unconditional dynamic W^X promotion qemu_guest_sync()
+ * already does for every target regardless of ops (see the "ONE EXCEPTION"
+ * comment on the call site below, and el2_exc_qemu_common.h's own comment on
+ * what a zeroed struct means). */
+static const struct qemu_guest_sync_ops snapshot_qemu_ops = { 0 };
 
 static inline uint32_t
 snap_loop_read(void)
@@ -126,23 +129,12 @@ print_rc(const char *what, int rc)
 	}
 }
 
-static void report_fault(struct el2_frame *frame, unsigned long kind) __attribute__((noreturn));
-
-static void
-report_fault(struct el2_frame *frame, unsigned long kind)
-{
-	pl011_puts("QEMU-SNAPSHOT-CI: FAULT kind=0x");
-	pl011_put_hex32((uint32_t)kind);
-	pl011_puts(" ESR=0x");
-	pl011_put_hex32((uint32_t)frame->esr);
-	pl011_puts(" ELR=0x");
-	pl011_put_hex64(frame->elr);
-	pl011_puts(" FAR=0x");
-	pl011_put_hex64(frame->far);
-	pl011_puts("\n");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+/* report_fault() used to be defined here (identical ESR/ELR/FAR dump to every
+ * other QEMU CI handler, halting in wfi rather than powering off — this
+ * target's own choice, preserved verbatim below); it is now
+ * qemu_report_fault() in el2_exc_qemu_common.c, called at this file's one
+ * call site with this target's own greppable marker "QEMU-SNAPSHOT-CI" and
+ * poweroff=0. See el2_exc_qemu_common.h for why the marker stays per-target. */
 
 static void
 do_verdict(void)
@@ -248,6 +240,24 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 	 * HVC (unlike guest.c's guest_demo_el1()/el2_exc_qemu.c's ack path) and
 	 * never should fault (flat, MMU-off EL1 writing to its own single
 	 * fixed, valid stage-2-backed word) -- so ANY lower-EL sync exception
-	 * here is unexpected and reported, not silently handled. */
-	report_fault(frame, kind);
+	 * here is unexpected and reported, not silently handled.
+	 *
+	 * ONE EXCEPTION, added 2026-08-26: "never should fault" stopped being
+	 * true when stage2.h made STAGE2_WX_DYNAMIC's XN mapping the default.
+	 * The payload's word is still valid and stage-2-backed, but its CODE now
+	 * starts out execute-never, so its very first instruction fetch takes a
+	 * permission fault that only stage2_wx_fault() can clear. That is normal
+	 * guest progress under the current policy, not the unexpected fault this
+	 * comment is about -- see stage2_wx_qemu.h (now reached indirectly, via
+	 * qemu_guest_sync()'s unconditional stage2_wx_qemu_try() call — see
+	 * el2_exc_qemu_common.h). Everything else still falls straight through
+	 * to qemu_report_fault() exactly as report_fault() did before. */
+	if ((kind >> 2) == 2u && t == EL2_KIND_SYNC) {
+		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
+
+		if (qemu_guest_sync(frame, ec, &snapshot_qemu_ops))
+			return;
+	}
+
+	qemu_report_fault(frame, kind, "QEMU-SNAPSHOT-CI", /*poweroff=*/0);
 }
