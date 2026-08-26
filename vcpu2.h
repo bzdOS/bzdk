@@ -18,13 +18,29 @@
  *      CPU2   guest vCPU1            <- this file
  *      CPU3   idle, or Zephyr in the `dual` build
  *
- * CPU1 IS NOT UP FOR DISCUSSION. It owns the EMAC/dbgmon channel, the GDB stub,
- * and — the part that matters — the hardware watchdog kick. It is the only
- * automatic recovery path this board has: a total EL2 wedge lets the WDOG fire
- * and reboot to U-Boot, where chimpd catches it and reloads, with no human and
- * no physical power cycle. That has saved this board repeatedly. Handing it to
- * the guest would mean designing a replacement crash-recovery mechanism first,
- * which is a separate body of work, not a bigger version of this one.
+ * CPU1 WAS NOT UP FOR DISCUSSION — AND THEN IT WAS. This banner used to end the
+ * argument, and its reasoning was sound at the time: CPU1 owns the EMAC/dbgmon
+ * channel, the GDB stub, and — the part that matters — the hardware watchdog
+ * kick. It is the only automatic recovery path this board has: a total EL2
+ * wedge lets the WDOG fire and reboot to U-Boot, where chimpd catches it and
+ * reloads, with no human and no physical power cycle. That has saved this board
+ * repeatedly. The banner then said handing it to the guest "would mean
+ * designing a replacement crash-recovery mechanism first, which is a separate
+ * body of work, not a bigger version of this one."
+ *
+ * That separate body of work was done (2026-08-26, v0.0.2-prealpha). The
+ * replacement mechanism is not a new subsystem but an existing guarantee:
+ * HCR_EL2.IMO=1 routes a physical IRQ to EL2 unconditionally, so a periodic
+ * CNTP tick on CPU1 preempts whatever guest code runs there and carries the
+ * watchdog kick and dbgmon service with it. CPU1 is a guest vCPU in the default
+ * build now, and FreeBSD runs 2-way SMP with measured linear speedup.
+ *
+ * READ vcpu1.h BEFORE REASONING ABOUT THIS — it states honestly what the
+ * mitigation does NOT cover (a hardware-level wedge of that specific core still
+ * has no recovery path, since EL2's own tick handler cannot run either), which
+ * is a narrower risk than this banner feared but not zero. The banner is kept
+ * rather than deleted because its reasoning is exactly what had to be answered,
+ * and because most of this tree's other comments still assume the old layout.
  *
  * WHY IT IS SAFE TO LET THE GUEST NAME AN ENTRY POINT HERE
  *
