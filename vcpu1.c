@@ -272,6 +272,28 @@ void vcpu1_run(void)
 	 * TIMER_INTID). */
 	musb_irq_arm_cpu1();
 
+#ifdef HV_HDMI
+	/* The HDMI/TCON1 vblank SPI, same treatment and for the same reason as
+	 * MUSB immediately above: the duty is event-shaped, not period-shaped.
+	 * TCON_INT0's vblank bit LATCHES, so a fixed 10 ms tick can straddle an
+	 * edge of a ~16.7 ms 60 Hz period and silently lose it — hdmi.c's own
+	 * header documents a past bug from exactly that assumption. Wiring this
+	 * restores the vblank pacing that stopped when CPU1 became a guest vCPU
+	 * (the last of the old tight loop's duties to have no equivalent).
+	 *
+	 * INTID 119 (GIC SPI 87) is cited from the live DTB, not guessed:
+	 * `lcd-controller@1c0d000`, `interrupts = <0 0x57 0x04>`, whose `reg`
+	 * matches hdmi.c's TCON1_BASE exactly and which /aliases confirms as
+	 * `tcon1` feeding `hdmi_out_tcon1`. Bounded by HDMI_IRQ_BUDGET_PER_TICK
+	 * (gic_timer.c) so that even if the line is not fully de-asserted by
+	 * hdmi_vblank_poll(), it cannot starve the tick that carries the watchdog
+	 * kick — the failure mode MUSB actually exhibited live.
+	 *
+	 * Same ordering constraint as musb_irq_arm_cpu1(): after
+	 * gic_timer_cpuif_init(), before this core's IRQs are unmasked below. */
+	hdmi_irq_arm_cpu1();
+#endif
+
 	/* THE addition vcpu2.c does not need: without this core's own periodic
 	 * CNTP tick, IMO=1 has nothing to route -- no physical IRQ means EL2
 	 * never regains control here at all, and dbg_vcpu1's whole watchdog/
