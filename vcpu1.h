@@ -127,10 +127,23 @@
  * arming a periodic CNTP tick (CPU2 has none), and the watchdog/dbgmon
  * service call wired into that tick rather than into a foreground loop.
  *
- * DEFAULT OFF. dbg_vcpu1 gates it; the guest must ALSO advertise cpu@1 in
- * its device tree or FreeBSD never issues the CPU_ON in the first place —
- * NOT YET DONE to the live DTB as of this writing; see the report for the
- * exact fdtput recipe used for cpu@2, mirrored for cpu@1.
+ * CURRENTLY ARMED BY DEFAULT — this said "DEFAULT OFF" until 2026-08-26 and
+ * that is no longer true, so read it here rather than being surprised by it.
+ * board-config.xml has `<feature name="vcpu1" ... enabled="true">`, so
+ * gen_config.py writes VCPU1=1 into config.mk, the Makefile adds
+ * -DVCPU1_DEFAULT_ON=1, AND the same run writes the matching cpu@1 node into
+ * the DTB — the two halves stay in lockstep by construction, which is exactly
+ * why gen_config.py exists (this feature was twice built armed with no cpu@1
+ * node to ask for the core). Flipping that one attribute to "false" and re-
+ * running gen_config.py disarms both halves together; `vcpu1 off` at the
+ * dbgmon prompt still works at runtime on an already-running board.
+ *
+ * The tradeoff in this file's header is therefore LIVE, not hypothetical, in
+ * the default `dbg` build: a SOFTWARE hang of the guest on CPU1 is covered by
+ * the unmaskable tick, a HARDWARE-level wedge of that specific core is not.
+ * Hardware track record so far: 4h09m continuous with hw.ncpu=2,
+ * cpu1:preempt at 171472, and the watchdog kick plus the EMAC debug channel
+ * responsive throughout.
  */
 #ifndef BZDOS_VCPU1_H
 #define BZDOS_VCPU1_H
