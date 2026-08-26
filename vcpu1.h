@@ -56,25 +56,74 @@
  *
  * WHAT ELSE STOPS RUNNING ON CPU1 WHEN THIS IS ARMED
  *
- * The old tight loop's remaining duty with no equivalent here is the HDMI
- * HUD repaint / real-vblank polling — that simply stops while dbg_vcpu1 is
- * armed (a real, deliberate scope cut: named here so nobody discovers a
- * dark HUD and mistakes it for a new bug). The eMMC PC5 pinmux enforcement
- * and (under HV_HDMI) the PHY relock DO get a tick-path equivalent, on the
- * 10 ms VCPU1_TICK_PERIOD_US cadence (see gic_timer_irq()'s dbg_vcpu1 block).
+ * UPDATED 2026-08-26: the HDMI HUD repaint / real-vblank duty described
+ * below as a flat scope cut now has a real-interrupt equivalent, built the
+ * same way the USB-ACM path already was — read on for what changed and
+ * what is still NOT hardware-verified.
  *
- * The USB-ACM console bridge (usbacm.c) does NOT move to that same 10 ms
- * tick — a fixed period is the wrong fit for USB full-speed frame timing
- * (~1 ms/frame; a 10 ms tick would miss ~10 frames' worth of MUSB endpoint
- * state-machine servicing between calls). Instead it is wired to the REAL
- * hardware MUSB "mc" SPI (musb.h's MUSB_IRQ_INTID, GIC SPI 71 — cited from
- * the live DTB, not guessed), targeted at CPU1 alone by
- * musb_irq_arm_cpu1() (gic_timer.c) and serviced by gic_timer_irq()'s
- * MUSB_IRQ_INTID arm, which calls usbacm_poll() the instant the real
- * hardware asserts an event — genuinely event-driven, not a period the
- * console has to wait out. See musb.h and gic_timer.c's musb_irq_arm_cpu1()
- * comment for exactly what is and is not hardware-verified about this
- * (GICD_ITARGETSR's bit-to-core mapping, GICD_ICFGR's level config).
+ * The eMMC PC5 pinmux enforcement and (under HV_HDMI) the PHY relock get a
+ * tick-path equivalent, on the 10 ms VCPU1_TICK_PERIOD_US cadence (see
+ * gic_timer_irq()'s dbg_vcpu1 block).
+ *
+ * Neither the USB-ACM console bridge (usbacm.c) nor the HDMI vblank/HUD
+ * duty moves to that same 10 ms tick — a fixed period is the wrong fit for
+ * either: USB full-speed frame timing (~1 ms/frame; a 10 ms tick would miss
+ * ~10 frames' worth of MUSB endpoint state-machine servicing between calls)
+ * and a ~16.7 ms 60 Hz vblank period (a 10 ms tick can straddle or miss an
+ * edge of TCON_INT0's LATCHING status bit — hdmi.c's own header on that
+ * register documents a past bug from assuming otherwise). Both are instead
+ * wired to their REAL hardware SPI, targeted at CPU1 alone, and serviced
+ * the instant the device asserts an event — genuinely event-driven, not a
+ * period either duty has to wait out:
+ *
+ *   - USB-ACM: musb.h's MUSB_IRQ_INTID (GIC SPI 71, "mc" — cited from the
+ *     live DTB, not guessed), armed by musb_irq_arm_cpu1() (gic_timer.c)
+ *     and serviced by gic_timer_irq()'s MUSB_IRQ_INTID arm, which calls
+ *     usbacm_poll(). See musb.h and gic_timer.c's musb_irq_arm_cpu1()
+ *     comment for exactly what is and is not hardware-verified about this
+ *     (GICD_ITARGETSR's bit-to-core mapping, GICD_ICFGR's level config) —
+ *     this one IS hardware-proven (see MUSB_IRQ_BUDGET_PER_TICK's comment
+ *     in gic_timer.c for the live storm it caught).
+ *
+ *   - HDMI vblank/HUD: hdmi.h's HDMI_TCON1_IRQ_INTID (GIC SPI 87, the
+ *     TV-facing TCON that feeds HDMI, "lcd-controller@1c0d000" — cited
+ *     from the same live DTB, matching TCON1_BASE in hdmi.c exactly),
+ *     armed by hdmi_irq_arm_cpu1() (gic_timer.c, built under #ifdef
+ *     HV_HDMI) and serviced by gic_timer_irq()'s HDMI_TCON1_IRQ_INTID arm,
+ *     which calls the SAME hdmi_vblank_poll() the old smp.c tight loop
+ *     used to call directly — so the vblank count/timestamp the guest's
+ *     scanout register file publishes keep meaning exactly what they meant
+ *     before. The HUD's own periodic REPAINT (as opposed to vblank
+ *     counting) is not separately re-armed here: hdmi_vblank_poll() was
+ *     always the pacing signal, not the paint call, so restoring it
+ *     restores the pacing a repaint loop would consume, but this file does
+ *     not itself add a repaint call to the tick or IRQ path — a real,
+ *     narrower gap than the old blanket "HUD stops" cut, named rather than
+ *     silently assumed closed. Carries the same MUSB_IRQ_BUDGET_PER_TICK-
+ *     shaped storm budget (HDMI_IRQ_BUDGET_PER_TICK, gic_timer.c) as a
+ *     precaution, but UNLIKE MUSB this path is NOT YET HARDWARE-VERIFIED
+ *     AT ALL — built and passing `make dbg` + `ci.sh` only. Before trusting
+ *     it live: confirm GICD_ITARGETSR_BYTE(HDMI_TCON1_IRQ_INTID) reads back
+ *     0x02, confirm TCON_INT0 bit30 (the enable bit hdmi_vblank_irq_enable()
+ *     sets) actually reads back 1, and confirm irq_counter[119] increments
+ *     in CPU1's g_gt[] slot once a real vblank occurs — see
+ *     hdmi_irq_arm_cpu1()'s own TODO(board) list (gic_timer.c) for the full
+ *     set of unverified assumptions, including one this project has not
+ *     needed before: that TCON_INT0's enable-bit position (BIT(30), a
+ *     cross-SoC-family Linux convention, not a per-board DTB fact) is
+ *     right on THIS silicon revision.
+ *
+ * WIRING IN THE CALL: hdmi_irq_arm_cpu1() is declared in gic_timer.h and
+ * implemented in gic_timer.c (both files this pass was allowed to touch);
+ * it is NOT yet called from anywhere, because the call site is vcpu1.c's
+ * entry sequence, which is owned by another lane. Wire it in with a single
+ * line, immediately next to (either just before or just after) the
+ * existing `musb_irq_arm_cpu1();` call vcpu1_run() already makes — same
+ * ordering constraint as that call: after gic_timer_cpuif_init() and before
+ * IRQs are unmasked on CPU1. Guard it exactly the way the rest of this file
+ * guards HDMI-specific code, i.e. `#ifdef HV_HDMI hdmi_irq_arm_cpu1();
+ * #endif`, since gic_timer.h only declares the function under that same
+ * guard.
  *
  * `dbgmon_service()` still runs every tick (see gic_timer.c), so the EMAC
  * debug channel and the hardware-watchdog kick — the two duties this file's

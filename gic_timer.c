@@ -496,6 +496,13 @@ struct gt_percpu {
 	 * interface handed it. */
 	uint32_t musb_irqs;           /* MUSB IRQs taken since the last tick    */
 	uint32_t musb_throttles;      /* times the budget ran out and we masked */
+#ifdef HV_HDMI
+	/* TCON1 vblank storm throttle, same shape as the MUSB pair above and
+	 * for the same reason (HDMI_IRQ_BUDGET_PER_TICK comment at the
+	 * dispatch site) -- per-core, though only CPU1 ever populates it. */
+	uint32_t hdmi_irqs;           /* TCON1 vblank IRQs since the last tick  */
+	uint32_t hdmi_throttles;      /* times the budget ran out and we masked */
+#endif
 } __attribute__((aligned(64)));
 
 static struct gt_percpu g_gt[SMP_MAX_CPUS];
@@ -556,6 +563,19 @@ __attribute__((weak)) void hdmi_relock(void)
 {
 }
 extern volatile uint32_t dbg_hdmi_relock;   /* smp.c, always linked, not weak */
+
+/* Same weak-fallback reasoning again, for the HDMI_TCON1_IRQ_INTID dispatch
+ * (hdmi_irq_arm_cpu1() below and its call site in gic_timer_irq()): these
+ * run whenever HV_HDMI is defined, independent of whether hdmi.o is
+ * actually linked. hdmi_vblank_poll() doing nothing and
+ * hdmi_vblank_irq_enable() doing nothing are both fail-safe (never touches
+ * TCON_INT0) if hdmi.c's real definitions are absent. */
+__attribute__((weak)) void hdmi_vblank_poll(void)
+{
+}
+__attribute__((weak)) void hdmi_vblank_irq_enable(void)
+{
+}
 #endif
 
 /* Real definition lives in el2_exc.c (or a QEMU stub); every target that
@@ -1040,6 +1060,78 @@ musb_irq_arm_cpu1(void)
 	    (1u << GICD_BIT(MUSB_IRQ_INTID));
 }
 
+#ifdef HV_HDMI
+/* ------------------------------------------------------------------ *
+ * HDMI_TCON1_IRQ_INTID (119, SPI 87, TCON1/"lcd-controller@1c0d000" — hdmi.h)
+ * wiring for the CPU1-as-vCPU1 design (vcpu1.c, EXPERIMENTAL): the same
+ * target-one-core treatment musb_irq_arm_cpu1() above gives the MUSB "mc"
+ * SPI, this time for the real TCON1 vblank line, so the HUD-repaint/
+ * real-vblank duty that CPU1's old tight poll loop used to provide (see
+ * vcpu1.h's "WHAT ELSE STOPS RUNNING ON CPU1" section) is restored as a
+ * genuinely event-driven interrupt rather than a revived fixed-period
+ * poll — a 10 ms tick is the wrong fit for a ~16.7 ms vblank period, exactly
+ * as vcpu1.h's own header explains for why this duty was NOT folded into
+ * the tick path the way the eMMC pinmux fix and PHY relock were.
+ *
+ * Like MUSB_IRQ_INTID, this SPI must NEVER be handed to vgic_inject_hw():
+ * the guest's own lcd-controller@1c0d000 DTB node is status="disabled" and
+ * has no driver for it (hdmi.h's citation), so it is EL2-owned
+ * unconditionally, same reasoning as MUSB's usb@1c19000.
+ *
+ * Call ONCE from vcpu1_run(), after gic_timer_cpuif_init() and before
+ * unmasking IRQs on CPU1 — same call site as musb_irq_arm_cpu1(), see
+ * vcpu1.h for exactly where it belongs (this file does not call vcpu1.c,
+ * which is owned by another lane). Idempotent, safe to call only when
+ * dbg_vcpu1 is being armed: nothing else in this tree ever enables
+ * HDMI_TCON1_IRQ_INTID at the distributor OR sets TCON_INT0's enable bit
+ * (hdmi_vblank_irq_enable(), hdmi.c), so leaving this uncalled (dbg_vcpu1
+ * off) means the real SPI stays exactly as unenabled/harmless as it always
+ * was, and the old smp.c poll loop (still driving hdmi_vblank_poll() in
+ * that build configuration) keeps working exactly as before.
+ *
+ * TODO(board), UNVERIFIED — same three open questions musb_irq_arm_cpu1()
+ * carries, not yet exercised on real hardware for THIS SPI:
+ *   1. GICD_ITARGETSR bit-to-core mapping (expect readback 0x02, bit1).
+ *   2. GICD_ICFGR level config for INTID 119 — left untouched here, trusting
+ *      the DTB's <0 0x57 0x04> (level-high) the same way MUSB's <0 0x47 0x04>
+ *      was trusted.
+ *   3. GICD_IGROUPR — left as whatever firmware already set, same reasoning
+ *      as musb_irq_arm_cpu1()'s TODO #3.
+ * A fourth, HDMI-specific one: whether TCON_INT0's enable bit really is
+ * BIT(30) on THIS silicon revision — hdmi_vblank_irq_enable()'s own comment
+ * cites the cross-SoC-family Linux driver convention this file already
+ * trusted for the STATUS bit pairing, but that specific ENABLE bit has never
+ * been read back on this board. TODO(board): after calling this, confirm
+ * TCON_INT0 bit30 reads back 1, and that irq_counter[119] increments in
+ * CPU1's g_gt[] slot once a real vblank occurs.
+ * ------------------------------------------------------------------ */
+void
+hdmi_irq_arm_cpu1(void)
+{
+	/* Same priority as MUSB's — see musb_irq_arm_cpu1()'s comment on why
+	 * TIMER_PRIORITY (highest non-secure value) is right for a real,
+	 * latency-sensitive peripheral event. */
+	GICD_IPRIORITYR_BYTE(HDMI_TCON1_IRQ_INTID) = (uint8_t)TIMER_PRIORITY;
+
+	/* Target CPU interface 1 ONLY (bit1), flat assignment not OR'd — same
+	 * fail-safe-toward-CPU0-untargeted reasoning as musb_irq_arm_cpu1(). */
+	GICD_ITARGETSR_BYTE(HDMI_TCON1_IRQ_INTID) = (1u << 1);
+
+	GICD_ISENABLER(GICD_WORD(HDMI_TCON1_IRQ_INTID)) =
+	    (1u << GICD_BIT(HDMI_TCON1_IRQ_INTID));
+
+	/* Unlike MUSB (whose "mc" line is already live the moment the
+	 * controller has traffic), TCON1's vblank line needs its OWN
+	 * device-level enable bit turned on, or the SPI never asserts no
+	 * matter how the GIC side is armed — see hdmi_vblank_irq_enable()'s
+	 * comment (hdmi.c) for why hdmi_init() leaves it masked. Do this
+	 * LAST, after the distributor already has the SPI enabled and
+	 * targeted, so there is no window where the device could assert
+	 * before the GIC is ready to route it anywhere. */
+	hdmi_vblank_irq_enable();
+}
+#endif
+
 /* ------------------------------------------------------------------ *
  * IRQ handler: called from el2_trap()'s EL2_KIND_IRQ arm. Bounded,
  * non-blocking - fixed number of MMIO accesses and breadcrumb stores,
@@ -1134,6 +1226,60 @@ gic_timer_irq(struct el2_frame *frame)
 		}
 		return;
 	}
+
+#ifdef HV_HDMI
+	/* HDMI_TCON1_IRQ_INTID (119, real TCON1 vblank SPI 87 — hdmi.h): checked
+	 * early, same as MUSB_IRQ_INTID just above and for the identical
+	 * reason — this INTID is EL2-owned unconditionally (the guest's
+	 * lcd-controller@1c0d000 node is status="disabled", no guest driver)
+	 * and must NEVER fall into vgic_inject_hw()'s generic forwarding path.
+	 * Reachable only on CPU1, and only once hdmi_irq_arm_cpu1()
+	 * (vcpu1_run()) has targeted+enabled it at the distributor AND set
+	 * TCON_INT0's device-level enable bit — on every other core/build this
+	 * INTID is never enabled, so GICC_IAR can never return it there.
+	 *
+	 * Service THEN EOI+DIR, same ordering as MUSB and for the same reason:
+	 * hdmi_vblank_poll() (hdmi.c) does the read-modify-write that clears
+	 * the latching TCON_INT0 status bits at the source, so by the time we
+	 * DIR it the line has actually been de-asserted. DIR'ing first would
+	 * re-pend this immediately on the very next vblank tick — the same
+	 * 145 kHz-storm shape this file already documents for EHCI/INTID 106,
+	 * just at a display's ~60 Hz instead. */
+	/* HDMI_IRQ_BUDGET_PER_TICK — a HARD ceiling on how many TCON1 vblank
+	 * IRQs this core will service between two of its own CNTP ticks,
+	 * mirroring MUSB_IRQ_BUDGET_PER_TICK above exactly, for the same
+	 * documented failure mode: a level-triggered source this handler fails
+	 * to fully de-assert (here: hdmi_vblank_poll() somehow leaving a
+	 * status bit set, or clearing the wrong pipe's bit) would otherwise
+	 * storm forever, feeding the watchdog on every EL2 exception while
+	 * starving dbgmon_service()/wdt_debug_kick() in the tick block below —
+	 * the exact signature MUSB_IRQ_BUDGET_PER_TICK's comment measured live
+	 * for that INTID. UNLIKE MUSB this specific failure has NOT been
+	 * reproduced for HDMI_TCON1_IRQ_INTID on hardware yet (this whole path
+	 * is unexercised — see hdmi_irq_arm_cpu1()'s TODO(board) list); the
+	 * budget is applied preemptively because the MUSB precedent already
+	 * proved a fixed-period tick underneath is not by itself enough
+	 * protection against a level source this project doesn't yet trust.
+	 * A real 60 Hz vblank is ~0.6 events per 10 ms tick, three orders of
+	 * magnitude under this ceiling, so a healthy TCON1 never reaches it. */
+#define HDMI_IRQ_BUDGET_PER_TICK 32u
+	if (intid == HDMI_TCON1_IRQ_INTID) {
+		hdmi_vblank_poll();
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		if (++gt->hdmi_irqs >= HDMI_IRQ_BUDGET_PER_TICK) {
+			/* Mask at the DISTRIBUTOR, not the CPU interface — same
+			 * self-healing reasoning as MUSB's throttle: the tick
+			 * (which we depend on to recover) must stay unaffected,
+			 * and the tick path below re-enables this unconditionally
+			 * every VCPU1_TICK_PERIOD_US. */
+			GICD_ICENABLER(GICD_WORD(HDMI_TCON1_IRQ_INTID)) =
+			    (1u << GICD_BIT(HDMI_TCON1_IRQ_INTID));
+			gt->hdmi_throttles++;
+		}
+		return;
+	}
+#endif
 
 	/* --- Interrupt-virtualization milestone: full vGIC forwarding ------ *
 	 * Only taken once vgic_init() has actually run (main_dbg.c's policy —
@@ -1316,6 +1462,20 @@ gic_timer_irq(struct el2_frame *frame)
 		gt->musb_irqs = 0;
 		GICD_ISENABLER(GICD_WORD(MUSB_IRQ_INTID)) =
 		    (1u << GICD_BIT(MUSB_IRQ_INTID));
+
+#ifdef HV_HDMI
+		/* Refresh the TCON1 vblank storm budget and un-mask the line if the
+		 * previous window exhausted it — identical shape and identical
+		 * reasoning to the MUSB refresh just above (see
+		 * HDMI_IRQ_BUDGET_PER_TICK's comment at the dispatch site): an
+		 * unconditional write is cheap, idempotent (ISENABLER is
+		 * write-1-to-set), and immune to a race between checking and
+		 * un-masking. This is what makes the HDMI throttle self-healing
+		 * instead of a one-way kill of the vblank/HUD-repaint duty. */
+		gt->hdmi_irqs = 0;
+		GICD_ISENABLER(GICD_WORD(HDMI_TCON1_IRQ_INTID)) =
+		    (1u << GICD_BIT(HDMI_TCON1_IRQ_INTID));
+#endif
 
 		{
 			struct el2_frame snap;

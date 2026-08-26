@@ -352,6 +352,46 @@ void     hdmi_vblank_poll(void);
 uint32_t hdmi_vblank_count(void);
 uint64_t hdmi_vblank_stamp(void);
 
+/* TCON1's real GIC SPI, cited from the ACTUAL flashed DTB, not guessed:
+ * `dtc -I dtb -O dts /opt/bzdos/tftpboot/bananapi-min.dtb` (2026-08-26 image)
+ * shows, under /soc, the TV-facing TCON that feeds HDMI (identified by its
+ * `reg`, which matches TCON1_BASE above EXACTLY: 0x01C0D000 == 0x1c0d000 --
+ * confirmed further by /aliases' tcon1 = "/soc/lcd-controller@1c0d000" and
+ * hdmi_out_tcon1 pointing at the same node's port@1):
+ *
+ *   lcd-controller@1c0d000 {
+ *           status = "disabled";
+ *           compatible = "allwinner,sun50i-a64-tcon-tv", "allwinner,sun8i-a83t-tcon-tv";
+ *           reg = <0x1c0d000 0x1000>;
+ *           interrupts = <0x00 0x57 0x04>;   // GIC_SPI 87, LEVEL_HIGH
+ *           ...
+ *   };
+ *
+ * status="disabled" here means exactly what it means for MUSB_IRQ_INTID in
+ * musb.h (same file, same citation pattern): FreeBSD's own driver never
+ * probes this node and never enables this SPI itself, so EL2 stealing it
+ * for its own use cannot collide with a guest driver already using it --
+ * see musb.h's identical citation and usbacm.h's "KNOWN OPEN RISK" section
+ * for the general pattern this mirrors. Cross-checked against docs/: grep
+ * turned up no prior citation of this specific SPI; docs/dma-bypass-
+ * stage2.md's "TCON-LCD ... HDMI ... all disabled" line names the same
+ * disabled status, not a conflicting number, for the same block family.
+ * No other DTB node uses SPI 0x57, and no existing INTID constant in this
+ * tree collides with 32+87=119. */
+#define HDMI_TCON1_IRQ_SPI    87u
+#define HDMI_TCON1_IRQ_INTID  (32u + HDMI_TCON1_IRQ_SPI)   /* 119 */
+
+/* Turn on the TCON1 vblank interrupt AT THE DEVICE (TCON_INT0's enable
+ * half), so the real GIC SPI (HDMI_TCON1_IRQ_INTID above) actually asserts
+ * on every vblank instead of just latching a status bit for a poller to
+ * find. hdmi_init()'s stage_tcon() writes TCON_INT0 = 0 ("mask interrupts",
+ * a straight port of lcdc_init(), which never uses interrupts at all), so
+ * without this call the SPI never fires no matter how the GIC side is
+ * armed. Safe to call any time after hdmi_init(): a plain OR into the
+ * register, touching only the enable bit -- see the definition in hdmi.c
+ * for the bit-position citation. Idempotent. */
+void hdmi_vblank_irq_enable(void);
+
 int hdmi_guestwin_enable(void);
 
 /* Repoint the guest-window layer at a different physical buffer, and commit.

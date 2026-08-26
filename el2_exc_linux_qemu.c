@@ -216,8 +216,14 @@ report_fault(struct el2_frame *frame, unsigned long kind)
  * No claim_first, no want_mmio_absorb: this target has no mechanism under
  * test ahead of the shared chain, and its DTB describes no absent devices to
  * absorb. Dynamic W^X promotion is unconditional in the shared chain (see
- * el2_exc_qemu_common.h) and needs no flag here — it used to be this file's
- * own `stage2_wx_qemu_try(frame, ec)` call, guarded by the same header. */
+ * el2_exc_qemu_common.h) and needs no flag here.
+ *
+ * CORRECTED 2026-08-26: an earlier draft of this comment said the promotion
+ * "used to be this file's own stage2_wx_qemu_try() call". It never was. This
+ * file — like all nine QEMU handlers — had NO dynamic W^X hook at all before
+ * the commit that introduced stage2_wx_qemu.h, and that missing hook IS the
+ * bug which left the whole board-free gate red. Saying otherwise would send
+ * the next reader hunting for code that never existed. */
 static const struct qemu_guest_sync_ops linux_qemu_ops = {
 	.want_console    = 1u,
 	.console_chan    = 0u,

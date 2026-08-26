@@ -83,6 +83,21 @@ extern void console_flush(void);
  * live guest frame lets it arm PSTATE.SS on the eret that resumes the guest. */
 extern int el2_ss_toggle(struct el2_frame *frame);
 
+/* CPU1's OWN guest frame (el2_exc.c), for the gr1/sr1 commands below --
+ * vcpu1.h's named follow-up now that vcpu1.c's third vCPU has a hardware
+ * track record. Deliberately NOT the same storage `frame` (this function's
+ * own parameter) points at: `frame`/g_last_guest_frame is, and stays,
+ * CPU0's FreeBSD guest (see vcpu1.h: "gr/sr STILL MEAN CPU0's GUEST"),
+ * even on a call that originated from CPU1's own tick. This extern pair is
+ * the separate slot el2_exc.c publishes CPU1's own frame into.
+ * el2_snapshot_guest_frame_cpu1() does the same seqlock-retry copy
+ * el2_snapshot_guest_frame() does for the CPU0 slot; g_cpu1_guest_frame_seq
+ * doubles as the "has CPU1 ever captured a frame at all" flag -- see
+ * cmd_gr1()/cmd_sr1() for why that distinction has to be explicit instead of
+ * just printing whatever is in the (possibly never-written) struct. */
+extern volatile uint32_t g_cpu1_guest_frame_seq;
+extern void el2_snapshot_guest_frame_cpu1(struct el2_frame *out);
+
 /* Hardware breakpoints/watchpoints (hwbp.c) + backtrace (backtrace.c), both
  * linked into the debugger build. dbgmon stays self-contained: extern decls
  * only, no hwbp.h/backtrace.h include. */
@@ -485,6 +500,105 @@ static void cmd_gr(struct el2_frame *f)
  * timer config -- via direct `mrs` reads from EL2. */
 static void cmd_sr(void)
 {
+	cputs("ELR_EL1=");   print_hex64(RDSYSREG(ELR_EL1));   newline();
+	cputs("ESR_EL1=");   print_hex64(RDSYSREG(ESR_EL1));   newline();
+	cputs("FAR_EL1=");   print_hex64(RDSYSREG(FAR_EL1));   newline();
+	cputs("SCTLR_EL1="); print_hex64(RDSYSREG(SCTLR_EL1)); newline();
+	cputs("TCR_EL1=");   print_hex64(RDSYSREG(TCR_EL1));   newline();
+	cputs("TTBR0_EL1=");print_hex64(RDSYSREG(TTBR0_EL1));  newline();
+	cputs("TTBR1_EL1=");print_hex64(RDSYSREG(TTBR1_EL1));  newline();
+	cputs("MAIR_EL1=");  print_hex64(RDSYSREG(MAIR_EL1));  newline();
+	cputs("VBAR_EL1=");  print_hex64(RDSYSREG(VBAR_EL1));  newline();
+	cputs("SP_EL1=");    print_hex64(RDSYSREG(SP_EL1));    newline();
+	cputs("SPSR_EL1=");  print_hex64(RDSYSREG(SPSR_EL1));  newline();
+	cputs("CNTV_CTL_EL0=");print_hex64(RDSYSREG(CNTV_CTL_EL0)); newline();
+	cputs("CNTP_CTL_EL0=");print_hex64(RDSYSREG(CNTP_CTL_EL0)); newline();
+	cputs("CurrentEL=");  print_hex64(RDSYSREG(CurrentEL)); newline();
+}
+
+/* gr1/sr1: the vcpu1.h follow-up -- gr/sr, but for CPU1's OWN guest vCPU
+ * (vcpu1.c's experimental third vCPU) instead of CPU0's FreeBSD guest.
+ * These are ADDITIVE: gr/sr above are untouched, still read exactly the
+ * `frame` this function was called with (CPU0's snapshot, always -- see the
+ * extern block above), never g_cpu1_guest_frame. Mixing the two would be
+ * exactly the "confidently wrong diagnosis" class of bug the CPU0 capture
+ * gate's own comment (el2_exc.c) warns about, just moved into dbgmon
+ * instead of el2_trap.
+ *
+ * Both commands share one problem gr/sr never had: CPU1 might have NEVER
+ * captured a frame at all -- either dbg_vcpu1 is off (CPU1 runs no guest
+ * code, so it cannot fault into the capture site) or it is armed but simply
+ * hasn't trapped yet since boot. A frame of zeros in that state is
+ * indistinguishable, byte-for-byte, from a real capture where the guest
+ * genuinely had every GPR at zero -- exactly the "publish real zeros" trap
+ * this project's breadcrumb-window discipline exists to avoid elsewhere.
+ * g_cpu1_guest_frame_seq is the tell (see its own comment in el2_exc.c): it
+ * starts at 0 and only the capture site ever advances it, so both commands
+ * check it FIRST and refuse to print a frame at all when it's still 0,
+ * rather than let a reader mistake "never captured" for "captured, and
+ * it's zero". */
+static void cmd_gr1(void)
+{
+	struct el2_frame f;
+	int i;
+
+	if (!g_cpu1_guest_frame_seq) {
+		cputs("gr1: CPU1 has never captured a guest frame (vcpu1 is ");
+		cputs(dbg_vcpu1 ? "armed, but hasn't trapped from EL1 yet)\r\n"
+				 : "off -- CPU1 runs no guest code)\r\n");
+		return;
+	}
+	el2_snapshot_guest_frame_cpu1(&f);
+	for (i = 0; i < 31; i++) {
+		console_putc('x');
+		if (i >= 10)
+			console_putc('0' + (i / 10));
+		console_putc('0' + (i % 10));
+		console_putc('=');
+		print_hex64(f.x[i]);
+		console_putc(((i % 3) == 2) ? '\r' : ' ');
+		if ((i % 3) == 2)
+			console_putc('\n');
+	}
+	newline();
+	cputs("elr(pc)="); print_hex64(f.elr);
+	cputs(" spsr=");   print_hex64(f.spsr);
+	newline();
+	cputs("esr=");     print_hex64(f.esr);
+	cputs(" far=");    print_hex64(f.far);
+	cputs(" kind=");   print_hex64(f.kind);
+	newline();
+}
+
+/* sr1: CPU1's own live EL1 sysregs, same fields and same direct `mrs` reads
+ * as cmd_sr() above, for the SAME reason cmd_sr() reads them directly --
+ * plus one property cmd_sr() does NOT have. cmd_sr() runs wherever
+ * exec_line() happened to be called from, which is CPU1 today but is not
+ * guaranteed by anything in this file (see the "per-PE registers are
+ * banked" rule in this project's ORIENTATION.md: a debug-channel register read
+ * is serviced by whichever core answers it, not necessarily the guest's
+ * own core -- CPU0's guest and CPU1's dbgmon are, in general, different
+ * cores). sr1 does not have that problem BY CONSTRUCTION: this function can
+ * only ever observe a nonzero g_cpu1_guest_frame_seq (see the gate below)
+ * once CPU1 itself has taken a lower-EL trap, and dbgmon_service() is only
+ * ever invoked on CPU1 once dbg_core_active is set (el2_exc.c's six
+ * `if (!dbg_core_active) dbgmon_service(frame);` fallback calls on CPU0
+ * stop firing the moment it is) -- and vcpu1_run() claims dbg_core_active
+ * for itself BEFORE it ever enters EL1 (vcpu1.h's "THAT WAS TRUE ONLY AFTER
+ * ONE MORE FIX" section). So any window in which sr1 has something real to
+ * report is also a window in which this function is provably executing on
+ * CPU1 -- the same core whose EL1 register file the `mrs` reads below
+ * return. That chain is worth restating if either invariant ever moves:
+ * dbg_core_active's claim-before-entry ordering, or the fallback guard that
+ * stops CPU0 from calling dbgmon_service once it's set. */
+static void cmd_sr1(void)
+{
+	if (!g_cpu1_guest_frame_seq) {
+		cputs("sr1: CPU1 has never captured a guest frame (vcpu1 is ");
+		cputs(dbg_vcpu1 ? "armed, but hasn't trapped from EL1 yet)\r\n"
+				 : "off -- CPU1 runs no guest code)\r\n");
+		return;
+	}
 	cputs("ELR_EL1=");   print_hex64(RDSYSREG(ELR_EL1));   newline();
 	cputs("ESR_EL1=");   print_hex64(RDSYSREG(ESR_EL1));   newline();
 	cputs("FAR_EL1=");   print_hex64(RDSYSREG(FAR_EL1));   newline();
@@ -980,8 +1094,11 @@ static void cmd_poweroff(void)
 static void cmd_help(void)
 {
 	cputs("bzdOS live hv-debugger commands:\r\n");
-	cputs("  gr                 guest GPRs x0..x30 + ELR(PC) + SPSR, this tick\r\n");
-	cputs("  sr                 guest EL1 sysregs (SCTLR/TCR/TTBRn/MAIR/VBAR/...)\r\n");
+	cputs("  gr                 guest GPRs x0..x30 + ELR(PC) + SPSR, this tick (CPU0)\r\n");
+	cputs("  sr                 guest EL1 sysregs (SCTLR/TCR/TTBRn/MAIR/VBAR/...) (CPU0)\r\n");
+	cputs("  gr1                CPU1's OWN guest GPRs (vcpu1, EXPERIMENTAL; 'never captured'\r\n");
+	cputs("                     if vcpu1 is off or hasn't trapped yet -- see vcpu1.h)\r\n");
+	cputs("  sr1                CPU1's OWN guest EL1 sysregs, same vcpu1 caveat as gr1\r\n");
 	cputs("  r  <addr> [n]      read n phys words (default n=1)\r\n");
 	cputs("  rb <addr> [n]      read n phys bytes (default n=1)\r\n");
 	cputs("  sd init            bring up the SD card, decode sd_bio breadcrumbs\r\n");
@@ -1178,6 +1295,14 @@ static void exec_line(char *line, struct el2_frame *frame)
 	}
 	if (streq(cmd, "sr")) {
 		cmd_sr();
+		return;
+	}
+	if (streq(cmd, "gr1")) {
+		cmd_gr1();
+		return;
+	}
+	if (streq(cmd, "sr1")) {
+		cmd_sr1();
 		return;
 	}
 	if (streq(cmd, "r")) {
