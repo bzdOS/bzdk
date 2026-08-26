@@ -229,24 +229,59 @@ shows CPU0's PC. `sr1` reads sane live EL1 state for that core
 (`VBAR_EL1=ffff000000924800` — the guest's real vectors, not the 0 that
 `guest_config()` leaves).
 
-## Also new, and NOT hardware-verified — read before trusting
+## HDMI vblank as a real interrupt — wired, verified, and partly disappointing
 
-This builds clean and passes the board-free gate. It has not been run on the
-board. It is listed here rather than in the feature table on purpose.
+The HUD/vblank duty was the last of CPU1's old tight-loop jobs with no
+equivalent after that core became a guest vCPU. It is now driven by the real
+TCON1 interrupt, located from evidence rather than guessed:
+`lcd-controller@1c0d000`, `interrupts = <0 0x57 0x04>` -> GIC SPI 87 -> **INTID
+119**, whose `reg` matches `hdmi.c`'s `TCON1_BASE` exactly and which `/aliases`
+confirms as `tcon1` feeding `hdmi_out_tcon1`.
 
-- **HDMI vblank as a real interrupt (dormant).** The HUD/vblank duty was the one
-  item with no equivalent after CPU1 became a vCPU. The interrupt was located
-  from evidence, not guessed: `lcd-controller@1c0d000`, `interrupts = <0 0x57
-  0x04>` → GIC SPI 87 → **INTID 119**, whose `reg` matches `hdmi.c`'s
-  `TCON1_BASE` exactly and which `/aliases` confirms as `tcon1` feeding
-  `hdmi_out_tcon1`. `hdmi_irq_arm_cpu1()` and the dispatch arm exist, with the
-  same per-tick storm budget as MUSB's. **It is deliberately not wired into
-  `vcpu1_run()`** — the call site is one line, named in `vcpu1.h`, and left
-  uncalled so nothing unverified is armed in a release. Before wiring it: read
-  back `GICD_ITARGETSR_BYTE(119)` (expect `0x02`), read back `TCON_INT0` bit30
-  (the enable bit — its position is a cross-SoC-family Linux convention, **not**
-  a per-board DTB fact, and this project has never written that half of the
-  register), and confirm `irq_counter[119]` increments in CPU1's slot.
+**Verifying it is what made this section worth writing.** Reading the
+distributor back showed neither the new HDMI path *nor the supposedly-proven
+MUSB one* was reaching CPU1 at all:
+
+    CPU0 irq_counter[103] +133/s    irq_counter[119] +80/s
+    CPU1 irq_counter[103] frozen at 3783, [119] frozen at 97
+    CPU0 musb_throttles 47168 — one throttle per interrupt taken
+
+The guest's own GIC driver resets `GICD_ITARGETSR` across the SPI range to the
+boot CPU during attach, so a one-shot "target CPU1 only" does not survive guest
+boot. Both lines fired on CPU0 — the guest's primary vCPU — which is precisely
+the hardware race `usbacm.h`'s "KNOWN OPEN RISK" section warns about, silently
+stealing guest cycles. And because the per-tick budget reset lives in the
+CPU1-only tick block, CPU0's counter grew forever, stayed over the ceiling, and
+masked the line on *every* interrupt, which CPU1's tick then re-enabled: an
+enable/mask ping-pong at tick rate.
+
+Fixed the way this tree already handles "the guest's driver keeps undoing our
+setting" for the PC5 eMMC pinmux: re-assert the targeting from CPU1's tick,
+write only when it drifted. Plus a core gate on both dispatch arms — a
+wrong-core arrival is EOI'd and counted, never serviced and never allowed to
+reach `vgic_inject_hw()`. After: `ITARGETSR` byte `0x02`, CPU0 taking zero of
+both, `wrong_core` counters flat at 0, CPU1 taking INTID 119 with
+`g_vblank_count` advancing at exactly the same rate.
+
+**Two measurements that did not come out as hoped:**
+
+- **MUSB genuinely storms**: ~646 interrupts/s on a completely idle CDC-ACM
+  console, exhausting the 32-per-tick budget ~29 times/s. So that budget is
+  containing a real defect in `usbacm_poll()`'s source de-assertion, not
+  hypothetical hardening. Bounded and harmless where it is, but it is a real
+  open bug in `musb.c`/`usbacm.c`, not a clean path.
+- **The vblank arrives at ~18 Hz, not the ~60 Hz** the old tight-loop polling
+  measured (0.0.1 reported 60.04 Hz). NOT a throttle artifact —
+  `hdmi_throttles` stays 0 and the ceiling is 3200/s. Unexplained. The most
+  plausible candidate is the guest's own KMS/lima driver, which also reads
+  `TCON_INT0` and may be consuming latches. **Do not treat vblank pacing as a
+  finished 60 Hz feature.**
+
+One assumption remains unproven by construction: `TCON_INT0` bit30 as the
+TCON1 vblank *enable* bit. It reads back as 1 and interrupts do arrive, which is
+strong evidence, but the bit position itself comes from the register's
+16-bit-offset enable/status symmetry (bits 30/31 enable what bits 14/15 report)
+plus the cross-SoC-family Linux convention — not from this board's DTB.
 
 ## Known broken — changes since 0.0.1
 
