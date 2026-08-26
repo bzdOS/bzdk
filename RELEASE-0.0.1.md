@@ -50,11 +50,22 @@ Named because a release that lists none of this is not honest.
 - **The RSP channel goes dark in long GDB sessions.** Unfixed. Breakpoints and
   register reads work; a long-running session eventually stops responding and
   only a board reset recovers it.
-- **No microSD support in practice.** The controller path exists and programs its
-  own pinmux and clock, but no card has ever been present — `sd init` reports
-  "no card". The second virtio-blk device that would back is not built.
-- **The guest's root filesystem is writable.** Making it read-only is the single
-  change that would retire a whole class of corruption; not done.
+- **~~No microSD support in practice~~ — DONE 2026-08-24.** A card is
+  present, `sd_bio.c` reclocks to 25 MHz after init (400 kHz was
+  unreliable — see `sd-write-fixed-by-25mhz-reclock` memory), and a
+  second virtio-blk device (`vblk_sd`) backs it to the guest as
+  `/dev/vtbd1`. One real bug found and fixed along the way: missing
+  `VIRTIO_BLK_F_SEG_MAX` negotiation wedged the guest forever on any
+  write bigger than one page (`vblk-sd-seg-max-hang` memory). Real
+  capacity is a hardcoded 1 GiB stub (`sd_bio.c` discards the CSD
+  response instead of parsing it) against an actual 64 GiB card —
+  still open if more than `/var`-sized use is ever needed.
+- **~~The guest's root filesystem is writable~~ — DONE 2026-08-25.** Root
+  is mounted `ro`; `/var` lives on the SD card above, `/tmp` is tmpfs.
+  `/usr/local` (where `pkg` installs everything) is read-only along with
+  the rest of `/` by the owner's explicit choice, not carved out onto its
+  own mount — installing or upgrading anything needs `mount -uw /` first,
+  `mount -ur /` after (see `read-only-root-shipped` memory).
 - **`hvfb` and the scanout-import route are dead ends** kept for the record. The
   import path they describe was measured to write an imported dma-buf exactly
   once, at ~400 fps of nothing changing.

@@ -28,10 +28,15 @@
  * THREADING MODEL (read before calling from anywhere but the CPU1 debug
  * loop): usbacm_poll() is the ONLY code in this tree, besides musb_init()
  * itself, that is expected to touch MUSB's MMIO registers once the
- * hypervisor is up. It is designed to be called in a tight loop from the
- * CPU1 SMP debug core (smp.c smp_secondary_main(), alongside
- * dbgmon_service()) -- NOT from CPU0's guest-fault path, and NOT
- * re-entrantly from more than one core. Splitting the RX/TX rings so CPU0
+ * hypervisor is up. It is designed to be called EITHER in a tight loop from
+ * the CPU1 SMP debug core (smp.c smp_secondary_main(), alongside
+ * dbgmon_service()) -- the default -- OR, under the CPU1-as-vCPU1 design
+ * (vcpu1.c, EXPERIMENTAL, dbg_vcpu1), from CPU1's own EL2 IRQ context, via
+ * gic_timer_irq()'s MUSB_IRQ_INTID arm (gic_timer.c), the instant the real
+ * MUSB "mc" SPI (musb.h) fires -- never both at once, since arming vcpu1
+ * stops smp.c's tight loop from running at all (see vcpu1.h). Either way,
+ * NOT from CPU0's guest-fault path, and NOT re-entrantly from more than one
+ * core. Splitting the RX/TX rings so CPU0
  * only ever pushes/pops its own end (vconsole_rx_push is producer-only from
  * usbacm.c's perspective... wait, no: vconsole_rx_push is called BY this
  * module, i.e. usbacm.c/CPU1 is the producer of guest RX and the consumer of

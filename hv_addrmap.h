@@ -79,9 +79,12 @@
 #define HVMAP_EMMC_HS_TESTBUF      0x50020300UL
 #define HVMAP_EMMC_HS_TESTBUF_SIZE 0x200UL
 
-/* SD-card driver breadcrumbs (sd_bio.c: idx 0..~9). */
+/* SD-card driver breadcrumbs (sd_bio.c: idx 0..12, widened 2026-08-25 for
+ * the CSD-capacity-parse fields -- was 0x28 (idx 0..9); 0x50020528..
+ * 0x505ff was free (HVMAP_ASYNC_BC starts at 0x50020600), so this is a
+ * pure widen, no relocation needed. */
 #define HVMAP_SD_BC          0x50020500UL
-#define HVMAP_SD_BC_SIZE     0x28UL
+#define HVMAP_SD_BC_SIZE     0x40UL
 
 /* CPU2 async-I/O offload breadcrumbs (vblk_async.c: "VBA1", idx 0..2). */
 #define HVMAP_ASYNC_BC       0x50020600UL
@@ -694,6 +697,50 @@ _Static_assert(HVMAP_VCPU2_BC >= HVMAP_PROF_HIST_END,
                "vcpu2 breadcrumbs overlap the profiler histogram");
 _Static_assert(HVMAP_VCPU2_BC_END <= 0x50100000UL,
                "vcpu2 breadcrumbs run into emac.c's DMA scratch (0x50100000)");
+
+/* ---- virtio-input keyboard (vinput.c) ----------------------------------
+ * Placed past HVMAP_VCPU2_BC, which is the current top of this block. */
+#define HVMAP_VINPUT_BC        0x5009E000UL
+#define HVMAP_VINPUT_BC_SIZE   0x00000040UL
+#define HVMAP_VINPUT_BC_END    (HVMAP_VINPUT_BC + HVMAP_VINPUT_BC_SIZE)
+
+_Static_assert(HVMAP_VINPUT_BC >= HVMAP_VCPU2_BC_END,
+               "vinput breadcrumbs overlap the vcpu2 breadcrumb lane");
+_Static_assert(HVMAP_VINPUT_BC_END <= 0x50100000UL,
+               "vinput breadcrumbs run into emac.c's DMA scratch (0x50100000)");
+
+/* ---- third guest vCPU on CPU1 (vcpu1.c) --------------------------------
+ * EXPERIMENTAL — trades CPU1's independent crash-recovery witness for a
+ * third vCPU's worth of guest compute; see vcpu1.h's header comment for the
+ * full tradeoff. Placed past HVMAP_VINPUT_BC, the current top of this
+ * block, same pattern as every other lane here. */
+#define HVMAP_VCPU1_BC        0x5009E100UL
+#define HVMAP_VCPU1_BC_SIZE   0x00000100UL
+#define HVMAP_VCPU1_BC_END    (HVMAP_VCPU1_BC + HVMAP_VCPU1_BC_SIZE)
+
+_Static_assert(HVMAP_VCPU1_BC >= HVMAP_VINPUT_BC_END,
+               "vcpu1 breadcrumbs overlap the vinput breadcrumb lane");
+_Static_assert(HVMAP_VCPU1_BC_END <= 0x50100000UL,
+               "vcpu1 breadcrumbs run into emac.c's DMA scratch (0x50100000)");
+
+/* ---- virtio-blk over the microSD card (vblk_sd.c) ----------------------
+ * Placed past HVMAP_VCPU1_BC, the current top of this block. Lock word
+ * first (4 bytes), breadcrumb window after — same layout convention as
+ * eMMC's HVMAP_VBLK_BC + HVMAP_EMMC_LOCK pairing further up this file. */
+#define HVMAP_VBLK_SD_LOCK      0x5009E200UL
+#define HVMAP_VBLK_SD_LOCK_SIZE 0x00000004UL
+
+#define HVMAP_VBLK_SD_BC        0x5009E300UL
+#define HVMAP_VBLK_SD_BC_SIZE   0x00000100UL
+#define HVMAP_VBLK_SD_BC_END    (HVMAP_VBLK_SD_BC + HVMAP_VBLK_SD_BC_SIZE)
+
+_Static_assert(HVMAP_VBLK_SD_LOCK >= HVMAP_VCPU1_BC_END,
+               "vblk_sd lock overlaps the vcpu1 breadcrumb lane");
+_Static_assert(HVMAP_VBLK_SD_BC >= HVMAP_VBLK_SD_LOCK + HVMAP_VBLK_SD_LOCK_SIZE,
+               "vblk_sd breadcrumbs overlap the vblk_sd lock word");
+_Static_assert(HVMAP_VBLK_SD_BC_END <= 0x50100000UL,
+               "vblk_sd breadcrumbs run into emac.c's DMA scratch (0x50100000)");
+
 #define HVMAP_WDT_DEBUG_HOLD_SIZE  0x10UL   /* one word used, room to grow */
 
 _Static_assert(HVMAP_WDT_DEBUG_HOLD >= HVMAP_VGICD_BC + HVMAP_VGICD_BC_SIZE,

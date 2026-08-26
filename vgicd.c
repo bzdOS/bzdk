@@ -107,13 +107,39 @@ static void gicd_wr(uint32_t off, uint32_t v, uint32_t sas)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* The affinity bit of the core that is asking. Under static partitioning each
- * guest owns whole cores, so "the faulting core" IS the identity we police
- * against — there is no need for a separate guest-id table, and not having one
- * means there is nothing to get out of sync. */
+/* CORRECTED 2026-08-25 (confirmed live): "the faulting core's own affinity
+ * bit, nothing else" was right for static partitioning (each PHYSICAL core
+ * is its own guest, so cross-core == cross-guest, always), but it is wrong
+ * the moment CPU1 runs as a SECOND vCPU of the SAME guest as CPU0
+ * (vcpu1.c/vcpu1.h) rather than a separate guest. FreeBSD's own SMP
+ * AP-release rendezvous (smp_rendezvous(), right after "Release APs...")
+ * sends a real inter-processor SGI from the BSP (CPU0) to the AP (CPU1)
+ * via GICD_SGIR; this function's old masking reduced that write's target
+ * list to CPU0's own bit, so CPU1 never received it and both cores hung
+ * forever waiting on a rendezvous that could never complete — reproduced
+ * and root-caused live, 2026-08-25 (see vcpu1-first-live-attempt-smp-ipi-
+ * hang memory). The SAME masking also applies to GICD_ITARGETSR below, so
+ * a cross-core interrupt-affinity write between CPU0 and CPU1 was equally
+ * broken, not just SGIs.
+ *
+ * dbg_vcpu1 (weak: 0 in any build that doesn't link vcpu1.o) is the ONLY
+ * thing that changes: CPU0 and CPU1 become one shared "same guest" group
+ * exactly when it's armed, and ONLY for CPU0/CPU1 — CPU2 (never a guest
+ * vCPU) and CPU3 (idle, or in the `dual` build a genuinely SEPARATE Zephyr
+ * guest that still needs real isolation from this one) are UNCHANGED: a
+ * write from or targeting either of them still masks to that core alone,
+ * exactly as before. When dbg_vcpu1 is 0 (the default, and every build
+ * that has never linked vcpu1.o), this function is byte-for-byte the old
+ * behavior. */
+__attribute__((weak)) volatile uint32_t dbg_vcpu1;
+
 static inline uint32_t own_cpu_mask(void)
 {
-	return 1u << (smp_cpu_id() & 7u);
+	uint32_t me = smp_cpu_id() & 7u;
+	uint32_t mask = 1u << me;
+	if (dbg_vcpu1 && (me == 0u || me == 1u))
+		mask |= (1u << 0u) | (1u << 1u);
+	return mask;
 }
 
 int vgicd_handle_fault(struct el2_frame *frame)
@@ -200,8 +226,23 @@ int vgicd_handle_fault(struct el2_frame *frame)
 		uint32_t filter = (val >> 24) & 0x3u;
 		uint32_t before = val;
 		if (filter == 0x1u) {
+			/* MUST exclude the sender. Rewriting "all except self" into an
+			 * explicit target list of own_cpu_mask() was a real bug while
+			 * dbg_vcpu1 is armed (introduced 2026-08-25, fixed 2026-08-26):
+			 * own_cpu_mask() then returns {CPU0,CPU1}, so the SGI came back
+			 * to the very core that asked for everyone BUT itself. An
+			 * unexpected self-IPI is not harmless — FreeBSD's
+			 * smp_rendezvous_action() would run a second, unrequested time
+			 * on the initiator, against smp_rv_* state it did not expect to
+			 * be re-entered for. With dbg_vcpu1 off own_cpu_mask() is just
+			 * this core's own bit, so this clears the list to 0 — the same
+			 * "reaches nobody else" outcome the old code intended, only now
+			 * actually honouring the "except self" the guest asked for. */
+			uint32_t me = smp_cpu_id() & 7u;
+
 			val &= ~(0x3u << 24);                   /* -> use target list */
-			val = (val & ~(0xFFu << 16)) | (own_cpu_mask() << 16);
+			val = (val & ~(0xFFu << 16)) |
+			      ((own_cpu_mask() & ~(1u << me)) << 16);
 		} else if (filter == 0x0u) {
 			uint32_t list = (val >> 16) & 0xFFu;
 			val = (val & ~(0xFFu << 16)) |

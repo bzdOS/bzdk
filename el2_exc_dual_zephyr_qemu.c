@@ -93,6 +93,11 @@
 #include "mmio_absorb.h"
 #include "hv_addrmap.h"
 #include "smp.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header.
+                                   * mmio_absorb.h/vconsole.h stay included above: CPU3's
+                                   * dispatch (handle_cpu3_trap() below) keeps calling both
+                                   * directly rather than through the shared ops struct — see
+                                   * that function's own comment for why. */
 
 /* CPU0's guest.c breadcrumb window (GUEST_BC_BASE, "GST1") -- word[1] is
  * guest_demo_el1()'s own loop counter, bumped every iteration at EL1. Same
@@ -150,18 +155,16 @@ read_u32(uint64_t pa)
 	return *(volatile uint32_t *)pa;
 }
 
-static void
-dual_zephyr_qemu_poweroff(void) __attribute__((noreturn));
-
-static void
-dual_zephyr_qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+/* dual_zephyr_qemu_poweroff() used to be defined here, verbatim-duplicated
+ * across every QEMU CI handler (see el2_exc_qemu_common.h's header for the
+ * full "nine copies" rationale); it now lives in el2_exc_qemu_common.c as
+ * qemu_psci_poweroff(), unchanged in behaviour (identical SMC #0x84000008
+ * SYSTEM_OFF, wfi fallback loop). Kept as a #define under the old name so
+ * every call site below reads exactly as it did before this refactor.
+ * (main_dual_zephyr_qemu.c has its OWN separate `static` definition of a
+ * same-named function — checked via grep before this change — so this is a
+ * same-file rename only, not a cross-TU forwarder.) */
+#define dual_zephyr_qemu_poweroff qemu_psci_poweroff
 
 /* ------------------------------------------------------------------ *
  * CPU3/Zephyr real console echo + PASS-marker matching -- same technique
@@ -220,6 +223,45 @@ zephyr_marker_step(uint8_t c)
  * capture-ring accounting the moment vconsole_handle_fault() reports it
  * (total_bytes strictly increases by exactly one per THR write/fault). */
 
+/* CPU0's own scenario config for the shared guest-sync chain (see
+ * el2_exc_qemu_common.h for the chain's fixed order: claim_first, console,
+ * then the unconditional dynamic W^X promotion, then HVC ack, SMC, MMIO
+ * absorb). No console, no SMC forward, no MMIO absorb: CPU0's guest_demo_el1
+ * payload runs with stage-2 disabled / flat physical and uses none of them
+ * (CPU3's real-Zephyr console/MMIO traffic is a wholly separate path, routed
+ * by handle_cpu3_trap() above, which this refactor deliberately leaves
+ * untouched -- see that function's own comment). Dynamic W^X promotion is
+ * unconditional in the shared chain and needs no flag here either (and is a
+ * no-op on this target regardless: no stage2.o is linked into the
+ * dual-zephyr-qemu build, only stage2_zephyr.o, so stage2_wx_fault resolves
+ * weak-absent -- see stage2_wx_qemu.h).
+ *
+ * hvc_advance_elr = 0, NOT 1: this is the exact case el2_exc_qemu_common.h's
+ * own header comment and this file's task brief call out by name. ELR_EL2
+ * already holds the post-HVC return address (it is a "return from call"
+ * address, not a faulting PC), so no adjustment is correct or needed --
+ * matching what this file's original code did (see the comment that used to
+ * sit on the `if (ec == 0x16u) return;` line below, preserved here) and
+ * el2_exc_dual2_qemu.c's own finding of the same thing, arrived at the hard
+ * way (a live guest wedge from a double-advanced ELR) before this file was
+ * ever written. */
+static const struct qemu_guest_sync_ops dual_zephyr_cpu0_ops = {
+	.want_hvc_ack    = 1u,
+	.hvc_advance_elr = 0u,
+};
+
+/* Kept LOCAL rather than delegated to the shared qemu_report_fault(): that
+ * helper's format is fixed as "<marker>: FAULT kind=.. ESR=.. ELR=.. FAR=..",
+ * but dual-zephyr-qemu-ci.sh greps literally for "DUAL-ZEPHYR-QEMU-CI: FAIL"
+ * (see its concurrent-pass check) -- calling qemu_report_fault() here would
+ * print "...: FAULT kind=.." instead and silently break that check. The
+ * "FAIL cpu=0" text is therefore load-bearing for CI, not just cosmetic, so
+ * this function is not a shared-format candidate at all (contrast
+ * el2_exc_dual2_qemu.c's report_fault(), which prints an EXTRA line and then
+ * DOES delegate -- that works there because dual-qemu-ci.sh/dual-rearm-
+ * qemu-ci.sh grep for the shared "FAULT" text, not "FAIL"). Only the
+ * terminal call is shared now, via the dual_zephyr_qemu_poweroff macro
+ * above. */
 static void report_fault_cpu0(struct el2_frame *frame, unsigned long kind) __attribute__((noreturn));
 
 static void
@@ -243,7 +285,17 @@ static void report_cpu3_fault(struct el2_frame *frame, unsigned long kind) __att
  * through vconsole AND mmio_absorb, or wasn't even a data abort" path --
  * the concrete, hardware-observed evidence a naive relocated boot is
  * actually broken, not just slow. Distinct marker string from CPU0's own
- * FAIL, on purpose (see this file's header). */
+ * FAIL, on purpose (see this file's header).
+ *
+ * Kept LOCAL, not delegated to qemu_report_fault(): dual-zephyr-qemu-ci.sh
+ * greps literally for the substring "CPU3 FAULT" (space, not the shared
+ * helper's "<marker>: FAULT" colon-then-space shape) to detect a genuine
+ * CPU3 wedge, and this function also carries an EC= field plus two extra
+ * diagnostic lines (console-bytes-so-far, marker-seen) that the shared
+ * fixed format has no room for. Per el2_exc_qemu_common.h's contract for
+ * this situation, none of that is reproducible through the shared helper,
+ * so the whole function stays as it was; only the terminal call is shared,
+ * via the dual_zephyr_qemu_poweroff macro. */
 static void
 report_cpu3_fault(struct el2_frame *frame, unsigned long kind)
 {
@@ -274,6 +326,38 @@ report_cpu3_fault(struct el2_frame *frame, unsigned long kind)
  * CPU3 dispatch -- mirrors el2_exc.c's own CPU3 routing (see that file's
  * header for the original): vconsole channel 1 first, mmio_absorb's
  * catch-all second, anything else is a genuine, reportable failure.
+ *
+ * DELIBERATELY NOT ROUTED THROUGH qemu_guest_sync()/qemu_guest_sync_ops,
+ * unlike CPU0's chain below. Two genuine entanglements with this file's
+ * per-core routing, not just an oversight:
+ *
+ *   1. want_mmio_absorb's DRAM exclusion (qemu_guest_sync_ops.h's own
+ *      comment) checks the reconstructed IPA against stage2.h's
+ *      STAGE2_DRAM_BASE/STAGE2_DRAM_SIZE -- FreeBSD's DRAM gigabyte,
+ *      0x40000000-0x80000000, the range this file's own header explicitly
+ *      names as where a broken relocation could send CPU3 wandering (the
+ *      "stale 0x51xxxxxx-range absolute address" scenario under "CPU3
+ *      FAILURE REPORTING"). The unconditional mmio_absorb_fault(frame) call
+ *      kept below absorbs a fault anywhere non-DRAM OR in that range alike
+ *      (today's real, if surprising, behaviour); switching to
+ *      want_mmio_absorb would make exactly that scenario stop being
+ *      absorbed and start reaching report_cpu3_fault() instead -- a genuine
+ *      behaviour change this refactor must not make, however much more
+ *      correct it looks.
+ *   2. qemu_guest_sync() unconditionally calls stage2_wx_qemu_try(), which
+ *      issues an AT S12E1W against the CALLING core's own banked VTTBR_EL2
+ *      -- CPU3's, pointed at stage2_zephyr.c's wholly disjoint table by
+ *      design (see stage2_zephyr.h's isolation rationale). This target
+ *      links no stage2.o, so stage2_wx_fault resolves weak-absent and the
+ *      call is a true no-op today, but wiring it into CPU3's path anyway
+ *      would be a needless, unproven interaction with the very isolation
+ *      boundary this scenario exists to prove, for a call that is a no-op
+ *      here regardless.
+ *
+ * Both are "entangled with per-core routing" in the sense the conversion
+ * brief calls out: left alone rather than guessed at. Only the terminal
+ * poweroff (report_cpu3_fault()'s last line) is shared, via the
+ * dual_zephyr_qemu_poweroff macro above.
  * ------------------------------------------------------------------ */
 static void
 handle_cpu3_trap(struct el2_frame *frame, unsigned long kind)
@@ -463,15 +547,20 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 			return;
 		}
 
-		/* Guest (lower-EL) synchronous HVC -- guest_demo_el1() issues one
-		 * periodically (see guest.c). ELR_EL2 already holds the correct
-		 * post-call return address for an HVC trap (unlike a data/instr
-		 * abort) -- see el2_exc_dual2_qemu.c's header for the +=4 bug this
-		 * mirrors the fix of; no adjustment here either. */
+		/* Guest (lower-EL) synchronous exception -- the shared chain handles
+		 * both the dynamic W^X promotion (without which the guest cannot
+		 * execute its first instruction under STAGE2_WX_DYNAMIC's default XN
+		 * mapping -- a no-op on this particular target, see
+		 * dual_zephyr_cpu0_ops's comment) and the HVC acknowledgement
+		 * guest_demo_el1() periodically needs (see guest.c). ELR_EL2 already
+		 * holds the correct post-call return address for an HVC trap (unlike
+		 * a data/instr abort) -- see dual_zephyr_cpu0_ops's comment and
+		 * el2_exc_dual2_qemu.c's header for the +=4 bug this mirrors the fix
+		 * of; no adjustment here either. */
 		if ((kind >> 2) == 2u && t == EL2_KIND_SYNC) {
 			uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
 
-			if (ec == 0x16u)
+			if (qemu_guest_sync(frame, ec, &dual_zephyr_cpu0_ops))
 				return;
 		}
 

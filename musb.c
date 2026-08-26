@@ -1421,8 +1421,46 @@ musb_init(void)
         MI(0x25);
     }
 
-    /* Enable RESET/CONNECT/DISCONNECT interrupts (polled, not IRQ-driven). */
+    /* Enable RESET/CONNECT/DISCONNECT interrupts. Historically "polled, not
+     * IRQ-driven" (musb_poll() reads+clears REG_INTUSB every call regardless
+     * of whether this line ever reaches a core) -- still true for every
+     * build EXCEPT the CPU1-as-vCPU1 tick-free design (vcpu1.c), which routes
+     * MUSB_IRQ_INTID (musb.h) to CPU1's GIC CPU interface and calls
+     * usbacm_poll() straight from that IRQ instead of a fixed 10 ms tick.
+     *
+     * REG_INTTXE/REG_INTRXE below were NEVER written before this change --
+     * grepped the file: only REG_INTUSBE was ever set. That is fine for the
+     * pure-poll design (musb_service_ep1_rx/tx() and ep0_read_setup() poll
+     * RXCSRL/TXCSRL/CSR0 LEVEL bits directly, never the latched INTTX/INTRX
+     * registers), but it means the physical "mc" SPI line (musb.h) would
+     * assert ONLY on bus RESET/CONNECT/DISCONNECT and never on an EP0 SETUP,
+     * an EP1-OUT packet arriving, or an EP1-IN packet completing -- exactly
+     * the events an IRQ-driven usbacm_poll() exists to react to. Enabling
+     * these two bits makes the SAME single "mc" SPI also pulse for those
+     * events (aggregated with INTUSB at the hardware OR gate MUSB is built
+     * on -- see musb.h's citation), with NO effect on the existing polled
+     * builds: nothing here changes what any REG_INTUSB/RXCSRL/TXCSRL read
+     * returns, and no build enables MUSB_IRQ_INTID at the GIC distributor
+     * except vcpu1_run() (musb_irq_arm_cpu1(), gic_timer.c/vcpu1.c) -- so a
+     * plain `dbg`/`gdb`/`fbsd` build asserts this line more often than
+     * before but nothing is listening at the GIC, which is architecturally
+     * harmless (an unenabled SPI's assertion never reaches any CPU
+     * interface). Bit layout is the standard Mentor MUSB one bit-per-
+     * endpoint-0..15 convention (same convention this file already assumes
+     * for RXCSR/TXCSR's shared EPINDEX addressing): bit0 = EP0 (TX side
+     * only -- EP0's RX-relevant events, e.g. a fresh SETUP, still report
+     * through INTRTX bit0 per the Mentor core's own combined-control-
+     * endpoint convention; INTRRX bit0 is unused), bit1 = EP1. TODO(board):
+     * this bit-per-endpoint claim is standard Mentor-MUSB behavior (matches
+     * this driver's own EPINDEX-addressed CSR model) but has NOT been
+     * independently confirmed against an Allwinner-specific erratum the way
+     * every register OFFSET above this comment was (see the REG_* block's
+     * own "ALLWINNER LAYOUT, NOT standard Mentor" warning) -- confirm live
+     * by checking a bit1 REG_INTTX/REG_INTRX read-back actually latches
+     * around a real EP1 transfer before trusting this in the field. */
     musb_write8(REG_INTUSBE, INTR_RESET | INTR_CONNECT | INTR_DISCONNECT);
+    musb_write16(REG_INTTXE, 0x0003u);  /* EP0 (bit0) + EP1 IN (bit1) */
+    musb_write16(REG_INTRXE, 0x0002u);  /* EP1 OUT (bit1); bit0 (EP0) unused */
     MI(0x26);
 
     /* EP0 max packet. */

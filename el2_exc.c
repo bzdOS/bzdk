@@ -26,6 +26,7 @@
 #include "exceptions.h"
 #include "trace.h"
 #include "vcpu2.h"
+#include "vcpu1.h"
 #include "profiler.h"
 #include "guest.h"
 #include "sched.h"
@@ -38,6 +39,8 @@
 #include "smp.h"
 #include "vblk_emmc.h"
 #include "vnet_emac.h"   /* vnet_mmio_fault() -- ROADMAP C1 virtio-net-over-EMAC */
+#include "vinput.h"      /* vinput_mmio_fault() -- virtual keyboard */
+#include "vblk_sd.h"     /* vblk_sd_mmio_fault() -- virtio-blk over microSD */
 #include "stage2.h"      /* stage2_wx_fault() -- opt-in dynamic W^X, see
                            * stage2.h's STAGE2_WX_DYNAMIC block and
                            * docs/wx-enforcement.md. The prototype itself is
@@ -267,6 +270,18 @@ __attribute__((weak)) int vcpu2_request(uint64_t entry_pa, uint64_t context_id)
 	return 0;
 }
 
+/* Third guest vCPU (vcpu1.c), EXPERIMENTAL — see vcpu1.h for the tradeoff.
+ * Same weak-fallback pattern as dbg_vcpu2/vcpu2_request immediately above:
+ * every target without vcpu1.o linked keeps refusing affinity 1, i.e. the
+ * pre-existing ALREADY_ON behaviour, unchanged. */
+__attribute__((weak)) volatile uint32_t dbg_vcpu1;
+
+__attribute__((weak)) int vcpu1_request(uint64_t entry_pa, uint64_t context_id)
+{
+	(void)entry_pa; (void)context_id;
+	return 0;
+}
+
 /* Event-trace ring (trace.c) and PC-sample profiler (profiler.c), linked only
  * into the `dbg` target. Weak fallbacks, same pattern as gic_timer_irq above,
  * so every other target links unchanged and pays one call to an empty
@@ -308,6 +323,23 @@ __attribute__((weak)) int vnet_mmio_fault(struct el2_frame *frame)
  * always reports "not my window" (correct: nothing configured that window),
  * unchanged behavior for every build that DOES link the real vblk_emmc.o. */
 __attribute__((weak)) int vblk_mmio_fault(struct el2_frame *frame)
+{
+	(void)frame;
+	return 0;
+}
+
+/* virtio-input keyboard MMIO device (vinput.c). Same weak-fallback pattern as
+ * vnet_mmio_fault/vblk_mmio_fault above so builds that don't link vinput.o
+ * still link; the call then always reports "not my window". */
+__attribute__((weak)) int vinput_mmio_fault(struct el2_frame *frame)
+{
+	(void)frame;
+	return 0;
+}
+
+/* virtio-blk over the microSD card (vblk_sd.c). Same weak-fallback pattern
+ * as vinput_mmio_fault immediately above. */
+__attribute__((weak)) int vblk_sd_mmio_fault(struct el2_frame *frame)
 {
 	(void)frame;
 	return 0;
@@ -632,6 +664,16 @@ static int psci_guest_filter(uint64_t fnid, uint64_t x1, uint64_t x2,
 		 * The guest chooses where its own vCPU starts, at its own
 		 * exception level, which is what PSCI is for. */
 		if (aff0 == 2ull && vcpu2_request(x2, x3)) {
+			*ret = PSCI_RET_SUCCESS;
+			return 1;
+		}
+
+		/* Affinity 1 — EXPERIMENTAL, see vcpu1.h. Same shape as affinity 2
+		 * above: vcpu1_request() alone decides, gated on dbg_vcpu1, and the
+		 * same "no EL3, no warm-boot-at-EL2" argument applies unchanged —
+		 * the guest still only ever picks where its OWN vCPU starts, at
+		 * its own exception level. */
+		if (aff0 == 1ull && vcpu1_request(x2, x3)) {
 			*ret = PSCI_RET_SUCCESS;
 			return 1;
 		}
@@ -1152,6 +1194,27 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * straight to the real EMAC (muxed with the debug-protocol traffic —
 			 * see vnet_emac.c's TX ethertype filter) and injects VNET_INTID. */
 			if (vnet_mmio_fault(frame)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
+			/* Next, the virtual keyboard at 0x0A003000 (vinput.h). Same
+			 * "handled -> return without recording" contract as vblk/vnet
+			 * above; vinput_mmio_fault() returns 0 for any abort outside its
+			 * own 0x200-byte window, so calling it unconditionally here is
+			 * safe. Events themselves are never driven from a guest write —
+			 * they are injected by vinput_send_key()/vinput_send_ascii() from
+			 * dbgmon.c's `type`/`key` commands, on CPU1. */
+			if (vinput_mmio_fault(frame)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
+			/* Next, virtio-blk over the microSD card at 0x0A004000
+			 * (vblk_sd.h) — a SECOND, independent disk so /var can move off
+			 * the boot-critical eMMC. Same "handled -> return without
+			 * recording" contract as every device above. */
+			if (vblk_sd_mmio_fault(frame)) {
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;

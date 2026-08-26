@@ -37,47 +37,38 @@
 #include "guest.h"
 #include "gic_timer_qemu.h"
 #include "pl011_qemu.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header */
 
 /* At the 100 ms period main_qemu.c arms, 20 ticks is ~2 seconds — long
  * enough to prove several preemptions happened, short enough that CI stays
  * fast. */
 #define PASS_AFTER_TICKS 20u
 
-static void qemu_poweroff(void) __attribute__((noreturn));
+/* qemu_poweroff()/report_fault() used to be defined here, verbatim-duplicated
+ * across every QEMU CI handler; they now live in el2_exc_qemu_common.c as
+ * qemu_psci_poweroff()/qemu_report_fault(). Behaviour is unchanged, including
+ * this target's choice to HALT in wfi rather than power off after a fault (see
+ * this file's header: a CI run either prints PASS or hangs until the wrapping
+ * `timeout` kills it — both greppable). */
+#define qemu_poweroff qemu_psci_poweroff
 
-/* PSCI SYSTEM_OFF (0x84000008) via SMC. QEMU's `virt` machine answers PSCI
- * calls itself (no real EL3/secure firmware is needed — this is exactly how
- * every bare-metal EL2 payload booted with `-kernel` and no `-bios` cleanly
- * shuts QEMU down) and terminates the process with exit status 0 on
- * SYSTEM_OFF. The wfi fallback below is only for the (not expected) case
- * that the SMC doesn't actually terminate the emulator. */
-static void
-qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
-
-static void report_fault(struct el2_frame *frame, unsigned long kind) __attribute__((noreturn));
-
-static void
-report_fault(struct el2_frame *frame, unsigned long kind)
-{
-	pl011_puts("QEMU-CI: FAULT kind=0x");
-	pl011_put_hex32((uint32_t)kind);
-	pl011_puts(" ESR=0x");
-	pl011_put_hex32((uint32_t)frame->esr);
-	pl011_puts(" ELR=0x");
-	pl011_put_hex64(frame->elr);
-	pl011_puts(" FAR=0x");
-	pl011_put_hex64(frame->far);
-	pl011_puts("\n");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+/* This target's own scenario config for the shared guest-sync chain.
+ *
+ * want_hvc_ack + hvc_advance_elr: preserves this file's original behaviour
+ * exactly. NOTE, carried over from el2_exc_dual2_qemu.c's header rather than
+ * quietly changed: the `+4` is architecturally WRONG for an HVC trap (ELR_EL2
+ * already holds the post-call return address), and it is harmless here only
+ * because this target's payload (guest_qemu_payload.c) never issues an HVC —
+ * i.e. it is dead code. It is left as-is so this refactor changes no observable
+ * behaviour; fixing it is a separate, deliberate change.
+ *
+ * No console, no SMC forward, no MMIO absorb: this minimal target's payload
+ * uses none of them. Dynamic W^X promotion is unconditional in the shared
+ * chain and needs no flag. */
+static const struct qemu_guest_sync_ops qemu_ci_ops = {
+	.want_hvc_ack    = 1u,
+	.hvc_advance_elr = 1u,
+};
 
 void
 el2_trap(struct el2_frame *frame, unsigned long kind)
@@ -107,22 +98,21 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 		return;   /* never advance ELR/SPSR for an async exception */
 	}
 
-	/* Guest (lower-EL) synchronous HVC — acknowledge and resume, matching
-	 * guest.c's documented optional hypercall path (see guest_demo_el1()'s
-	 * comment); this target's own payload doesn't issue one, but a future
-	 * one might. */
+	/* Guest (lower-EL) synchronous exception: the shared chain handles the
+	 * HVC acknowledgement this file's header documents AND the dynamic W^X
+	 * promotion without which the guest cannot execute a single instruction
+	 * under STAGE2_WX_DYNAMIC's default XN mapping. See
+	 * el2_exc_qemu_common.h for what is shared and why. */
 	if ((kind >> 2) == 2u && t == EL2_KIND_SYNC) {
 		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
 
-		if (ec == 0x16u) {   /* HVC from AArch64 */
-			frame->elr += 4u;
+		if (qemu_guest_sync(frame, ec, &qemu_ci_ops))
 			return;
-		}
 	}
 
 	/* Anything else — an unexpected guest fault, or our own EL2
 	 * synchronous exception — is a genuine problem on this milestone's
 	 * boot path: report it and halt rather than silently resuming into a
 	 * possibly-corrupt state. */
-	report_fault(frame, kind);
+	qemu_report_fault(frame, kind, "QEMU-CI", /*poweroff=*/0);
 }

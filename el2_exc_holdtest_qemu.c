@@ -30,6 +30,7 @@
 #include "exceptions.h"
 #include "holdtest_guest.h"
 #include "pl011_qemu.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that header */
 
 /* ---- Faithful transcription of gdbstub.c's set_tde() ------------------ */
 static void
@@ -101,16 +102,16 @@ restore_orig(uint32_t *site, uint32_t saved)
 }
 
 /* ---- PSCI SYSTEM_OFF -- identical pattern to el2_exc_qemu.c's
- * qemu_poweroff(): cleanly terminates qemu-system-aarch64 with exit 0. ---- */
-static void qemu_poweroff(void) __attribute__((noreturn));
-static void
-qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
+ * qemu_poweroff(): cleanly terminates qemu-system-aarch64 with exit 0.
+ *
+ * This used to be a static function defined right here, verbatim-duplicated
+ * across every QEMU CI handler; it now lives in el2_exc_qemu_common.c as
+ * qemu_psci_poweroff(). It was `static` (internal linkage), so no other
+ * translation unit could have been calling this file's copy by name — the
+ * #define below is purely a thin forwarder so every existing call site
+ * (`qemu_poweroff();`, below) keeps compiling unchanged. Behaviour is
+ * unchanged: same SMC #0 with x0=SYSTEM_OFF, same wfi fallback loop. */
+#define qemu_poweroff qemu_psci_poweroff
 
 /* ---- Test state ---------------------------------------------------- */
 enum { PHASE_A = 0, PHASE_B = 1 };
@@ -160,6 +161,65 @@ print_verdict(const char *label, int outcome)
 		           "not expected on real silicon)\n");
 }
 
+/* ---- THE mechanism under test: guest software BRK, EC==0x3C, same check
+ * el2_exc.c's real divert condition uses. Wired in as qemu_guest_sync()'s
+ * `claim_first` hook (el2_exc_qemu_common.h) so it still gets first refusal
+ * on every lower-EL sync exception, ahead of even the shared chain's own
+ * unconditional dynamic W^X promotion -- not that the two would ever
+ * collide (BRK's EC 0x3C is disjoint from the abort ECs 0x20/0x21/0x24/0x25
+ * stage2_wx_qemu_try() acts on), but the ordering guarantee is the whole
+ * point of claim_first and this is exactly the scenario it exists for. ---- */
+static int
+holdtest_claim_brk(struct el2_frame *frame, uint32_t ec)
+{
+	(void)frame;
+
+	if (ec != 0x3Cu)
+		return 0;
+
+	if (g_phase == PHASE_A) {
+		pl011_puts("HV: EL2 caught guest BRK (EC=0x3C) at "
+		           "holdtest_entryA's patch site -- PASS for test A\n");
+		restore_orig(holdtest_entryA_patchsite, saved_a);
+		a_outcome = 1;
+	} else {
+		pl011_puts("HV: EL2 caught guest BRK (EC=0x3C) at "
+		           "holdtest_entryB's patch site -- PASS for test B\n");
+		restore_orig(holdtest_entryB_patchsite, saved_b);
+		b_outcome = 1;
+	}
+	/* Do NOT advance ELR: the instruction at that PA is now
+	 * restored to its original NOP, so resuming at the same
+	 * address just (harmlessly) executes it and falls
+	 * through -- mirrors gdbstub.c's own "for a BRK the stub
+	 * rewinds/reprograms the instruction itself" contract. */
+	return 1;
+}
+
+/* This target's own scenario config for the shared guest-sync chain
+ * (el2_exc_qemu_common.h). Only claim_first is set:
+ *
+ *   - claim_first = holdtest_claim_brk: see that function's own comment --
+ *     this diagnostic's entire reason for existing is the guest BRK divert,
+ *     so it must run before anything the shared chain does.
+ *
+ *   - No want_hvc_ack: this target's HVC handling is NOT a blind
+ *     ack-and-advance -- it's a multi-immediate phase-transition state
+ *     machine (HOLDTEST_HVC_A_DONE / B_ARM_NOW / B_DONE / SELFTRAP) the
+ *     shared chain has no hook for, so it stays below, hand-written, tried
+ *     only after qemu_guest_sync() reports EC 0x16 as "not mine".
+ *
+ *   - No console/SMC/mmio-absorb: this diagnostic's guest payload
+ *     (holdtest_guest.c) uses none of them.
+ *
+ * The shared chain still does its one unconditional thing -- dynamic W^X
+ * promotion -- which this file used to call directly via
+ * stage2_wx_qemu_try(frame, ec); that call is now folded into
+ * qemu_guest_sync() below instead of being duplicated here. */
+static const struct qemu_guest_sync_ops holdtest_ops = {
+	.claim_first = holdtest_claim_brk,
+};
+
 void
 el2_trap(struct el2_frame *frame, unsigned long kind)
 {
@@ -175,27 +235,15 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 	if ((kind >> 2) == 2u && t == EL2_KIND_SYNC) {
 		uint32_t ec = ((uint32_t)(frame->esr >> 26)) & 0x3fu;
 
-		/* ---- THE mechanism under test: guest software BRK, EC==0x3C,
-		 * same check el2_exc.c's real divert condition uses. ---- */
-		if (ec == 0x3Cu) {
-			if (g_phase == PHASE_A) {
-				pl011_puts("HV: EL2 caught guest BRK (EC=0x3C) at "
-				           "holdtest_entryA's patch site -- PASS for test A\n");
-				restore_orig(holdtest_entryA_patchsite, saved_a);
-				a_outcome = 1;
-			} else {
-				pl011_puts("HV: EL2 caught guest BRK (EC=0x3C) at "
-				           "holdtest_entryB's patch site -- PASS for test B\n");
-				restore_orig(holdtest_entryB_patchsite, saved_b);
-				b_outcome = 1;
-			}
-			/* Do NOT advance ELR: the instruction at that PA is now
-			 * restored to its original NOP, so resuming at the same
-			 * address just (harmlessly) executes it and falls
-			 * through -- mirrors gdbstub.c's own "for a BRK the stub
-			 * rewinds/reprograms the instruction itself" contract. */
+		/* Shared chain: holdtest_claim_brk() (the mechanism under test)
+		 * gets first refusal via claim_first, then the chain does the
+		 * unconditional dynamic W^X promotion every QEMU guest needs --
+		 * without it the guest cannot execute its first instruction
+		 * under STAGE2_WX_DYNAMIC's default XN mapping. See
+		 * el2_exc_qemu_common.h for what else the chain offers (none of
+		 * it applies to this target -- see holdtest_ops above). */
+		if (qemu_guest_sync(frame, ec, &holdtest_ops))
 			return;
-		}
 
 		/* ---- HVC: this test's own phase-transition sync points. ---- */
 		if (ec == 0x16u) {

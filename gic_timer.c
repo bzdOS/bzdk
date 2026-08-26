@@ -195,6 +195,13 @@
 #include "timer.h"
 #include "vgic.h"
 #include "flightrec.h"
+#include "wdt.h"     /* wdt_debug_kick() — CPU1-as-vCPU2 tick-path kick, see below */
+#include "dbgmon.h"  /* dbgmon_service() — ditto */
+#include "musb.h"    /* MUSB_IRQ_SPI/MUSB_IRQ_INTID — cited constants, see musb.h */
+#include "usbacm.h"  /* usbacm_poll() — CPU1 MUSB-IRQ path, see musb_irq_arm_cpu1() */
+#ifdef HV_HDMI
+#include "hdmi.h"    /* hdmi_phy_locked()/hdmi_relock() — ditto, HDMI PHY relock */
+#endif
 #include "smp.h"   /* SMP_MAX_CPUS, smp_cpu_id() — Phase 2 P1 per-core state,
                     * see the inventory comment above struct gt_percpu below.
                     * Header-only (smp_cpu_id() is `static inline`): does not
@@ -210,9 +217,18 @@
 #define GICD_CTLR         (*(volatile uint32_t *)(GICD_BASE + 0x000))
 #define GICD_IGROUPR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x080 + 4u * (n)))
 #define GICD_ISENABLER(n) (*(volatile uint32_t *)(GICD_BASE + 0x100 + 4u * (n)))
+/* ICENABLER (GICv2 0x180): write-1-to-CLEAR the enable bit, the counterpart of
+ * ISENABLER above. Added 2026-08-26 for the MUSB storm throttle — this tree had
+ * never needed to DISABLE an INTID at the distributor before, only enable. */
+#define GICD_ICENABLER(n) (*(volatile uint32_t *)(GICD_BASE + 0x180 + 4u * (n)))
 #define GICD_ISPENDR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x200 + 4u * (n)))
 /* GICD_IPRIORITYR is byte-addressable, one byte per interrupt ID. */
 #define GICD_IPRIORITYR_BYTE(id) (*(volatile uint8_t *)(GICD_BASE + 0x400 + (id)))
+/* GICD_ITARGETSR: byte-addressable, one byte per SPI (IDs 0..31/PPIs+SGIs
+ * are RO "always this CPU"), a bitmap of target CPU interfaces (bit N =
+ * CPU interface N). Used ONLY for MUSB_IRQ_INTID below, to steer that one
+ * real device SPI to CPU1's interface alone — see musb_irq_arm_cpu1(). */
+#define GICD_ITARGETSR_BYTE(id) (*(volatile uint8_t *)(GICD_BASE + 0x800 + (id)))
 
 #define GICC_CTLR (*(volatile uint32_t *)(GICC_BASE + 0x000))
 #define GICC_PMR  (*(volatile uint32_t *)(GICC_BASE + 0x004))
@@ -474,9 +490,81 @@ struct gt_percpu {
 	uint32_t cntv_el2_masked;     /* 1 = WE set IMASK, guest hasn't cleared */
 	uint32_t cntv_masked_ticks;   /* EL2 ticks our mask has survived        */
 	uint32_t cntv_rescues;        /* times we had to unmask it ourselves    */
+	/* MUSB storm throttle (added 2026-08-26, HARDWARE-PROVEN NECESSARY — see
+	 * the MUSB_IRQ_BUDGET_PER_TICK comment at the dispatch site). Per-core for
+	 * the same reason irq_counter[] is: this counts what THIS core's own CPU
+	 * interface handed it. */
+	uint32_t musb_irqs;           /* MUSB IRQs taken since the last tick    */
+	uint32_t musb_throttles;      /* times the budget ran out and we masked */
 } __attribute__((aligned(64)));
 
 static struct gt_percpu g_gt[SMP_MAX_CPUS];
+
+#ifdef HV_HDMI
+/* Last gt->ticks value (this core's OWN per-core tick count, already
+ * maintained by gic_timer_irq() below — see the "ticks" field in struct
+ * gt_percpu above and vcpu1.h's breadcrumb-layout note on word [13], "this
+ * core's own gic_timer tick count") at which the HDMI PHY relock tick-path
+ * service (below) last called hdmi_relock(). Deliberately NOT a new
+ * per-loop-pass counter like smp.c's `last_relock_iters` — that variable
+ * lived in the old free-running debug loop, which this tick path replaces
+ * entirely, and a tick count is what a wall-clock rate limit needs anyway
+ * (see the usage site for the full 65536-iterations -> ~1s conversion
+ * reasoning). Only CPU1 (SMP_DEBUG_CPU) ever reads or writes this, so a
+ * single file-scope static, not a per-core array slot, is sufficient. */
+static uint64_t hdmi_last_relock_tick;
+#endif
+
+/* ---- CPU1-as-third-vCPU tick-path service (vcpu1.c, EXPERIMENTAL) --------
+ * See vcpu1.h for the full design/tradeoff. Weak so every target that
+ * doesn't link vcpu1.o (gdb, the QEMU CI variants, fbsd/zephyr) sees a
+ * permanent 0 and the block in gic_timer_irq() below is simply dead code —
+ * same pattern as every other opt-in feature this tree gates this way
+ * (vcpu2.c's dbg_vcpu2, vinput.c's device, etc). dbgmon_service() itself is
+ * declared (non-weak) by dbgmon.h; this weak DEFINITION is what lets a
+ * build without dbgmon.o (the `gdb` target links gdbstub.c instead) still
+ * link — dbgmon.o's real definition overrides it wherever both are linked. */
+__attribute__((weak)) volatile uint32_t dbg_vcpu1;
+__attribute__((weak)) void dbgmon_service(struct el2_frame *guest_frame)
+{
+	(void)guest_frame;
+}
+
+#ifdef HV_HDMI
+/* HDMI PHY relock (hdmi.c), same weak-fallback reasoning as dbgmon_service()
+ * above, needed for the same class of reason even though the call sites
+ * below are themselves wrapped in #ifdef HV_HDMI: HV_HDMI is a *target*-
+ * scoped CFLAGS addition (only `dbg`'s Makefile rule sets -DHV_HDMI today —
+ * see the Makefile's own "HV_HDMI belongs to the target, not to whoever
+ * remembers the command line" comment, which exists precisely because this
+ * tree has already been bitten once by a flag/object-list mismatch here),
+ * not a promise that whichever target defines it will always also link
+ * hdmi.o. Weak fallbacks make that pairing a performance/behavior nicety
+ * instead of a link-time landmine: hdmi_phy_locked() reporting "locked" and
+ * hdmi_relock() doing nothing are both fail-safe (never attempts a relock)
+ * if hdmi.c's real, strong definitions are ever absent from a build that
+ * still sets -DHV_HDMI. dbg_hdmi_relock is NOT weak here, unlike the two
+ * functions: it is defined unconditionally in smp.c (no #ifdef there), and
+ * smp.o is linked into every target this tree builds — the same
+ * "already provides a strong definition everywhere" situation wdt_debug_kick
+ * is in below, just via smp.h instead of wdt.h. */
+__attribute__((weak)) int hdmi_phy_locked(void)
+{
+	return 1;   /* fail "locked" => the tick path never calls hdmi_relock() */
+}
+__attribute__((weak)) void hdmi_relock(void)
+{
+}
+extern volatile uint32_t dbg_hdmi_relock;   /* smp.c, always linked, not weak */
+#endif
+
+/* Real definition lives in el2_exc.c (or a QEMU stub); every target that
+ * links THIS file already links one or the other (see el2_exc.c's own
+ * g_last_guest_frame / smp.c's identical extern for the existing precedent —
+ * duplicated here rather than pulled from a shared header, matching that
+ * convention). Not weak: unlike dbg_vcpu1/dbgmon_service, every target
+ * really does provide a strong definition of this one already. */
+extern void el2_snapshot_guest_frame(struct el2_frame *out);
 
 /* Defensive clamp only — MPIDR affinity0 on this SoC is architecturally
  * 0..3 (SMP_MAX_CPUS==4, smp.h:42), so the out-of-range arm can never be hit
@@ -880,6 +968,79 @@ gic_timer_init(uint32_t period_us)
 }
 
 /* ------------------------------------------------------------------ *
+ * MUSB_IRQ_INTID (103, SPI 71, "mc" — musb.h) wiring for the CPU1-as-vCPU1
+ * design (vcpu1.c, EXPERIMENTAL): make CPU1's GIC CPU interface the sole
+ * target of the real MUSB aggregate SPI, so the tick-free, event-driven
+ * usbacm_poll() dispatch below (gic_timer_irq()'s MUSB_IRQ_INTID arm) is
+ * only ever presented to CPU1, never to CPU0 (which runs the primary guest
+ * and may separately be running vgic_active()'s forwarding policy — this
+ * SPI must NEVER be handed to vgic_inject_hw(), since the guest's own
+ * usb@1c19000 DTB node is status="disabled" and has no driver for it; see
+ * musb.h's citation and usbacm.h's "KNOWN OPEN RISK" section).
+ *
+ * Call ONCE from vcpu1_run(), after gic_timer_cpuif_init() (which already
+ * did the CPU-interface-wide GICD_CTLR/GICC_CTLR/PMR enable this also
+ * needs) and before unmasking IRQs on CPU1. Idempotent (plain register
+ * writes), safe to call only when dbg_vcpu1 is being armed — nothing else
+ * in this tree ever enables MUSB_IRQ_INTID at the distributor, so leaving
+ * this uncalled (dbg_vcpu1 off) means the real SPI stays exactly as
+ * harmless/unenabled as it always was.
+ *
+ * TODO(board), UNVERIFIED — read this before trusting the routing:
+ *   1. GICD_ITARGETSR bit-to-core mapping. This assumes GICv2's architectural
+ *      convention (target-list bit N == CPU interface N == affinity0 N),
+ *      which is what every other SPI-targeting GIC-400 integration does, but
+ *      NOTHING ELSE in this codebase has ever targeted an SPI at a specific
+ *      core before today (every existing device-SPI path — EHCI/INTID 106,
+ *      the generic vgic_inject_hw() catch-all — runs on whichever core
+ *      happens to be executing gic_timer_irq(), which has only ever been
+ *      CPU0 until vcpu1.c). Confirm on hardware: after calling this, read
+ *      back GICD_ITARGETSR_BYTE(MUSB_IRQ_INTID) (expect 0x02, bit1) and,
+ *      once traffic flows, confirm irq_counter[103] increments in CPU1's
+ *      g_gt[] slot and NOT CPU0's.
+ *   2. GICD_ICFGR (edge/level) for INTID 103 is deliberately left untouched
+ *      here (not read, not written) — the DTB's <0 0x47 0x04> says
+ *      level-high, and unlike the timer PPI (gic_timer_init()'s IGROUPR
+ *      dance) nothing in this tree has ever needed to REPROGRAM a real
+ *      device SPI's level/edge config, only trusted whatever firmware left
+ *      it as. TODO(board): read back GICD_ICFGR for INTID 103 once and
+ *      confirm it already reads as level (bit pattern 0b00 per pair) before
+ *      relying on this — if it somehow reads edge, treat that as a real
+ *      finding, not a copy-paste target for the vblk-emmc "prefer edge"
+ *      precedent, which applies only to a SOFTWARE-pended SPI, not a real
+ *      hardware line.
+ *   3. GICD_IGROUPR — like gic_timer_init()'s TIMER_INTID handling, this
+ *      does NOT force Group 1: it is left as whatever firmware/ATF already
+ *      set for a real, firmware-known peripheral SPI (the EMAC/pinctrl SPIs
+ *      this tree already services via vgic_inject_hw() on CPU0 prove
+ *      device SPIs on this board DO reach non-secure EL2 as Group 1 IRQs
+ *      today, which is why no explicit IGROUPR write is attempted here —
+ *      but this specific INTID's group has never itself been read back).
+ * ------------------------------------------------------------------ */
+void
+musb_irq_arm_cpu1(void)
+{
+	/* Priority: same highest-non-secure value as the CNTP tick (see
+	 * TIMER_PRIORITY's own comment on the NS-view priority remap) — this
+	 * is a real, latency-sensitive peripheral event, not diagnostics. */
+	GICD_IPRIORITYR_BYTE(MUSB_IRQ_INTID) = (uint8_t)TIMER_PRIORITY;
+
+	/* Target CPU interface 1 ONLY (bit1) — see TODO #1 above. Deliberately
+	 * NOT OR'd with whatever was already there: if firmware had targeted
+	 * this at CPU0 (plausible, since the node was "okay" before someone
+	 * disabled it — see usbacm.h), leaving that bit set would let a real
+	 * MUSB event ALSO interrupt CPU0's primary guest, which is exactly the
+	 * hardware race usbacm.h's "KNOWN OPEN RISK" section warns about. A
+	 * flat assignment is the safer default; if hardware testing (TODO #1)
+	 * shows bit1 is not in fact CPU1, this write still leaves CPU0
+	 * untargeted, which is the fail-safe direction. */
+	GICD_ITARGETSR_BYTE(MUSB_IRQ_INTID) = (1u << 1);
+
+	GICD_ISENABLER(GICD_WORD(MUSB_IRQ_INTID)) =
+	    (1u << GICD_BIT(MUSB_IRQ_INTID));
+}
+
+/* ------------------------------------------------------------------ *
  * IRQ handler: called from el2_trap()'s EL2_KIND_IRQ arm. Bounded,
  * non-blocking - fixed number of MMIO accesses and breadcrumb stores,
  * no loops, no allocation.
@@ -904,6 +1065,73 @@ gic_timer_irq(struct el2_frame *frame)
 	if (intid >= GIC_SPURIOUS_MIN) {
 		/* 1020-1023: spurious, nothing pending for this CPU interface.
 		 * No EOI for a spurious read (GICv2 spec). */
+		return;
+	}
+
+	/* MUSB_IRQ_INTID (103, real "mc" SPI 71 — musb.h): checked FIRST, ahead
+	 * of the vgic_active()/legacy-forwarding blocks below, for the same
+	 * reason TIMER_INTID and VGIC_MAINT_INTID are pulled out early — this
+	 * INTID is EL2-owned unconditionally and must NEVER fall into
+	 * vgic_inject_hw()'s generic "hand it to the guest" path. Reachable
+	 * only on CPU1, and only once musb_irq_arm_cpu1() (vcpu1_run()) has
+	 * targeted+enabled it at the distributor — on every other core/build
+	 * this INTID is never enabled, so GICC_IAR can never return it there.
+	 *
+	 * Service THEN EOI+DIR (real level source: musb_poll() write-1-clears
+	 * REG_INTUSB and drains the EP0/EP1 CSR-level RXPKTRDY/TXPKTRDY bits
+	 * that are the other two OR'd-in sources on this same line — see
+	 * musb.h's "one aggregate line" citation — so by the time we DIR it,
+	 * the line has actually been de-asserted at the source. DIR'ing before
+	 * servicing, the way the generic device-SPI path defers to the guest's
+	 * virtual EOI, would re-pend this immediately and reproduce exactly the
+	 * 145 kHz INTID-106/EHCI storm this file already documents and works
+	 * around below. usbacm_poll() is bounded/non-blocking (see usbacm.c) —
+	 * safe to call from IRQ context, matching musb.c's own module-header
+	 * contract for this being the one place besides musb_init() allowed to
+	 * touch MUSB's MMIO. */
+	/* MUSB_IRQ_BUDGET_PER_TICK — a HARD ceiling on how many MUSB IRQs this
+	 * core will service between two of its own CNTP ticks, after which the
+	 * INTID is masked at the distributor and the tick path re-enables it.
+	 *
+	 * NOT speculative hardening: measured live on hardware 2026-08-26. With no
+	 * ceiling, the first host-side write to /dev/ttyACM0 after arming
+	 * dbg_vcpu1 put this line into exactly the self-sustaining level-triggered
+	 * storm this file already documents for EHCI/INTID 106 — usbacm_poll()
+	 * evidently does not always de-assert every source OR'd into MUSB's single
+	 * aggregate "mc" line, so DIR re-pended it immediately and forever. The
+	 * failure mode is nastier than a plain hang and is worth naming: the
+	 * hardware watchdog stayed FED the whole time (wdt_pet() runs on every EL2
+	 * exception, and a storm supplies those in abundance), so nothing reset the
+	 * board — while dbgmon_service() and wdt_debug_kick(), which live ONLY in
+	 * the tick block below, starved completely. Observed order: the EMAC debug
+	 * channel went dark first, the guest kept running normally for minutes on
+	 * ssh, and only then did the guest itself wedge as CPU1's vCPU was starved
+	 * of every cycle. A dark debug channel plus a healthy guest is the
+	 * signature.
+	 *
+	 * WHY A BUDGET AND NOT A FIX AT THE SOURCE: draining every OR'd MUSB
+	 * source correctly is real work in musb.c (and unverified, which is how
+	 * this bug got here). This makes the failure IMPOSSIBLE to be fatal rather
+	 * than merely unlikely: whatever musb.c does or fails to do, the tick — and
+	 * with it the watchdog kick and the debug channel, i.e. every recovery
+	 * lever this project has — is guaranteed to run. 32 events per 10 ms tick
+	 * is ~3200/s, far more than a CDC-ACM console can generate, so a healthy
+	 * MUSB never reaches the ceiling and this costs nothing in the normal case. */
+#define MUSB_IRQ_BUDGET_PER_TICK 32u
+	if (intid == MUSB_IRQ_INTID) {
+		usbacm_poll();
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		if (++gt->musb_irqs >= MUSB_IRQ_BUDGET_PER_TICK) {
+			/* Mask at the DISTRIBUTOR, not the CPU interface: PMR/priority
+			 * games would also mask the tick we depend on to recover. The
+			 * tick path below re-enables it unconditionally, so this is
+			 * self-healing — a genuinely stuck line degrades USB-ACM to
+			 * 32-events-per-tick instead of killing the core. */
+			GICD_ICENABLER(GICD_WORD(MUSB_IRQ_INTID)) =
+			    (1u << GICD_BIT(MUSB_IRQ_INTID));
+			gt->musb_throttles++;
+		}
 		return;
 	}
 
@@ -1062,7 +1290,108 @@ gic_timer_irq(struct el2_frame *frame)
 	 * a diagnostics cadence, not a control-loop period. */
 	vtimer_mask_watchdog(gt);
 
-	if ((gt->ticks % REPORT_EVERY) == 0) {
+	/* CPU1-as-third-vCPU watchdog/dbgmon service (vcpu1.c, EXPERIMENTAL).
+	 * See vcpu1.h for the full rationale. This is the ENTIRE mitigation:
+	 * because HCR_EL2.IMO=1 routes this core's physical timer IRQ to EL2
+	 * unconditionally (see this file's own header comment on IMO), this
+	 * runs every VCPU1_TICK_PERIOD_US regardless of what guest code was
+	 * just preempted on this core — the same unmaskable-tick guarantee
+	 * CPU0's own guest already lives under. wdt_debug_kick() first,
+	 * unconditionally, before anything that could conceivably have a bug —
+	 * matching wdt_debug_kick()'s own existing foreground-loop precedent
+	 * (smp.c) of being the very first thing done each pass. dbgmon_service()
+	 * gets a SNAPSHOT of CPU0's guest frame, not this core's own vCPU2
+	 * frame, so gr/sr/gva keep meaning exactly what they mean today — see
+	 * vcpu1.h's note on why that is deliberate, not an oversight. */
+	if (smp_cpu_id() == SMP_DEBUG_CPU && dbg_vcpu1) {
+		wdt_debug_kick();
+
+		/* Refresh the MUSB storm budget and un-mask the line if the previous
+		 * window exhausted it (see MUSB_IRQ_BUDGET_PER_TICK above). Written
+		 * unconditionally rather than only when throttled: ISENABLER is
+		 * write-1-to-set and idempotent, so an unconditional write is both
+		 * cheaper than a read-compare and immune to losing the un-mask if
+		 * musb_throttles was bumped between the check and the write. This is
+		 * what makes the throttle self-healing instead of a one-way kill. */
+		gt->musb_irqs = 0;
+		GICD_ISENABLER(GICD_WORD(MUSB_IRQ_INTID)) =
+		    (1u << GICD_BIT(MUSB_IRQ_INTID));
+
+		{
+			struct el2_frame snap;
+
+			el2_snapshot_guest_frame(&snap);
+			dbgmon_service(&snap);
+		}
+		/* CORRECTED 2026-08-25: arming vcpu1 stops smp.c's old tight loop
+		 * from ever running, including its continuous eMMC clock pinmux
+		 * enforcement (PC5 must stay function 3/mmc2; FreeBSD's own
+		 * pinctrl driver leaves it at gpio despite PC5 being correctly
+		 * listed in the DTB's own mmc2-pins group -- confirmed live, this
+		 * is a FreeBSD driver bug, not a DTB completeness gap). Without
+		 * this, vcpu1 would race that driver bug from cold boot with NO
+		 * correction at all, not just a slower one -- eMMC (root) would
+		 * very likely fail before ever reaching this tick. Same
+		 * read-modify-write as smp.c's own loop, same "write only when it
+		 * drifted" reasoning, just re-armed on this tick's bounded cadence
+		 * (VCPU1_TICK_PERIOD_US) instead of every loop pass -- more than
+		 * tight enough for a misconfiguration that happens once, early,
+		 * during the guest's own pinctrl driver attach. */
+		{
+			volatile uint32_t *pc = (volatile uint32_t *)0x01C20848UL;
+			uint32_t v = *pc;
+			if (((v >> 20) & 0xFu) != 3u)
+				*pc = (v & ~(0xFu << 20)) | (3u << 20);
+		}
+
+#ifdef HV_HDMI
+		/* ADDED 2026-08-25, same "arming vcpu1 stops smp.c's old tight loop"
+		 * gap as the pinmux fix just above, this time for smp.c's HDMI PHY
+		 * lock-loss defense (smp.c ~682-696): FreeBSD's axp8xx driver cuts
+		 * the PHY's supply (dldo1) ~1s into guest boot as "unused", dropping
+		 * PHY_STATUS bit7; without this, arming vcpu1 would leave the
+		 * display dark forever once that happens, with nothing left to
+		 * notice or fix it.
+		 *
+		 * The CHECK (hdmi_phy_locked()) is one cheap MMIO read, so — exactly
+		 * like the old loop's own "one cheap MMIO read every pass" framing —
+		 * it runs on EVERY tick (10ms). Only the ACTUAL relock call is rate-
+		 * limited, and that rate limit had to be re-derived rather than
+		 * copied: the old loop gated hdmi_relock() to "at most once per
+		 * 65536 loop PASSES" (smp.c's `last_relock_iters`), a free-running,
+		 * unmeasured iteration count in a tight bare-metal loop with no
+		 * fixed period — not a wall-clock quantity at all. This tick path
+		 * has the opposite property: ticks ARE wall-clock-spaced, exactly
+		 * VCPU1_TICK_PERIOD_US (10000us == 10ms, vcpu1.c) apart, so "65536"
+		 * cannot be carried over as a tick count without silently changing
+		 * its meaning (65536 ticks would be ~11 wall-clock MINUTES, far more
+		 * conservative than the old loop ever was). Lacking any measured
+		 * iters-per-second figure for that loop to convert properly, this
+		 * deliberately picks a wall-clock target instead of guessing one:
+		 * retry at most once per ~1s (100 ticks * 10ms). hdmi_relock() costs
+		 * ~110ms (smp.c's own dbg_hdmi_relock comment), so worst case (PHY
+		 * never relocks) this steals at most ~11% of CPU1's tick-path time —
+		 * well under the old loop's already-accepted cost profile — while
+		 * still being far more aggressive than "once every 11 minutes" would
+		 * have been. Once hdmi_phy_locked() reports 1 again, this simply
+		 * stops firing, same as the old loop. */
+		if (dbg_hdmi_relock && !hdmi_phy_locked() &&
+		    (gt->ticks - hdmi_last_relock_tick) > 100u) {
+			hdmi_relock();
+			hdmi_last_relock_tick = gt->ticks;
+		}
+#endif
+	}
+
+	/* Storm/jitter diagnostics stay CPU0-only. GICT_BC_BASE/IRQ_COUNTER_BC_
+	 * BASE are single, file-scope breadcrumb windows (see the state-
+	 * inventory comment above struct gt_percpu) — exactly the "Phase 2"
+	 * case that comment warned about, now real. Rather than splitting those
+	 * windows for a second writer, this core's tick simply skips the block:
+	 * a plain, cheap correctness fix (no interleaved writes from two cores
+	 * into one lane) that defers "give CPU1 its own diagnostics lane" as a
+	 * real, separate follow-up rather than doing it speculatively here. */
+	if (smp_cpu_id() == 0 && (gt->ticks % REPORT_EVERY) == 0) {
 		jitter_report_bc(&gt->jitter);
 
 		gict_bc(1, (uint32_t)gt->ticks);

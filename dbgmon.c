@@ -19,6 +19,9 @@
 #include "exceptions.h"
 #include "dbgmon.h"
 #include "vcpu2.h"
+#include "vcpu1.h"
+#include "vinput.h"
+#include "hv_addrmap.h"
 #include "hv_addrmap.h"
 
 /* ── weak fallbacks for optional providers ──────────────────────────────────
@@ -1329,6 +1332,157 @@ static void exec_line(char *line, struct el2_frame *frame)
 			cputs(" last=");
 			cputs(wv < 4u ? why[wv] : "?");
 			cputs("\r\n  usage: vcpu2 [on|off]\r\n");
+		}
+		return;
+	}
+	if (streq(cmd, "type")) {
+		/* Type text into the guest's virtual keyboard (vinput.c) — each
+		 * token gets a synthesized space before it (tok[1] excepted), since
+		 * tokenize() has already destroyed the original whitespace run
+		 * lengths. No trailing Enter: chain with `key enter` when one is
+		 * wanted, mirroring guest_sh.py's own console-inject convention of
+		 * not assuming what the operator wants to happen next. */
+		if (nt < 2) {
+			err("usage: type <text...>");
+			return;
+		}
+		for (int i = 1; i < nt; i++) {
+			if (i > 1)
+				vinput_send_ascii(' ');
+			for (char *c = tok[i]; *c; c++)
+				vinput_send_ascii(*c);
+		}
+		cputs("typed\r\n");
+		return;
+	}
+	if (streq(cmd, "key")) {
+		/* Raw key injection for anything `type` can't express (arrows, tab,
+		 * enter, backspace, ctrl/alt as modifiers) or explicit press/release
+		 * control. `key <name>` sends a full press+release; `key <name> 0|1`
+		 * sends just that transition (for holding a modifier across other
+		 * keys — not currently exposed as a combo, single-key-at-a-time is
+		 * enough for v1). */
+		static const struct { const char *name; uint16_t code; } named[] = {
+			{ "enter", KEY_ENTER }, { "esc", KEY_ESC },
+			{ "tab", KEY_TAB }, { "backspace", KEY_BACKSPACE },
+			{ "space", KEY_SPACE },
+			{ "up", KEY_UP }, { "down", KEY_DOWN },
+			{ "left", KEY_LEFT }, { "right", KEY_RIGHT },
+			{ "shift", KEY_LEFTSHIFT }, { "ctrl", KEY_LEFTCTRL },
+			{ "alt", KEY_LEFTALT },
+		};
+		uint16_t code = 0;
+		int found = 0;
+
+		if (nt < 2) {
+			err("usage: key <name> [0|1]  (name: enter esc tab "
+			    "backspace space up down left right shift ctrl alt)");
+			return;
+		}
+		for (uint32_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+			if (streq(tok[1], named[i].name)) {
+				code = named[i].code;
+				found = 1;
+				break;
+			}
+		}
+		if (!found) {
+			err("unknown key name");
+			return;
+		}
+		if (nt >= 3) {
+			if (streq(tok[2], "0"))
+				vinput_send_key(code, 0);
+			else if (streq(tok[2], "1"))
+				vinput_send_key(code, 1);
+			else {
+				err("usage: key <name> [0|1]");
+				return;
+			}
+		} else {
+			vinput_send_key(code, 1);
+			vinput_send_key(code, 0);
+		}
+		cputs("ok\r\n");
+		return;
+	}
+	if (streq(cmd, "vinput")) {
+		/* Status, mirroring `vcpu2`'s own read-only report block: whether
+		 * the guest has ever attached (magic/status), the two queues'
+		 * ready bits, and the sent/dropped counters -- `dropped` climbing
+		 * while `type`/`key` are in use means the guest hasn't posted
+		 * eventq buffers yet (driver not attached / not DRIVER_OK), not a
+		 * device bug. */
+		volatile uint32_t *bc = (volatile uint32_t *)HVMAP_VINPUT_BC;
+
+		cputs("vinput: ");
+		if (bc[0] != 0x56494E31u) {
+			cputs("window not published\r\n");
+			return;
+		}
+		cputs("status=");
+		print_hex32(bc[1]);
+		cputs(" eventq_ready=");
+		print_hex32(bc[2]);
+		cputs(" statusq_ready=");
+		print_hex32(bc[3]);
+		cputs(" sent=");
+		print_hex32(bc[4]);
+		cputs(" dropped=");
+		print_hex32(bc[5]);
+		cputs(" irqs=");
+		print_hex32(bc[6]);
+		cputs("\r\n");
+		return;
+	}
+	if (streq(cmd, "vcpu1")) {
+		/* Arm/disarm the THIRD GUEST vCPU on CPU1 (vcpu1.c) — EXPERIMENTAL,
+		 * see vcpu1.h for the full tradeoff before arming this on a board
+		 * you care about recovering automatically: CPU1 stops being an
+		 * independent crash-recovery witness and becomes a guest core
+		 * whose watchdog kick/dbgmon service now depend on a GIC-priority
+		 * tick surviving whatever the guest does SOFTWARE-side (it does,
+		 * via the same IMO=1 mechanism CPU0 already relies on) but NOT a
+		 * hardware-level wedge of this specific core (it does not).
+		 *
+		 * Off by default. The guest also has to ASK (cpu@1 in the device
+		 * tree) — same two-sided gate as vcpu2. */
+		if (nt > 1 && streq(tok[1], "on")) {
+			dbg_vcpu1 = 1u;
+			cputs("vcpu1: ARMED -- CPU1 will become a guest vCPU on "
+			      "the next guest CPU_ON for affinity 1. CPU1 no longer "
+			      "independently witnesses a wedge on this core -- see "
+			      "vcpu1.h before relying on this.\r\n");
+		} else if (nt > 1 && streq(tok[1], "off")) {
+			dbg_vcpu1 = 0u;
+			cputs("vcpu1: disarmed (CPU1 stays the debug/EMAC/watchdog "
+			      "core)\r\n");
+		} else {
+			volatile uint32_t *bc =
+			    (volatile uint32_t *)HVMAP_VCPU1_BC;
+			static const char *const st[] = {
+				"not reached", "parked", "request accepted",
+				"entering EL1"
+			};
+			static const char *const why[] = {
+				"accepted", "gate off", "already handed over",
+				"not parked yet"
+			};
+			uint32_t sv = bc[1], wv = bc[7];
+
+			cputs("vcpu1: gate=");
+			cputs(dbg_vcpu1 ? "ARMED" : "off");
+			cputs("  state=");
+			cputs(bc[0] == VCPU1_MAGIC
+			      ? (sv < 4u ? st[sv] : "?")
+			      : "window not published");
+			cputs("  requests=");
+			print_hex32(bc[2]);
+			cputs(" refused=");
+			print_hex32(bc[6]);
+			cputs(" last=");
+			cputs(wv < 4u ? why[wv] : "?");
+			cputs("\r\n  usage: vcpu1 [on|off]\r\n");
 		}
 		return;
 	}

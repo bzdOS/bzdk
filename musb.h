@@ -6,6 +6,32 @@
 #define BZDOS_MUSB_H
 #include <stdint.h>
 
+/* MUSB's real GIC SPI, cited from the ACTUAL flashed DTB, not guessed:
+ * `dtc -I dtb -O dts /opt/bzdos/tftpboot/bananapi-min.dtb` (2026-08-25 image)
+ * shows, under /soc:
+ *
+ *   usb@1c19000 {
+ *           compatible = "allwinner,sun8i-a33-musb";
+ *           interrupts = <0x00 0x47 0x04>;   // GIC_SPI 71, LEVEL_HIGH
+ *           interrupt-names = "mc";          // ONE aggregate line
+ *           status = "disabled";             // guest does NOT probe this node
+ *   };
+ *
+ * "mc" (one name, one cell) confirms this Mentor-derived MUSB core has a
+ * SINGLE physical/GIC line for the whole controller — internally it ORs
+ * together three latched status/enable pairs (REG_INTUSB/E, REG_INTTX/E,
+ * REG_INTRX/E above), so an ISR driven by this one SPI must still drain all
+ * three, exactly what musb_poll() already does unconditionally on every call
+ * (see its own header comment). status="disabled" means FreeBSD's own
+ * musbotg/awusbdrd driver never attaches this node and never enables this
+ * SPI itself — see usbacm.h's "KNOWN OPEN RISK" section for why that
+ * matters. Also confirmed against docs/virtio-blk-design.md §"Which SPI /
+ * INTID" ("MUSB SPI 71→INTID 103, seen in use") and
+ * docs/virtio-blk-integration.md's SPI-collision-avoidance note — both
+ * written independently, from the same DTB. */
+#define MUSB_IRQ_SPI    71u
+#define MUSB_IRQ_INTID  (32u + MUSB_IRQ_SPI)   /* 103 */
+
 /* Bring up MUSB in device (peripheral) mode: EP0 control + EP1 bulk IN/OUT.
  * Assumes U-Boot left the OTG clock enabled and PHY configured; re-asserts the
  * clock gate defensively. Does NOT touch the MMU. */

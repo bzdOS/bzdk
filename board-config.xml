@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  board-config.xml — single source of truth for "which optional features are
+  armed in this build" AND "what the guest's DTB needs to advertise for them
+  to actually do anything", generated together by gen_config.py so the two
+  can never drift apart.
+
+  WHY THIS EXISTS: every opt-in feature in this tree needs TWO things kept in
+  lockstep by a human today — a build-time CFLAGS define (or a runtime
+  dbgmon toggle) AND a matching device-tree node, added by hand with fdtput.
+  This session hit that exact mismatch twice: vcpu2 was armed once with no
+  cpu@2 node in the live DTB (only a separate, never-merged bananapi-2cpu.dtb
+  had it), and vcpu1 was built with no cpu@1 node at all — in both cases the
+  code was live and correct but the guest could never ask for the core
+  because nothing told it to. gen_config.py reads THIS file once and emits
+  both config.mk (Makefile CFLAGS) and the DTB edits (idempotent fdtput
+  calls, safe to re-run), so "armed in the build" and "advertised in the
+  DTB" are the same statement instead of two things to remember separately.
+
+  Edit this file, run `python3 gen_config.py`, then `make dbg` — that is the
+  whole workflow. Nothing here is consulted directly by the Makefile or by
+  el2 C code; gen_config.py is the only reader, and config.mk (generated,
+  gitignored) is the only thing the Makefile actually includes.
+-->
+<bzdk-config board="bananapi-m64" target="dbg">
+
+  <!-- Real, hardware-determined core roles (see microkernel/CLAUDE.md's
+       "Core layout"). Not settable here — documentation only, so a reader
+       of this file sees the whole picture in one place; gen_config.py does
+       not act on this element at all. -->
+  <cpu-roles>
+    <cpu id="0" role="guest-vcpu0" note="runs the guest, takes its traps"/>
+    <cpu id="1" role="debug-watchdog" note="EMAC/dbgmon/GDB/watchdog kick; survives guest wedges. NOT reassignable without accepting vcpu1's tradeoff below."/>
+    <cpu id="2" role="async-emmc-io" note="vblk_async.c offload, unless vcpu2 below is armed"/>
+    <cpu id="3" role="idle"/>
+  </cpu-roles>
+
+  <!-- Build-time feature gates. `enabled` maps to -D<MACRO>=1 in config.mk;
+       gen_config.py derives <MACRO> from the feature's own `define`
+       attribute so this file names features once, not per call site. -->
+  <!-- `mkvar` is the EXACT Makefile variable this feature controls (VCPU2,
+       HV_HDMI, ...) — gen_config.py writes `<mkvar> = 0|1` into config.mk
+       verbatim, no name-guessing, so it always matches whatever the
+       Makefile's own `ifeq ($(<mkvar>),1)` block checks. -->
+  <features>
+    <feature name="hv_hdmi"    mkvar="HV_HDMI"          enabled="true"/>
+    <feature name="hdmi_1080p" mkvar="HDMI_MODE_1080P"  enabled="true"/>
+
+    <!-- EXPERIMENTAL, see vcpu2.h/vcpu1.h before flipping either to true:
+         both trade an independent crash-recovery witness for guest compute.
+         needs-dtb-cpu is what ties the build flag to the DTB edit below —
+         gen_config.py refuses to enable the flag without also being able to
+         write the matching cpu@N node (or, symmetrically, warns if a cpu@N
+         node exists in the DTB but its feature is disabled here, since that
+         means a core the guest can ask for but the build won't hand over). -->
+    <feature name="vcpu2" mkvar="VCPU2" enabled="false" needs-dtb-cpu="2"/>
+    <feature name="vcpu1" mkvar="VCPU1" enabled="true" needs-dtb-cpu="1"/>
+  </features>
+
+  <!-- virtio-mmio devices inside the 2 MiB trapped block at 0x0A000000
+       (vblk_emmc.h's "MMIO window" comment — the canonical explanation of
+       why this block exists and why adding a device here needs no stage2.c
+       change). `always` devices are linked into every dbg build regardless
+       of any feature flag (vblk/vnet — the guest simply won't find them
+       without a DTB node, same as everything else here); devices with
+       `enabled-by` only get their DTB node written when that feature is on.
+       spi values must stay inside the documented free gap 0x68..0x73
+       (docs/virtio-blk-dtb.md) and must not repeat — gen_config.py checks
+       both before writing anything. -->
+  <devices>
+    <virtio-mmio name="vblk_emmc" base="0x0A000000" spi="105" device-id="2"  always="true"/>
+    <virtio-mmio name="vnet_emac" base="0x0A001000" spi="106" device-id="1"  always="true"/>
+    <virtio-mmio name="scanout"   base="0x0A002000" spi="none" device-id="none" enabled-by="hv_hdmi" no-dtb-node="true"/>
+    <virtio-mmio name="vinput"    base="0x0A003000" spi="107" device-id="18" always="true"/>
+    <virtio-mmio name="vblk_sd"   base="0x0A004000" spi="108" device-id="2"  always="true"/>
+  </devices>
+
+</bzdk-config>

@@ -41,12 +41,18 @@
 #include "exceptions.h"
 #include "vconsole.h"
 #include "pl011_qemu.h"
+#include "el2_exc_qemu_common.h"  /* the shared half of this dispatch — see that
+                                   * header, including the want_mmio_absorb DRAM
+                                   * exclusion this target's ops below rely on */
 
-/* ESR_EL2.EC values we care about. Spelled out locally (same as
- * el2_exc_qemu.c does) rather than pulled from a shared header — these two
- * are the whole vocabulary of this file. */
-#define EC_HVC64      0x16u
-#define EC_DABT_LOWER 0x24u
+/* qemu_poweroff()/the lower-EL sync dispatch chain used to be defined here,
+ * verbatim-duplicated across every QEMU CI handler (see
+ * el2_exc_qemu_common.h for the whole story); qemu_poweroff() now lives in
+ * el2_exc_qemu_common.c as qemu_psci_poweroff(). Behaviour is unchanged,
+ * including this target's choice to POWER OFF (not halt) after a fault —
+ * report_fault() below still calls qemu_poweroff() on the FAIL path exactly
+ * as before. */
+#define qemu_poweroff qemu_psci_poweroff
 
 /* The string whose arrival means "this worked".
  *
@@ -70,21 +76,6 @@
  * Matched against the raw byte stream (before the "[guest] " prefixing
  * below), so the prefix can change freely without breaking the gate. */
 static const char PASS_MARKER[] = "heartbeat 1";
-
-static void qemu_poweroff(void) __attribute__((noreturn));
-
-/* PSCI SYSTEM_OFF via SMC — QEMU's virt machine answers PSCI itself for a
- * bare-metal EL2 payload booted with -kernel and no -bios, and exits 0. See
- * el2_exc_qemu.c's copy of this for the longer note. */
-static void
-qemu_poweroff(void)
-{
-	register uint64_t x0 __asm__("x0") = 0x84000008ull;
-
-	__asm__ volatile("smc #0" :: "r"(x0) : "memory");
-	for (;;)
-		__asm__ volatile("wfi");
-}
 
 /* ------------------------------------------------------------------ *
  * Guest console echo + marker match.
@@ -156,8 +147,62 @@ drain_guest_console(void)
 	}
 }
 
+/* This target's own scenario config for the shared guest-sync chain.
+ *
+ * want_console=1, console_chan=0, after_console=drain_guest_console: this
+ * target's guest console is not a real device it can write to directly (see
+ * this file's header, job 1) — it's the trap-emulated Allwinner UART0 page.
+ * qemu_guest_sync() tries vconsole_handle_fault(frame, 0) on a lower-EL data
+ * abort exactly as this file used to inline, and after_console drains
+ * vconsole's TX tee ring only when vconsole claimed the fault, so the
+ * PASS-marker match and the "[guest] "-prefixed echo still happen on every
+ * claimed byte, in the same place they always did.
+ *
+ * want_mmio_absorb=1: this target links the REAL Zephyr image built for
+ * boards/bzdos/bpi_m64_hv, whose DTS describes the A64's own GIC, and
+ * Zephyr's arm_gic_init() probes it at boot regardless of what QEMU virt
+ * actually has (virt's GIC is at 0x08000000, the A64's GICD at 0x01C81000).
+ * CORRECTED 2026-08-26: a data abort here used to be treated as fatal,
+ * which failed this gate on completely healthy behaviour. Measured failure
+ * before the fix: EC=0x24 ESR=0x93800007 (translation fault, level 3)
+ * FAR=0x01c81004 — GICD_TYPER — from ELR=0x51003d04, i.e. Zephyr's own code
+ * at its 0x51000000 load address. mmio_absorb.c's read-as-zero/write-as-noop
+ * catch-all (already used by the dual-guest targets for exactly this: Zephyr
+ * is tickless and never needs a real interrupt, it just must not hang
+ * waiting for a device that will never answer) now handles it via the shared
+ * chain's want_mmio_absorb, which gates on the IPA being outside guest DRAM
+ * before absorbing — see el2_exc_qemu_common.h's want_mmio_absorb comment
+ * for why that exclusion matters on THIS target specifically: it uses
+ * stage2.c's identity map, which does cover guest DRAM, unlike the
+ * dual-guest targets' disjoint stage2_zephyr.c slice.
+ *
+ * want_hvc_ack=1, hvc_advance_elr=1: Zephyr does not issue HVC on this
+ * board, but the generic guest.c contract documents one, so this target
+ * honours it rather than treating it as fatal — same as before.
+ *
+ * No claim_first (nothing here needs first refusal ahead of the console),
+ * no on_smc (this target forwards no PSCI SMC). Dynamic W^X promotion is
+ * unconditional in the shared chain and needs no flag here either. */
+static const struct qemu_guest_sync_ops zephyr_ci_ops = {
+	.want_console     = 1u,
+	.console_chan     = 0u,
+	.after_console    = drain_guest_console,
+	.want_hvc_ack     = 1u,
+	.hvc_advance_elr  = 1u,
+	.want_mmio_absorb = 1u,
+};
+
 static void report_fault(struct el2_frame *frame, unsigned long kind) __attribute__((noreturn));
 
+/* Kept as this file's own function rather than switched to the shared
+ * qemu_report_fault(): this target's FAIL path does real extra work that the
+ * shared helper's fixed line format has no hook for — flushing whatever the
+ * guest had already printed before it died (the most informative thing in a
+ * crash log) and the guest-byte counter, plus an EC field the shared helper
+ * does not print. Reproducing the CI-visible output exactly matters more
+ * than removing this one duplicate, so it stays; it now calls the shared
+ * qemu_poweroff() (== qemu_psci_poweroff(), see the #define above) rather
+ * than a locally duplicated PSCI implementation. */
 static void
 report_fault(struct el2_frame *frame, unsigned long kind)
 {
@@ -204,23 +249,15 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 		return;
 
 	if (group == 2u) {   /* from a lower EL: the guest */
-		if (ec == EC_DABT_LOWER) {
-			if (vconsole_handle_fault(frame, 0)) {
-				drain_guest_console();
-				return;
-			}
-			/* A guest data abort somewhere other than UART0 — a
-			 * real bug (a stage-2 hole, or the guest touching an
-			 * address this map does not cover). Fall through. */
-		}
-
-		if (ec == EC_HVC64) {
-			/* Zephyr does not issue HVC on this board, but the
-			 * generic guest.c contract documents one, so honour it
-			 * rather than treating it as fatal. */
-			frame->elr += 4u;
+		/* The shared chain handles, in order: the trap-emulated UART0
+		 * console (+ this target's drain_guest_console() afterwards),
+		 * dynamic W^X promotion (without which the guest cannot execute
+		 * its first instruction under STAGE2_WX_DYNAMIC's default XN
+		 * mapping), the optional guest HVC, and the non-DRAM MMIO absorb
+		 * this target's ops struct above documents. See
+		 * el2_exc_qemu_common.h for what is shared and why. */
+		if (qemu_guest_sync(frame, ec, &zephyr_ci_ops))
 			return;
-		}
 	}
 
 	report_fault(frame, kind);

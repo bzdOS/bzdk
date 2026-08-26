@@ -51,8 +51,29 @@ int sd_bio_read(uint32_t lba, uint64_t buf_pa);
 
 /* Write one 512-byte block at `lba` from DRAM at `buf_pa`. Returns 0 on
  * success, negative on timeout. Mirrors sd_bio_read()'s sequence in the write
- * direction (CMD24); like emmc_bio_write() this is structurally correct but
- * treat a 0 return with a read-back compare until confirmed on silicon. */
+ * direction (CMD24). CONFIRMED on silicon 2026-08-24 (45/45 write/read-back
+ * round trips + a guest-level virtio dd/md5 round trip) -- but only AFTER
+ * sd_bio_set_highspeed()'s 25 MHz reclock; at the 400 kHz identification
+ * clock this same function was observed to either time out outright or
+ * report success while the data never actually landed. */
 int sd_bio_write(uint32_t lba, uint64_t buf_pa);
+
+/* Best-effort reclock from the 400 kHz identification clock to SD Default
+ * Speed (25 MHz), FAIL-SAFE by construction: unlike eMMC's HS_TIMING switch,
+ * SD cards support the whole 0-25 MHz default-speed range with NO CMD6
+ * SWITCH_FUNC negotiation, so this is a controller-side-only reclock plus a
+ * mandatory post-switch test read; any failure reclocks straight back to
+ * 400 kHz and returns nonzero. Called automatically, once, at the end of a
+ * successful sd_bio_init() -- callers never need to call this themselves.
+ * Written in response to sd_bio_write() being confirmed (2026-08-24, live
+ * hardware) to fail outright or silently not persist data at 400 kHz; see
+ * sd_bio.c's block comment above it for the fix rationale. */
+int sd_bio_set_highspeed(void);
+
+/* Real capacity in 512-byte sectors, parsed from the card's CSD during
+ * sd_bio_init() (see sd_bio.c's parse site). Falls back to a conservative
+ * 1 GiB stub if the card's CSD wasn't CSD-version-2.0 or init never ran.
+ * Callers must not call this before a successful sd_bio_init(). */
+uint64_t sd_bio_capacity_sectors(void);
 
 #endif /* BZDOS_SD_BIO_H */
