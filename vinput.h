@@ -44,6 +44,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"     /* struct el2_frame */
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 #define VINPUT_MMIO_BASE     0x0A003000UL
 #define VINPUT_MMIO_SIZE     0x00000200UL   /* one virtio-mmio device slot   */
@@ -59,7 +60,7 @@
 
 /* Real GICv2 distributor (identity-passed-through to the guest under IMO=0).
  * Same physical register vblk_emmc.h/vnet_emac.h use; duplicated here. */
-#define VINPUT_GICD_BASE       0x01C81000UL
+#define VINPUT_GICD_BASE       SOC_A64_GICD_BASE
 #define VINPUT_GICD_ISPENDR    0x200u
 
 /* ------------------------------------------------------------------ *

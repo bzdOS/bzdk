@@ -64,6 +64,7 @@
  */
 #include <stdint.h>
 #include "emac.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 #if defined(DBG_AUTH)
 #include "hmac_sha256.h"   /* ROADMAP T5 keyed-auth gate, see dbg_auth_check()
                             * below and docs/security-notes.md. Only pulled in
@@ -81,18 +82,18 @@
 /* ------------------------------------------------------------------ */
 /* EMAC MMIO: sun50i-a64.dtsi ethernet@1c30000 "reg = <0x01c30000 0x10000>"
  * (dtsi line ~1121-1124). */
-#define EMAC_BASE      0x01C30000UL
+#define EMAC_BASE      SOC_A64_EMAC_BASE
 /* SYS_CON EMAC clock register: syscon@1c00000 (dtsi ~393) + a64 variant
  * syscon_offset 0x30 (sun8i_emac.c emac_variant_a64, line ~893-896). */
-#define SYSCON_EMAC    0x01C00030UL
+#define SYSCON_EMAC    SOC_A64_SYSCON_EMAC
 /* CCU (clock/reset). CLK_BUS_EMAC = GATE(0x060, BIT(17)); RST_BUS_EMAC =
  * RESET(0x2c0, BIT(17)) — u-boot drivers/clk/sunxi/clk_a64.c lines 23 & 79. */
-#define CCU_BASE       0x01C20000UL
+#define CCU_BASE       SOC_A64_CCU_BASE
 #define CCU_BUS_GATE0  0x060u
 #define CCU_BUS_RST0   0x2C0u
 #define CCU_EMAC_BIT   (1u << 17)
 /* PIO (GPIO/pinmux) controller — the PD bank carries the RGMII pins. */
-#define PIO_BASE       0x01C20800UL
+#define PIO_BASE       SOC_A64_PIO_BASE
 
 /* ------------------------------------------------------------------ */
 /* EMAC register offsets (sun8i_emac.c lines 81-125, verbatim)          */

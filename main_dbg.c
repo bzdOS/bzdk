@@ -61,6 +61,7 @@ extern void bmc_init(void);
  * they never double-drain the RX ring. gdb_getc() pumps emac_poll() itself
  * because the stub spins on it while the guest is stopped and EL2 IRQs masked. */
 #include "emac.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 int  gdb_getc(void)  { emac_poll(); return emac_getc(); }
 void gdb_putc(int c) { emac_putc(c); }
 void gdb_flush(void) { emac_flush(); }
@@ -557,7 +558,7 @@ int main(void)
 	 * CPU1 debug core re-enforces it (see smp.c). PC_CFG0 @ 0x01C20848, PC5 =
 	 * nibble 5 (bits[23:20]). */
 	{
-		volatile uint32_t *pc_cfg0 = (volatile uint32_t *)0x01C20848UL;
+		volatile uint32_t *pc_cfg0 = (volatile uint32_t *)SOC_A64_PIO_PC_CFG0;
 		uint32_t v = *pc_cfg0;
 		v = (v & ~(0xFu << 20)) | (3u << 20);
 		*pc_cfg0 = v;

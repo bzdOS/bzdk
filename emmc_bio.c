@@ -29,13 +29,14 @@
 #include "emmc_bio.h"
 #include "hv_addrmap.h"     /* HVMAP_EBIO_BC / HVMAP_EMMC_HS_TESTBUF */
 #include "cntpct.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ------------------------------------------------------------------ */
 /* Physical bases                                                      */
 /* ------------------------------------------------------------------ */
-#define EMMC_BASE        0x01c11000UL   /* SMHC2/aw_mmc1 (eMMC) controller  */
-#define PIO_PC_CFG0      0x01C20848UL   /* PC5 pinmux nibble (bits[23:20])  */
-#define CCU_MMC2_CLK     0x01c20090UL   /* CCU MMC2_CLK gate/divider reg    */
+#define EMMC_BASE        SOC_A64_SMHC2_BASE   /* SMHC2/aw_mmc1 (eMMC) controller  */
+#define PIO_PC_CFG0      (SOC_A64_PIO_BASE + 0x48)   /* PC5 pinmux nibble (bits[23:20])  */
+#define CCU_MMC2_CLK     SOC_A64_CCU_MMC2_CLK   /* CCU MMC2_CLK gate/divider reg    */
 
 /* ------------------------------------------------------------------ */
 /* Controller register offsets (byte, off EMMC_BASE) — verbatim from the   */

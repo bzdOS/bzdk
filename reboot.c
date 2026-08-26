@@ -4,17 +4,18 @@
  * dependency on musb.c), so any image can link it. */
 #include <stdint.h>
 #include "reboot.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
-#define MUSB_BASE   0x01c19000UL
+#define MUSB_BASE   SOC_A64_MUSB_BASE
 #define REG_ISCR    0x0400u          /* Allwinner USB iface status/control */
 #define REG_POWER   0x0040u          /* sunxi MUSB POWER (8-bit)            */
 #define ISCR_DPDM_PULLUP_EN (1u << 16)
 #define ISCR_CHANGE_DETECT  ((1u << 4) | (1u << 5) | (1u << 6)) /* w1c */
 #define POWER_SOFTCONN      0x40u
 
-#define WDOG_CTRL   0x01c20cb0UL
-#define WDOG_CFG    0x01c20cb4UL
-#define WDOG_MODE   0x01c20cb8UL
+#define WDOG_CTRL   SOC_A64_WDOG_CTRL
+#define WDOG_CFG    SOC_A64_WDOG_CFG
+#define WDOG_MODE   SOC_A64_WDOG_MODE
 
 void usb_gadget_disconnect(void)
 {

@@ -47,6 +47,7 @@
  */
 #include <stdint.h>
 #include "led.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ---- active-level knobs: flip to 0 for a color if it turns out wired
  * active-low (LED on when the DATA bit is 0) once checked on real HW. ---- */
@@ -62,11 +63,11 @@
 
 /* ---- recomputed absolute register addresses (see derivation above) ---- */
 
-#define PIO_D_CFG3 0x01C20878u /* port D CFG3 (pins 24-31) */
-#define PIO_D_DATA 0x01C2087Cu /* port D DATA */
+#define PIO_D_CFG3 (SOC_A64_PIO_BASE + 0x78) /* port D CFG3 (pins 24-31) */
+#define PIO_D_DATA (SOC_A64_PIO_BASE + 0x7C) /* port D DATA */
 
-#define PIO_E_CFG1 0x01C20894u /* port E CFG1 (pins 8-15) */
-#define PIO_E_DATA 0x01C208A0u /* port E DATA */
+#define PIO_E_CFG1 (SOC_A64_PIO_BASE + 0x94) /* port E CFG1 (pins 8-15) */
+#define PIO_E_DATA (SOC_A64_PIO_BASE + 0xA0) /* port E DATA */
 
 #define MMIO32(addr) (*(volatile uint32_t *)(uintptr_t)(addr))
 

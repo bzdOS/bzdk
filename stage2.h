@@ -59,6 +59,7 @@
 #define BZDOS_STAGE2_H
 
 #include <stdint.h>
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ------------------------------------------------------------------ *
  * Identity-map region definitions. Both bases/sizes are 1 GiB block
@@ -100,7 +101,7 @@
  * USB gadget, not the UART pins) — vconsole.c emulates the UART from there.
  * Every other MMIO page (GIC, EMAC, CCU, UART1, ...) stays identity-mapped
  * exactly as before. */
-#define UART0_BASE   0x01C28000UL
+#define UART0_BASE   SOC_A64_UART0_BASE
 #define UART0_SIZE   0x1000UL      /* 4 KiB page carved out of stage-2 */
 
 /* ------------------------------------------------------------------ *

@@ -199,6 +199,7 @@
 #include "dbgmon.h"  /* dbgmon_service() — ditto */
 #include "musb.h"    /* MUSB_IRQ_SPI/MUSB_IRQ_INTID — cited constants, see musb.h */
 #include "usbacm.h"  /* usbacm_poll() — CPU1 MUSB-IRQ path, see musb_irq_arm_cpu1() */
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 #ifdef HV_HDMI
 #include "hdmi.h"    /* hdmi_phy_locked()/hdmi_relock() — ditto, HDMI PHY relock */
 #endif
@@ -211,8 +212,8 @@
  * GIC-400 MMIO bases (see citation above) and the handful of registers
  * this driver touches. Offsets are architectural (GICv2 spec).
  * ------------------------------------------------------------------ */
-#define GICD_BASE 0x01c81000UL
-#define GICC_BASE 0x01c82000UL
+#define GICD_BASE SOC_A64_GICD_BASE
+#define GICC_BASE SOC_A64_GICC_BASE
 
 #define GICD_CTLR         (*(volatile uint32_t *)(GICD_BASE + 0x000))
 #define GICD_IGROUPR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x080 + 4u * (n)))
@@ -670,7 +671,7 @@ vtimer_mask_watchdog(struct gt_percpu *gt)
 	 * attempt caused. */
 	if ((gt->cntv_rescues & 0xFFu) == 1u) {
 		uint64_t hcr_el2;
-		uint32_t gich_hcr = *(volatile uint32_t *)(0x01c84000UL);
+		uint32_t gich_hcr = *(volatile uint32_t *)(SOC_A64_GICH_BASE);
 
 		__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr_el2));
 		flightrec_log(FLTR_K_VTRESCUE, ctl,
@@ -1599,7 +1600,7 @@ gic_timer_irq(struct el2_frame *frame)
 		 * tight enough for a misconfiguration that happens once, early,
 		 * during the guest's own pinctrl driver attach. */
 		{
-			volatile uint32_t *pc = (volatile uint32_t *)0x01C20848UL;
+			volatile uint32_t *pc = (volatile uint32_t *)SOC_A64_PIO_PC_CFG0;
 			uint32_t v = *pc;
 			if (((v >> 20) & 0xFu) != 3u)
 				*pc = (v & ~(0xFu << 20)) | (3u << 20);

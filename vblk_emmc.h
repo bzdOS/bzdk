@@ -54,6 +54,7 @@
 #include <stdint.h>
 #include "exceptions.h"     /* struct el2_frame */
 #include "hv_addrmap.h"     /* HVMAP_* fixed-DRAM address map (single source) */
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ------------------------------------------------------------------ *
  * MMIO window.
@@ -109,7 +110,7 @@
 #define VBLK_INTID    (32u + VBLK_SPI)    /* == 137 */
 
 /* Real GICv2 distributor (identity-passed-through to the guest under IMO=0). */
-#define VBLK_GICD_BASE       0x01C81000UL
+#define VBLK_GICD_BASE       SOC_A64_GICD_BASE
 #define VBLK_GICD_ISPENDR    0x200u       /* +0x200 + 4*(intid/32), bit intid%32 */
 
 /* ------------------------------------------------------------------ *

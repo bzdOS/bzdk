@@ -53,6 +53,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ================================================================
  *  vGIC virtual-timer (CNTV/INTID 27) deep-dive toggles (2026-07-25).
@@ -130,16 +131,16 @@
  * remap. So a passing QEMU run proves the GICH/LR/GICV chain but says nothing
  * about the stage-2 redirect — that half stays hardware-only. */
 #ifndef VGIC_GICD_BASE
-#define VGIC_GICD_BASE   0x01c81000UL   /* distributor (passed through in v1) */
+#define VGIC_GICD_BASE   SOC_A64_GICD_BASE   /* distributor (passed through in v1) */
 #endif
 #ifndef VGIC_GICC_BASE
-#define VGIC_GICC_BASE   0x01c82000UL   /* physical CPU i/f — guest IPA target */
+#define VGIC_GICC_BASE   SOC_A64_GICC_BASE   /* physical CPU i/f — guest IPA target */
 #endif
 #ifndef VGIC_GICH_BASE
-#define VGIC_GICH_BASE   0x01c84000UL   /* hypervisor control — driven here   */
+#define VGIC_GICH_BASE   SOC_A64_GICH_BASE   /* hypervisor control — driven here   */
 #endif
 #ifndef VGIC_GICV_BASE
-#define VGIC_GICV_BASE   0x01c86000UL   /* virtual CPU i/f — mapped to guest  */
+#define VGIC_GICV_BASE   SOC_A64_GICV_BASE   /* virtual CPU i/f — mapped to guest  */
 #endif
 
 /* The guest's virtual timer PPI: CNTV = GIC_PPI 11 -> INTID 16+11 = 27 (per

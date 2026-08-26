@@ -58,6 +58,7 @@
 #include "vblk_emmc.h"
 #include "el2_ncmap.h"
 #include "dbgtools.h"    /* CPU1 heartbeat / build-id / entry-hold (2026-07-26) */
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 #define K_ELF     0x44000000UL
 #define K_PABASE  0x46000000UL
@@ -200,7 +201,7 @@ int main(void)
 	 * main_dbg.c's fuller comment; identical fix, needed regardless of which
 	 * tick-path debugger is linked. */
 	{
-		volatile uint32_t *pc_cfg0 = (volatile uint32_t *)0x01C20848UL;
+		volatile uint32_t *pc_cfg0 = (volatile uint32_t *)SOC_A64_PIO_PC_CFG0;
 		uint32_t v = *pc_cfg0;
 		v = (v & ~(0xFu << 20)) | (3u << 20);
 		*pc_cfg0 = v;

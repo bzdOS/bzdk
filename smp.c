@@ -25,6 +25,7 @@
 #include "wdt.h"
 #include "hv_addrmap.h"   /* HVMAP_DBGTOOLS_HEARTBEAT: CPU1 debug-loop heartbeat */
 #include "hwbp.h"          /* hwbp_set_wp_el2(): per-core EL2 self-watch arm */
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 #ifdef HV_HDMI
 #include "hud.h"    /* hud_update(): live HUD refresh on CPU1 (HV_HDMI build) */
 #include "hdmi.h"   /* hdmi_phy_locked()/hdmi_relock(): PHY lock-loss defense */
@@ -224,8 +225,8 @@ static volatile uint32_t g_online;
  * ISENABLER0 / IPRIORITYR for PPIs (INTID 0..31) are banked PER CORE, so each
  * secondary must (re)program its own copy for INTID 30.
  * ------------------------------------------------------------------ */
-#define GICD_BASE 0x01c81000UL
-#define GICC_BASE 0x01c82000UL
+#define GICD_BASE SOC_A64_GICD_BASE
+#define GICC_BASE SOC_A64_GICC_BASE
 
 #define GICD_IGROUPR0    (*(volatile uint32_t *)(GICD_BASE + 0x080))
 #define GICD_ISENABLER0  (*(volatile uint32_t *)(GICD_BASE + 0x100))
@@ -571,7 +572,7 @@ void smp_secondary_main(uint64_t cpuid)
 			 * OCR=0. Hold it at 3 (RMW preserves FreeBSD's other PC pins; write
 			 * only when it drifted, so we don't fight the bus every iteration). */
 			{
-				volatile uint32_t *pc = (volatile uint32_t *)0x01C20848UL;
+				volatile uint32_t *pc = (volatile uint32_t *)SOC_A64_PIO_PC_CFG0;
 				uint32_t v = *pc;
 				if (((v >> 20) & 0xFu) != 3u)
 					*pc = (v & ~(0xFu << 20)) | (3u << 20);
