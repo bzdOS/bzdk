@@ -496,6 +496,13 @@ struct gt_percpu {
 	 * interface handed it. */
 	uint32_t musb_irqs;           /* MUSB IRQs taken since the last tick    */
 	uint32_t musb_throttles;      /* times the budget ran out and we masked */
+	/* Arrivals on a core that is NOT SMP_DEBUG_CPU — i.e. the guest's own
+	 * vCPU0 taking an interrupt EL2 targeted at CPU1. Nonzero means the
+	 * distributor's ITARGETSR has drifted (the guest's GIC driver resets it);
+	 * the tick's re-assert should drive these back to a standstill. Added
+	 * 2026-08-26, when they were the whole story rather than a corner case. */
+	uint32_t musb_wrong_core;
+	uint32_t hdmi_wrong_core;
 #ifdef HV_HDMI
 	/* TCON1 vblank storm throttle, same shape as the MUSB pair above and
 	 * for the same reason (HDMI_IRQ_BUDGET_PER_TICK comment at the
@@ -1185,21 +1192,44 @@ gic_timer_irq(struct el2_frame *frame)
 	 * core will service between two of its own CNTP ticks, after which the
 	 * INTID is masked at the distributor and the tick path re-enables it.
 	 *
-	 * NOT speculative hardening: measured live on hardware 2026-08-26. With no
-	 * ceiling, the first host-side write to /dev/ttyACM0 after arming
-	 * dbg_vcpu1 put this line into exactly the self-sustaining level-triggered
-	 * storm this file already documents for EHCI/INTID 106 — usbacm_poll()
-	 * evidently does not always de-assert every source OR'd into MUSB's single
-	 * aggregate "mc" line, so DIR re-pended it immediately and forever. The
-	 * failure mode is nastier than a plain hang and is worth naming: the
-	 * hardware watchdog stayed FED the whole time (wdt_pet() runs on every EL2
-	 * exception, and a storm supplies those in abundance), so nothing reset the
-	 * board — while dbgmon_service() and wdt_debug_kick(), which live ONLY in
-	 * the tick block below, starved completely. Observed order: the EMAC debug
-	 * channel went dark first, the guest kept running normally for minutes on
-	 * ssh, and only then did the guest itself wedge as CPU1's vCPU was starved
-	 * of every cycle. A dark debug channel plus a healthy guest is the
-	 * signature.
+	 * THIS CEILING IS LOAD-BEARING, AND THE NUMBERS ARE REAL (2026-08-26).
+	 * Measured on the board with the line correctly targeted at CPU1:
+	 *
+	 *     irq_counter[103] on CPU1:  ~646 interrupts per second
+	 *     musb_throttles   on CPU1:  +86 in 3 s, i.e. ~29 times/second the
+	 *                                32-per-tick budget was exhausted
+	 *
+	 * ~646/s on a completely idle CDC-ACM console is not normal traffic — it is
+	 * the level-triggered aggregate "mc" line re-asserting because
+	 * usbacm_poll() does not de-assert every source OR'd into it. Same shape as
+	 * the 145 kHz EHCI/INTID-106 storm this file documents elsewhere, three
+	 * orders of magnitude gentler, and fully contained: masking at the
+	 * distributor and re-enabling on the next tick bounds it to 32/tick and
+	 * keeps the tick itself — the watchdog kick and the debug channel, i.e.
+	 * every recovery lever this project has — guaranteed to run.
+	 *
+	 * A NOTE ON HOW THIS COMMENT GOT ITS FACTS, because the flip-flop is
+	 * instructive. An earlier revision claimed a measured storm; a second
+	 * revision RETRACTED that, on the grounds that reading GICD_ISENABLER back
+	 * live showed this INTID disabled and targeted at CPU0, "so it could not
+	 * have stormed". The retraction was wrong, and wrong in a specific,
+	 * repeatable way: the bit read 0 *because this very throttle had masked
+	 * it*, and the target byte read 0x01 because the guest's GIC driver resets
+	 * ITARGETSR (see the tick's re-assert). Reading a register back and finding
+	 * the state you did not expect is not evidence the mechanism is inert — it
+	 * can be evidence the mechanism is working. Only the per-core counters,
+	 * which cannot be explained away like that, settled it.
+	 *
+	 * The EMAC channel death that the first revision blamed on this storm was
+	 * genuinely a different bug (dbg_core_active stuck at 0 — see vcpu1.c's
+	 * comment at the store that fixes it). Both things were true at once; the
+	 * error was attributing one symptom to the other rather than measuring.
+	 *
+	 * The residual failure mode worth naming, unchanged: a storm keeps the
+	 * hardware watchdog FED, because wdt_pet() runs on every EL2 exception and
+	 * a storm supplies those in abundance — so nothing resets the board while
+	 * everything that lives only in the tick block starves. A dark debug
+	 * channel next to a perfectly healthy guest is that signature.
 	 *
 	 * WHY A BUDGET AND NOT A FIX AT THE SOURCE: draining every OR'd MUSB
 	 * source correctly is real work in musb.c (and unverified, which is how
@@ -1210,6 +1240,39 @@ gic_timer_irq(struct el2_frame *frame)
 	 * is ~3200/s, far more than a CDC-ACM console can generate, so a healthy
 	 * MUSB never reaches the ceiling and this costs nothing in the normal case. */
 #define MUSB_IRQ_BUDGET_PER_TICK 32u
+	/* CORE-GATED, added 2026-08-26 after reading the live distributor back.
+	 * Without this gate the whole design degenerates, and it did — measured:
+	 *
+	 *   CPU0 irq_counter[103] climbing ~133/s, musb_throttles 47168 ~= that
+	 *   same count, while CPU1's counters sat frozen at 3783 and its
+	 *   musb_irqs was 0.
+	 *
+	 * Two faults compounding. First, the guest's own GIC driver resets
+	 * GICD_ITARGETSR across the SPI range to the boot CPU during attach, so
+	 * musb_irq_arm_cpu1()'s one-shot "target CPU1 only" does NOT survive guest
+	 * boot — read back live, INTID 103's target byte was 0x01, not 0x02. The
+	 * line therefore fires on CPU0, the guest's primary vCPU, which is exactly
+	 * the hardware race usbacm.h's "KNOWN OPEN RISK" section warns about.
+	 * Second, the per-tick budget RESET lives in the
+	 * `smp_cpu_id() == SMP_DEBUG_CPU && dbg_vcpu1` tick block, i.e. only on
+	 * CPU1 — so on CPU0 gt->musb_irqs grew monotonically, stayed permanently
+	 * above the ceiling, and masked the line on EVERY single interrupt, which
+	 * CPU1's tick then dutifully re-enabled: an enable/mask ping-pong running
+	 * at tick rate.
+	 *
+	 * So a wrong-core arrival is EOI'd and dropped rather than serviced. It
+	 * must not fall through either: the generic path below would hand this
+	 * INTID to vgic_inject_hw(), and the guest has no driver for a node its
+	 * own DTB marks status="disabled". Dropping is safe because the tick
+	 * re-asserts the targeting (see the tick block), so this self-corrects;
+	 * the counter exists so "it is landing on the wrong core" is visible
+	 * instead of being a silent performance leak on the guest's vCPU0. */
+	if (intid == MUSB_IRQ_INTID && smp_cpu_id() != SMP_DEBUG_CPU) {
+		gt->musb_wrong_core++;
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		return;
+	}
 	if (intid == MUSB_IRQ_INTID) {
 		usbacm_poll();
 		GICC_EOIR = iar;
@@ -1263,6 +1326,19 @@ gic_timer_irq(struct el2_frame *frame)
 	 * A real 60 Hz vblank is ~0.6 events per 10 ms tick, three orders of
 	 * magnitude under this ceiling, so a healthy TCON1 never reaches it. */
 #define HDMI_IRQ_BUDGET_PER_TICK 32u
+	/* Core-gated for exactly the same measured reason as MUSB above (CPU0 was
+	 * taking INTID 119 at ~80/s with hdmi_throttles tracking it one-for-one
+	 * while CPU1 sat frozen at 97). Dropped rather than serviced on the wrong
+	 * core: servicing would run hdmi_vblank_poll() on the guest's primary vCPU
+	 * and clear the latch out from under CPU1, and falling through would hand a
+	 * TCON interrupt to vgic_inject_hw() for a guest whose DTB marks that node
+	 * disabled. The tick's re-assert repairs the targeting. */
+	if (intid == HDMI_TCON1_IRQ_INTID && smp_cpu_id() != SMP_DEBUG_CPU) {
+		gt->hdmi_wrong_core++;
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		return;
+	}
 	if (intid == HDMI_TCON1_IRQ_INTID) {
 		hdmi_vblank_poll();
 		GICC_EOIR = iar;
@@ -1463,6 +1539,26 @@ gic_timer_irq(struct el2_frame *frame)
 		GICD_ISENABLER(GICD_WORD(MUSB_IRQ_INTID)) =
 		    (1u << GICD_BIT(MUSB_IRQ_INTID));
 
+		/* RE-ASSERT THE TARGETING, not just the enable (added 2026-08-26).
+		 * musb_irq_arm_cpu1()/hdmi_irq_arm_cpu1() run ONCE, at vcpu1 entry —
+		 * and the guest's GIC driver then resets GICD_ITARGETSR across the SPI
+		 * range to the boot CPU during its own attach, silently undoing them.
+		 * Read back live: INTID 103's target byte was 0x01 (CPU0), not the
+		 * 0x02 that was written, and CPU0 was taking the interrupts.
+		 *
+		 * This is the SAME class of problem as the PC5 pinmux enforcement a
+		 * few lines below — "FreeBSD's own driver keeps undoing our setting" —
+		 * and it gets the same, already-proven treatment: re-assert on the
+		 * tick, and write only when it has actually drifted, so we are not
+		 * fighting the distributor bus every 10 ms for nothing.
+		 *
+		 * ITARGETSR is BYTE-addressable, one byte per INTID; the byte accessor
+		 * exists precisely so a single INTID can be retargeted without
+		 * splattering its three neighbours (see GICD_ITARGETSR_BYTE's own
+		 * comment and vgicd.c's SAS-decode note on the same hazard). */
+		if (GICD_ITARGETSR_BYTE(MUSB_IRQ_INTID) != (1u << 1))
+			GICD_ITARGETSR_BYTE(MUSB_IRQ_INTID) = (1u << 1);
+
 #ifdef HV_HDMI
 		/* Refresh the TCON1 vblank storm budget and un-mask the line if the
 		 * previous window exhausted it — identical shape and identical
@@ -1475,6 +1571,11 @@ gic_timer_irq(struct el2_frame *frame)
 		gt->hdmi_irqs = 0;
 		GICD_ISENABLER(GICD_WORD(HDMI_TCON1_IRQ_INTID)) =
 		    (1u << GICD_BIT(HDMI_TCON1_IRQ_INTID));
+
+		/* Same drift-correcting re-assert as MUSB's just above, same measured
+		 * reason (CPU0 was taking INTID 119 while CPU1 sat frozen). */
+		if (GICD_ITARGETSR_BYTE(HDMI_TCON1_IRQ_INTID) != (1u << 1))
+			GICD_ITARGETSR_BYTE(HDMI_TCON1_IRQ_INTID) = (1u << 1);
 #endif
 
 		{
