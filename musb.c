@@ -22,20 +22,21 @@
 #include <stdint.h>
 #include "musb.h"
 #include "wdt.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ------------------------------------------------------------------ */
 /* Physical addresses (PROJECT.md, verified on BPI-M64 "Chimp")        */
 /* ------------------------------------------------------------------ */
-#define MUSB_MMIO_BASE   0x01c19000UL
-#define CCU_MMIO_BASE    0x01c20000UL
+#define MUSB_MMIO_BASE   SOC_A64_MUSB_BASE
+#define CCU_MMIO_BASE    SOC_A64_CCU_BASE
 
 /* USB PHY0 "phy_ctrl" register block (A64 DT phy@1c19400) — this is the SAME
  * window the MUSB glue reaches as MUSB_base + 0x400 (so REG_ISCR below lands
  * here). ISCR = +0x00, PHYCTL (A33-style, bit-banged calibration) = +0x10,
  * OTGCTL (PHY0 host/gadget route) = +0x20. */
-#define USBPHY_CTRL_BASE 0x01c19400UL
-#define USBPHY_PMU0_BASE 0x01c1a800UL   /* DT "pmu0"; HCI_PHY_CTL at +0x10   */
-#define SRAMC_MMIO_BASE  0x01c00000UL   /* SRAM controller (USB FIFO mapping) */
+#define USBPHY_CTRL_BASE SOC_A64_USBPHY_CTRL_BASE
+#define USBPHY_PMU0_BASE SOC_A64_USBPHY_PMU0_BASE   /* DT "pmu0"; HCI_PHY_CTL at +0x10   */
+#define SRAMC_MMIO_BASE  SOC_A64_SRAMC_BASE   /* SRAM controller (USB FIFO mapping) */
 
 #define USBPHY_PHYCTL    (USBPHY_CTRL_BASE + 0x10)  /* REG_PHYCTL_A33          */
 #define USBPHY_OTGCTL    (USBPHY_CTRL_BASE + 0x20)  /* REG_PHY_OTGCTL          */

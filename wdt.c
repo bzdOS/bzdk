@@ -39,10 +39,11 @@
 #include <stdint.h>
 #include "wdt.h"
 #include "cntpct.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
-#define WDOG_CTRL (*(volatile uint32_t *)0x01C20CB0UL)
-#define WDOG_CFG  (*(volatile uint32_t *)0x01C20CB4UL)
-#define WDOG_MODE (*(volatile uint32_t *)0x01C20CB8UL)
+#define WDOG_CTRL (*(volatile uint32_t *)SOC_A64_WDOG_CTRL)
+#define WDOG_CFG  (*(volatile uint32_t *)SOC_A64_WDOG_CFG)
+#define WDOG_MODE (*(volatile uint32_t *)SOC_A64_WDOG_MODE)
 
 #define WDOG_CTRL_RESTART  (((uint32_t)0x0A57u << 1) | 1u)   /* 0x14AF */
 #define WDOG_CFG_RESET_SYS 0x00000001u

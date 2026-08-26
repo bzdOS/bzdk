@@ -27,6 +27,7 @@
 #include "fb.h"
 #include "exceptions.h"
 #include "hv_addrmap.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ------------------------------------------------------------------ *
  * Palette — dark background, cyan headers, green/amber values, red for
@@ -255,9 +256,9 @@ _Static_assert(HDMI_BC_BASE == HVMAP_LOW_HDMI_BC,
 #define VCON_MAGIC   0x55415254u    /* "UART" */
 #define EXC_MAGIC    0x45584331u    /* "EXC1" */
 
-#define GICD_CTLR_ADDR 0x01c81000UL
-#define GICC_PMR_ADDR  0x01c82004UL
-#define MUSB_POWER_ADDR 0x01c19040UL
+#define GICD_CTLR_ADDR SOC_A64_GICD_BASE
+#define GICC_PMR_ADDR  (SOC_A64_GICC_BASE + 0x4)
+#define MUSB_POWER_ADDR (SOC_A64_MUSB_BASE + 0x40)
 
 /* ------------------------------------------------------------------ *
  * Small drawing helpers.

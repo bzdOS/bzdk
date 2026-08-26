@@ -71,6 +71,7 @@
 
 #include <stdint.h>
 #include "exceptions.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 #define VBLK_SD_MMIO_BASE   0x0A004000UL
 #define VBLK_SD_MMIO_SIZE   0x00000200UL
@@ -80,7 +81,7 @@
 #define VBLK_SD_SPI      108u
 #define VBLK_SD_INTID    (32u + VBLK_SD_SPI)   /* == 140 */
 
-#define VBLK_SD_GICD_BASE       0x01C81000UL
+#define VBLK_SD_GICD_BASE       SOC_A64_GICD_BASE
 #define VBLK_SD_GICD_ISPENDR    0x200u
 
 /* Register offsets — identical layout to vblk_emmc.h's (the virtio-mmio

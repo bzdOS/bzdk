@@ -46,6 +46,7 @@ extern void reboot_clean(void);
  * wdt.h (rather than a local `extern volatile uint32_t wdt_debug_hold;`)
  * is what makes that macro visible here. */
 #include "wdt.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 extern void wdt_arm(void);
 extern void wdt_disarm(void);
 
@@ -157,7 +158,7 @@ _Static_assert(BMC_UART_BASE == HVMAP_LOW_VCONSOLE_HDR,
  * If the controller is not running (raw==0 or 0xFFF) we report 0 = n/a rather
  * than a bogus temperature. NOTE: this is the ONLY new hardware touch in the
  * whole BMC; every other verb is pure façade. */
-#define A64_THS_BASE    0x01C25000UL
+#define A64_THS_BASE    SOC_A64_THS_BASE
 #define A64_THS0_DATA   (A64_THS_BASE + 0x80u)
 
 /* ------------------------------------------------------------------ *

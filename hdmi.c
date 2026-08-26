@@ -77,6 +77,7 @@
 #include "hdmi.h"
 #include "timer.h"
 #include "rsb.h"    /* re-enable the PHY's dldo1 supply FreeBSD gates off */
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ==================================================================== *
  * MMIO helpers
@@ -169,14 +170,14 @@ static int wait_bits(uintptr_t addr, uint32_t mask, uint32_t want, uint32_t time
  * Physical bases (all cited above; repeated here as the single source of
  * truth this file actually compiles against).
  * ==================================================================== */
-#define CCU_BASE        0x01C20000UL
-#define SRAMC_BASE      0x01C00000UL
+#define CCU_BASE        SOC_A64_CCU_BASE
+#define SRAMC_BASE      SOC_A64_SRAMC_BASE
 #define DE2_BASE        0x01000000UL
 #define DE2_MUX1_BASE   (DE2_BASE + 0x200000UL) /* mux1 == the path routed
                                                   * to HDMI on non-H3/H5
                                                   * DE2 SoCs (A64 included) --
                                                   * sunxi_de2.c line 262 */
-#define TCON1_BASE      0x01C0D000UL /* SUNXI_LCD1_BASE */
+#define TCON1_BASE      SOC_A64_TCON1_BASE /* SUNXI_LCD1_BASE */
 #define HDMI_CTRL_BASE  0x01EE0000UL
 #define HDMI_PHY_BASE   (HDMI_CTRL_BASE + 0x10000UL) /* sunxi_dw_hdmi.c:45 */
 

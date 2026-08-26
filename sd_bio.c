@@ -33,13 +33,14 @@
 #include "sd_bio.h"
 #include "hv_addrmap.h"     /* HVMAP_SD_BC */
 #include "cntpct.h"
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 /* ------------------------------------------------------------------ */
 /* Physical bases (SD-specific)                                        */
 /* ------------------------------------------------------------------ */
-#define SD_BASE          0x01c0f000UL   /* SMHC0/aw_mmc0 (SD card) controller */
-#define PIO_PF_CFG0      0x01C208B4UL   /* Port F config reg 0 (PF0..PF7)     */
-#define CCU_MMC0_CLK     0x01c20088UL   /* CCU MMC0_CLK gate/divider          */
+#define SD_BASE          SOC_A64_SMHC0_BASE   /* SMHC0/aw_mmc0 (SD card) controller */
+#define PIO_PF_CFG0      (SOC_A64_PIO_BASE + 0xB4)   /* Port F config reg 0 (PF0..PF7)     */
+#define CCU_MMC0_CLK     SOC_A64_CCU_MMC0_CLK   /* CCU MMC0_CLK gate/divider          */
 
 /* PF0..PF5 -> function 2 (mmc0), preserving PF6 (card-detect) / PF7 nibbles. */
 #define PF_MMC0_CFG0     0x00222222u

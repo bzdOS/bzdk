@@ -51,6 +51,7 @@
 #define BZDOS_VGICD_H
 
 #include <stdint.h>
+#include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
 struct el2_frame;
 
@@ -59,7 +60,7 @@ struct el2_frame;
  * as UART0, which stage2_build_mmio_tables() already splits to 4 KiB pages for
  * the UART trap — so trapping it costs one more invalid L3 entry, no new table
  * and no new level. Verified live: index 129 in that table. */
-#define VGICD_BASE   0x01c81000UL
+#define VGICD_BASE   SOC_A64_GICD_BASE
 #define VGICD_SIZE   0x00001000UL
 
 /* Distributor register offsets this module cares about (GICv2). */

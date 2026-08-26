@@ -314,6 +314,65 @@ Everything in 0.0.1's list still stands except where noted, plus:
   regression.
 - **One board.** Unchanged, and still the largest caveat in this file.
 
+## Portability: the first real step, taken deliberately now
+
+The stated product direction is the Allwinner Banana Pi family and the
+PinePhone. One fact makes half of that much cheaper than it sounds: **the
+PinePhone is the same Allwinner A64 die as the BPI-M64** — same GIC-400, CCU,
+PIO, watchdog, SMHC, MUSB and PHY, same DE2 and Mali-400, same AXP803 PMIC. It
+is not a new platform, it is a second board on a known SoC.
+
+"The whole Banana Pi family" is not one family, though: M64 is A64, M2+ is H3,
+M3 is A83T, M2 Zero is H2+, M2 Berry is V40 — but M5 is Amlogic, R2 is
+MediaTek, and F3 is RISC-V. The coherent target is the Allwinner subset; the
+rest are different projects wearing the same brand.
+
+**Two findings that matter more than the address consolidation itself:**
+
+- **The PinePhone has no Ethernet.** This project's differentiator — a debug
+  plane that outlives the guest: dbgmon, the GDB stub, coredumps and snapshots
+  over the network, `hvdbg` — is built entirely on EMAC. On the PinePhone it
+  would have to move to USB. That promotes the MUSB storm measured above from a
+  bounded nuisance to a defect on the critical path of the stated direction.
+- **The display path genuinely differs** even on the same die: MIPI-DSI off
+  TCON0 rather than HDMI off TCON1. DE2, Mali-400, zero-copy and KMS carry over;
+  the output stage does not.
+
+Those two converge on one conclusion worth writing down: the single investment
+that serves both the feature axis and the portability axis is making the debug
+plane **transport-independent and reliable**. The feature axis needs it stable
+(source-level GDB, the one genuinely broken headline, is blocked behind channel
+reliability); the portability axis needs it non-Ethernet. Same work.
+
+### What was actually done here
+
+`soc_a64.h` now holds every A64 peripheral address in one place. Before it, 48
+`#define`s across 44 files each carried their own copy, and the same address was
+often spelled several ways — the GIC distributor at `0x01C81000` had **eight
+names across 19 files** (`GICD_BASE`, `GICD_CTLR_ADDR`, `VGICD_BASE`,
+`VGIC_GICD_BASE`, `VBLK_GICD_BASE`, `VBLK_SD_GICD_BASE`, `VINPUT_GICD_BASE`,
+`VNET_GICD_BASE`); MUSB, CCU and SRAMC had two each; `WDOG_CTRL`/`CFG`/`MODE`
+were defined twice each in different letter case. That is not untidiness, it is
+the mechanism by which a port breaks: change seven of eight and the eighth
+silently keeps the old address.
+
+Deliberately a *pure consolidation*, not a HAL: local names are kept and simply
+re-pointed at the canonical ones, so no use site changed and nothing is selected
+at runtime. Verified the only way that claim can be verified — **the compiled
+binary is byte-for-byte identical**, same md5 before and after — plus the full
+board-free gate, plus a boot on hardware.
+
+Done now rather than after the pause for a specific reason: it is a
+44-file mechanical change on a bare-metal image where a wrong address means a
+board that does not boot, and physical access to press reset is the one resource
+that disappears during a months-long pause. The green board-free gate is what
+made it reviewable at all.
+
+**Still hardcoded, and named rather than quietly left:** the load address
+(`0x42000000`) and DRAM window in `link.ld`/`stage2.h`; RSB/AXP803 register
+knowledge; the GIC SPI numbers, which stay with the drivers that cite them from
+the DTB; and the HDMI/DE2 pipeline's assumption of an HDMI sink.
+
 ## Core allocation in the default build — CHANGED
 
 **CPU0** guest vCPU0 · **CPU1** guest vCPU1 *(was: debug/watchdog plane)*, with
