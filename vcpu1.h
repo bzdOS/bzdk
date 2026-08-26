@@ -41,18 +41,39 @@
  *
  * A *software* guest hang on CPU1 (spin loop, masked EL1 interrupts, a
  * deadlocked driver) can no longer starve the watchdog kick — IMO=1 routes
- * around it exactly as it already does for CPU0. What is NOT recovered is a
- * *hardware*-level wedge of this specific physical core (a cache-coherency
- * deadlock, an exception storm that also corrupts EL2's own state on this
- * core, a bus hang) — if the core itself stops fetching instructions, no
- * amount of GIC priority helps, because EL2's tick handler can't run either.
- * That is the residual risk this project accepted CPU1's separateness to
- * avoid, and it is real: this file does not make it go away, it narrows it
- * from "any guest bug on CPU1" down to "a hardware-level wedge of CPU1
- * specifically" — which is rarer, but not impossible, and this project's own
- * history has hit strange hardware-level wedge states before (see the
- * hold-gate-plus-breakpoint-crashes-board incident). Whoever arms this
- * feature is accepting that narrower, but nonzero, residual risk.
+ * around it exactly as it already does for CPU0.
+ *
+ * CORRECTED 2026-08-26. This paragraph used to claim that a HARDWARE-level
+ * wedge of CPU1 "is NOT recovered", on the reasoning that EL2's tick handler
+ * cannot run on a core that has stopped fetching instructions. That reasoning
+ * is backwards, and the claim overstated the risk badly enough to be worth
+ * replacing rather than softening: if this core stops kicking the watchdog,
+ * the watchdog is precisely what FIRES. Not kicking it is the recovery path,
+ * not the loss of one.
+ *
+ * Read wdt.c's own header for the layering that closes this. The watchdog has
+ * two independent feeds and only one of them is unconditional:
+ *   - wdt_debug_kick(), from this core's tick, unconditional. Its own comment
+ *     already said the right thing: "If CPU1 itself ever dies, petting stops
+ *     on its own and the same <=16 s HW fire recovers the board."
+ *   - wdt_pet(), from el2_trap() on ANY core, GATED on the guest having made
+ *     observable progress (a console byte) within WDT_TIMEOUT_S. So a board
+ *     that is trapping busily but producing nothing — the exact shape of a
+ *     wedge — is NOT held alive by it. wdt.c names that as the case an
+ *     el2_trap-only pet got wrong.
+ * So: CPU1 dies -> the guest hits its first IPI to that vCPU and stops making
+ * progress -> wdt_pet() stops re-arming -> the hardware timer fires within
+ * <=16 s -> U-Boot -> chimpd reloads. No human.
+ *
+ * THE ONE RESIDUAL CASE, stated narrowly because that is what it is: CPU1 is
+ * hardware-dead AND the guest nonetheless keeps emitting console bytes. Then
+ * wdt_pet() keeps the board resident in a degraded state — one vCPU dead, and
+ * no debug channel, since dbgmon rides this core's tick. For an SMP guest that
+ * combination is unlikely (FreeBSD will almost certainly block on an IPI to the
+ * missing core long before 16 s elapse), but it is not impossible, and this
+ * project has met strange hardware-level wedge states before — see the
+ * hold-gate-plus-breakpoint-crashes-board incident. That, and only that, is
+ * what arming this feature accepts.
  *
  * WHAT ELSE STOPS RUNNING ON CPU1 WHEN THIS IS ARMED
  *
