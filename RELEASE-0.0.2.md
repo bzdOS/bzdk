@@ -400,3 +400,54 @@ async eMMC I/O · **CPU3** idle, or a concurrent Zephyr guest in `make dual`.
 
 Giving the guest all four cores is still not done: CPU2's async I/O is
 load-bearing, and CPU3 is architecturally exclusive with the second-guest build.
+
+## The board's own build environment: repaired, and a false alarm worth recording
+
+The board has been its own build host since July. That stopped being true at
+some point: `python3 -c "pass"` segfaulted, which blocked `meson`, which blocked
+the native Mesa/lima build.
+
+**It looked like our bug, and the trail was a good one.** `ktrace` put the
+SEGV_MAPERR immediately after an anonymous `mmap()` that had itself *succeeded* —
+and this hypervisor maps guest DRAM writable-but-execute-never, promoting pages
+on demand from a fixed pool (`STAGE2_WX_DYNAMIC`). "The kernel granted a mapping
+and the first touch faulted" is precisely the shape a bug in that mechanism
+takes.
+
+It was not that. The new `guest_memtest.c` says so by measurement rather than
+argument: anonymous RW at four sizes, anonymous RWX, and — the step that matters,
+because the first five would pass even with promotion entirely broken — write
+bytes, `mprotect` them `R|X`, and *call* them. All six pass on hardware; the
+called page returns 42. **The lesson is cheaper than the diagnosis: `ktrace`
+names the last syscall before a SIGSEGV, not its cause.** A userland process
+faults between syscalls, so adjacency in a trace is not evidence.
+
+The real fault was on disk. Working back from the register state — `ob_type ==
+NULL` on a static exception type, so CPython was raising an error before
+`PyType_Ready` had run on the type it needed — the actual message recovered from
+the core was `"non-string found in code slot"`: the *frozen* `importlib` bytecode
+compiled into `libpython3.12.so.1.0` would not unmarshal. Comparing all 8027
+files of the package against an intact reference already sitting in
+`/var/cache/pkg`: **70 files corrupt at exactly their correct length**, scattered
+across headers, `lib-dynload/*.so`, stdlib `.py`, test data and a bundled
+`.whl` — the signature of the era when `rd_cntpct()` could run backwards. That
+cause is fixed; this was its stale wreckage. `meson` had 6 more of the same.
+
+`pkg check -s` had said python312 was fine, and that meant nothing: its file
+list in pkg's database is *empty*, so there was nothing to check. Both packages
+with an emptied list — python312 and meson — are ones an earlier `pkg install`
+of mine was killed inside; the other 121 are intact, and a full sweep of every
+package with an exact-version cached reference found **zero** further damaged
+files. The blast radius really was those two packages.
+
+Repaired from the local references, with `pkg` deliberately not involved (it is
+the thing that crashes here). Both write windows put the read-only root back
+with a `trap`, not a line at the end of the happy path — earlier the same day a
+`pkg` crash inside such a window left root writable precisely because the
+cleanup was unreachable. `fsck_ffs -n` clean before and after, identical file
+counts. `PyYAML` and `ply` were missing outright and are staged under `/opt` on
+`PYTHONPATH` instead of installed, so that need cost no root write at all.
+
+Proven by the task rather than by version strings: `meson setup` now completes
+on the board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is
+building all 993 targets.
