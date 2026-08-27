@@ -300,6 +300,30 @@ static inline void exc_bc(int i, uint32_t v)
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 
+/* Per-core fault attribution (EC 0x0E storm triage, 2026-08-27): during the
+ * 4-vCPU repro the guest froze in a two-secondary-core synchronous-fault
+ * storm, but the global EXC1 window records no core. Record, per core, a
+ * count + last (esr, elr) into the free tail of the VCPU3_BC window so a
+ * reader can see WHICH cores are storming. Additive diagnostic only -- no
+ * behaviour change. Layout (all inside VCPU3_BC's 0x100-byte window, which
+ * runs 0x5009E400..0x5009E500 and ends just below HVMAP_VGIC_BC_HI):
+ *   word (32 + core*4)     : fault count for that core
+ *   word (33 + core*4)     : last esr
+ *   word (34 + core*4)     : last elr lo
+ *   word (35 + core*4)     : last elr hi
+ * Each core is the SOLE writer of its own slot (it keys the slot off its own
+ * smp_cpu_id()), so the read-modify-write of the count has no cross-core race.
+ */
+#define PCORE_BC_BASE (HVMAP_VCPU3_BC + 0x80u)
+static inline void pcore_bc(int core, int slot, uint32_t v)
+{
+	volatile uint32_t *p = (volatile uint32_t *)(PCORE_BC_BASE +
+	                                            (uint32_t)core * 0x10u +
+	                                            (uint32_t)slot * 4u);
+	*p = v;
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
 /* Optional best-effort console line. Weak so a build without a console
  * (e.g. a pure fault-catcher) still links; main_*.c provides the real one. */
 __attribute__((weak)) void exc_report_line(const struct el2_frame *f)
@@ -1266,13 +1290,29 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	}
 
 	/* Guest (lower-EL) synchronous DATA ABORT (ESR EC==0x24): route by which
-	 * core is trapping. Every existing target only ever reaches this with
-	 * cpu==0 (CPU3 sits in `wfi` in all of them, see smp.c), so the cpu==3
-	 * branch below is dead code for them; the cpu!=3 branch is the ORIGINAL
-	 * code, unchanged, just now inside an explicit else. */
+	 * core is trapping. Every target without the 4th vCPU armed only ever
+	 * reaches this with cpu==0 (CPU3 sits in `wfi` in them, see smp.c), so the
+	 * cpu==3 branch below is dead code for those; the cpu!=3 branch is the
+	 * ORIGINAL FreeBSD-guest code, unchanged, just now inside an explicit
+	 * else.
+	 *
+	 * WHO OWNS CPU3: that is not a compile-time fact -- it is the runtime flag
+	 * `dbg_vcpu3` (see vcpu3.c/vcpu3.h). It is nonzero exactly when vcpu3_run()
+	 * handed CPU3 to FreeBSD as a FOURTH vCPU (the `make dbg VCPU3=1` build);
+	 * it is zero in every other build, including the `dual` target, where CPU3
+	 * runs Zephyr (zguest_cpu3.c) instead. CPU3's data aborts MUST be routed by
+	 * the same rule: when dbg_vcpu3 is set it is a FreeBSD vCPU on the SAME
+	 * stage-2 tables as CPU0/1/2, so its device faults need the FreeBSD handler
+	 * set below (vconsole(0)/vgicd/wdogtrap/vblk/vnet/vinput/vblk_sd), NOT the
+	 * Zephyr channel-1 set. Prior to this fix the cpu==3 branch was selected
+	 * UNCONDITIONALLY, so in the 4-vCPU build a FreeBSD device MMIO fault on
+	 * CPU3 (e.g. generic_bs_r_4 reading a kernel device VA) fell through every
+	 * Zephyr handler, hit the unhandled path, and -- since guest faults never
+	 * advance ELR -- re-trapped at the identical (esr,elr) forever: the fault
+	 * storm that froze the 4-vCPU guest (2026-08-27). */
 	if ((kind >> 2) == 2u && (kind & 3u) == EL2_KIND_SYNC &&
 	    (((uint32_t)(frame->esr >> 26)) & 0x3fu) == 0x24u) {
-		if (smp_cpu_id() == 3u) {
+		if (smp_cpu_id() == 3u && !dbg_vcpu3) {
 			/* Dual-guest milestone: CPU3/Zephyr. Try the channel-1 virtual
 			 * UART0 first (the one real, meaningfully-emulated device
 			 * Zephyr's console needs — see vconsole.c/vconsole.h); anything
@@ -1434,6 +1474,27 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		exc_bc(10, (uint32_t)frame->x[30]);
 		exc_bc(11, (uint32_t)((hpfar & 0xFFFFFFFFF0ULL) << 8)); /* IPA low */
 		exc_bc(12, (uint32_t)(((hpfar & 0xFFFFFFFFF0ULL) << 8) >> 32));
+
+		/* Per-core fault attribution (see pcore_bc above): the WINDOW is the
+		 * storm triage from the 4-vCPU repro -- the global EXC1 breadcrumb is
+		 * last-writer-wins across all cores, so it could not say WHICH cores
+		 * were storming. Here each core stamps its own count + last esr/elr. */
+		{
+			uint32_t core = smp_cpu_id();
+			if (core < 4u) {
+				volatile uint32_t *cnt =
+					(volatile uint32_t *)(PCORE_BC_BASE + core * 0x10u);
+				uint32_t n = *cnt + 1u;
+				__asm__ volatile("dc civac, %0\n\tdsb sy"
+				                 :: "r"(cnt) : "memory");
+				*cnt = n;
+				__asm__ volatile("dc civac, %0\n\tdsb sy"
+				                 :: "r"(cnt) : "memory");
+				pcore_bc(core, 1, (uint32_t)frame->esr);
+				pcore_bc(core, 2, (uint32_t)frame->elr);
+				pcore_bc(core, 3, (uint32_t)(frame->elr >> 32));
+			}
+		}
 
 		/* AD-HOC diagnostic capture (2026-07-23, first-ever userland-
 		 * transition fault storm investigation): the guest's own EL1 MMU

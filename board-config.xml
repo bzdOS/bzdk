@@ -64,7 +64,7 @@
          fix); vcpu3 has none yet. Arm with `make dbg VCPU3=1` or flip this to
          "true" once vcpu2's fix is confirmed on real hardware, see
          RELEASE-0.0.2.md/PROGRESS.md for that result once it exists. -->
-    <feature name="vcpu3" mkvar="VCPU3" enabled="false" needs-dtb-cpu="3"/>
+    <feature name="vcpu3" mkvar="VCPU3" enabled="true" needs-dtb-cpu="3"/>
     <!-- guest_dram_2g: hand the guest the board's whole 2 GiB instead of the low
          GiB, giving up snapshot/restore, whose mirror IS that high GiB. Turned on
          2026-08-27 for a measured reason, not a preference: the board is the
