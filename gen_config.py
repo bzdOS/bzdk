@@ -39,6 +39,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_XML = HERE / "board-config.xml"
 DEFAULT_DTB = Path("/opt/bzdos/tftpboot/bananapi-min.dtb")
+# The /memory size the board ships with when no feature widens it: the low
+# GiB, matching stage2.h's STAGE2_DRAM_SIZE default.
+DEFAULT_MEMORY_SIZE = "0x40000000"
 CONFIG_MK = HERE / "config.mk"
 
 # SPI numbers must stay inside the documented free gap (docs/virtio-blk-dtb.md).
@@ -358,12 +361,19 @@ def main():
         if f["enabled"] and f["needs_dtb_cpu"]:
             ensure_cpu_node(dtb_path, dts_text, f["needs_dtb_cpu"], args.dry_run)
 
-    # /memory tracks whichever feature declares a dtb-memory-size; when none is
-    # enabled the node keeps whatever it has, which is the 1 GiB default.
+    # /memory tracks whichever feature declares a dtb-memory-size -- and, just as
+    # importantly, gets put BACK when none is enabled. Leaving it wide after the
+    # feature is switched off is the same one-directional bug this script had for
+    # a stale cpu@N node, and it is worse here: a /memory node promising a GiB
+    # that stage-2 no longer maps means the guest faults the moment it allocates
+    # up there, which is exactly how it presented (translation fault, level 1,
+    # IPA 0xBFFF0000) when the two halves were briefly out of step.
+    want = None
     for name, f in features.items():
         if f["enabled"] and f["dtb_memory_size"]:
-            ensure_memory_size(dtb_path, dts_text, f["dtb_memory_size"],
-                               args.dry_run)
+            want = f["dtb_memory_size"]
+    ensure_memory_size(dtb_path, dts_text, want or DEFAULT_MEMORY_SIZE,
+                       args.dry_run)
 
     # NOTE on ORDER, observed the same day: ensure_cpu_node() adds nodes with
     # `fdtput -p`, which PREPENDS. Arming vcpu2 therefore produced /cpus in the
