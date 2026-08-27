@@ -24,6 +24,18 @@
 #include "guest.h"
 #include "kload.h"
 #include "gic_timer.h"
+#include "vgic.h"    /* vgic_init() -- see the call site below. Added
+                      * 2026-08-27; this core never had it before, and per
+                      * RELEASE-0.0.2.md's own account of CPU1's identical bug
+                      * ("`vcpu1_run()` never called `vgic_init()` on CPU1 ...
+                      * that core had zero interrupts: no timer, no IPI") plus
+                      * this file's own 0.0.1-era hardware result ("Verified —
+                      * the guest enumerates CPU 1 ... affinity: 2, sets up
+                      * IPIs, completes Release APs. That was as far as it
+                      * went" -- RELEASE-0.0.2.md, "The headline"), CPU2 as
+                      * shipped here almost certainly hit the exact same wedge
+                      * CPU1 did, just never root-caused as such because
+                      * VCPU2 defaults off and attention moved to CPU1. */
 
 /* Default off. Overridable at BUILD time because the guest issues its PSCI
  * CPU_ON during its own early boot, long before anything can reach dbgmon over
@@ -174,6 +186,41 @@ void vcpu2_run(void)
 	 * this out for exactly this kind of caller. */
 	gic_timer_cpuif_init();
 
+	/* THE FIX THIS FILE WAS MISSING (added 2026-08-27, ported from vcpu1.c's
+	 * hardware-proven root-cause fix -- board-UNVERIFIED here; VCPU2 defaults
+	 * off, see vcpu2.h, so this changes no default-build behaviour).
+	 *
+	 * Under this project's live HCR_EL2.IMO=1/FMO=1 policy (main_dbg.c; set
+	 * again on THIS core three bits above), EL2 owns every physical
+	 * interrupt and the ONLY route to the guest is vgic_inject_hw() tying it
+	 * to a GICH List Register (vgic.c). GICH is per-PE-banked and
+	 * vgic_active() reads the CALLING core's own vg_percpu slot -- a core
+	 * that never ran its own vgic_init() has GICH_HCR.En == 0 and nr_lr == 0,
+	 * so gic_timer_irq()'s forwarding block (`if (vgic_active() && ...)`)
+	 * never triggers there, and the fallback legacy path's own
+	 * vgic_inject_hw() call (gic_timer.c) finds no free List Register either
+	 * (nr_lr == 0) and queues into a per-core pending queue that nothing
+	 * ever drains, because the maintenance PPI that drains it
+	 * (VGIC_MAINT_INTID) was also never armed here. Net effect: every
+	 * physical interrupt this core takes -- in particular the smp_rendezvous
+	 * IPI FreeBSD's SMP bring-up sends the instant it needs cross-call
+	 * coordination -- is accepted at the GIC but never reaches the guest.
+	 *
+	 * That is exactly the "Release APs...done." wedge vcpu1.c's header
+	 * documents finding and fixing for CPU1 (missing vgic_init() there too),
+	 * and RELEASE-0.0.2.md records this file getting no further than that
+	 * same line on real hardware during 0.0.1 -- before the root cause was
+	 * understood. It was never revisited here because CPU1 became the
+	 * default second vCPU and VCPU2 stayed an off-by-default experiment.
+	 *
+	 * Must run BEFORE this core's own IRQ+FIQ unmask below, same ordering
+	 * vcpu1.c uses and for the same reason: EL2 must never take a physical
+	 * IRQ on this core before it has somewhere (a List Register) and a
+	 * policy (HW-mode injection) ready for it. Also zeroes CNTVOFF_EL2,
+	 * deliberately: two vCPUs of one SMP guest must share one virtual
+	 * timebase, and main_dbg.c already zeroes CPU0's copy explicitly. */
+	vgic_init();
+
 	/* Publish what THIS core's banked registers actually hold, read on this
 	 * core. They cannot be checked from anywhere else: a read over the debug
 	 * channel is serviced by CPU1 and returns CPU1's bank, which is exactly
@@ -193,6 +240,19 @@ void vcpu2_run(void)
 	/* Core-agnostic EL1 configuration, unchanged and shared with CPU0's
 	 * path and with zguest_cpu3.c. */
 	guest_config();
+
+	/* Added alongside vgic_init() above, same derivation: secondaries boot
+	 * with DAIF masked (start.S's _start_secondary reset state -- see
+	 * vblk_async.c's header for the same fact stated about CPU2's other
+	 * role) and nothing in this file's ORIGINAL sequence ever cleared it.
+	 * main_dbg.c does this for CPU0 (`msr daifclr, #3`, right before its own
+	 * guest entry) and vcpu1.c does it for CPU1, calling it out as "the
+	 * actual mechanism the whole mitigation rests on" -- this core had no
+	 * equivalent. Unmask EL2 IRQ+FIQ now that vgic_init() and this core's own
+	 * HCR_EL2 write are both in place, immediately before handing off, so
+	 * there is no window where a physical interrupt could arrive on this
+	 * core with nowhere configured to take it. */
+	__asm__ volatile("msr daifclr, #3" ::: "memory");
 
 	/* x0 = the context ID the guest passed to PSCI CPU_ON, which is what
 	 * DEN0022 says the newly-started core receives. SP_EL1 is a

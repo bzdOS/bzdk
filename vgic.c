@@ -276,12 +276,27 @@ _Static_assert(2UL * VGIC_BC_STRIDE <= 0x100UL,
 
 static inline void vg_bc(int i, uint32_t v)
 {
-	/* Lane by core, clamped: only CPU1 gets lane 1: everything else shares
-	 * lane 0. CPU2/CPU3 never call into this file at all today (see the
-	 * state inventory), so the clamp is defensive, not a real case -- same
-	 * posture as vg_self()'s own out-of-range clamp just below. */
-	uint32_t lane = (smp_cpu_id() == 1u) ? 1u : 0u;
-	volatile uint32_t *p = (volatile uint32_t *)(VGIC_BC_BASE +
+	/* Lane by core -- and cores above CPU1 write NOTHING rather than share.
+	 * This used to CLAMP them onto lane 0, which is CPU0's, on the stated
+	 * grounds that "CPU2/CPU3 never call into this file at all today". That
+	 * premise died the moment vcpu2 was armed: vcpu2_run() now calls
+	 * vgic_init() on CPU2, and under the old clamp CPU2's breadcrumbs would
+	 * have silently overwritten the ones triage.py and hvdbg read to
+	 * diagnose CPU0 -- turning a diagnostic into a source of confidently
+	 * wrong conclusions, which is a failure mode this project has already
+	 * paid for more than once.
+	 *
+	 * Silence beats somebody else's data. Giving CPU2/CPU3 real lanes needs
+	 * HVMAP_LOW_VGIC_BC grown past its currently-saturated 2 * 0x80, which
+	 * shifts every window after it in hv_addrmap.h -- deliberately deferred
+	 * (see breadcrumb-window-hygiene), not forgotten. Until then a vGIC
+	 * breadcrumb read for CPU2/CPU3 is absent, and absent is legible. */
+	uint32_t lane = smp_cpu_id();
+	volatile uint32_t *p;
+
+	if (lane > 1u)
+		return;
+	p = (volatile uint32_t *)(VGIC_BC_BASE +
 	    lane * VGIC_BC_STRIDE + (uint32_t)i * 4u);
 	*p = v;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
