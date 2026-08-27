@@ -101,6 +101,13 @@
  * these two must keep their real spacing, not just their values. */
 #define SOC_A64_SMHC0_BASE       0x01C0F000UL  /* `mmc@1c0f000`, microSD   */
 #define SOC_A64_SMHC2_BASE       0x01C11000UL  /* `mmc@1c11000`, eMMC      */
+/* SMHC1 (`mmc@1c10000`) carries the AP6212/BCM43430 WiFi module over SDIO.
+ * Not referenced by any EL2 C code today -- entirely a guest concern, gated
+ * by board-config.xml's guest_wifi_sdio feature (docs/guest-hw-enablement.md)
+ * -- listed here for the same reason this file already lists
+ * SOC_A64_TCON0_BASE despite hdmi.c only ever driving TCON1: a real A64 fact
+ * worth having in one place even before this tree's own C code touches it. */
+#define SOC_A64_SMHC1_BASE       0x01C10000UL  /* `mmc@1c10000`, WiFi SDIO */
 
 /* ---- Networking: EMAC (Gigabit, external RGMII PHY) --------------------- *
  * Everything this project's debug plane is built on rides here. Worth knowing
