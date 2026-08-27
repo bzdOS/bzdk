@@ -73,13 +73,32 @@ were, by two different mechanisms depending on what the duty actually needs:
   cited from the live DTB). USB full-speed frames are ~1 ms apart; a 10 ms tick
   would miss ten of them between calls.
 
-**Honest residual risk, unchanged by any of this:** a *software* hang of the
-guest on CPU1 can no longer starve the watchdog. A *hardware*-level wedge of
-that specific core still can — if the core stops fetching instructions, EL2's
-tick handler cannot run either. That risk is now live in the default build
-rather than opt-in. `board-config.xml` holds the one attribute that disarms it
-(`vcpu1 enabled="false"` plus `python3 gen_config.py`, which flips the build
-flag and the `cpu@1` DTB node together).
+**Residual risk, and it is smaller than this section first claimed.** A
+*software* hang of the guest on CPU1 can no longer starve the watchdog. An
+earlier draft here went on to say a *hardware*-level wedge of that core still
+can, "because if the core stops fetching instructions, EL2's tick handler
+cannot run either" — which is backwards, and worth correcting rather than
+softening: **if that core stops kicking the watchdog, the watchdog is exactly
+what fires.** Not kicking it is the recovery path.
+
+`wdt.c`'s layering closes the loop, and already documented it. There are two
+feeds and only one is unconditional: `wdt_debug_kick()` from CPU1's tick,
+unconditional; and `wdt_pet()` from `el2_trap()` on any core, **gated on the
+guest having emitted a console byte within `WDT_TIMEOUT_S`** — so a board that
+traps busily while producing nothing (the shape of a wedge) is not held alive by
+it. So: CPU1 dies → the guest blocks on its first IPI to that vCPU → progress
+goes stale → `wdt_pet()` stops re-arming → the hardware timer fires within 16 s
+→ U-Boot → chimpd reloads. No human.
+
+What genuinely remains is narrow: CPU1 hardware-dead *while the guest somehow
+keeps printing* leaves the board resident but degraded — one vCPU gone, and no
+debug channel, since dbgmon rides that core's tick. For an SMP guest that
+combination is unlikely; it is not impossible.
+
+That risk is live in the default build rather than opt-in.
+`board-config.xml` holds the one attribute that disarms it (`vcpu1
+enabled="false"` plus `python3 gen_config.py`, which flips the build flag and the
+`cpu@1` DTB node together).
 
 ## Two more real bugs found on the way there
 
