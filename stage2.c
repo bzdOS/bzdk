@@ -14,6 +14,8 @@
 #include "stage2.h"
 #include "vblk_emmc.h"   /* VBLK_MMIO_BASE — trapped virtio-mmio window */
 #include "vgic.h"        /* VGIC_GICV_BASE — GICC->GICV redirect target */
+#include "wdogtrap.h"    /* WDOGTRAP_PAGE_BASE — CCU/PIO/WDOG trap L3 index,
+                           * see STAGE2_TRAP_WDOG_PAGE below */
 
 /* ------------------------------------------------------------------ *
  * Breadcrumb window: 0x50000c00 ("STG2"). Distinct from every other window
@@ -203,6 +205,33 @@ _Static_assert(VGICD_L3_IDX == 129u,
 _Static_assert((VGICD_BASE >> STAGE2_L2_BLOCK_SHIFT) == (UART0_BASE >> STAGE2_L2_BLOCK_SHIFT),
                "GICD is no longer in the same 2 MiB block as UART0 -- needs its own L3 table");
 
+/* CCU/PIO/WDOG trap (wdogtrap.c) -- STAGE2_TRAP_WDOG_PAGE, default OFF. Same
+ * "one more invalid entry in the SAME stage2_l3_uart[] table" shape as the
+ * GICD trap just above: WDOGTRAP_PAGE_BASE (0x01C20000) sits in the SAME 2
+ * MiB block as UART0 (verified live via the same >>21 arithmetic used
+ * throughout this file), so no new table, no new level -- see
+ * docs/wdog-ccu-pio-stage2.md for the full analysis and why this stays
+ * behind a flag rather than being unconditional like the GICD trap.
+ *
+ * WHY GATED, UNLIKE GICD: the GICD trap was hardware-verified before landing
+ * (this file's own history). This page sits on the critical path of eMMC
+ * clocking (PC5, see soc_a64.h's SOC_A64_PIO_PC_CFG0) and CCU covers clock
+ * gates the guest's real EHCI/OHCI/MMC drivers genuinely need at boot
+ * (docs/dma-bypass-stage2.md's own inventory says as much) -- turning every
+ * access to this page into a stage-2 fault has NOT been hardware-validated,
+ * and DEBUG_RULES.md is explicit that this class of change (could stop the
+ * guest from ever reaching a mounted root) must not be guessed at. Flip this
+ * flag and reload once boot-verified; until then it stays off and the page
+ * below is byte-for-byte identity-mapped exactly as before wdogtrap.c
+ * existed. */
+#ifdef STAGE2_TRAP_WDOG_PAGE
+#define WDOGTRAP_L3_IDX ((unsigned)((WDOGTRAP_PAGE_BASE & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT))
+_Static_assert(WDOGTRAP_L3_IDX == 32u,
+               "CCU/PIO/WDOG page is not at L3 index 32 -- the live-verified assumption changed");
+_Static_assert((WDOGTRAP_PAGE_BASE >> STAGE2_L2_BLOCK_SHIFT) == (UART0_BASE >> STAGE2_L2_BLOCK_SHIFT),
+               "CCU/PIO/WDOG page is no longer in the same 2 MiB block as UART0 -- needs its own L3 table");
+#endif
+
 /* vGIC GICC->GICV redirect (internal task): VGIC_GICC_BASE (0x01c82000) sits in
  * the SAME 2 MiB MMIO block as UART0 (both are within 0x01c00000..0x01e00000,
  * block index UART_L2_IDX==14 — verified by the same >>21 arithmetic used
@@ -321,6 +350,21 @@ stage2_build_mmio_tables(void)
 			stage2_l3_uart[j] = 0;
 			continue;
 		}
+
+#ifdef STAGE2_TRAP_WDOG_PAGE
+		if (j == WDOGTRAP_L3_IDX) {
+			/* INVALID: the trapped CCU/PIO/WDOG page. Every guest access
+			 * now faults to EL2 and is policed by wdogtrap_handle_fault()
+			 * -- see that file and docs/wdog-ccu-pio-stage2.md. Unlike
+			 * GICD/UART, this page carries real per-boot AND potentially
+			 * per-poll traffic (CCU clock gates, PIO pinmux) whose volume
+			 * has not been measured on hardware -- see the design doc's
+			 * hardware-validation section before ever flipping this flag
+			 * on a board that matters. */
+			stage2_l3_uart[j] = 0;
+			continue;
+		}
+#endif
 
 		uint64_t pa = l2_block_base + (uint64_t)j * STAGE2_L3_PAGE_SIZE;
 
