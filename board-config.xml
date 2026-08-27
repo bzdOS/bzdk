@@ -78,7 +78,64 @@
          implementation would cost ~2 MiB of page tables per GiB instead and
          retire this trade entirely. -->
     <feature name="guest_dram_2g" mkvar="GUEST_DRAM_2G" enabled="false" dtb-memory-size="0x80000000"/>
+
+    <!-- Guest hardware-enablement features (2026-08-27 survey of the "dark"
+         A64 peripheral list, docs/guest-hw-enablement.md). Each flips ONLY a
+         `status` property on real silicon node(s) already present in the
+         upstream-derived DTB tree (bananapi-min.dtb) — verified against a
+         scratch `dtc -I dtb -O dts` decompile before this file was written,
+         these nodes already carry correct clocks/resets/regulator/pinctrl
+         references copied from sun50i-a64.dtsi/sun50i-a64-bananapi-m64.dts,
+         so "enable" means exactly one `status = "disabled"` to `"okay"` edit
+         per node, nothing added. `dtb-only="true"` means gen_config.py does
+         NOT require an `mkvar` and writes nothing to config.mk — there is no
+         EL2 C code gated by any of these, only what the guest's own DTB
+         advertises, so a build-time flag would be pure noise. See
+         `<soc-nodes>` below for exactly which node path(s) each one owns.
+         ALL default OFF, per this file's existing "one feature per device,
+         one board cycle at a time" idiom. -->
+    <feature name="guest_usb_host1"   dtb-only="true" enabled="false"/>
+    <feature name="guest_wifi_sdio"   dtb-only="true" enabled="false"/>
+    <feature name="guest_audio_codec" dtb-only="true" enabled="false"/>
+    <feature name="guest_mipi_dsi"    dtb-only="true" enabled="false"/>
+    <feature name="guest_mipi_csi"    dtb-only="true" enabled="false"/>
+    <feature name="guest_ir"          dtb-only="true" enabled="false"/>
   </features>
+  <!-- Deliberately NOT a feature: a "guest_usb_host0" for usb@1c1a000/
+       usb@1c1a400 (EHCI0/OHCI0). Both sit on PHY0 ("pmu0"), the SAME silicon
+       usb@1c19000 (MUSB OTG) uses — and MUSB is this hypervisor's OWN
+       CDC-ACM debug/break-glass gadget (usbacm.c, driven live from CPU1).
+       Handing the guest's generic-ehci/generic-ohci + aw_usbphy drivers
+       write access to PHY0's registers is a real hardware race against that
+       channel, not a software one, and untested — the very thing R0/R2 in
+       SESSION-RULES.md exist to protect. gen_config.py's FORBIDDEN_DTB_NODES
+       enforces this structurally (a soc-node entry naming either path is a
+       hard validate() error, not just a comment to notice), matching this
+       file's own "note you have to notice is not a safeguard" lesson from
+       reconcile_drift() above. Only usb@1c1b000/usb@1c1b400 (EHCI1/OHCI1,
+       PHY1/"pmu1", electrically independent) are exposed, as
+       guest_usb_host1 below. -->
+  <!-- Also deliberately NOT wired: dai@1c22c00 (the codec-i2s DAI) under
+       guest_audio_codec. It is the ONLY node in the audio chain with a
+       `dmas` property (dmas = <&dma-controller 0x0f ...>), and
+       dma-controller@1c02000 is the SoC's general-purpose memory-to-memory
+       DMA engine — no SMMU gates it, and docs/dma-bypass-stage2.md
+       documents it today as "provably unused" precisely because every
+       consumer that could arm it is disabled. Enabling the DAI re-arms it
+       with zero stage-2 mitigation (that doc's own draft denial patch,
+       STAGE2_DENY_DMA_CTRL, is written but explicitly NOT wired in yet, and
+       needs board-validated boot-through before it can be). guest_audio_codec
+       below therefore gets the guest's a33_codec/sun50i_a64_acodec drivers to
+       ATTACH (register-level control only) but not to produce sound —
+       correct and expected, not a bug in this config. -->
+  <!-- guest_mipi_dsi / guest_mipi_csi: landed with NO known FreeBSD driver
+       for either allwinner,sun50i-a64-mipi-dsi or allwinner,sun50i-a64-csi
+       anywhere in the releng/15.1-based tree searched for this survey
+       (docs/guest-hw-enablement.md) — flipping either `status` is safe
+       (neither node carries a `dmas` property or shares a PHY with anything
+       else this project depends on) but will NOT attach a new device; it
+       exists so the DTB half is ready the day a driver appears, not as a
+       feature expected to do anything today. -->
 
   <!-- virtio-mmio devices inside the 2 MiB trapped block at 0x0A000000
        (vblk_emmc.h's "MMIO window" comment — the canonical explanation of
@@ -97,5 +154,29 @@
     <virtio-mmio name="vinput"    base="0x0A003000" spi="107" device-id="18" always="true"/>
     <virtio-mmio name="vblk_sd"   base="0x0A004000" spi="108" device-id="2"  always="true"/>
   </devices>
+
+  <!-- Real A64 silicon nodes whose `status` gen_config.py flips to track one
+       guest-hardware-enablement feature above. `okay` when the feature is
+       enabled, `disabled` (self-healed back, same both-directions philosophy
+       as reconcile_drift() above) when it is not. Multiple <soc-node> entries
+       under the same feature are a cluster that only does anything together
+       — gen_config.py does not special-case that, it just flips every listed
+       path to the same status. usb@1c1a000/usb@1c1a400 (EHCI0/OHCI0, shares
+       the MUSB debug channel's PHY0) and dai@1c22c00 (re-arms the
+       provably-unused system DMA controller) are deliberately absent — see
+       the two comments above and gen_config.py's FORBIDDEN_DTB_NODES, which
+       makes listing either here a hard validate() error, not just a review
+       note. -->
+  <soc-nodes>
+    <soc-node feature="guest_usb_host1"   path="/soc/usb@1c1b000"/>       <!-- EHCI1, PHY1 -->
+    <soc-node feature="guest_usb_host1"   path="/soc/usb@1c1b400"/>       <!-- OHCI1, PHY1 -->
+    <soc-node feature="guest_wifi_sdio"   path="/soc/mmc@1c10000"/>       <!-- SMHC1; wifi@1 (brcm,bcm4329-fmac) child has no status of its own, follows the parent -->
+    <soc-node feature="guest_audio_codec" path="/soc/codec@1c22e00"/>     <!-- digital codec, the "codec" side -->
+    <soc-node feature="guest_audio_codec" path="/soc/codec-analog@1f015c0"/>
+    <soc-node feature="guest_mipi_dsi"    path="/soc/dsi@1ca0000"/>
+    <soc-node feature="guest_mipi_dsi"    path="/soc/d-phy@1ca1000"/>
+    <soc-node feature="guest_mipi_csi"    path="/soc/csi@1cb0000"/>
+    <soc-node feature="guest_ir"          path="/soc/ir@1f02000"/>
+  </soc-nodes>
 
 </bzdk-config>
