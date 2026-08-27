@@ -478,6 +478,23 @@ __attribute__((weak)) void vblk_async_cpu2_run(void)
 		__asm__ volatile("wfi" ::: "memory");
 }
 
+/* Fourth guest vCPU, on CPU3 — see vcpu3.h. Weak default: a no-op return, so
+ * the caller (smp_secondary_main(), below) falls straight through into
+ * zephyr_cpu3_run() (the `dual` target's real Zephyr path, or that
+ * function's own weak WFI park everywhere else), on every target that
+ * doesn't link vcpu3.o. Same pattern as vcpu1_run()/vcpu2_run() above, and
+ * the SAME dispatch shape CPU2 already uses (try the FreeBSD-vCPU path
+ * first, fall through to the pre-existing CPU3 behaviour if it declines).
+ * vcpu3.o and zguest_cpu3.o are additionally mutually exclusive at LINK
+ * TIME via bzdos_cpu3_owner — see vcpu3.h's header comment for why a
+ * Makefile-only "don't link both" convention was judged insufficient here,
+ * unlike CPU2's vcpu2.o/vblk_async.o pairing (vblk_async_cpu2_run() has no
+ * feature of its own that a parked vcpu2 could silently orphan;
+ * zephyr_cpu3_run()'s `zboot` does). */
+__attribute__((weak)) void vcpu3_run(void)
+{
+}
+
 /* ------------------------------------------------------------------ *
  * CPU3 Zephyr-guest hook (dual-guest milestone — see zguest_cpu3.h for the
  * full design). WEAK default: a plain WFI park, byte-for-byte the old
@@ -736,12 +753,22 @@ void smp_secondary_main(uint64_t cpuid)
 		 * that invariant is ever broken by a future change. */
 	}
 
-	/* ---- CPU3 = dual-guest Zephyr core (weak/strong, see above) ---------
+	/* ---- CPU3 = dual-guest Zephyr core, OR a 4th guest vCPU (weak/strong,
+	 * see above) ------------------------------------------------------
 	 * Every existing target links only the weak zephyr_cpu3_run() (a plain
 	 * WFI park, identical to the old inline loop this replaces); the `dual`
 	 * target's zguest_cpu3.o overrides it with the real wfe-poll-for-
-	 * `zboot` implementation. */
+	 * `zboot` implementation. vcpu3_run() is tried FIRST, same ordering
+	 * vcpu2_run() uses ahead of vblk_async_cpu2_run() for CPU2: it returns
+	 * immediately when dbg_vcpu3 is 0, so zephyr_cpu3_run() stays the
+	 * default and this core behaves exactly as it always has until the
+	 * feature is deliberately switched on. Weak, so targets that do not
+	 * link vcpu3.o are unaffected. vcpu3.o and zguest_cpu3.o are mutually
+	 * exclusive at link time (bzdos_cpu3_owner, see vcpu3.h) — this
+	 * dispatch never has to choose between two ALREADY-STRONG
+	 * implementations at runtime. */
 	if (cpu == 3) {
+		vcpu3_run();
 		zephyr_cpu3_run();
 		/* NOTREACHED — see the CPU2 comment above for the same defensive
 		 * fallthrough reasoning. */

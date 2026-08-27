@@ -31,8 +31,8 @@
   <cpu-roles>
     <cpu id="0" role="guest-vcpu0" note="runs the guest, takes its traps"/>
     <cpu id="1" role="debug-watchdog" note="EMAC/dbgmon/GDB/watchdog kick; survives guest wedges. NOT reassignable without accepting vcpu1's tradeoff below."/>
-    <cpu id="2" role="async-emmc-io" note="vblk_async.c offload, unless vcpu2 below is armed"/>
-    <cpu id="3" role="idle"/>
+    <cpu id="2" role="async-emmc-io-or-guest-vcpu2" note="vblk_async.c offload today. vcpu2 below makes it a guest vCPU instead, trading that offload away -- smp.c's cpu==2 dispatch tries vcpu2_run() first and falls to vblk_async_cpu2_run() only while the feature is off. Armed on hardware 2026-08-27: bring-up WORKS (three cores enumerated, past 'Release APs...done.') but the guest then stalls at root mount with virtio-blk's INTID stuck Active. Disarmed again pending that diagnosis, see this file's vcpu2 feature entry."/>
+    <cpu id="3" role="idle-or-guest-vcpu3" note="idle unless vcpu3 below is armed (a 4th FreeBSD vCPU). NEVER armed on hardware -- and it should stay that way until CPU2's stall above is understood, since it is the same mechanism one core further out. Mutually exclusive at LINK TIME with the `dual` target's Zephyr-on-CPU3 guest via vcpu3.h's bzdos_cpu3_owner marker: not buildable together regardless of what this file says."/>
   </cpu-roles>
 
   <!-- Build-time feature gates. `enabled` maps to -D<MACRO>=1 in config.mk;
@@ -55,6 +55,16 @@
          means a core the guest can ask for but the build won't hand over). -->
     <feature name="vcpu2" mkvar="VCPU2" enabled="false" needs-dtb-cpu="2"/>
     <feature name="vcpu1" mkvar="VCPU1" enabled="true" needs-dtb-cpu="1"/>
+
+    <!-- NEW, board-UNVERIFIED (2026-08-27): vcpu3.c ports vcpu2.c's fixed
+         entry sequence (vgic_init() + EL2 IRQ/FIQ unmask included from the
+         start) to CPU3. Left disabled here deliberately, unlike vcpu1/vcpu2
+         above: those two have SOME hardware track record (vcpu1 4h09m+
+         continuous, vcpu2 at least reaching guest boot before this session's
+         fix); vcpu3 has none yet. Arm with `make dbg VCPU3=1` or flip this to
+         "true" once vcpu2's fix is confirmed on real hardware, see
+         RELEASE-0.0.2.md/PROGRESS.md for that result once it exists. -->
+    <feature name="vcpu3" mkvar="VCPU3" enabled="false" needs-dtb-cpu="3"/>
   </features>
 
   <!-- virtio-mmio devices inside the 2 MiB trapped block at 0x0A000000

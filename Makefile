@@ -329,6 +329,15 @@ ifeq ($(VCPU1),1)
 CFLAGS += -DVCPU1_DEFAULT_ON=1
 endif
 
+# Fourth guest vCPU on CPU3 (vcpu3.c). Same build-time-only reasoning as
+# VCPU1/VCPU2 above. Use `make dbg VCPU3=1`. NOT available on the `dual`
+# target: vcpu3.o and zguest_cpu3.o are link-time mutually exclusive (see
+# vcpu3.h's bzdos_cpu3_owner note), and DUAL_OBJS below never lists vcpu3.o.
+VCPU3 ?= 0
+ifeq ($(VCPU3),1)
+CFLAGS += -DVCPU3_DEFAULT_ON=1
+endif
+
 HDMI_MODE_1080P ?= 1
 ifeq ($(HDMI_MODE_1080P),1)
 # Global, not `dbg:`-scoped. Three targets link hud.o (DBG_OBJS, the repl list
@@ -348,7 +357,7 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o g
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
             netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
-            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o
+            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
@@ -384,8 +393,12 @@ hv-uimage: dbg
 # DUAL_OBJS = DBG_OBJS, MINUS snapshot.o/snapshot_net.o (ROADMAP D1 snapshot/
 # restore is mutually exclusive with this milestone this pass — both claim
 # the same high-GiB DRAM window, see stage2_zephyr.h's "FUTURE
-# RECONCILIATION NOTE"), PLUS the four new dual-guest-only objects
-# (zguest_cpu3.o/zload2.o/stage2_zephyr.o/mmio_absorb.o).
+# RECONCILIATION NOTE"), MINUS vcpu3.o (never added below — this target's
+# CPU3 is Zephyr, not a 4th FreeBSD vCPU; vcpu3.o and zguest_cpu3.o are
+# additionally link-time mutually exclusive via bzdos_cpu3_owner even if a
+# future edit ever adds vcpu3.o here by mistake — see vcpu3.h), PLUS the four
+# new dual-guest-only objects (zguest_cpu3.o/zload2.o/stage2_zephyr.o/
+# mmio_absorb.o).
 #
 # main_dbg.c NEEDS NO CHANGES / no separate main_dual.c: grepped before
 # writing this target -- main_dbg.c has no direct call to snapshot_save()/

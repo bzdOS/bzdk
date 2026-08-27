@@ -20,6 +20,7 @@
 #include "dbgmon.h"
 #include "vcpu2.h"
 #include "vcpu1.h"
+#include "vcpu3.h"
 #include "vinput.h"
 #include "hv_addrmap.h"
 #include "hv_addrmap.h"
@@ -1457,6 +1458,52 @@ static void exec_line(char *line, struct el2_frame *frame)
 			cputs(" last=");
 			cputs(wv < 4u ? why[wv] : "?");
 			cputs("\r\n  usage: vcpu2 [on|off]\r\n");
+		}
+		return;
+	}
+	if (streq(cmd, "vcpu3")) {
+		/* Arm/disarm the FOURTH GUEST vCPU on CPU3 (vcpu3.c). Same
+		 * contract as `vcpu2` above -- off by default, arming it alone
+		 * changes nothing visible until the guest is also booted with a
+		 * device tree that advertises cpu@3. On the `dual` target this
+		 * command is inert by construction: vcpu3.o is never linked
+		 * there (vcpu3.c is link-time mutually exclusive with
+		 * zguest_cpu3.c, see vcpu3.h), so dbg_vcpu3/vcpu3_request()
+		 * resolve to el2_exc.c's weak always-refuse stubs and this
+		 * reports "gate=off" / "window not published" no matter what. */
+		if (nt > 1 && streq(tok[1], "on")) {
+			dbg_vcpu3 = 1u;
+			cputs("vcpu3: ARMED -- CPU3 will become a guest vCPU on "
+			      "the next guest CPU_ON for affinity 3\r\n");
+		} else if (nt > 1 && streq(tok[1], "off")) {
+			dbg_vcpu3 = 0u;
+			cputs("vcpu3: disarmed\r\n");
+		} else {
+			volatile uint32_t *bc =
+			    (volatile uint32_t *)HVMAP_VCPU3_BC;
+			static const char *const st[] = {
+				"not reached", "parked", "request accepted",
+				"entering EL1"
+			};
+			static const char *const why[] = {
+				"accepted", "gate off", "already handed over",
+				"not parked yet"
+			};
+			uint32_t sv = bc[1], wv = bc[7];
+
+			cputs("vcpu3: gate=");
+			cputs(dbg_vcpu3 ? "ARMED" : "off");
+			cputs("  state=");
+			cputs(bc[0] == VCPU3_MAGIC
+			      ? (sv < 4u ? st[sv] : "?")
+			      : "window not published");
+			cputs("  requests=");
+			print_hex32(bc[2]);
+			cputs(" refused=");
+			print_hex32(bc[6]);
+			cputs(" last=");
+			cputs(wv < 4u ? why[wv] : "?");
+			cputs("\r\n  usage: vcpu3 [on|off]\r\n");
 		}
 		return;
 	}

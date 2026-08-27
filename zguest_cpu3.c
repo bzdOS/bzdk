@@ -14,6 +14,22 @@
 #include "kload.h"
 #include "hv_addrmap.h"
 
+/* MUTUAL EXCLUSION WITH vcpu3.c, ENFORCED AT LINK TIME (added 2026-08-27,
+ * when vcpu3.c -- a genuine FreeBSD 4th-vCPU path for CPU3 -- was added
+ * alongside this file's Zephyr-on-CPU3 path). Both files strongly override
+ * smp.c's weak cpu==3 dispatch target with a DIFFERENT function
+ * (zephyr_cpu3_run() here, vcpu3_run() there), so linking both into one
+ * image would NOT be a link error on the dispatch functions themselves --
+ * only a runtime ambiguity, discovered on hardware, where an armed vcpu3
+ * parks forever waiting for FreeBSD's own PSCI CPU_ON and silently orphans
+ * this file's entire `zboot` feature (see vcpu3.h's header comment for the
+ * full mechanism). This symbol turns that into a build-time failure
+ * instead: vcpu3.c defines the SAME non-weak name with a different value,
+ * so linking both objects into one Makefile target's object list fails with
+ * `multiple definition of bzdos_cpu3_owner`. Never read by anything --
+ * exists to collide, not to be consulted. */
+const char *const bzdos_cpu3_owner = "zephyr_cpu3";
+
 /* Staging addresses (ZG3_PA_BASE / ZG3_ELF_STAGE_PA) now live in
  * zguest_cpu3.h — zstage.c needs the staging address too, and a second
  * private copy of it here would be free to drift. */
