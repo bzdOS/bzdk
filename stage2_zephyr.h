@@ -115,4 +115,14 @@ void stage2_zephyr_enable(void);
  */
 int stage2_zephyr_isolation_selfcheck(void);
 
+
+/* Zephyr's slice (0xBE000000-0xC0000000) lives inside the high GiB that
+ * GUEST_DRAM_2G hands entirely to the FreeBSD guest, so the two cannot coexist.
+ * A build error, not a comment: the same posture vcpu3.h takes with
+ * bzdos_cpu3_owner, and for the same reason -- silent overlap of two guests'
+ * DRAM is the one mistake this file exists to prevent. */
+#if defined(GUEST_DRAM_2G) && GUEST_DRAM_2G
+#error "GUEST_DRAM_2G gives the FreeBSD guest the high GiB that Zephyr's slice sits in -- the dual build cannot be built with it"
+#endif
+
 #endif /* BZDOS_STAGE2_ZEPHYR_H */

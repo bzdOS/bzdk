@@ -86,7 +86,34 @@
 #define STAGE2_MMIO_SIZE   0x40000000UL   /* 1 GiB: covers 0..0x40000000 */
 
 #define STAGE2_DRAM_BASE   0x40000000UL
+
+/* GUEST_DRAM_2G takes the invitation in the comment above: the board has 2 GiB
+ * of DRAM at [0x40000000, 0xC0000000) -- 0xC0000000 is the top, confirmed live
+ * by a dram_copy() that faulted with FAR exactly there -- and by default the
+ * guest only gets the low half, because snapshot.c claims the high GiB as its
+ * verbatim mirror (SNAP_DRAM_STORE, exactly 1 GiB, hv_addrmap.h). That is a
+ * real trade, not an oversight, and with GUEST_DRAM_2G the trade is taken the
+ * other way: the guest gets all 2 GiB and snapshot/restore is not linked.
+ *
+ * Why anyone would want that: the board is the project's own build host, and
+ * measured on 2026-08-27 a single Mesa NIR generator peaks at 648 MB against
+ * ~850 MB of usermem -- so Mesa could not be built at all, at any -j, and
+ * `ninja -j3` merely failed faster. See
+ * [[guest-memory-limits-build-parallelism]].
+ *
+ * MUTUALLY EXCLUSIVE WITH THE `dual` BUILD, enforced at compile time in
+ * stage2_zephyr.h rather than left to a comment: Zephyr's guest slice is
+ * 0xBE000000-0xC0000000, i.e. INSIDE the high GiB this hands to FreeBSD.
+ *
+ * Whoever flips this must also widen the DTB's /memory node -- gen_config.py
+ * does it from the same board-config.xml switch, for the same reason it now
+ * removes a stale cpu@N node: a build flag whose DTB half was not applied is
+ * exactly the half-configured state that has cost this project board time. */
+#if defined(GUEST_DRAM_2G) && GUEST_DRAM_2G
+#define STAGE2_DRAM_SIZE   0x80000000UL   /* 2 GiB (0x40000000..0xC0000000) */
+#else
 #define STAGE2_DRAM_SIZE   0x40000000UL   /* 1 GiB by default (0x40000000..0x80000000) */
+#endif
 
 /* A64 UART0 — the physical console FreeBSD's DTB points the kernel at
  * (chosen/stdout-path = "serial0:115200n8", serial0 = /soc/serial@1c28000,

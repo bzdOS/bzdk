@@ -65,6 +65,19 @@
          "true" once vcpu2's fix is confirmed on real hardware, see
          RELEASE-0.0.2.md/PROGRESS.md for that result once it exists. -->
     <feature name="vcpu3" mkvar="VCPU3" enabled="false" needs-dtb-cpu="3"/>
+    <!-- guest_dram_2g: hand the guest the board's whole 2 GiB instead of the low
+         GiB, giving up snapshot/restore, whose mirror IS that high GiB. Turned on
+         2026-08-27 for a measured reason, not a preference: the board is the
+         project's own build host and a single Mesa NIR generator peaks at 648 MB
+         against ~850 MB of usermem, so Mesa could not be built at any -j.
+         dtb-memory-size makes gen_config.py widen /memory in the same breath:
+         the flag and its DTB half must never be set apart. Mutually exclusive
+         with the `dual` build (Zephyr's slice sits in that high GiB); that is a
+         compile error in stage2_zephyr.h, not a footnote. Snapshots need this
+         GiB only because snapshot.c copies guest DRAM eagerly; a copy-on-write
+         implementation would cost ~2 MiB of page tables per GiB instead and
+         retire this trade entirely. -->
+    <feature name="guest_dram_2g" mkvar="GUEST_DRAM_2G" enabled="true" dtb-memory-size="0x80000000"/>
   </features>
 
   <!-- virtio-mmio devices inside the 2 MiB trapped block at 0x0A000000
