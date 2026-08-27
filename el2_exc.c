@@ -23,6 +23,9 @@
 #include <stdint.h>
 #include "hv_addrmap.h"
 #include "vgicd.h"   /* vgicd_handle_fault() -- trapped GIC distributor */
+#include "wdogtrap.h"   /* wdogtrap_handle_fault() -- CCU/PIO/WDOG page, see
+                          * that file; inert while STAGE2_TRAP_WDOG_PAGE
+                          * (stage2.c) is off, safe to call unconditionally */
 #include "exceptions.h"
 #include "trace.h"
 #include "vcpu2.h"
@@ -1320,6 +1323,15 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * polices the two affinity fields that can reach across the
 			 * partition boundary -- see vgicd.h. */
 			if (vgicd_handle_fault(frame)) {
+				return;
+			}
+			/* The trapped CCU/PIO/WDOG page (wdogtrap.c). Same "handled ->
+			 * return without recording" contract. Unconditionally safe to
+			 * call: with STAGE2_TRAP_WDOG_PAGE off (stage2.c, default),
+			 * this page is never trapped, so this fault can never occur and
+			 * wdogtrap_handle_fault()'s address check always returns 0
+			 * here -- see wdogtrap.h. */
+			if (wdogtrap_handle_fault(frame)) {
 				return;
 			}
 			/* Next, the eMMC-backed virtio-blk device at 0x0A000000. Same
