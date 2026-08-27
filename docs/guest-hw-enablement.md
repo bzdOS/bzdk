@@ -41,14 +41,57 @@ removed, only `status` values change.
 
 | Device | DTB node(s) | Node work needed | FreeBSD 15.1 driver | Conflict risk | Verdict |
 |---|---|---|---|---|---|
-| **USB host, port 1** | `usb@1c1b000` (EHCI1) + `usb@1c1b400` (OHCI1), PHY1 ("pmu1", independent lane) | Flip `status` on 2 already-correct nodes | `generic-ehci`/`generic-ohci` (`compatible` includes the generic fallback) + `aw_usbphy`/awusbphy0, which the guest ALREADY attaches today with nothing hooked to it | Low — physically independent PHY from the debug channel; and the EHCI/INTID-106 storm this SoC is known for was a symptom of an incomplete `IMO=1` vGIC (List Registers never populated for device IRQs), not of USB itself. The **current** default (`main_dbg.c`, "interrupt-virtualization milestone") is complete `HCR_EL2.IMO=1/FMO=1` HW-mode forwarding — `vgic_inject_hw()` ties every physical INTID to a GICH List Register so the guest's own EOI deactivates the physical source, with an LR-exhaustion pending queue backing up GIC-400's 4 hardware LRs so a burst is queued, not dropped (`vgic.c`). This is hardware-verified for the CNTV timer and the virtio-mmio SPIs (105-108) and for cross-core SGIs (vcpu1/vcpu2), but **not yet for a real external device SPI under sustained storm conditions** — EHCI/OHCI have been disabled the whole time this architecture has existed, so the specific "will the new forwarding survive the same 145 kHz pathological case that broke the old one" question is architecturally answered (yes, by design) but not board-measured. | **Land it, try it first.** Highest confidence of the six, matches the user's own instinct. |
+| **USB host, port 1** | `usb@1c1b000` (EHCI1) + `usb@1c1b400` (OHCI1), PHY1 ("pmu1", independent lane) | Flip `status` on 2 already-correct nodes | **Proven, built in.** `sys/dev/usb/controller/generic_ehci_fdt.c` binds `"generic-ehci"`, `generic_ohci.c` binds `"generic-ohci"`, `sys/arm/allwinner/aw_usbphy.c` binds `"allwinner,sun50i-a64-usb-phy"` — all in `files.arm64`. Empirically confirmed on THIS board today: `awusbphy0` already attaches on the live guest, so this driver family is compiled into the running kernel right now, not just present in source. | Low — physically independent PHY from the debug channel; and the EHCI/INTID-106 storm this SoC is known for was a symptom of an incomplete `IMO=1` vGIC (List Registers never populated for device IRQs), not of USB itself. The **current** default (`main_dbg.c`, "interrupt-virtualization milestone") is complete `HCR_EL2.IMO=1/FMO=1` HW-mode forwarding — `vgic_inject_hw()` ties every physical INTID to a GICH List Register so the guest's own EOI deactivates the physical source, with an LR-exhaustion pending queue backing up GIC-400's 4 hardware LRs so a burst is queued, not dropped (`vgic.c`). This is hardware-verified for the CNTV timer and the virtio-mmio SPIs (105-108) and for cross-core SGIs (vcpu1/vcpu2), but **not yet for a real external device SPI under sustained storm conditions** — EHCI/OHCI have been disabled the whole time this architecture has existed, so the specific "will the new forwarding survive the same 145 kHz pathological case that broke the old one" question is architecturally answered (yes, by design) but not board-measured. **EHCI1 is `usb@1c1b000`, SPI 74 = INTID 106 — the EXACT INTID that stormed before.** The first hardware measurement on this feature is therefore GIC SPI-74/INTID-106's rate (`dbgmon`'s `GICD_ISPENDR`/`GICC_HPPIR`, or `preempt_cnt`'s climb rate), not just whether `uhub` shows up in the guest's own `dmesg` — a quiet-looking guest console does not by itself rule out a storm EL2 is silently absorbing. | **Land it, try it first.** Highest confidence of the six, matches the user's own instinct — but check the SPI-74 rate specifically, not just guest `dmesg`. |
 | **USB host, port 0** | `usb@1c1a000` (EHCI0) + `usb@1c1a400` (OHCI0), PHY0 ("pmu0") | N/A — deliberately no lever | same drivers as port 1 | **High — do not enable.** PHY0 is the SAME silicon `usb@1c19000` (MUSB OTG) uses, and MUSB is this hypervisor's OWN CDC-ACM debug/break-glass gadget (`usbacm.c`, bit-banged live from CPU1) — this is exactly usbacm.h's pre-existing "KNOWN OPEN RISK". Enabling this pair hands the guest's own PHY driver write access to the same PHY0 registers the recovery channel depends on, untested, with no stage-2 trap protecting it. | **No feature offered.** `gen_config.py`'s `FORBIDDEN_DTB_NODES` makes listing either path a hard `validate()` error, not just a comment — same treatment as `watchdog@1c20ca0`. |
-| **WiFi** (AP6212/BCM43430, SDIO) | `mmc@1c10000` (SMHC1) + `wifi@1` child (`brcm,bcm4329-fmac`, no independent status) | Flip `status` on 1 node | *(see FreeBSD driver survey below)* | Low, DTB-wise — SMHC1 is its own controller instance, not shared with anything the HV touches (that's exactly why `soc_a64.h`, which lists only addresses EL2 C code itself touches, has no SMHC1 entry — correct, not a gap) | *(pending driver verdict)* |
-| **Bluetooth** (BCM43438, UART) | none — child of `serial@1c28400` (uart1), already `status = "okay"` today | **None at all.** There is no `status` to flip; the `bluetooth {}` node is metadata under an already-enabled UART. | *(see FreeBSD driver survey below)* | None — uart1 is already exposed, stable, unrelated to any HV-owned peripheral | *(pending driver verdict; no machinery needed regardless — see below)* |
-| **Audio codec** | `codec@1c22e00` (digital) + `codec-analog@1f015c0` (analog); **`dai@1c22c00` (codec-i2s DAI) deliberately excluded** | Flip `status` on 2 of the 3 nodes the full path needs | *(see FreeBSD driver survey below)* | The DAI is the ONLY enabled-or-disabled node in the whole audio chain with a `dmas` property — it is `dma-controller@1c02000`'s one path back to being armed. That controller is the SoC's general-purpose memory-to-memory DMA engine, has no SMMU in front of it, and `docs/dma-bypass-stage2.md`'s own inventory calls it out as the single genuinely dangerous block that is "provably unused" today **specifically because every possible consumer is disabled**. Re-arming it with zero stage-2 mitigation (a draft denial patch exists in that doc, not wired in) is not a risk this survey will spend without a deliberate decision. | **Partial land.** `codec@1c22e00`/`codec-analog@1f015c0` get a flag (drivers can ATTACH, register-level only) so the DTB half is honest and testable; the DAI does not, so there is no I2S data path and therefore no sound regardless of driver support — this is intentional, not a bug in the config. |
-| **MIPI-DSI** | `dsi@1ca0000` + `d-phy@1ca1000` | Flip `status` on 2 nodes | *(see FreeBSD driver survey below — expected absent)* | None — neither node carries a `dmas` property or shares a PHY/register block with anything the HV depends on | Land the flag anyway (cheap, safe, zero conflict) so the DTB half is ready; expect it to do nothing until a driver exists |
-| **MIPI-CSI** | `csi@1cb0000` | Flip `status` on 1 node | *(see FreeBSD driver survey below — expected absent)* | None, same reasoning as DSI | Land the flag anyway, same reasoning as DSI |
-| **IR receiver** | `ir@1f02000` | Flip `status` on 1 node | *(see FreeBSD driver survey below — expected absent)* | None | Land the flag anyway |
+| **WiFi** (AP6212/BCM43430, SDIO) | `mmc@1c10000` (SMHC1) + `wifi@1` child (`brcm,bcm4329-fmac`, no independent status) | Flip `status` on 1 node | **Source exists, does nothing as shipped.** `sys/contrib/dev/broadcom/brcm80211/brcmfmac/*` is a real LinuxKPI port with `sdio.c`/`bcmsdh.c`/`of.c`, but `sys/modules/brcm80211/brcmfmac/Makefile` sets **`BRCMFMAC_SDIO=0` and `BRCMFMAC_OF=0`** — neither the SDIO bus glue nor the FDT/OF binding is actually compiled into the module as shipped. Firmware is absent from the FreeBSD tree entirely; the exact board-matched blob (`brcmfmac43430-sdio.sinovoip,bananapi-m64.txt`/`.bin`) exists only in this HOST's own Linux firmware tree (`/usr/lib/firmware/brcm/`) — copying it into the guest would need its own licensing check, not evaluated here. | Low, DTB-wise — SMHC1 is its own controller instance, not shared with anything the HV touches | **Landed, flagged insufficient on its own.** The DTB flip is necessary but nowhere near sufficient — this needs `BRCMFMAC_SDIO=1 BRCMFMAC_OF=1`, a guest kernel/module rebuild (on the guest itself, its own build host — see `CLAUDE.md`), and a firmware file placed where `brcmfmac` looks for it. **Hardest of the six, confirming the user's own instinct** — the DTB machinery alone will not produce a `wlan0`. |
+| **Bluetooth** (BCM43438, UART) | none — child of `serial@1c28400` (uart1), already `status = "okay"` today | **None at all.** There is no `status` to flip; the `bluetooth {}` node is metadata under an already-enabled UART. | **Structurally absent.** `sys/netgraph/bluetooth/drivers/` has only `ubt` and `ubtbcmfw`, both USB HCI transports. There is no `ng_h4` (or any other) UART/H4 HCI transport anywhere in this tree — not a missing config option, a missing transport. | None — uart1 is already exposed, stable, unrelated to any HV-owned peripheral | **Nothing to land.** No DTB lever exists (nothing to flip) and none would help — a `status` flip cannot supply a transport driver that plain doesn't exist. This is a "needs a driver someone would have to write" finding, not a "needs a board cycle" one. |
+| **Audio codec** | `codec@1c22e00` (digital) + `codec-analog@1f015c0` (analog); **`dai@1c22c00` (codec-i2s DAI) deliberately excluded** | Flip `status` on 2 of the 3 nodes the full path needs | **Real, SoC-specific, and already compiled in.** `sys/arm/allwinner/a33_codec.c` matches the digital codec's *second* compat string (`"allwinner,sun8i-a33-codec"`); `sys/arm/allwinner/a64/sun50i_a64_acodec.c` matches the analog codec's primary string exactly; `sys/arm/allwinner/aw_i2s.c` matches `"allwinner,sun50i-a64-codec-i2s"` (the internal DAI ONLY — the three general-purpose `i2s0-2` blocks have no driver at all, consistent with them staying disabled and out of scope here). All pulled in via `std.allwinner` + `device sound`; empirically confirmed live today — `pcm0: <simple-audio-card>` already attaches on the guest, proving `device sound` is compiled into the exact kernel on the board right now. So this is a **DTB-node problem, not a driver problem** — a real reassessment upward from a first-pass "probably no driver" guess. | The DAI is the ONLY enabled-or-disabled node in the whole audio chain with a `dmas` property — it is `dma-controller@1c02000`'s one path back to being armed. That controller is the SoC's general-purpose memory-to-memory DMA engine, has no SMMU in front of it, and `docs/dma-bypass-stage2.md`'s inventory calls it out as the single genuinely dangerous block that is "provably unused" today **specifically because every possible consumer is disabled** (that doc had the controller's OWN status wrong — corrected in this pass, see below — but the "every consumer disabled" argument, which is what actually matters, was and remains correct). Re-arming it with zero stage-2 mitigation (a draft denial patch exists in that doc, not wired in or board-validated) is not a risk this survey will spend without a deliberate decision. | **Partial land, and the good half is bigger than expected.** `codec@1c22e00`/`codec-analog@1f015c0` get a flag and WILL attach for real (not just register-probe theater — these are the actual production drivers for this exact silicon); the DAI does not, so there is no I2S data path and therefore no *sound* regardless — intentional, not a bug in the config, and worth a real board cycle specifically to confirm the attach (see the one-line check below), even without audio output yet. |
+| **MIPI-DSI** | `dsi@1ca0000` + `d-phy@1ca1000` | Flip `status` on 2 nodes | **Absent.** No DSI/D-PHY/panel driver anywhere under `sys/arm/allwinner` or `sys/dev/drm` in this tree. | None — neither node carries a `dmas` property or shares a PHY/register block with anything the HV depends on | Land the flag anyway (cheap, safe, zero conflict) so the DTB half is ready; expect it to do nothing until a driver exists — do not spend a board cycle expecting a device to appear. |
+| **MIPI-CSI** | `csi@1cb0000` | Flip `status` on 1 node | **Absent.** No camera/v4l2-equivalent framework for this SoC anywhere in this tree. | None, same reasoning as DSI | Land the flag anyway, same reasoning as DSI. |
+| **IR receiver** | `ir@1f02000` | Flip `status` on 1 node | **Present, built in — with one narrow residual question.** `sys/arm/allwinner/aw_cir.c` (`device aw_cir` in the arm64 `NOTES`) feeds real `evdev` events. Its `compat_data` table lists only `"allwinner,sun6i-a31-ir"`, NOT the A64-specific `"allwinner,sun50i-a64-ir"` string that's listed FIRST on this node — so it only matches via the node's *second* compatible string, through `ofw_bus_search_compatible()`'s fallback-list walk (the same mechanism `a33_codec.c` uses for the digital audio codec above). That walk is standard FreeBSD OFW machinery and expected to work, but it is the one place in this row that is inference from source, not an observed attach on this exact board — worth confirming the driver actually binds, not just that a matching compat string exists in its table. | None — isolated block, no `dmas` property, no shared PHY | Land the flag. Cheapest of the six to verify (one node, real driver, no DMA/PHY entanglement) — good second or third board cycle. |
+
+## Cost, risk, and an ordered recommendation
+
+1. **USB host, port 1** (`guest_usb_host1`). Cheapest node work, most mature
+   driver (already partially attached today), lowest conflict risk of
+   anything that does something real. The one open question — the new
+   IMO=1 vGIC forwarding under a genuine device-IRQ storm — is answered by
+   a single, specific measurement (GIC SPI-74/INTID-106 rate), not a
+   guess. Try this first, alone.
+2. **Audio codec** (`guest_audio_codec`). Moved up from an initial
+   "probably no driver, low value" assumption once the source survey found
+   real, already-compiled SoC-specific drivers — cheaper to verify than
+   WiFi and with no PHY-sharing risk, only the (structurally enforced) DMA
+   consideration. Worth a board cycle specifically to confirm the digital
+   and analog codec attach for real, even with no sound yet.
+3. **IR receiver** (`guest_ir`). Cheapest single-node flip with a real,
+   already-compiled driver and zero conflict surface — low ceiling (an IR
+   receiver is a minor feature) but essentially free to confirm.
+4. **WiFi** (`guest_wifi_sdio`). Confirmed hardest, matching the original
+   instinct behind this survey: the DTB flip is necessary but the driver
+   module ships with both `BRCMFMAC_SDIO` and `BRCMFMAC_OF` off, and
+   firmware is absent from FreeBSD entirely. This is a guest-kernel-rebuild
+   project (on the guest, its own build host) plus a firmware-sourcing
+   decision, not a board-cycle-sized task — but it remains the most
+   valuable single item on this list for the PinePhone direction `soc_a64.h`
+   already calls out, so it is landed (flag ready) rather than dropped.
+5. **MIPI-DSI / MIPI-CSI**. Landed as flags anyway — cheap, zero conflict,
+   and the DTB half should not be the reason a driver-day-one bring-up is
+   slower — but confirmed no FreeBSD driver exists for either; do not
+   expect a board cycle here to show anything.
+6. **Bluetooth**. Not landed as a feature at all — there is no DTB lever to
+   flip (`uart1` is already fully enabled) and no UART/H4 HCI transport
+   anywhere in FreeBSD's Bluetooth stack to receive it. This is the one
+   item that is a "someone has to write a driver" finding, categorically
+   different from the other five.
+
+This mostly matches, and where it differs it's evidence-driven: USB stays
+the clear first move, and WiFi stays hardest despite being the most
+valuable long-term target — both agree with the instinct that opened this
+survey. Audio's ranking moved up from "lowest value" specifically because
+the driver-reality assumption behind that ranking turned out to be wrong;
+it is now a legitimate second try, just still capped short of real sound by
+a structural decision (the DMA controller) rather than a driver gap.
 
 ## What was landed
 
@@ -105,18 +148,55 @@ Validated entirely off the board, against a scratch copy of the live DTB:
 
 | Feature | It worked | It broke something else |
 |---|---|---|
-| `guest_usb_host1` | `guest_sh.py 'dmesg \| grep -E "usbus\|uhub"'` shows a new `usbus`/`uhub` attach, and `usbconfig list` (or plugging a drive) shows a device on port 1 | **Debug channel check, mandatory**: confirm `/dev/ttyACM0` / `chimpd`'s U-Boot-gadget catch window still behaves normally on the NEXT reload cycle. This feature does not touch PHY0, so it should be a no-op on the channel — any change there means the port-0/port-1 PHY independence assumed above was wrong and must be re-examined before trying anything else |
-| `guest_wifi_sdio` | `dmesg \| grep -i bcm` or `sysctl -a \| grep -i wlan`; a `wlan0`-capable device probing at all (even failing firmware load) is progress — see the driver-reality table for what "attach" even means here | none expected — SMHC1 is not shared with anything HV-owned |
-| `guest_audio_codec` | `dmesg \| grep -iE "codec\|sun8i-a33"` shows the digital/analog codec attaching (register probe only) | none expected |
-| `guest_mipi_dsi` / `guest_mipi_csi` / `guest_ir` | `dmesg` after boot — expect NO new device (no known driver); confirms the flag is inert as predicted rather than silently wrong | none expected — no `dmas`, no shared PHY |
+| `guest_usb_host1` | `guest_sh.py 'dmesg \| grep -E "usbus\|uhub"'` shows a new `usbus`/`uhub` attach, and `usbconfig list` (or plugging a drive) shows a device on port 1 | **Two checks, both mandatory.** (1) Debug channel: confirm `/dev/ttyACM0` / `chimpd`'s U-Boot-gadget catch window still behaves normally on the NEXT reload cycle — this feature does not touch PHY0, so it should be a no-op on the channel; any change there means the port-0/port-1 PHY independence assumed above was wrong. (2) **INTID-106 storm check, specific to this device**: sample `dbgmon`'s `GICD_ISPENDR`/`GICC_HPPIR` or `preempt_cnt`'s climb rate right after boot — EHCI1 IS the SPI-74/INTID-106 device this SoC's storm history is about, and a quiet guest console does not rule out EL2 silently absorbing a storm via the new HW-mode forwarding path |
+| `guest_wifi_sdio` | `dmesg \| grep -i bcm` shows SOME probe attempt from `mmc1`/`wifi@1` (even one that then fails on the missing SDIO/OF glue or firmware) — that is still useful signal, distinct from "nothing probed at all" | none expected — SMHC1 is not shared with anything HV-owned. Do not expect `wlan0` — the driver survey found `BRCMFMAC_SDIO=0`/`BRCMFMAC_OF=0` in the shipped module build, so a clean probe failure (not a `wlan0`) is the CORRECT and expected outcome of this flag alone |
+| `guest_audio_codec` | `dmesg \| grep -iE "a33codec\|a64codec\|acodec"` shows the digital AND analog codec actually attaching (real drivers, confirmed present and built in — not a register-probe guess) | none expected. Do not expect `/dev/sndstat` to show a channel — the DAI (`dai@1c22c00`) is deliberately not enabled, so there is no I2S data path; a silent-but-attached codec is the correct outcome, not a failure |
+| `guest_mipi_dsi` / `guest_mipi_csi` | `dmesg` after boot — expect NO new device (confirmed no driver exists in this FreeBSD tree for either); confirms the flag is inert as predicted rather than silently wrong | none expected — no `dmas`, no shared PHY |
+| `guest_ir` | `dmesg \| grep -i aw_cir` shows the driver attaching (it binds via the node's SECOND compat string, `"allwinner,sun6i-a31-ir"`, not the A64-specific one listed first — worth confirming that fallback match actually fires), then `/dev/input/eventN` appears | none expected |
 
 ## What this survey could not determine from this host
 
-FreeBSD driver reality for WiFi/Bluetooth/audio-codec/DSI/CSI/IR needed a
-dedicated source-tree search (`/opt/bzdos/freebsd-src-earlyboot-wt`,
-`/opt/bzdos/freebsd-src`) rather than the DTB work above — see the driver
-survey findings folded into the per-device table. Not independently
-verified here: whether `dma-controller@1c02000`'s draft stage-2 denial
-patch (`docs/dma-bypass-stage2.md`) is safe to land ahead of ever wanting
-real audio — that is a separate, deliberate decision, not a DTB question,
-and this survey does not make it.
+- **Whether `dma-controller@1c02000`'s draft stage-2 denial patch
+  (`docs/dma-bypass-stage2.md`, `STAGE2_DENY_DMA_CTRL`) is safe to land
+  ahead of ever wanting real audio** — that is a separate, deliberate
+  decision (whether to spend engineering effort closing a hole that is
+  today provably unused, before there is any actual consumer pressuring it
+  open again), not a DTB question, and this survey does not make it.
+- **Whether `brcmfmac`'s exact runtime firmware-loading path in FreeBSD's
+  `firmware(9)`/LinuxKPI shim would even accept a copied-over Linux
+  firmware blob** — no literal firmware path reference was found in
+  `sys/contrib/dev/broadcom/brcm80211/brcmfmac/firmware.c`'s search list
+  during the source survey; this needs either reading that code more
+  closely or a real attempt on the guest (its own build host), not
+  something this DTB-side survey established.
+- **Which exact `KERNCONF` produced the kernel currently booting on the
+  board.** Not cited in `BRING-UP.md`/`docs/guest-dtb.md`; the audio/USB/IR
+  driver-presence claims above are inferred from `std.allwinner`'s presence
+  in stock `GENERIC` plus the empirical fact that `awusbphy0` and `pcm0`
+  already attach live today — strong evidence, but an inference about
+  *this* kernel build, not a direct read of its config file.
+- **MMC1 (WiFi SDIO)'s IDMAC cache-coherency behavior under this project's
+  `el2_ncmap.c` remap.** The remap covers all guest DRAM by construction
+  (so it should apply here too), but only `mmc0`/`mmc2` have an actual
+  hardware track record proving the remap handles their IDMAC descriptor
+  writes correctly — `mmc1` would be new, unmeasured territory for that
+  interaction specifically, on top of everything else WiFi already needs.
+
+## Two corrections this survey made to existing docs, not just new findings
+
+- **`docs/dma-bypass-stage2.md`** stated `dma-controller@1c02000` itself is
+  `status = "disabled"`. Re-checked directly against a scratch decompile of
+  the live DTB: it has **no `status` property at all** (`okay` by spec
+  default). The doc's "provably unused" conclusion still holds, corrected
+  to rest on the actual reason — every one of its seven potential
+  consumers, not the controller, is what's disabled — and that doc has
+  been updated in this same pass (including the draft patch's own
+  comment, which had the same error).
+- **This project's own initial framing of Audio as low-value** (matching
+  the task's own working assumption) undersold it: the digital and analog
+  codec drivers are real, SoC-specific, and already compiled into the
+  running kernel — this is a DTB-node problem, not a driver problem, same
+  shape as USB and cheaper than WiFi. The genuine limiter is the
+  DMA-controller hazard on the DAI, not driver absence, so it moves up in
+  practical value while staying capped below "real sound" until that
+  separate decision gets made.
