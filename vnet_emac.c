@@ -122,6 +122,7 @@
  */
 #include <stdint.h>
 #include "vnet_emac.h"
+#include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 #include "emac.h"           /* emac_send_frame() */
 #include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO, ...) on QueueNotify */
 
@@ -215,8 +216,11 @@ static uint8_t g_rx_stage[VNET_STAGE_BUF_SIZE];
  * STAGE2_DRAM_SIZE (currently 0x40000000 / 0x40000000). Does NOT protect the
  * in-DRAM hv-image/hv-scratch windows (see vblk_emmc.c's comment) — that
  * needs real stage-2/DMA isolation (milestone A1), out of scope here. */
-#define GUEST_DRAM_BASE   0x40000000ULL
-#define GUEST_DRAM_SIZE   0x40000000ULL
+/* Derived from stage2.h, not copied -- see vblk_emmc.c's note: five files
+ * carried this pair hardcoded, none of them followed when STAGE2_DRAM_SIZE was
+ * widened, and the guest panicked on a rejected descriptor. */
+#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
+#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
 #define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
 
 static inline int gpa_in_range(uint64_t gpa, uint32_t len)

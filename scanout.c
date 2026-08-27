@@ -19,6 +19,7 @@
 #include "scanout.h"
 #include "hv_addrmap.h"
 #include "hdmi.h"
+#include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -196,8 +197,22 @@ static int scanout_decide_flip(struct scanout_dev *d, uint32_t requested,
  * documents the same numbers. Mirroring is this tree's convention for exactly
  * this situation, so the _Static_asserts below tie the copies to the header's
  * values and a divergence fails the build instead of silently opening a hole. */
-#define SCANOUT_GUEST_DRAM_BASE  0x40000000ULL
-#define SCANOUT_GUEST_DRAM_END   0x80000000ULL   /* 1 GiB DRAM */
+/* Derived from stage2.h, not copied. These used to be hardcoded 0x40000000
+ * pairs in five separate files (vblk_emmc.c, vblk_sd.c, vinput.c, vnet_emac.c
+ * and scanout.c, the last under its own spelling), each carrying a comment
+ * saying it MUST stay in lockstep with stage2.h -- which is a request, not a
+ * mechanism. On 2026-08-27 STAGE2_DRAM_SIZE was widened to 2 GiB and none of
+ * them followed: the guest addressed a buffer above 0x80000000, gpa_in_range()
+ * rejected the descriptor as "outside DRAM", virtio-blk returned S_IOERR, and
+ * the guest panicked with `Going nowhere without my init!` after two
+ * `vtbd0: hard error` lines. Measured, not inferred -- g_gmem_oob and
+ * g_ioerr_badpa both read 2.
+ *
+ * Same disease soc_a64.h was created to cure earlier the same day: one value,
+ * several spellings, and changing one silently breaks the rest. Local names are
+ * kept so no use site changes. */
+#define SCANOUT_GUEST_DRAM_BASE  ((uint64_t)STAGE2_DRAM_BASE)
+#define SCANOUT_GUEST_DRAM_END   ((uint64_t)(STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE))
 #define SCANOUT_HVIMG_BASE       0x42000000ULL   /* DTB hv-image@42000000  */
 #define SCANOUT_HVIMG_SIZE       0x00200000ULL   /* 2 MiB */
 #define SCANOUT_HVSCR_BASE       0x50000000ULL   /* DTB hv-scratch@50000000 */

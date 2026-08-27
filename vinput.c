@@ -47,6 +47,7 @@
 #include <stdint.h>
 #include "vinput.h"
 #include "hv_addrmap.h"
+#include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -91,8 +92,22 @@ static uint32_t g_sent, g_dropped, g_irqs, g_faults, g_gmem_oob;
  * vnet_emac.c's gmem_cmo/gmem_read/gmem_write. Duplicated per this file's
  * self-containment convention.
  * ------------------------------------------------------------------ */
-#define GUEST_DRAM_BASE   0x40000000ULL
-#define GUEST_DRAM_SIZE   0x40000000ULL
+/* Derived from stage2.h, not copied. These used to be hardcoded 0x40000000
+ * pairs in five separate files (vblk_emmc.c, vblk_sd.c, vinput.c, vnet_emac.c
+ * and scanout.c, the last under its own spelling), each carrying a comment
+ * saying it MUST stay in lockstep with stage2.h -- which is a request, not a
+ * mechanism. On 2026-08-27 STAGE2_DRAM_SIZE was widened to 2 GiB and none of
+ * them followed: the guest addressed a buffer above 0x80000000, gpa_in_range()
+ * rejected the descriptor as "outside DRAM", virtio-blk returned S_IOERR, and
+ * the guest panicked with `Going nowhere without my init!` after two
+ * `vtbd0: hard error` lines. Measured, not inferred -- g_gmem_oob and
+ * g_ioerr_badpa both read 2.
+ *
+ * Same disease soc_a64.h was created to cure earlier the same day: one value,
+ * several spellings, and changing one silently breaks the rest. Local names are
+ * kept so no use site changes. */
+#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
+#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
 #define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
 
 static inline int gpa_in_range(uint64_t gpa, uint32_t len)

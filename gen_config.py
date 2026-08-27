@@ -332,8 +332,11 @@ def ensure_memory_size(dtb_path, dts_text, size_hex, dry_run):
         print(f"[gen_config] /memory: size already {want:#x}, leaving as-is")
         return
     have = f"{cur[1]:#x}" if cur and len(cur) >= 2 else "unreadable"
+    # MiB, not GiB: a non-power-of-two size like 0x78000000 (1920 MiB) printed
+    # as "want >> 30 GiB" reads as "1 GiB", which is exactly the sort of quietly
+    # wrong log line that costs someone an hour later.
     print(f"[gen_config] /memory: size {have} -> {want:#x} "
-          f"({want >> 30} GiB), base left at 0x40000000")
+          f"({want >> 20} MiB), base left at 0x40000000")
     fdtput(dtb_path, "/memory", "x", "reg", 0x40000000, want, dry_run=dry_run)
 
 
