@@ -696,6 +696,13 @@ stage2_build_dram_table(uint64_t block_base)
  * made the flat case live and it turned out un-flippable under
  * STAGE2_WX_DYNAMIC; every block now gets a table, see stage2_init().) */
 
+/* Forward declarations: the vector-page mutators and stage2_init() live
+ * above the W^X section where these are defined (see that section's own
+ * comment for the lock's rationale). */
+static volatile uint32_t stage2_wx_lock;
+static int  stage2_wx_acquire_bounded(void);
+static void stage2_wx_unlock(void);
+
 void
 stage2_unmap_guest_vector(void)
 {
@@ -706,6 +713,13 @@ stage2_unmap_guest_vector(void)
 	uint64_t l1_block_base = (uint64_t)VEC_L1_IDX << STAGE2_BLOCK_SHIFT;
 	uint64_t l2_block_base = l1_block_base +
 		((uint64_t)VEC_L2_IDX << STAGE2_L2_BLOCK_SHIFT);
+
+	/* Runs on CPU0 during guest bring-up, but takes the same lock as the
+	 * W^X flips: a vCPU that has already launched could fault into this
+	 * same 2 MiB block's neighborhood concurrently. Unconditional hold is
+	 * safe here — firstfault_handle() runs before the guest is entered
+	 * and after stage2_init() zeroed the lock. */
+	stage2_wx_acquire_bounded();
 
 	/* Level-3: identity Normal-WB 4 KiB pages across the 2 MiB block
 	 * (executable unless STAGE2_WX_DYNAMIC opts into the writable-but-XN
@@ -737,6 +751,7 @@ stage2_unmap_guest_vector(void)
 	 * the same first 1 GiB span). Just flush the combined stage-1+2 TLB so
 	 * the walker picks up the level-3 split before the guest runs. */
 	stage2_tlb_flush();
+	stage2_wx_unlock();
 }
 
 void
@@ -747,11 +762,14 @@ stage2_map_guest_vector(void)
 	 * flush. Called by firstfault_handle() once it has latched the
 	 * original fault, so the guest's re-entered vector fetch now succeeds
 	 * and no further stage-2 abort loops in EL2. Assumes
-	 * stage2_unmap_guest_vector() already built stage2_l3_vec[]. */
+	 * stage2_unmap_guest_vector() already built stage2_l3_vec[]. Same
+	 * lock discipline as the unmap side above. */
+	stage2_wx_acquire_bounded();
 	uint64_t pa = GUEST_VECTOR_IPA & STAGE2_L3_ADDR_MASK;
 	stage2_l3_vec[VEC_L3_IDX] = stage2_page_desc(pa,
 		S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 	stage2_tlb_flush();
+	stage2_wx_unlock();
 }
 
 /* ------------------------------------------------------------------ *
@@ -906,6 +924,12 @@ stage2_init(void)
 	for (unsigned t = 0; t < STAGE2_L1_TABLES; t++)
 		for (unsigned i = 0; i < STAGE2_L1_ENTRIES; i++)
 			stage2_l1[t][i] = 0;
+
+	/* Same WDT-warm-reset discipline as EMAC's TX lock: DRAM survives the
+	 * reset, so a stale held-lock from the previous boot must never
+	 * deadlock the fresh one. Zero it BEFORE anything can flip. */
+	stage2_wx_lock = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
 
 	uint32_t ndesc = 0;
 
@@ -1471,13 +1495,17 @@ stage2_wx_selfcheck(void)
  * row is selected by the block index, the entry within it by the 2 MiB
  * index — see the raw/b/l2_idx split in stage2_wx_flip().
  *
- * CONCURRENCY NOTE: only CPU0 ever runs the FreeBSD guest and takes its
- * traps (smp.c's design; the `dual` target's second guest on CPU3 has its
- * own, wholly disjoint stage-2 tables in stage2_zephyr.c and never reaches
- * this code). A core cannot take a second synchronous exception while
- * still inside this handler for the first, so there is no concurrent
- * access to stage2_l2_dram[]/the pool from this mechanism to guard against
- * on any target this tree builds today.
+ * CONCURRENCY NOTE: the W^X runtime mutators (stage2_wx_flip(),
+ * stage2_unmap_guest_vector(), stage2_map_guest_vector()) all hold the
+ * stage2_wx_lock test-and-set across their edit+publish+flush — required
+ * since vcpu1/2/3 gave the guest four concurrently-faulting vCPUs
+ * (2026-08-27; the note below predates that and described the single-core
+ * era). WITHIN one core the reasoning still holds: a core cannot take a
+ * second synchronous exception while still inside this handler for the
+ * first, so there is no same-core re-entry into the lock. What the lock
+ * GUARDS against is cross-core: two vCPUs flipping the same 2 MiB block,
+ * and the pool_used counter racing. The tick path and dbgmon never touch
+ * these tables, so no lock-ordering hazard exists against them.
  * ------------------------------------------------------------------ */
 #if STAGE2_WX_DYNAMIC
 #include "hv_addrmap.h"   /* HVMAP_WXDYN_BC / HVMAP_WXDYN_MAGIC */
@@ -1524,6 +1552,70 @@ static uint32_t stage2_wx_pool_used;
 static uint32_t stage2_wx_pool_exhausted;   /* distinct blocks that fell back */
 static uint32_t stage2_wx_flip_count;       /* total flips, either direction */
 
+/* The stage-2 table W^X lock. Every runtime mutator of stage2_l2_dram[][] /
+ * the W^X L3 pool (stage2_wx_flip(), stage2_unmap_guest_vector(),
+ * stage2_map_guest_vector()) holds it across its whole edit+publish+flush.
+ * With four guest vCPUs (vcpu1/2/3 armed) the fault handlers run
+ * concurrently on four cores, and pre-2026-08-27 this was a real race:
+ * two cores flipping the same 2 MiB block could both see a plain BLOCK
+ * descriptor, both consume a pool table for it, and the loser's L3 fill
+ * would be silently discarded by the winner's table_desc install -- plus
+ * the unsynchronized pool_used counter could hand the SAME pool table to
+ * two cores at once. ldaxr/stlxr test-and-set, same idiom as
+ * emac_tx_trylock() / vblk_emmc_trylock() (A53 has no LSE). Zeroed in
+ * stage2_init() with the same WDT-warm-reset discipline as EMAC's TX
+ * lock: DRAM survives the reset, so a stale 1 must never deadlock a
+ * fresh boot. */
+static volatile uint32_t stage2_wx_lock;
+
+static int stage2_wx_trylock(void)
+{
+    volatile uint32_t *p = &stage2_wx_lock;
+    uint32_t prev, status, one = 1u;
+    __asm__ volatile(
+        "	ldaxr	%w0, [%3]\n"
+        "	cbnz	%w0, 1f\n"
+        "	stlxr	%w1, %w2, [%3]\n"
+        "	b	2f\n"
+        "1:	mov	%w1, #1\n"
+        "2:\n"
+        : "=&r"(prev), "=&r"(status)
+        : "r"(one), "r"(p)
+        : "memory");
+    if (prev == 0u && status == 0u) {
+        __asm__ volatile("dsb sy" ::: "memory");
+        return 1;
+    }
+    return 0;
+}
+
+static void stage2_wx_unlock(void)
+{
+    volatile uint32_t *p = &stage2_wx_lock;
+    __asm__ volatile("dsb sy" ::: "memory");
+    *p = 0u;
+    __asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
+/* Bounded acquire. A critical section here is one L2 read + at most one
+ * 512-entry L3 fill + a full TLB flush -- all bounded, none of it blocks
+ * on an external event, so a few thousand spins is generous. A failed
+ * acquire (astronomically unlikely: flips are ~2/s aggregate) must NOT
+ * hang a guest trap: return 0 and let the caller decide -- stage2_wx_fault()
+ * declines the flip (the fault stays unowned exactly as if the block were
+ * not DRAM, which today means the generic recorder logs it; a lost flip
+ * self-heals on the guest's next identical fault). */
+#define STAGE2_WX_LOCK_SPINS  20000u
+static int stage2_wx_acquire_bounded(void)
+{
+    for (uint32_t i = 0; i < STAGE2_WX_LOCK_SPINS; i++) {
+        if (stage2_wx_trylock())
+            return 1;
+        __asm__ volatile("yield" ::: "memory");
+    }
+    return 0;
+}
+
 static inline void
 wxd_bc(unsigned i, uint32_t v)
 {
@@ -1564,6 +1656,10 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 	if (raw >= STAGE2_DRAM_L1_BLOCKS * STAGE2_L2_ENTRIES)
 		return 0;   /* defensive: unreachable given stage2_wx_fault()'s range check */
 
+	if (!stage2_wx_acquire_bounded())
+		return 0;   /* another core mid-flip past the spin budget: decline,
+		             * see stage2_wx_acquire_bounded()'s own comment */
+
 	l2d = stage2_l2_dram[b][l2_idx];
 
 	if ((l2d & 0x3ull) == S2_DESC_VALID_TABLE) {
@@ -1576,8 +1672,10 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 		/* First-ever touch of this 2 MiB block. This can only be an
 		 * EXECUTE fault: the block is still a plain RW+XN descriptor, so a
 		 * WRITE to it is already permitted and could not have faulted. */
-		if (!want_exec)
+		if (!want_exec) {
+			stage2_wx_unlock();
 			return 0;   /* defensive: unreachable, see above */
+		}
 
 		if (stage2_wx_pool_used >= STAGE2_WX_POOL_TABLES) {
 			/* FAIL OPEN — see this block's own header comment for why.
@@ -1589,6 +1687,7 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 			stage2_wx_pool_exhausted++;
 			wxd_publish(block_ipa);
 			stage2_tlb_flush();
+			stage2_wx_unlock();
 			return 1;
 		}
 
@@ -1606,6 +1705,7 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 		}
 		stage2_l2_dram[b][l2_idx] = stage2_table_desc((uint64_t)(uintptr_t)l3);
 	} else {
+		stage2_wx_unlock();
 		return 0;   /* invalid — unreachable given stage2_wx_fault()'s
 		             * HV-window check, but never guess here */
 	}
@@ -1631,6 +1731,7 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 	stage2_tlb_flush();
 	stage2_wx_flip_count++;
 	wxd_publish(ipa);
+	stage2_wx_unlock();
 	return 1;
 }
 
