@@ -33,6 +33,25 @@ cores — immediately after FreeBSD printed `Release APs...done.`
 | Parallel throughput, idle guest | one job **3.95 s** wall / 3.89 s CPU; two jobs **3.92 s** wall / **7.80 s** CPU — two jobs in one job's wall time, ~1.92x |
 | Continuous uptime with the debug plane still responsive | 4 h 09 m and counting |
 
+**Superseded the same day.** This table is the historical record of the first
+jump, from 1 vCPU to 2 — it is not what a fresh boot of this tree reports
+today. CPU2 joined as a genuine third vCPU later on 2026-08-27: `hw.ncpu=3`,
+`kern.smp.cpus=3`, and it is now armed in the default build alongside CPU1.
+See "A third guest vCPU, hardware-proven" below for the fixes it took, what it
+cost, and a correction of my own that belongs on the record.
+
+**And CPU1's own tick cost the guest something worth measuring separately: its
+network.** `vnet_emac.c` states the guest's virtio-net RX is fed exclusively
+from inside `emac_poll()` on CPU1 — true before this release (a tight loop)
+and true after it (now `dbgmon_service()` called once per 10 ms EL2 tick,
+`gic_timer.c`'s tick handler). A packet that arrives just after a tick fires
+waits up to one full period before the guest's ring sees it. Measured: 40/40
+ICMP packets to the guest, zero loss, RTT 0.47–9.4 ms, mean 4.2 ms — against
+0.17–1.6 ms for the LAN gateway over the same link, for comparison. Not noise:
+the spread is the shape a 10 ms polling period produces. This bounds guest
+network latency, and probably throughput, architecturally — it is not a bug to
+fix so much as a cost of the tick design to know about.
+
 ### Why it used to wedge
 
 `vcpu1_run()` never called `vgic_init()` on CPU1. Under this project's live
