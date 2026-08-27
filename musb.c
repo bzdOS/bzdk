@@ -1446,7 +1446,16 @@ musb_init(void)
      * plain `dbg`/`gdb`/`fbsd` build asserts this line more often than
      * before but nothing is listening at the GIC, which is architecturally
      * harmless (an unenabled SPI's assertion never reaches any CPU
-     * interface). Bit layout is the standard Mentor MUSB one bit-per-
+     * interface).
+     *
+     * THAT LAST CLAUSE NO LONGER LETS US OFF. It was written while vcpu1 was
+     * opt-in; vcpu1 is now the DEFAULT, so `dbg` does call
+     * musb_irq_arm_cpu1() and something IS listening at the GIC. Enabling
+     * two latched sources onto a LEVEL_HIGH aggregate line without ever
+     * draining their status registers is what produced the ~646/s storm
+     * measured on an idle console -- our own regression, from this very
+     * commit, not an inherited defect. musb_poll() now drains REG_INTTX and
+     * REG_INTRX on every call; the root-cause reasoning lives there. Bit layout is the standard Mentor MUSB one bit-per-
      * endpoint-0..15 convention (same convention this file already assumes
      * for RXCSR/TXCSR's shared EPINDEX addressing): bit0 = EP0 (TX side
      * only -- EP0's RX-relevant events, e.g. a fresh SETUP, still report
@@ -1586,6 +1595,58 @@ musb_poll(void)
         if ((intr & INTR_CONNECT) && usb_state == ST_RESET)
             usb_state = ST_WAIT_SETUP;
         PP(0x05);
+    }
+
+    /* ROOT CAUSE of the ~646/s MUSB storm measured live on hardware
+     * 2026-08-26 (see gic_timer.c's MUSB_IRQ_BUDGET_PER_TICK comment for the
+     * numbers and how the throttle contains it). musb.h's own citation says
+     * this core ORs THREE latched status/enable pairs onto the single "mc"
+     * SPI line: REG_INTUSB/E (serviced above), REG_INTTX/E and REG_INTRX/E.
+     * musb_init() enables INTTXE (EP0 bit0 + EP1 IN bit1) and INTRXE (EP1 OUT
+     * bit1) so the IRQ-driven vcpu1 design (usbacm_poll() called straight
+     * from gic_timer_irq()'s MUSB_IRQ_INTID arm, not a poll loop) actually
+     * gets an edge/level on EP0 and EP1 activity, not just bus RESET/CONNECT/
+     * DISCONNECT. But until this fix, NOTHING in this file ever read
+     * REG_INTTX or REG_INTRX -- grep found only their *enable* registers
+     * (INTTXE/INTRXE) written, never the status registers themselves. Per
+     * the DTB (musb.h) the "mc" line is LEVEL_HIGH: any bit EPTXE/EPRXE
+     * unmasks that latches in INTTX/INTRX and is never read back holds the
+     * line asserted forever, and a level IRQ that is EOI'd+DIR'd while its
+     * source is still asserted is re-presented immediately -- exactly the
+     * storm shape gic_timer.c documents (and the same failure mode as the
+     * 145 kHz EHCI/INTID-106 storm elsewhere in this file's sibling driver).
+     * EP0 alone guarantees this fires: enumeration always clears TXPKTRDY on
+     * EP0 IN packets (ep0_txstate()), which sets INTRTX bit0 the very first
+     * time -- so the line latches high during boot enumeration and stays
+     * that way even with an otherwise-idle console, matching the measured
+     * "idle guest, storming SPI" signature exactly.
+     *
+     * Read+clear both, every call, unconditionally -- cheap (two 16-bit MMIO
+     * reads) and must run regardless of usb_state for the same reason the
+     * REG_INTUSB read above is unconditional: the source has to be drained
+     * before this function returns to gic_timer_irq(), which DIRs the IRQ
+     * right after usbacm_poll() returns (see its comment on why service-then-
+     * EOI+DIR order matters). Cleared the same way as REG_INTUSB just above
+     * (write back exactly what was read) since this Allwinner variant's
+     * INTUSB is confirmed write-1-to-clear rather than the standard-Mentor
+     * read-clears-it behavior musb.h's citation already warned not to trust
+     * blindly on this silicon -- TODO(board): the musb_init() comment on
+     * INTTXE/INTRXE already flags the bit-per-endpoint layout as UNCONFIRMED
+     * on this specific core; confirm word37 (below) actually changes shape
+     * (not just goes to all-1s once and sticks) across a live EP1 transfer
+     * before trusting the exact bit assignments, though the read+write-back
+     * itself is safe either way (a no-op write-back on a register that turns
+     * out to already be read-clear costs nothing but the read). */
+    {
+        uint16_t inttx = musb_read16(REG_INTTX);
+        uint16_t introx = musb_read16(REG_INTRX);
+
+        if (inttx != 0)
+            musb_write16(REG_INTTX, inttx);
+        if (introx != 0)
+            musb_write16(REG_INTRX, introx);
+        if (inttx != 0 || introx != 0)
+            BC(37, ((uint32_t)introx << 16) | inttx);
     }
 
     /* Drive the EP0 control state machine unconditionally on every call —
