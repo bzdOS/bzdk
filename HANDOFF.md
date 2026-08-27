@@ -79,11 +79,13 @@ throughout. Recovery lever that needs no EMAC and no user action: `reboot`
 inside the guest (PSCI SYSTEM_RESET → `wdt_debug_hold` → WDOG → U-Boot →
 TFTP reload of the current tftpboot image).
 
-Residual (unfixed, low priority): nothing retries a *failed* PHY train at
-runtime in the vcpu1-tick configuration — `emac_link_watchdog()`'s bounded
-self-heal is only invoked from the old SMP_DEBUG_CPU tight loop, and
-`link_recheck()`'s reneg kick may not rescue a PHY that never answered MDIO.
-One reload has recovered it every time so far.
+Residual — CLOSED same day: the link watchdog now also runs from CPU1's
+10 ms tick (gic_timer.c's `dbg_vcpu1` block), the only place it is reachable
+now that the old SMP_DEBUG_CPU tight loop is dead code whenever vcpu1 is
+armed. Verified on hardware by reload: no regression (channel green from
+first second, 150 s watch, 4-vCPU guest + ssh end-to-end); the heal path
+itself (failed train → re-kick at ~8 s intervals, ≤6 attempts) could not be
+reproduced at will — the PHY has trained on every warm reset so far.
 
 Not yet committed: `el2_exc.c` (fix) + `board-config.xml` (vcpu3 on).
 

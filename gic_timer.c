@@ -199,7 +199,13 @@
 #include "dbgmon.h"  /* dbgmon_service() — ditto */
 #include "musb.h"    /* MUSB_IRQ_SPI/MUSB_IRQ_INTID — cited constants, see musb.h */
 #include "usbacm.h"  /* usbacm_poll() — CPU1 MUSB-IRQ path, see musb_irq_arm_cpu1() */
+#include "emac.h"    /* emac_link_watchdog() — link self-heal, see the CPU1 tick block */
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
+
+/* smp.c:93's OPT-IN escalation flag (default 0): what the old SMP_DEBUG_CPU
+ * tight loop consulted when emac_link_watchdog() gave up — same contract
+ * preserved at the tick-block call site below. */
+extern volatile uint32_t dbg_emac_watchdog_reboot;
 #ifdef HV_HDMI
 #include "hdmi.h"    /* hdmi_phy_locked()/hdmi_relock() — ditto, HDMI PHY relock */
 #endif
@@ -1615,6 +1621,17 @@ gic_timer_irq(struct el2_frame *frame)
 			el2_snapshot_guest_frame(&snap);
 			dbgmon_service(&snap);
 		}
+		/* EMAC link self-heal, relocated from the SMP_DEBUG_CPU tight loop
+		 * (smp.c:660) — dead code whenever vcpu1 is armed, and without a
+		 * call here a cold boot whose PHY never trained (measured
+		 * 2026-08-27: dark debug channel beside a fully healthy 4-vCPU
+		 * guest) had no runtime retry at all. Internally rate-limited to
+		 * one real check per LINK_WD_CHECK_PERIOD_S, and it only ever
+		 * re-inits while zero RX frames have arrived, so the healthy path
+		 * costs ~one branch. Escalation on give-up stays OPT-IN, exactly
+		 * like the tight loop it replaces. */
+		if (emac_link_watchdog() && dbg_emac_watchdog_reboot)
+			wdt_debug_hold = 1;
 		/* KNOWN GAP (board-free code-reading finding, 2026-08-27, STILL NOT
 		 * fixed here, now for a DIFFERENT and more fundamental reason than
 		 * when this comment was first written -- see the update below).
