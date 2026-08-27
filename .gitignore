@@ -52,6 +52,13 @@ test_bmc_arm_gate
 a2-logs/
 crash-evidence/
 backups/
+# `bzdctl.py crash` writes timestamped bundles as crash-<YYYYMMDD-HHMMSS>/, which
+# the crash-evidence/ line above never actually matched -- so they were piling up
+# untracked and unignored. Ignore the raw dumps, but keep the hand-written
+# analysis that cites them: a finding.md is the part worth reading in a year,
+# and the numbers it quotes are in the text.
+crash-2*/
+!crash-2*/finding.md
 
 # Host-side unit-test binaries built by `make test` -- same class as the ones
 # already listed above, missed when this one was added.
