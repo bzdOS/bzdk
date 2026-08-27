@@ -259,19 +259,37 @@ def reorder_virtio_nodes(dtb_path, dry_run):
     print("[gen_config] DTB recompiled with virtio_mmio nodes in address order")
 
 
-def check_drift(features, devices, dts_text):
-    """Warn about the OTHER direction of the mismatch this script exists to
-    prevent: a DTB node present for something the build currently has
-    disabled. Not fatal — maybe that's deliberate for a follow-up boot — but
-    worth a loud line so it's never silently mysterious."""
+def remove_cpu_node(dtb_path, cpu_id, dry_run):
+    node = f"cpu@{cpu_id}"
+    path = f"/cpus/{node}"
+    print(f"[gen_config] {node}: REMOVING (its feature is disabled — a node "
+          f"without the build flag is the same mismatch as a flag without "
+          f"the node)")
+    if dry_run:
+        return
+    subprocess.run(["fdtput", "-r", str(dtb_path), path], check=True)
+
+
+def reconcile_drift(features, dts_text, dtb_path, dry_run):
+    """Both directions of the mismatch this script exists to prevent.
+
+    An earlier version of this function only PRINTED a note here, on the
+    reasoning that a leftover node might be "deliberate for a follow-up boot".
+    That reasoning cost real board time on 2026-08-27: vcpu2 was armed, the
+    guest stalled, and disarming it again left cpu@2 sitting in the DTB with
+    VCPU2=0 — so FreeBSD would enumerate a third core, issue PSCI CPU_ON for
+    affinity 2, and EL2 would refuse it. That is precisely the half-configured
+    state the header of this file and board-config.xml both warn about, in the
+    one direction the script had declined to actually fix. A note you have to
+    notice is not a safeguard.
+
+    So: remove it. The DTB is a generated artifact here, a backup is written
+    above, and "I want that node" is spelled by enabling the feature."""
     for name, f in features.items():
         if f["needs_dtb_cpu"] and not f["enabled"]:
             node = f"cpu@{f['needs_dtb_cpu']}"
             if node_exists(dts_text, node):
-                print(f"[gen_config] NOTE: {node} exists in the DTB but "
-                      f"feature '{name}' is disabled in board-config.xml — "
-                      f"the guest can ask for that core but this build "
-                      f"won't hand it over.")
+                remove_cpu_node(dtb_path, f["needs_dtb_cpu"], dry_run)
 
 
 def main():
@@ -300,11 +318,22 @@ def main():
             print(f"[gen_config] backup: {backup}")
 
     dts_text = dtb_to_dts_text(dtb_path)
-    check_drift(features, devices, dts_text)
+    reconcile_drift(features, dts_text, dtb_path, args.dry_run)
+    if not args.dry_run:
+        dts_text = dtb_to_dts_text(dtb_path)   # a removal invalidates it
 
     for name, f in features.items():
         if f["enabled"] and f["needs_dtb_cpu"]:
             ensure_cpu_node(dtb_path, dts_text, f["needs_dtb_cpu"], args.dry_run)
+
+    # NOTE on ORDER, observed the same day: ensure_cpu_node() adds nodes with
+    # `fdtput -p`, which PREPENDS. Arming vcpu2 therefore produced /cpus in the
+    # order `cpu@2 cpu@1 cpu@0`, and FreeBSD duly enumerated "CPU 1 ...
+    # affinity: 2" and "CPU 2 ... affinity: 1" -- its logical numbering is DTB
+    # order, not MPIDR. Harmless for bring-up but genuinely confusing while
+    # reading a console log, and the exact same prepend footgun that once
+    # silently swapped vtbd0/vtbd1 (see the virtio ordering self-heal below,
+    # which exists for that reason). Not self-healed for cpu nodes yet.
 
     for d in devices:
         if d["no_dtb_node"]:
