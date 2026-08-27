@@ -685,3 +685,97 @@ question on purpose, not resolved in either direction here.
 The experiment that would separate them is named, not run yet: a build that
 goes start-to-finish with zero resets, then checking `/opt` for damage
 afterward.
+
+## The last hours: two attempts that did not land, and why that is on record
+
+Both are switched off in `board-config.xml` and both got far enough to be worth
+writing down rather than deleting.
+
+**A fourth vCPU** (`vcpu3.c`, wired, unarmed). On hardware the guest went
+*further* than the three-core case ever did — past `Release APs...done.`,
+through `TCP_ratelimit` — and stopped at `regulator: shutting down
+vcc-hdmi-dsi`, with `liveness` reporting `FROZEN=cpu3`: the fourth core never
+started at all. That rail is `dldo1`, which FreeBSD's `axp8xx` driver disables
+and which EL2 reclaims over RSB, so guest and hypervisor meet on that bus at
+exactly that moment. EL2 stayed healthy throughout. The next reading is CPU3's
+own breadcrumb window, to separate "PSCI CPU_ON never arrived" from "entered EL1
+and died" — chasing the regulator line first would be chasing a symptom.
+
+**A bigger guest window** (`GUEST_DRAM_2G`, unarmed). Three separate things had
+to be true and only two of them were:
+
+- The board really does have 2 GiB — U-Boot's own `bdinfo` says
+  `memory[0] [0x40000000-0xbfffffff]`. But it reserves `[0xb8f18770-0xbfffffff]`
+  `no-overwrite` and puts its **own MMU translation tables at `0xbfff0000`**.
+  FreeBSD allocates downward from whatever ceiling it is told, so handing it
+  `0xC0000000` hands it U-Boot's page tables; the first attempt did exactly that
+  and the board went unreachable. The shape that follows: **map the full 2 GiB,
+  tell the guest `0xB8000000`.** Those two numbers differ on purpose.
+- `stage2_init()` builds whole 1 GiB level-1 blocks, so
+  `nblocks = STAGE2_DRAM_SIZE / STAGE2_BLOCK_SIZE` silently **truncates** a
+  non-multiple. Setting `0x78000000` gave `nblocks == 1` and left everything
+  above `0x80000000` unmapped — a level-1 translation fault at IPA `0xB7FF1000`
+  with `stage2_l1[0][2]` still zero. The header comment promising it "fills
+  however many contiguous 1 GiB blocks that implies" was exactly right and
+  exactly the trap.
+- **Five files carried the guest DRAM window as hardcoded constants** —
+  `vblk_emmc.c`, `vblk_sd.c`, `vinput.c`, `vnet_emac.c`, and `scanout.c` under
+  its own spelling — each with a comment instructing whoever changed `stage2.h`
+  to keep it in lockstep. None did. The guest addressed a buffer above the old
+  ceiling, `gpa_in_range()` rejected the descriptor as "outside DRAM",
+  virtio-blk answered `S_IOERR`, and the guest died with two
+  `vtbd0: hard error cmd=read` lines and `panic: Going nowhere without my
+  init!`. Measured, not inferred: `g_gmem_oob` and `g_ioerr_badpa` both read 2.
+  All five now derive from `stage2.h`. **This is the same disease `soc_a64.h`
+  was created to cure earlier the same day**, which is the part worth
+  remembering: an instruction in a comment is a request, not a mechanism.
+
+With all of that fixed the guest gets past `start_init` with no I/O error at
+all, and then stops in early userland after the regulator shutdowns. That is
+where it sits. The remaining question is no longer the block path.
+
+One citation corrected while here: `hv_addrmap.h` says `0xC0000000` is "the last
+byte of real, installed DRAM (confirmed live)". That fault was under QEMU. The
+board's real usable ceiling for a guest was established for the first time by
+the `bdinfo` read above.
+
+**Why any of this matters**: the board is the project's own build host, and a
+single Mesa NIR generator peaks at **648 MB** against ~850 MB of usermem
+(measured with `time -l`: max RSS 663020 KB, 740 s, exit 0 when run alone). So
+Mesa cannot be built at any `-j` — and giving the guest a third vCPU made it
+*worse*, because `ninja -j3` triples peak memory on a machine with under a
+gigabyte. More cores made the build fail faster.
+
+## Dark hardware: the machinery, and one reframing
+
+`bananapi-min.dtb` already carries the **full** upstream node set, with correct
+clocks, resets, regulators and pinctrl. "Minimal" describes which nodes say
+`status = "okay"`, not which nodes exist — verified directly:
+`mmc@1c10000` (the AP6212's SDIO controller), `usb@1c1a000`/`1c1a400`/
+`1c1b000`/`1c1b400`, `codec@1c22e00`, `codec-analog@1f015c0` and `ir@1f02000`
+are all present and disabled. So handing the guest a dark device is **one status
+flip**, not a node to author.
+
+`gen_config.py` gained `<soc-nodes>` — a DTB-only feature flips node status in
+both directions — and one `board-config.xml` switch per device, all off, so each
+can be armed for a single board cycle. Two devices get no switch at all, refused
+by a hard `validate()` error: USB host **port 0**, because it shares PHY0 with
+MUSB and MUSB carries the CDC-ACM console and the break-glass reset; and the DMA
+controller's one live consumer. Audio lands attach-only — its third (DAI) node
+is the live path to re-arming an unguarded DMA engine.
+
+Driver reality, established against a real FreeBSD 15.1 aarch64 tree rather than
+assumed: USB EHCI/OHCI/PHY and IR are compiled in and bind through *fallback*
+compat strings; the audio codec drivers are real and already compiled (`pcm0`
+attaches today), so **audio was a DTB problem, not a driver problem** — the
+earlier ranking of it as lowest-value was wrong. WiFi ships with
+`BRCMFMAC_SDIO=0` and `BRCMFMAC_OF=0`: source present, nothing compiled, and
+firmware absent from the FreeBSD tree though the exact board-matched blob exists
+in the host's Linux tree — so it needs a guest kernel rebuild, not a switch.
+Bluetooth, MIPI-DSI and MIPI-CSI have **no driver anywhere** in FreeBSD and are
+closed as absent, with the absence checks cited, rather than left as vague
+future work.
+
+First hardware measurement for USB host is the GIC SPI-74 / INTID-106 rate, not
+whether `uhub` appears: that SPI is a documented storm source in this tree that
+once fired at 145 kHz.
