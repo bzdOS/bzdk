@@ -193,9 +193,20 @@
  *
  * Deliberately: same park-and-enter structure, same stage2/HCR/guest_config
  * reuse argument (see vcpu2.h's own comment for why none of that is new).
- * The differences are exactly the two things CPU1 needs that CPU2 didn't:
- * arming a periodic CNTP tick (CPU2 has none), and the watchdog/dbgmon
- * service call wired into that tick rather than into a foreground loop.
+ * CORRECTED (2026-08-27): this used to say "the differences are exactly the
+ * two things CPU1 needs that CPU2 didn't: arming a periodic CNTP tick (CPU2
+ * has none), and the watchdog/dbgmon service call wired into that tick
+ * rather than a foreground loop." The first half stopped being true the same
+ * day it was written: vcpu2.c now arms its own tick too (VCPU2_TICK_PERIOD_US,
+ * same 10 ms period), for vtimer_mask_watchdog() coverage -- see vcpu2.c's
+ * own comment at that call site for why CPU2 needed it once it started
+ * running real guest code. What is still genuinely CPU1-only is the SECOND
+ * half: the watchdog kick, dbgmon service, and MUSB/HDMI IRQ retargeting
+ * wired into the tick (gic_timer.c's `smp_cpu_id() == SMP_DEBUG_CPU &&
+ * dbg_vcpu1` gate, just below `gt->ticks++`/`vtimer_mask_watchdog(gt)` which
+ * both run unconditionally on ANY core with its own tick armed). CPU2's tick
+ * exists solely to keep this core's own CNTV rescue-able; it kicks no
+ * watchdog and services no dbgmon request.
  *
  * CURRENTLY ARMED BY DEFAULT — this said "DEFAULT OFF" until 2026-08-26 and
  * that is no longer true, so read it here rather than being surprised by it.
