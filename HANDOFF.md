@@ -54,29 +54,38 @@ Worth reading in order, because the third is the interesting one:
 
 ## 3. Open, with the next step named
 
-### 3a. Four vCPUs — closest to done
+### 3a. Four vCPUs — DONE on hardware (2026-08-27)
 
-`vcpu3.c` exists, is wired (PSCI filter, dispatch, breadcrumb window, `VCPU3`
-flag, a `vcpu3` dbgmon command) and is **off** in `board-config.xml`.
+Root cause of the freeze found and fixed. `el2_exc.c`'s data-abort dispatch
+tested `smp_cpu_id() == 3u` and routed CPU3's EC-0x24 faults into the `dual`
+build's Zephyr path (`vconsole(1)`/`vgicd`/`mmio_absorb_fault`). With `vcpu3`
+armed (FreeBSD vCPU on CPU3) those faults fell through unhandled, ELR never
+advanced, and CPU3 sat in an infinite EL2 fault storm — the whole-guest
+freeze. Fix: the branch now also requires `!dbg_vcpu3`, so an armed CPU3
+takes the FreeBSD handler set exactly like CPU1/CPU2.
 
-Tried on hardware. The guest got **much further than the 3-core case** — past
-`Release APs...done.`, through `TCP_ratelimit` — and stopped at:
+Verified on hardware (fixed build, `board-config.xml` vcpu3 enabled, DTB with
+cpu@3): guest boots to multiuser, `sysctl hw.ncpu` → **4** over ssh, `hw.ncpu=4`
+also confirmed over the serial console, guest network end-to-end (ping 0 %
+loss, ssh) green.
 
-```
-regulator: shutting down vcc-hdmi-dsi...
-```
+One operational gotcha, measured: on the cold boot right after a physical
+power cycle the PHY did not train (`link=0` forever → EMAC dbg channel dark,
+guest `vtnet0` up-but-deaf, host ARP INCOMPLETE). It is NOT the "channel dies
+when guest active" regression — a WDOG warm reset re-runs `emac_init()`, the
+link trains (EMAC bc: `stage=11 link=1 speed=100`), and a 300 s one-read-per-
+second EMAC watch with the guest fully active showed the channel healthy
+throughout. Recovery lever that needs no EMAC and no user action: `reboot`
+inside the guest (PSCI SYSTEM_RESET → `wdt_debug_hold` → WDOG → U-Boot →
+TFTP reload of the current tftpboot image).
 
-with `liveness` reporting **`FROZEN=cpu3`**, i.e. the fourth core never started.
-`vcc-hdmi-dsi` is the `dldo1` rail that FreeBSD's `axp8xx` driver disables and
-that EL2 reclaims over RSB, so guest and hypervisor meet on the RSB bus at
-exactly that moment. EL2 itself was healthy throughout (virtio trap counter
-climbing).
+Residual (unfixed, low priority): nothing retries a *failed* PHY train at
+runtime in the vcpu1-tick configuration — `emac_link_watchdog()`'s bounded
+self-heal is only invoked from the old SMP_DEBUG_CPU tight loop, and
+`link_recheck()`'s reneg kick may not rescue a PHY that never answered MDIO.
+One reload has recovered it every time so far.
 
-**Next step**: read CPU3's own breadcrumb window (`HVMAP_VCPU3_BC`) to see
-whether `vcpu3_request()` was ever accepted, and whether state reaches 3
-("entered EL1") or sticks at 2 ("request accepted"). That single reading
-separates "PSCI CPU_ON never arrived" from "entered and died". Do not chase the
-regulator line first — it may be a symptom of a core that never came up.
+Not yet committed: `el2_exc.c` (fix) + `board-config.xml` (vcpu3 on).
 
 ### 3b. A bigger guest window — one real bug fixed, one left
 
