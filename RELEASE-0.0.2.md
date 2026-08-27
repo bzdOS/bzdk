@@ -396,14 +396,34 @@ made it reviewable at all.
 knowledge; the GIC SPI numbers, which stay with the drivers that cite them from
 the DTB; and the HDMI/DE2 pipeline's assumption of an HDMI sink.
 
-## Core allocation in the default build — CHANGED
+## Core allocation in the default build — CHANGED AGAIN
 
 **CPU0** guest vCPU0 · **CPU1** guest vCPU1 *(was: debug/watchdog plane)*, with
 the watchdog kick and dbgmon moved onto its unmaskable 10 ms tick · **CPU2**
-async eMMC I/O · **CPU3** idle, or a concurrent Zephyr guest in `make dual`.
+**guest vCPU2** *(was: async eMMC I/O offload)*, hardware-proven 2026-08-27 ·
+**CPU3** idle, or a concurrent Zephyr guest in `make dual`, or (wired but
+**not** armed on hardware) a fourth FreeBSD vCPU via `vcpu3.c`.
 
-Giving the guest all four cores is still not done: CPU2's async I/O is
-load-bearing, and CPU3 is architecturally exclusive with the second-guest build.
+`board-config.xml` now ships `vcpu1` and `vcpu2` both `enabled="true"` — the
+guest is SMP across **three** cores by default, not two. CPU3 is the only core
+still withheld, and for a specific, named reason: the three fixes that made
+CPU2 work (`vgic_init()`+IRQ/FIQ unmask, CPU2's own tick, `own_cpu_mask()`
+learning about every armed core generically) are all generic now, so CPU3 is
+*expected* to behave the same way — but expected is not measured, and it is
+mutually exclusive at link time with the `dual` build's Zephyr-on-CPU3 guest
+regardless.
+
+The trade CPU2 made: it no longer offloads eMMC I/O asynchronously.
+`vblk_async_post()` gates on `g_vblk_async_ready`, and the board has always run
+the synchronous fallback when that offload isn't available, so this is a
+performance regression, not a correctness one. The risk to watch is
+contention: three vCPUs can now all reach the synchronous eMMC path and
+serialize on one unfair test-and-set lock, and two-way contention there has
+already cost this project a root filesystem once. The mitigating fact for the
+immediate use case is that root lives on eMMC read-only, while the Mesa build
+below writes through `vblk_sd` (the SD card) instead — a different device, a
+different lock. See "/opt corruption during the three-vCPU build" below for
+why that distinction matters and is not, on its own, a full alibi.
 
 ## The board's own build environment: repaired, and a false alarm worth recording
 
@@ -456,10 +476,13 @@ Proven by the task rather than by version strings: `meson setup` now completes
 on the board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is
 building all 993 targets.
 
-## A third guest vCPU: the old wall is gone, a new one is named
+## A third guest vCPU, hardware-proven — three fixes, found in this order
 
 Tried on hardware 2026-08-27, because the board is now the project's own build
-host and two cores make that slow.
+host and two cores make that slow. It took three fixes, landed as three
+separate attempts, and is now armed in the default build.
+
+### Fix 1: the same `vgic_init()` gap vcpu1 already had
 
 `vcpu2.c` had sat in the tree since 2026-08-21 doing the hard parts right —
 `stage2_arm_secondary()` against the banked `VTTBR_EL2`, the banked
@@ -473,8 +496,8 @@ list nothing drains. **0.0.1 recorded exactly this symptom for CPU2 and 0.0.2
 root-caused it for CPU1; the fix was applied to `vcpu1.c` and never carried
 across.** Two calls, derived from a hardware-proven pattern.
 
-**It works, for what it was aimed at.** The guest enumerated three cores and
-printed the line every previous attempt died before:
+**This got the guest past the point every previous attempt died at.** Three
+cores enumerated, and the line no earlier attempt had reached:
 
 ```
 CPU  0: ARM Cortex-A53 r0p4 affinity:  0.
@@ -492,7 +515,8 @@ swapped `vtbd0`/`vtbd1`.)
 **Then it stalled at root mount, and not in the way anyone predicted.** Not the
 eMMC-lock contention the trade was expected to risk — the console stayed alive,
 EL2 kept ticking, the isolation self-check passed, `g_ioerrs` was 0 and the
-block lock was free. What `triage.py` found:
+block lock was free. What `triage.py` found (preserved in
+`crash-20260827-133425/`):
 
 ```
 INTID 137  en=1 pend=0 act=1 cfg=EDGE   virtio-blk (SPI 105)
@@ -502,24 +526,87 @@ GICH_LR0:  vINTID=27 state=1(pending) HW=0
 **`act=1`.** Something read IAR for virtio-blk's SPI and nothing ever
 deactivated it, and an Active SPI is never delivered again — hence exactly two
 disk reads (`g_reads=2`, the last being the GPT backup header) and then silence
-forever. `GICH_LR0` separately held an unconsumed pending virtual timer. So the
-failure is an interrupt that stops completing its lifecycle once a third vCPU
-exists, and the obvious place to look is who owns the deactivate when GICD is
-passed through to the guest while the guest acknowledges through GICV.
+forever. Disarmed rather than chased live at that point, since the board was a
+working build host and this was not yet understood.
 
-Disarmed rather than chased live, since the board is a working build host; the
-state is preserved in `crash-20260827-133425/`. **`vcpu3.c` exists and is wired
-(PSCI filter, dispatch, breadcrumb window, `VCPU3` flag, a `vcpu3` dbgmon
-command) and is deliberately NOT armed** — it is the same mechanism one core
-further out, so arming it before the CPU2 stall is understood would stack one
-unknown on another. Its exclusivity with `dual`'s Zephyr-on-CPU3 is a **link
-error**, not a comment: both files define `bzdos_cpu3_owner` incompatibly, and
-linking the two objects together fails on purpose — verified directly, not
-asserted.
+### Fix 2: CPU2 had no periodic tick of its own
+
+`vtimer_mask_watchdog()` — the rescue for FreeBSD's CNTV mask self-latch —
+runs exclusively from the TIMER_INTID arm of `gic_timer_irq()`, which only
+fires on a core that has armed its own CNTP comparator. CPU0 gets one from
+`main_dbg.c`, CPU1 from `vcpu1.c`; `vcpu2.c` had neither, so its vCPU had no
+path to that rescue at all. That is what left virtio-blk's SPI stuck `act=1`
+above: without the rescue, CPU2's vCPU stopped servicing and the HW=1 List
+Register it held was never EOI'd. Ported `vcpu1.c`'s
+`gic_timer_arm_preserving_cntvoff()` arm verbatim (same 10 ms period, same
+ordering — after `vgic_init()`, before `daifclr`).
+
+Re-armed with this fix, `act=1` was gone (`act=0`), which also confirmed the
+mechanism. But the guest still didn't finish booting — a new failure appeared
+in its place, recorded live in `crash-20260827-vcpu2-livelock/finding.md`
+along with a new breadcrumb window (`HVMAP_VGIC_BC_HI`) giving CPU2/CPU3 their
+own vgic lanes for the first time, without which the next measurement could
+not have been taken at all.
+
+### Fix 3, and the one worth remembering: `own_cpu_mask()` never learned about CPU2
+
+CPU2's new lane showed ~1174 vgic injections/second, every one succeeding,
+zero drops, empty pending queue. **My first read of that number was wrong, and
+the correction belongs on the record rather than being quietly folded in.** I
+called it a livelock caused by CPU2, and went looking for a `CNTVOFF_EL2`
+timebase disagreement between CPU0 and CPU2 to explain a storm. The hypothesis
+was refuted by reading the source, not by burning a board cycle: `vgic_init()`
+zeroes `CNTVOFF_EL2` unconditionally on every core that calls it — CPU0, CPU1
+and CPU2 all do — and `gic_timer_arm_preserving_cntvoff()` only preserves
+whatever was already there, which is already zero. There was no timebase to
+disagree about.
+
+The real cause was in `vgicd.c`. `own_cpu_mask()` — the function that polices
+every guest write to `GICD_SGIR`/`GICD_ITARGETSR`, the only two paths that can
+cross a core boundary — was extended on 2026-08-25 so CPU0/CPU1's rendezvous
+IPIs could reach each other, and it hardcoded that exact pair. CPU2 became a
+real third vCPU two days later and this function was never told: a rendezvous
+SGI aimed at CPU2 still computed `{0,1}`, so **CPU2's bit was stripped from the
+target list before the write ever reached the real distributor, in both
+directions.** CPU2 was never spinning in a storm — it was running a perfectly
+healthy per-CPU clock at a normal rate, simply cut off from the other two, which
+were the ones actually stuck: CPU0 and CPU1, parked in `smp_rendezvous_action()`
+waiting for an acknowledgement from a core nobody was able to ask. Their low
+injection counts (71 and 3) were the real signature of "parked", exactly as
+suspected — the reason was just on the other side of the wall.
+
+**The lesson generalises past this one bug**: a busy core running normally next
+to two parked ones should prompt "who cannot talk to it", not "the busy core is
+the problem." Every number in the original measurement was correct; the story
+built on top of it was not. Fixed by generalizing `own_cpu_mask()` to compute
+its "same guest" group from every core's own `dbg_vcpuN` gate instead of a
+hardcoded pair — CPU0 is always in the group, CPU1/2/3 join iff their own gate
+is armed, and a build with nothing beyond CPU0 armed reduces to the old
+behaviour byte-for-byte. This also covers `vcpu3.c` generically, without
+touching the `dual` build's CPU3-as-Zephyr isolation.
+
+### Result
+
+**Hardware-proven, 2026-08-27, and armed in the default build**: `hw.ncpu=3`,
+`kern.smp.cpus=3`, `cpu2:rendezvous` nonzero in `vmstat -i` (the counter that
+was structurally impossible before — no cross-core SGI could reach CPU2 at
+all), and three parallel spinners each completing identical work in the same
+wall clock, which two cores cannot do.
+
+`vcpu3.c` exists and is wired (PSCI filter, dispatch, breadcrumb window,
+`VCPU3` flag, a `vcpu3` dbgmon command) and is **deliberately NOT armed**. All
+three fixes above are generic now, so CPU3 is *expected* to work the same way
+— but expected is not measured, and vcpu3 has no hardware track record at all
+yet, unlike vcpu1/vcpu2 going into their respective fixes. Its exclusivity
+with `dual`'s Zephyr-on-CPU3 is a **link error**, not a comment: both files
+define `bzdos_cpu3_owner` incompatibly, and linking the two objects together
+fails on purpose — verified directly (`ld --unresolved-symbols=ignore-all`
+against both `.o` files), not asserted.
 
 One tooling gap closed on the way out. `gen_config.py` knew about both
 directions of the DTB/build-flag mismatch it exists to prevent and only acted
 on one: a `cpu@N` node left behind by a disabled feature got a printed NOTE and
-nothing more. Disarming vcpu2 therefore left `cpu@2` in the DTB with `VCPU2=0`
-— FreeBSD would enumerate a third core, ask for it by PSCI, and EL2 would
-refuse. A note you have to notice is not a safeguard; it removes the node now.
+nothing more. Disarming vcpu2 mid-session therefore left `cpu@2` in the DTB
+with `VCPU2=0` — FreeBSD would enumerate a third core, ask for it by PSCI, and
+EL2 would refuse. A note you have to notice is not a safeguard; it removes the
+node now.
