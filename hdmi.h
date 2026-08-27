@@ -277,6 +277,33 @@ void hdmi_relock(void);
  *                      programmed into DE_UI1_CFG0_TOP_LADDR — added for
  *                      zero-copy scanout (docs/zero-copy-scanout.md); reads
  *                      back HDMI_FB_BASE until the first flip ever happens
+ *   [12] vblank_count g_vblank_count (hdmi.c) — real TCON1 vblanks observed,
+ *                      via hdmi_vblank_poll(), whichever caller runs it
+ *                      (CPU1's tight poll loop with dbg_vcpu1 off, or
+ *                      gic_timer.c's HDMI_TCON1_IRQ_INTID dispatch with it
+ *                      on). Free-running since boot; take two reads N
+ *                      seconds apart to get a rate.
+ *   [13] hdmi_wrong_core  gic_timer.c's gt->hdmi_wrong_core for CPU1 — SPI
+ *                      arrivals EL2 caught landing on the wrong core
+ *                      (ITARGETSR drift), EOI+DIR'd and dropped rather than
+ *                      serviced. ADDED so this is one dbgmon `d` away
+ *                      instead of ELF symbol archaeology: IRQ_COUNTER_BC_
+ *                      BASE (gic_timer.c) is CPU0-only by construction, and
+ *                      HDMI_TCON1_IRQ_INTID only ever arrives on CPU1, so it
+ *                      had no live-readable export before this word.
+ *                      Written every REPORT_EVERY (100) ticks from CPU1's
+ *                      own tick, i.e. about once a second — nonzero here
+ *                      means "wrong core" is a live contributor to the
+ *                      measured vblank-rate shortfall; flat at 0 across a
+ *                      run rules it out for that run.
+ *   [14] hdmi_throttles  gic_timer.c's gt->hdmi_throttles for CPU1 — times
+ *                      the HDMI_IRQ_BUDGET_PER_TICK (32/tick) ceiling was
+ *                      hit and the SPI was masked until the next tick.
+ *                      Same reachability note as [13]. Nonzero means the
+ *                      per-tick budget is actually being exhausted (it
+ *                      shouldn't be: 32/tick is ~53x a healthy 60 Hz
+ *                      source's ~0.6/tick); flat at 0 rules the throttle
+ *                      out as the source of a low vblank rate.
  * ------------------------------------------------------------------ */
 /* Relocated 2026-07-25 from 0x50003000 — that address sits INSIDE the
  * vconsole 64 KiB capture ring (0x50000f10..0x50010f10) and was being
