@@ -94,7 +94,7 @@
          `<soc-nodes>` below for exactly which node path(s) each one owns.
          ALL default OFF, per this file's existing "one feature per device,
          one board cycle at a time" idiom. -->
-    <feature name="guest_usb_host1"   dtb-only="true" enabled="false"/>
+    <feature name="guest_usb_host1"   dtb-only="true" enabled="true"/>
     <feature name="guest_wifi_sdio"   dtb-only="true" enabled="false"/>
     <feature name="guest_audio_codec" dtb-only="true" enabled="false"/>
     <feature name="guest_mipi_dsi"    dtb-only="true" enabled="false"/>
