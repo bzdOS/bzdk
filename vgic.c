@@ -234,6 +234,31 @@ static inline void write_cntvoff_el2(uint64_t v)
  *                      the pending queue fills/drains)
  *   [19] maint_intid_en  GICD_ISENABLER0 readback (bit25 must be 1 — the
  *                      maintenance PPI is enabled at the real distributor)
+ *   --- CNTV injection additions (vgic_inject_cntv(), see that function) ---
+ *   [20] cntv_inject   CNTV ticks actually placed in a List Register
+ *   [21] cntv_gate     CNTV ticks skipped: a live vINTID 27 was already in
+ *                      an LR (the one-shot gate — see vgic_inject_cntv())
+ *   [22] last_cntv_lr  last LR word vgic_inject_cntv() wrote
+ *   [23] cntv_drop     CNTV ticks dropped: no free LR and no live 27 either
+ *   --- added 2026-08-27 (crash-20260827-vcpu2-livelock) ---------------
+ *   [24] last_vintid   the vINTID of the LAST successful injection via ANY
+ *                      path on this core (vgic_inject_hw()/vgic_maintenance()
+ *                      via vgic_lr_write_hw(), the legacy vgic_inject(), and
+ *                      vgic_inject_cntv()). Exists because [4]/[5]
+ *                      (inject_count/inject_ok) are a SINGLE shared counter
+ *                      across every one of those paths — a high injection
+ *                      rate on this counter alone cannot say whether it is
+ *                      the guest's own virtual timer (27), a device SPI, or
+ *                      a mix, which was exactly the ambiguity that made a
+ *                      live ~1174/s reading on CPU2 impossible to name from
+ *                      this window alone. Compare against [20] (cntv_inject):
+ *                      if inject_ok == cntv_inject, every injection on this
+ *                      core is CNTV; if not, at least one device SPI is
+ *                      landing here too — that comparison needs no code
+ *                      change and could have been read from the SAME dump
+ *                      that produced the 1174/s figure. [24] is the
+ *                      one-word-cheaper version that survives even if
+ *                      [20]/[5] silently stop lining up in the future.
  * ================================================================ */
 /* 0x50001c00, matching the window documented just above (and smp.h / hv_addrmap.h).
  * Was 0x00018000 — guest-writable SRAM, next to start.S's boot breadcrumbs; a
@@ -272,7 +297,12 @@ _Static_assert(VGIC_BC_HI_BASE == HVMAP_VGIC_BC_HI,
  * side reader (triage.py, hvdbg, vgic_qemu_ci.h) keeps working byte-for-byte
  * without knowing this split happened. */
 #define VGIC_BC_STRIDE 0x80UL
-#define VGIC_BC_MAXIDX 19
+/* CORRECTED 2026-08-27: this was left at 19 when the CNTV fields ([20]-[23])
+ * were added, so the assert below had stopped checking the real highest
+ * index in use (harmlessly, since 23 still fit inside the 32-word stride —
+ * but an assert that silently stops meaning what it says is its own kind of
+ * bug). Now covers [24] (last_vintid) too. */
+#define VGIC_BC_MAXIDX 24
 _Static_assert((VGIC_BC_MAXIDX + 1) * 4UL <= VGIC_BC_STRIDE,
                "vgic.c writes past its per-core breadcrumb lane into the next core's");
 _Static_assert(2UL * VGIC_BC_STRIDE <= 0x100UL,
@@ -547,6 +577,7 @@ static void vgic_lr_write_hw(struct vg_percpu *vg, uint32_t n, uint32_t vintid,
 	vg_bc(4, vg->inject_count);
 	vg_bc(5, vg->inject_ok);
 	vg_bc(7, lr);
+	vg_bc(24, vintid);   /* last_vintid — see the window-layout comment */
 	/* B4 flight recorder: a0=vintid(==pintid for HW mode), a1=LR word. */
 	flightrec_log(FLTR_K_IRQ, vintid, lr);
 }
@@ -651,6 +682,7 @@ void vgic_inject(uint32_t vintid, int priority)
 			vg_bc(5, vg->inject_ok);
 			vg_bc(7, lr);
 			vg_bc(8, elrsr);
+			vg_bc(24, vintid);   /* last_vintid */
 			/* B4 flight recorder: one event per IRQ actually landed in a
 			 * List Register — a0=vintid, a1=the LR word written (priority +
 			 * state folded in, cheaper than a second arg). */
@@ -743,6 +775,7 @@ int vgic_inject_cntv(void)
 	vg_bc(8, elrsr);
 	vg_bc(20, vg->cntv_inject);
 	vg_bc(22, lr);
+	vg_bc(24, VGIC_VTIMER_INTID);   /* last_vintid */
 	flightrec_log(FLTR_K_IRQ, VGIC_VTIMER_INTID, lr);
 	return 1;
 }
