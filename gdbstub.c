@@ -74,6 +74,45 @@ extern int  gdb_getc(void);
 extern void gdb_putc(int c);
 extern void gdb_flush(void);
 
+/* CPU1-owned HW WDOG (wdt.c). MUST be called from every spin that can block
+ * this core waiting on wire bytes -- not just once before entering the wait.
+ *
+ * ROOT CAUSE (board-free, confirmed by reading wdt.c): wdt_debug_kick()
+ * restarts the RAW hardware watchdog, whose interval is capped at 16s (the
+ * hardware maximum -- wdt.c's WDOG_MODE_16S_EN, "the HARDWARE MAXIMUM
+ * interval"). This is a *different* register/timer than wdt_pet()'s
+ * software-extended, 180s-progress-gated one; wdt_debug_kick()'s whole
+ * contract (wdt.c's "SMP debug-core watchdog ownership" block comment) is
+ * "as long as CPU1 is alive [and callling this], the board stays resident" --
+ * i.e. it must be called roughly every poll pass, unconditionally, exactly
+ * like the original dedicated CPU1 loop (smp.c) always did.
+ *
+ * Before this fix, every caller of wdt_debug_kick() in this file called it
+ * exactly ONCE per top-of-command-loop iteration (see command_loop_ex()
+ * below), immediately before blocking inside gdb_recv()/gdb_recv_body() --
+ * both of which spin on gdb_getc() with NO internal timeout and NO further
+ * kick, "used only while the guest is halted" (gdb_recv_body()'s own
+ * comment). Any gap longer than ~16s between two complete RSP packets --
+ * e.g. a human reading a stack trace or typing a command after hitting a
+ * breakpoint, completely ordinary interactive use -- let the raw HW
+ * watchdog interval elapse with nobody re-arming it, silently resetting the
+ * board mid-session. This is the confirmed mechanism behind both "the RSP
+ * channel goes dark in long sessions, only a board reset recovers it" and
+ * the separately-reported "pause-gate + an armed Z0 breakpoint kills the
+ * board ~15s after release" (main_gdb.c's hold-gate parks CPU0 at a real
+ * stop with nobody yet typing GDB commands -- the same starved wait, just
+ * reached by a different front door). It reproduces independent of vcpu1 /
+ * CPU1-ownership: it only needs command_loop_ex() to be reached and idle
+ * for 16s, which happens even in the dedicated `gdb` build where CPU1 stays
+ * the debug core throughout.
+ *
+ * Fix: kick on every failed gdb_getc() poll inside every blocking wait in
+ * this file (gdb_recv(), gdb_recv_body()'s byte/escape/run-length/checksum
+ * waits, tx_raw_and_ack()'s ack wait) -- restoring the "kicked every poll
+ * pass, unconditionally" cadence the original CPU1 tight loop guaranteed,
+ * instead of once per fully-received packet. */
+extern void wdt_debug_kick(void);
+
 /* ------------------------------------------------------------------ *
  * Small freestanding helpers.
  * ------------------------------------------------------------------ */
@@ -244,8 +283,10 @@ static void tx_raw_and_ack(void)
 			long spin;
 			for (spin = 0; spin < 4000000; spin++) {
 				c = gdb_getc();
-				if (c < 0)
+				if (c < 0) {
+					wdt_debug_kick();   /* see file-scope comment */
 					continue;
+				}
 				if (c == '+')
 					return;         /* acked */
 				if (c == '-')
@@ -299,14 +340,20 @@ static int gdb_recv_body(void)
 	last = -1;
 	for (;;) {
 		c = gdb_getc();
-		if (c < 0)
+		if (c < 0) {
+			wdt_debug_kick();   /* see file-scope comment */
 			continue;
+		}
 		if (c == '#')
 			break;
 		sum += (unsigned)(c & 0xff);
 		if (c == '}') {                 /* escape: next ^ 0x20 */
 			int e;
-			do { e = gdb_getc(); } while (e < 0);
+			do {
+				e = gdb_getc();
+				if (e < 0)
+					wdt_debug_kick();
+			} while (e < 0);
 			sum += (unsigned)(e & 0xff);
 			e ^= 0x20;
 			if (len < GDB_BUF - 1)
@@ -314,7 +361,11 @@ static int gdb_recv_body(void)
 			last = e;
 		} else if (c == '*') {          /* run-length: repeat `last` */
 			int rc, rep, k;
-			do { rc = gdb_getc(); } while (rc < 0);
+			do {
+				rc = gdb_getc();
+				if (rc < 0)
+					wdt_debug_kick();
+			} while (rc < 0);
 			sum += (unsigned)(rc & 0xff);
 			rep = rc - 29;
 			for (k = 0; k < rep && len < GDB_BUF - 1 && last >= 0; k++)
@@ -330,8 +381,16 @@ static int gdb_recv_body(void)
 	/* Two checksum hex digits. */
 	{
 		int h, l;
-		do { h = gdb_getc(); } while (h < 0);
-		do { l = gdb_getc(); } while (l < 0);
+		do {
+			h = gdb_getc();
+			if (h < 0)
+				wdt_debug_kick();
+		} while (h < 0);
+		do {
+			l = gdb_getc();
+			if (l < 0)
+				wdt_debug_kick();
+		} while (l < 0);
 		expect = (unhex(h) << 4) | unhex(l);
 	}
 
@@ -352,8 +411,10 @@ static int gdb_recv(void)
 	int c;
 	for (;;) {
 		c = gdb_getc();
-		if (c < 0)
+		if (c < 0) {
+			wdt_debug_kick();   /* see file-scope comment */
 			continue;
+		}
 		if (c == '$')
 			return gdb_recv_body();
 		/* '+', '-', 0x03 and stray bytes while stopped: ignore. */
@@ -887,12 +948,15 @@ static int command_loop_ex(struct el2_frame *g, int first_open)
 	int first = first_open;
 
 	for (;;) {
-		extern void wdt_debug_kick(void);   /* CPU1-owned HW WDOG */
 		int n;
 		int act;
 
-		wdt_debug_kick();                   /* keep the board alive while
-						      * gdb dwells at a breakpoint  */
+		wdt_debug_kick();                   /* first kick of this packet;
+						      * gdb_recv()/gdb_recv_body()
+						      * (see file-scope comment)
+						      * keep re-kicking for as
+						      * long as the actual wait
+						      * for wire bytes takes */
 		n = first ? gdb_recv_body() : gdb_recv();
 		first = 0;
 		if (n < 0)
