@@ -129,7 +129,7 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_vgicd test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -142,6 +142,7 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_gdbstub_resolve
 	./test_gdbstub_hwop
 	./test_vgic_pendq
+	./test_vgicd
 	./test_sd_bio_addr
 	./test_snapshot_fmt
 	./test_bmc_arm_gate
@@ -204,6 +205,9 @@ test_bmc_arm_gate: test_bmc_arm_gate.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vgic_pendq: test_vgic_pendq.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+test_vgicd: test_vgicd.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_coredump_elf: test_coredump_elf.c
@@ -880,4 +884,4 @@ clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
 	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart \
-	      test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq
+	      test_gdbstub_resolve test_gdbstub_hwop test_vgic_pendq test_vgicd
