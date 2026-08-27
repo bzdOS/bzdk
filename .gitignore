@@ -14,6 +14,7 @@ test_vconsole_uart
 test_vblk_stitch
 test_gdbstub_resolve
 test_gdbstub_hwop
+test_gdbstub_wdt_kick
 test_automount
 
 # Agent worktrees (isolated per-task git worktrees, not part of the tree)

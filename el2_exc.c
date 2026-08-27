@@ -1044,8 +1044,46 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 		 * gdbstub_attached is 0 (null address) and this is skipped entirely, so
 		 * hwbp.c / the fault path below behave exactly as before. Must sit
 		 * BEFORE hwbp_handle() so its one-shot handler can't clear a slot gdb
-		 * wants sticky. */
+		 * wants sticky.
+		 *
+		 * CORE-OWNERSHIP GATE (2026-08-27, board-free finding, landed
+		 * alongside the gdbstub.c watchdog-starvation fix per that commit's
+		 * own note that the two must ship together): `smp_cpu_id() == 0u`,
+		 * same style as the two sibling guest-frame-snapshot blocks a few
+		 * dozen lines above (the CPU0 block's `smp_cpu_id() == 0u` outer
+		 * gate and the CPU1-mirror block's `smp_cpu_id() == 1u`) -- both
+		 * exist precisely because mixing two vCPUs' register state into one
+		 * report is this codebase's recurring failure class (see the CPU0
+		 * block's own comment). This divert was the one place left without
+		 * that gate. Every step below assumes the trapping core is CPU0:
+		 * g_last_guest_frame is CPU0's slot (the CPU1-mirror block above
+		 * has its own g_cpu1_guest_frame precisely so the two are never
+		 * conflated), and the servicing side is CPU1's debug-core loop
+		 * (smp.c) or tick (gic_timer.c) -- i.e. a DIFFERENT core is always
+		 * assumed to be free to run the RSP command loop and clear
+		 * gdb_stop_pending. If CPU1 itself ever took a qualifying trap here
+		 * (reachable only once/if a future change wires gdb_channel into
+		 * vcpu1's own tick path -- see gic_timer.c's "KNOWN GAP" comment,
+		 * deliberately NOT done in that same change; see this fix's commit
+		 * message for why), it would set gdb_stop_pending=1 and park in the
+		 * `while (gdb_resume_act == 0xffffffffu) wfe;` loop below waiting
+		 * for CPU1 -- itself -- to service that same flag: an unconditional
+		 * self-deadlock, with no watchdog backstop inside that specific wfe
+		 * loop (wdt_debug_kick() only runs from CPU1's *tick*, which can't
+		 * fire again until this trap handler returns -- and it never
+		 * would). CPU2/CPU3 traps must stay excluded too: today they can
+		 * never reach here (gdbstub_attached() requires either the `gdb`
+		 * build, which never links vcpu2.o/vcpu3.o, or the `dbg` build with
+		 * dbg_vcpu1 armed and gdb_channel wired in -- neither links a path
+		 * from CPU2/CPU3's own traps to gdbstub_attached() becoming true),
+		 * but gating on the one core this divert's design actually
+		 * supports, rather than on "whichever cores happen to be
+		 * unreachable today", is what keeps this correct as vcpu2.c/
+		 * vcpu3.c gain capability. CPU0 traps are unaffected: smp_cpu_id()
+		 * is a cheap `mrs mpidr_el1` either way, same as the sibling
+		 * blocks' own comment notes. */
 		if (gdbstub_attached && gdbstub_attached() &&
+		    smp_cpu_id() == 0u &&
 		    (ec == 0x3Cu ||                                  /* guest SW BRK   */
 		     ec == 0x32u ||                                  /* step complete  */
 		     ((ec == 0x30u || ec == 0x34u) &&                /* HW bp / watch  */

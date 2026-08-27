@@ -1615,6 +1615,76 @@ gic_timer_irq(struct el2_frame *frame)
 			el2_snapshot_guest_frame(&snap);
 			dbgmon_service(&snap);
 		}
+		/* KNOWN GAP (board-free code-reading finding, 2026-08-27, STILL NOT
+		 * fixed here, now for a DIFFERENT and more fundamental reason than
+		 * when this comment was first written -- see the update below).
+		 * Unlike smp.c's old SMP_DEBUG_CPU loop (the `if (&gdb_channel &&
+		 * gdb_channel) { ... gdb_stop_pending ... } else {
+		 * dbgmon_service(&snap); }` branch that loop still has, now dead
+		 * code whenever dbg_vcpu1 is armed), THIS tick-path call to
+		 * dbgmon_service() is unconditional and has NO gdb_channel
+		 * awareness at all. In the `dbg` build dbgmon_service() resolves to
+		 * dbgmon.c's real text monitor, which never checks gdb_channel
+		 * either (its `gdb` command only sets the flag; nothing downstream
+		 * reads it). Net effect: with vcpu1 armed (board-config.xml's
+		 * default), issuing dbgmon's `gdb` command is a complete no-op --
+		 * raw RSP bytes get fed byte-by-byte into the ASCII line parser,
+		 * gdbstub_attached() can never become true, and no
+		 * breakpoint/step/watchpoint trap can ever reach gdbstub.c's
+		 * command loop. Source-level GDB against the guest is therefore
+		 * fully unreachable in this exact configuration (`dbg` build +
+		 * vcpu1 armed + runtime `gdb` command), independent of the
+		 * gdbstub.c watchdog-starvation fix (see that file's file-scope
+		 * wdt_debug_kick() comment) and independent of the two banked-
+		 * register fixes in gdbstub.c/gdbstub_hw.c (commit 3c28d5e).
+		 *
+		 * UPDATE (same pass): el2_exc.c's GDB divert now HAS a
+		 * core-ownership gate (`smp_cpu_id() == 0u`, see that file's "GDB
+		 * divert (ROADMAP B2)" block comment) -- landed in the same change
+		 * as the gdbstub.c watchdog fix, per this comment's own prior
+		 * instruction that the two must ship together. That closes the
+		 * self-deadlock this comment used to describe (CPU1 taking its own
+		 * qualifying trap, setting gdb_stop_pending, and parking forever
+		 * waiting for itself to service it).
+		 *
+		 * Wiring gdb_channel/gdb_stop_pending into THIS block is still
+		 * deliberately NOT done, because closing the self-deadlock exposed
+		 * a SEPARATE, more fundamental hazard underneath it: gdbstub.c's
+		 * register access assumes the core running dispatch() is CPU1
+		 * acting as an inert, guest-free debug plane -- true today only
+		 * because dbg_vcpu1's tick never calls into gdbstub at all. Two
+		 * concrete spots break that assumption the moment this IS wired in:
+		 *
+		 *   - reg_get()/reg_set() for REG_SP (gdbstub.c) do `mrs/msr
+		 *     sp_el1` directly -- SP_EL1 is a per-PE BANKED register (same
+		 *     class as this project's four-confidently-wrong-diagnoses
+		 *     history, CLAUDE.md rule 4). Serviced from CPU1's tick while
+		 *     CPU1 is itself running vcpu1's live FreeBSD guest, a GDB `g`/
+		 *     `p` register read would silently return CPU1's OWN vcpu1
+		 *     guest's SP_EL1 as if it were CPU0's guest's SP -- a live,
+		 *     PLAUSIBLE value, not obvious garbage, indistinguishable from
+		 *     correct without cross-checking. A `G`/`P` write is worse: it
+		 *     would corrupt CPU1's live, running vcpu1 guest's stack
+		 *     pointer, which then resumes on that corrupted SP the moment
+		 *     the tick returns.
+		 *   - arm_step()/disarm_step() (gdbstub.c) toggle MDCR_EL2.TDE and
+		 *     MDSCR_EL1.SS via raw mrs/msr -- also per-PE. Run from CPU1's
+		 *     tick, these would toggle CPU1's OWN debug-exception routing
+		 *     and single-step state for its live vcpu1 guest, not CPU0's --
+		 *     harmless only by accident today (CPU1 never runs guest code
+		 *     in the working design), not by anything in gdbstub.c that
+		 *     checks which core it is running on.
+		 *
+		 * Both are dead code paths TODAY -- unreachable for the same
+		 * reason this whole block is a known gap -- but wiring gdb_channel
+		 * in here would make them live without touching either function.
+		 * A real fix needs gdbstub.c's register path reworked to the same
+		 * shape hwbp already uses for HW breakpoint ops (gdb_hw_op_pending,
+		 * el2_exc.c): queue the operation, have CPU0 (the core that
+		 * actually owns the frame being debugged) apply it from inside its
+		 * own parked wfe loop, same as gdbstub_hw_apply_op() already does
+		 * for Z1..Z4/z1..z4 -- out of scope for a board-free-only pass, so
+		 * left unimplemented and undone rather than landed unverified. */
 		/* CORRECTED 2026-08-25: arming vcpu1 stops smp.c's old tight loop
 		 * from ever running, including its continuous eMMC clock pinmux
 		 * enforcement (PC5 must stay function 3/mmc2; FreeBSD's own
