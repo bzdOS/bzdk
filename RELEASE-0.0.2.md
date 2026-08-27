@@ -306,31 +306,35 @@ plus the cross-SoC-family Linux convention — not from this board's DTB.
 
 Everything in 0.0.1's list still stands except where noted, plus:
 
-- **NEW: `python3.12` on the guest segfaults.** `python3 -c "pass"` dies with
-  SIGSEGV inside `Py_InitializeFromConfig` (`python3 --version` "works" only
-  because it exits before running bytecode). `ktrace` shows SEGV_MAPERR right
-  after an `mmap` that itself succeeds; `pkg check -s` passes, so this is not
-  file corruption; a core dump dated **2026-08-23** proves it predates this
-  release. **Consequence: `meson` cannot run, so no meson-based build — the
-  native Mesa build included — is possible on the board at all.** This narrows
-  "the board is also a build host" considerably: `cc`/`ninja`/`make` still work,
-  anything Python-dependent does not. Repair needs `pkg install
-  --force-reinstall`, which needs `mount -uw /` on a deliberately read-only
-  root — treat it as a maintenance window, not a side quest.
-- **NEW: the Mesa sources are staged but unbuilt.** `/opt/src/mesa-26.2.0`
-  (399 MB, complete) is in place for a native build that cannot start until the
-  above is fixed. The verified `meson setup` option set already exists in
-  `../bsdOS/hal/lima/mesa/FEASIBILITY.md` — do not re-derive it.
+- **FIXED during this release: `python3.12` on the guest segfaulted.** An earlier
+  draft of this bullet said "`pkg check -s` passes, so this is not file
+  corruption" — that was wrong twice over, and the correction is in its own
+  section below ("The board's own build environment"). It *was* file corruption:
+  70 python312 files and 6 meson files damaged at exactly their correct length,
+  stale wreckage from the already-fixed `rd_cntpct()`-runs-backwards era. `pkg
+  check -s` said nothing because that package's file list in pkg's database is
+  empty. Repaired from intact references already on the board; a sweep of every
+  package with an exact-version cached reference found no further damage.
+- **The Mesa sources are staged and now building.** `/opt/src/mesa-26.2.0`
+  (399 MB, complete). `meson setup` completes on the board (`Gallium drivers:
+  lima`, EGL and GBM enabled) and `ninja` is working through 993 targets on two
+  slow vCPUs — resumable with `ninja -C /opt/build/mesa`, not restartable from
+  scratch. The verified option set is in `../bsdOS/hal/lima/mesa/FEASIBILITY.md`
+  — do not re-derive it. `PyYAML` and `ply` were missing and are staged under
+  `/opt` on `PYTHONPATH` rather than installed, so they cost no root write.
 - **The RSP channel goes dark in long GDB sessions** — still unfixed. Note that
   the EMAC channel death described earlier in this file was a *different*,
   now-fixed bug (`dbg_core_active`); do not treat that fix as covering this one.
 - **`holdtest` TEST B is INCONCLUSIVE**, unchanged: a documented QEMU-TCG
   self-modifying-code artifact on an already-executed page, not expected on real
   silicon. That target is not part of `ci.sh`; `run_holdtest.sh` runs it.
-- **The "100 clean boots" streak was reset** by this session's reload cycles
-  (best 130, current 5). The gate's own reasoning in `ROADMAP.md` is unchanged
-  and it stays closed; noted only so nobody reads the current counter as a
-  regression.
+- **The "100 clean boots" gate is now MET on this build.** 100 cycles, zero
+  failures, on the SoC-consolidated image with vcpu1 armed; the cumulative
+  ledger reads current 110, best 130, 367 total. An earlier draft of this bullet
+  recorded the streak as reset to 5 by reload cycles — that was true when
+  written and is superseded. `boot_streak.py` drives it, deliberately via
+  `board_ctl.force_to_uboot()`'s proven ladder rather than
+  `reliable_load.py --cycles N`, whose EMAC self-reboot failed 3/3 when tried.
 - **One board.** Unchanged, and still the largest caveat in this file.
 
 ## Portability: the first real step, taken deliberately now
