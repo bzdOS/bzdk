@@ -21,14 +21,23 @@
  * both") exactly: the real dbgmon.c is never linked, so there is only ever
  * one implementation live under that name, and it IS gdbstub.
  *
- * GAP (documented, not fixed here — see the task report): this trick only
- * wires the "poll for incoming GDB traffic / Ctrl-C while the guest runs"
- * half of gdbstub (gdbstub_poll). It does NOT wire gdbstub_on_debug_event()
- * for an actual breakpoint/single-step STOP — el2_exc.c's EC==0x30/0x32/0x34
- * cases still go straight to hwbp_handle()/el2_ss_handle() and EC==0x3C
- * (guest software BRK) has no case at all. That needs a small, surgical
- * edit to el2_exc.c's trap dispatch (out of scope here per the task's
- * el2_exc.c exclusion — see the report for the exact proposed diff).
+ * STALE GAP NOTE, CORRECTED 2026-08-27 (board-free code-reading pass): this
+ * paragraph used to say el2_exc.c's trap dispatch did not divert a real
+ * breakpoint/step/watchpoint STOP to gdbstub_on_debug_event() at all, citing
+ * "out of scope here per the task's el2_exc.c exclusion". That was true when
+ * this file was written (58eed55, 2026-07-23) but stopped being true two
+ * days later: commit 76b0e8e ("gdbstub: wire guest breakpoint/step STOP into
+ * the main dbg build (B2)", 2026-07-25) added exactly that divert to
+ * el2_exc.c's lower-EL sync-trap path (search that file for "GDB divert
+ * (ROADMAP B2)") — gated on `gdbstub_attached()`, covering EC==0x3C (guest
+ * SW BRK), EC==0x32 (completed single-step), and EC==0x30/0x34 (HW bp/wp,
+ * additionally gated on `gdbstub_hw_active()`). This file's own header
+ * comment simply was never updated afterward. The divert publishes the stop
+ * into `g_last_guest_frame`, parks the trapping core in a `wfe` loop, and
+ * smp.c's CPU1 debug-service loop (reached in THIS build, since GDB_OBJS
+ * does not link vcpu1.o/vcpu2.o — see that file's own comment) services it
+ * via gdbstub_on_debug_event() exactly as gdbstub.h's DESIGN section
+ * describes. Verified by reading, not by a board run.
  *
  * `dbgmon_call_active` is also normally defined (strong) in dbgmon.c and
  * referenced `extern` by el2_exc.c's cmd_call() fault-recovery path; since
