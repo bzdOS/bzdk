@@ -433,10 +433,13 @@ binary is byte-for-byte identical**, same md5 before and after — plus the full
 board-free gate, plus a boot on hardware.
 
 Done now rather than after the pause for a specific reason: it is a
-44-file mechanical change on a bare-metal image where a wrong address means a
+23-file mechanical change on a bare-metal image where a wrong address means a
 board that does not boot, and physical access to press reset is the one resource
 that disappears during a months-long pause. The green board-free gate is what
-made it reviewable at all.
+made it reviewable at all. (23 files actually touched to re-point at the
+canonical addresses; the 44-file, 48-`#define` figure above is how many files
+carried a duplicate copy of one — a different count, easy to conflate with the
+size of the fix itself.)
 
 **Still hardcoded, and named rather than quietly left:** the load address
 (`0x42000000`) and DRAM window in `link.ld`/`stage2.h`; RSB/AXP803 register
