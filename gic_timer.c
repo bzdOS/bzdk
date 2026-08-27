@@ -1577,6 +1577,36 @@ gic_timer_irq(struct el2_frame *frame)
 		 * reason (CPU0 was taking INTID 119 while CPU1 sat frozen). */
 		if (GICD_ITARGETSR_BYTE(HDMI_TCON1_IRQ_INTID) != (1u << 1))
 			GICD_ITARGETSR_BYTE(HDMI_TCON1_IRQ_INTID) = (1u << 1);
+
+		/* Publish gt->hdmi_wrong_core / gt->hdmi_throttles into the HDMI
+		 * breadcrumb (hdmi.h's BC_HDMI_BASE words [13]/[14]), same cadence
+		 * as the CPU0-only storm diagnostics below (REPORT_EVERY ticks,
+		 * ~1/s). ADDED while investigating a measured ~18 Hz vblank rate
+		 * against a ~60 Hz mode: these counters already existed and are the
+		 * cheap, direct way to confirm or rule out "wrong-core drop" and
+		 * "budget throttle" as the cause, but had no live-readable export —
+		 * IRQ_COUNTER_BC_BASE below is deliberately CPU0-only (see its own
+		 * comment: "Rather than splitting those windows for a second
+		 * writer, this core's tick simply skips the block"), and
+		 * HDMI_TCON1_IRQ_INTID only ever arrives on CPU1. Same lane-
+		 * ownership reasoning applies here in reverse: these two words in
+		 * BC_HDMI_BASE are written ONLY from this CPU1 tick path, so there
+		 * is no writer race with hdmi.c's own words in the same window
+		 * (word [12]'s g_vblank_count is likewise CPU1-only in this build).
+		 * Same coherent-store idiom as hdmi.c's bc_write() / this file's
+		 * own IRQ_COUNTER_BC_BASE write just below (`dc civac` + `dsb sy`). */
+		if ((gt->ticks % REPORT_EVERY) == 0) {
+			volatile uint32_t *hdmi_bc =
+			    (volatile uint32_t *)BC_HDMI_BASE;
+
+			hdmi_bc[13] = gt->hdmi_wrong_core;
+			hdmi_bc[14] = gt->hdmi_throttles;
+			/* [13]/[14] are adjacent words, same cacheline -- one
+			 * clean+dsb covers both, same as IRQ_COUNTER_BC_BASE's
+			 * two-word write just below. */
+			__asm__ volatile("dc civac, %0\n\tdsb sy"
+			                  :: "r"(&hdmi_bc[13]) : "memory");
+		}
 #endif
 
 		{
