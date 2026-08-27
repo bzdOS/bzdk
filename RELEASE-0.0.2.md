@@ -290,16 +290,34 @@ both, `wrong_core` counters flat at 0, CPU1 taking INTID 119 with
 **Two measurements that did not come out as hoped:**
 
 - **MUSB genuinely storms**: ~646 interrupts/s on a completely idle CDC-ACM
-  console, exhausting the 32-per-tick budget ~29 times/s. So that budget is
-  containing a real defect in `usbacm_poll()`'s source de-assertion, not
-  hypothetical hardening. Bounded and harmless where it is, but it is a real
-  open bug in `musb.c`/`usbacm.c`, not a clean path.
+  console, exhausting the 32-per-tick budget ~29 times/s. **Root-caused since:
+  it is not inherited hardware behaviour, it is this release's own
+  regression.** Commit `6cf4215` (arming CPU1 as vcpu1) enabled
+  `REG_INTTXE`/`REG_INTRXE` so an IRQ-driven `usbacm_poll()` could see EP0/EP1
+  activity — and nothing in this tree had ever read the matching status
+  registers, `REG_INTTX`/`REG_INTRX`; the driver polls CSR-level bits
+  directly instead. A latched endpoint bit — guaranteed during enumeration —
+  holds the single OR'd "mc" SPI line asserted, and `gic_timer_irq()`'s
+  EOI-then-recheck sequence re-presents it at once. Fixed by draining and
+  writing back both registers in `musb.c`. **NOT hardware-validated, and the
+  arithmetic does not fully close**: 646/s against a 32-per-tick ceiling at a
+  100 Hz tick does not cleanly fit a permanently-asserted line. The mechanism
+  is established from the code; the size of the effect still needs the
+  measurement.
 - **The vblank arrives at ~18 Hz, not the ~60 Hz** the old tight-loop polling
   measured (0.0.1 reported 60.04 Hz). NOT a throttle artifact —
   `hdmi_throttles` stays 0 and the ceiling is 3200/s. Unexplained. The most
   plausible candidate is the guest's own KMS/lima driver, which also reads
   `TCON_INT0` and may be consuming latches. **Do not treat vblank pacing as a
-  finished 60 Hz feature.**
+  finished 60 Hz feature.** The two counters cited to rule out the CPU1-side
+  causes (`hdmi_wrong_core`, `hdmi_throttles`) had no live export — CPU1's
+  vblank SPI and `IRQ_COUNTER_BC_BASE`'s CPU0-only window meant the numbers
+  above were a one-off nobody could re-take. Both are now published from
+  CPU1's tick into `BC_HDMI_BASE` words 13/14, diagnostic only. The leading
+  explanation for the ~18 Hz figure is now same-GIC-priority contention on
+  CPU1: INTID 119, 103 and 30 all sit at `TIMER_PRIORITY`, and a same-priority
+  IRQ cannot preempt on GICv2, against a status bit that latches rather than
+  counts.
 
 One assumption remains unproven by construction: `TCON_INT0` bit30 as the
 TCON1 vblank *enable* bit. It reads back as 1 and interrupts do arrive, which is
