@@ -47,6 +47,30 @@ CONFIG_MK = HERE / "config.mk"
 # SPI numbers must stay inside the documented free gap (docs/virtio-blk-dtb.md).
 SPI_GAP = range(0x68, 0x74)
 
+# Existing-hardware nodes no <feature dtb-nodes="..."> may ever list, checked
+# structurally (not just by review) for the same reason wdogtrap.c's WDOG
+# check is a hard first-return rather than a case a future edit could shuffle
+# past. Each one is a real hazard already root-caused elsewhere in this tree:
+#   - usb@1c19000 (MUSB/OTG) and usb@1c1a000/usb@1c1a400 (EHCI0/OHCI0) share
+#     the OTG PHY (phys = <&usbphy 0>, same "usb0" lane as MUSB) with the
+#     hypervisor's OWN debug/break-glass console (usbacm.c) -- see usbacm.h's
+#     "KNOWN OPEN RISK". EHCI1/OHCI1 use the independent "usb1" lane instead
+#     (phys = <&usbphy 1>) and are the pair guest_usb_host1 in
+#     board-config.xml actually enables.
+#   - watchdog@1c20ca0 is disabled BY DESIGN (PROGRESS.md 2026-07-15) -- the
+#     board's only unattended recovery path. See CLAUDE.md.
+#   - dma-controller@1c02000 is the SoC's general-purpose memory-to-memory
+#     DMA engine: no SMMU gates it, and docs/dma-bypass-stage2.md documents
+#     it as "provably unused" today specifically because every consumer that
+#     could arm it is also disabled. dai@1c22c00 (the codec-i2s DAI, the
+#     ONLY thing in the audio chain with a `dmas` property) is its one path
+#     back to armed; leaving both off keeps that invariant true.
+FORBIDDEN_DTB_NODES = {
+    "/soc/usb@1c19000", "/soc/usb@1c1a000", "/soc/usb@1c1a400",
+    "/soc/watchdog@1c20ca0",
+    "/soc/dma-controller@1c02000", "/soc/dai@1c22c00",
+}
+
 
 def load_config(xml_path):
     tree = ET.parse(xml_path)
@@ -59,6 +83,11 @@ def load_config(xml_path):
             "enabled": f.get("enabled", "false") == "true",
             "needs_dtb_cpu": f.get("needs-dtb-cpu"),
             "dtb_memory_size": f.get("dtb-memory-size"),
+            # dtb-only: no C code anywhere is gated by this feature, only
+            # what the guest's DTB advertises -- see board-config.xml's
+            # guest_usb_host1-and-siblings comment. Skips the mkvar
+            # requirement below and is never written to config.mk.
+            "dtb_only": f.get("dtb-only", "false") == "true",
         }
 
     devices = []
@@ -73,10 +102,19 @@ def load_config(xml_path):
             "no_dtb_node": d.get("no-dtb-node", "false") == "true",
         })
 
-    return features, devices
+    soc_nodes = []
+    soc_nodes_el = root.find("soc-nodes")
+    if soc_nodes_el is not None:
+        for n in soc_nodes_el:
+            soc_nodes.append({
+                "feature": n.get("feature"),
+                "path": n.get("path"),
+            })
+
+    return features, devices, soc_nodes
 
 
-def validate(features, devices):
+def validate(features, devices, soc_nodes):
     """Cheap, load-bearing sanity checks before touching anything real."""
     errors = []
 
@@ -95,10 +133,24 @@ def validate(features, devices):
         seen_spi[spi] = d["name"]
 
     for name, f in features.items():
-        if not f["mkvar"]:
-            errors.append(f"feature {name}: no mkvar= attribute — "
-                           f"gen_config.py doesn't know which Makefile "
-                           f"variable this controls")
+        if not f["mkvar"] and not f["dtb_only"]:
+            errors.append(f"feature {name}: no mkvar= attribute (and not "
+                           f"dtb-only=\"true\") — gen_config.py doesn't know "
+                           f"which Makefile variable this controls")
+
+    for n in soc_nodes:
+        if not n["path"] or not n["path"].startswith("/"):
+            errors.append(f"soc-node feature={n['feature']}: path "
+                           f"{n['path']!r} must be an absolute DTB path")
+        if n["feature"] not in features:
+            errors.append(f"soc-node path={n['path']}: feature "
+                           f"{n['feature']!r} has no matching <feature> entry")
+        if n["path"] in FORBIDDEN_DTB_NODES:
+            errors.append(f"soc-node path={n['path']} (feature "
+                           f"{n['feature']!r}): this node is in "
+                           f"FORBIDDEN_DTB_NODES — see that constant's "
+                           f"comment for which hazard it reopens, and do not "
+                           f"remove the node from the set to get past this")
 
     if errors:
         for e in errors:
@@ -114,6 +166,8 @@ def emit_makefile_fragment(features, dry_run):
         "",
     ]
     for name, f in sorted(features.items()):
+        if f["dtb_only"]:
+            continue
         lines.append(f"{f['mkvar']} = {1 if f['enabled'] else 0}")
     content = "\n".join(lines) + "\n"
 
@@ -294,6 +348,33 @@ def fdtget_ints(dtb_path, node, prop):
         return None
 
 
+def fdtget_str(dtb_path, node, prop):
+    r = subprocess.run(["fdtget", str(dtb_path), node, prop],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def ensure_node_status(dtb_path, node_path, want_enabled, dry_run):
+    """Flip ONE existing silicon node's `status` between "okay"/"disabled" —
+    see board-config.xml's <soc-nodes>. Never adds or removes a node, only
+    the property that gates whether FreeBSD's OFW device-enumeration probes
+    it at all. A DTB node with no `status` property is implicitly "okay" per
+    the devicetree spec, so an unreadable/missing property is treated as
+    "okay", not as "needs no action" — this is the same both-directions
+    self-healing reconcile_drift() does for cpu@N nodes, applied here to a
+    property instead of a whole node."""
+    want = "okay" if want_enabled else "disabled"
+    cur = fdtget_str(dtb_path, node_path, "status")
+    cur_effective = cur if cur is not None else "okay"
+    if cur_effective == want:
+        print(f"[gen_config] {node_path}: status already {want}, leaving as-is")
+        return
+    print(f"[gen_config] {node_path}: status {cur_effective} -> {want}")
+    fdtput(dtb_path, node_path, "s", "status", want, dry_run=dry_run)
+
+
 def remove_cpu_node(dtb_path, cpu_id, dry_run):
     node = f"cpu@{cpu_id}"
     path = f"/cpus/{node}"
@@ -335,8 +416,8 @@ def main():
     ap.add_argument("--no-backup", action="store_true")
     args = ap.parse_args()
 
-    features, devices = load_config(args.xml)
-    validate(features, devices)
+    features, devices, soc_nodes = load_config(args.xml)
+    validate(features, devices, soc_nodes)
 
     emit_makefile_fragment(features, args.dry_run)
 
@@ -392,6 +473,14 @@ def main():
             ensure_virtio_node(dtb_path, dts_text, d, args.dry_run)
 
     reorder_virtio_nodes(dtb_path, args.dry_run)
+
+    # Real silicon nodes gated on a dtb-only feature (board-config.xml's
+    # <soc-nodes>) — always reconciled, both directions, same as everything
+    # above: a node left "okay" after its feature is switched off again is
+    # the same drift this whole script exists to prevent.
+    for n in soc_nodes:
+        f = features.get(n["feature"], {})
+        ensure_node_status(dtb_path, n["path"], f.get("enabled", False), args.dry_run)
 
     print("[gen_config] done")
 
