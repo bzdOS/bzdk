@@ -789,4 +789,34 @@ _Static_assert(HVMAP_WDT_DEBUG_HOLD + HVMAP_WDT_DEBUG_HOLD_SIZE <= 0x50100000UL,
                "wdt debug-hold flag runs into el2_ncmap.c's non-cacheable "
                "DMA scratch window (SCRATCH_BASE 0x50100000)");
 
+/* ---- wdogtrap.c: the CCU/PIO/WDOG page trap (docs/wdog-ccu-pio-stage2.md) -
+ * Same shape as HVMAP_VGICD_BC: a magic word, per-outcome counters, last
+ * offset/value, last faulting CPU. Only ever written when
+ * STAGE2_TRAP_WDOG_PAGE actually traps the page (stage2.c) -- with that flag
+ * off (every shipping target today) this window stays all-0xFF, same "never
+ * happened" convention vgicd.c documents.
+ *
+ *   [0] magic "WDPG"
+ *   [1] total accesses trapped on this page
+ *   [2] reads passed through
+ *   [3] writes passed through unmodified (CCU/PIO/timer, outside PC_CFG0)
+ *   [4] WDOG-range writes REFUSED (the counter that must stay 0 on a
+ *       correctly-behaving guest -- nonzero means something just tried to
+ *       touch the reset lever)
+ *   [5] PIO_PC_CFG0 writes that had to re-force PC5 back to func 3
+ *   [6] last offset faulted
+ *   [7] last value written (post-policy, i.e. what actually reached hardware
+ *       or would have, for a refused WDOG write)
+ *   [8] accesses with ISV==0 (same meaning as vgicd.c's word 8)
+ *   [9] last CPU id that faulted here
+ * Placed past HVMAP_VGIC_BC_HI, the current top of this block. */
+#define HVMAP_WDOGTRAP_BC       0x5009E600UL
+#define HVMAP_WDOGTRAP_BC_SIZE  0x00000040UL
+#define HVMAP_WDOGTRAP_BC_END   (HVMAP_WDOGTRAP_BC + HVMAP_WDOGTRAP_BC_SIZE)
+
+_Static_assert(HVMAP_WDOGTRAP_BC >= HVMAP_VGIC_BC_HI_END,
+               "wdogtrap breadcrumbs overlap the CPU2/CPU3 vgic breadcrumb lanes");
+_Static_assert(HVMAP_WDOGTRAP_BC_END <= 0x50100000UL,
+               "wdogtrap breadcrumbs run into emac.c's DMA scratch (0x50100000)");
+
 #endif /* HV_ADDRMAP_H */
