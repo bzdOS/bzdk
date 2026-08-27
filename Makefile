@@ -350,6 +350,22 @@ ifeq ($(VCPU3),1)
 CFLAGS += -DVCPU3_DEFAULT_ON=1
 endif
 
+# GUEST_DRAM_2G — give the guest the board's full 2 GiB instead of the low GiB,
+# at the cost of snapshot/restore, which claims the high GiB as its mirror. See
+# stage2.h's comment for the trade and the measurement that motivated it (a
+# single Mesa NIR generator peaks at 648 MB against ~850 MB of usermem, so Mesa
+# could not be built on the board at any -j).
+#
+# NOT scoped to a target on purpose: it changes the stage-2 DRAM window, which
+# every hardware target shares, and stage2_zephyr.h turns the one genuine
+# conflict (the `dual` build, whose Zephyr slice sits in that high GiB) into a
+# compile error rather than letting it be a runtime overlap. So a `dual` build
+# with this set fails loudly at compile time, which is the intended behaviour.
+GUEST_DRAM_2G ?= 0
+ifeq ($(GUEST_DRAM_2G),1)
+CFLAGS += -DGUEST_DRAM_2G=1
+endif
+
 HDMI_MODE_1080P ?= 1
 ifeq ($(HDMI_MODE_1080P),1)
 # Global, not `dbg:`-scoped. Three targets link hud.o (DBG_OBJS, the repl list
@@ -364,12 +380,24 @@ CFLAGS += -DHDMI_MODE_1080P
 endif
 dbg: $(DBG_BIN)
 
+# snapshot.o/snapshot_net.o are conditional: GUEST_DRAM_2G hands the high GiB to
+# the guest, and that GiB is exactly snapshot's mirror window, so the two cannot
+# both exist. Dropping them is safe by construction rather than by luck --
+# emac.c already carries a weak snapshot_net_rx_frame() stub for precisely the
+# "snapshot_net not linked" case (emac.c:225-233), which is how the other
+# targets that never linked it have always worked.
+SNAP_OBJS := snapshot.o snapshot_net.o
+ifeq ($(GUEST_DRAM_2G),1)
+SNAP_OBJS :=
+endif
+
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
-            musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
-            netcon.o snapshot_net.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
-            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o
+            musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o el2_ncmap.o flightrec.o coredump.o \
+            netcon.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
+            gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o \
+            $(SNAP_OBJS)
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@

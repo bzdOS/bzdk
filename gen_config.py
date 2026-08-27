@@ -55,6 +55,7 @@ def load_config(xml_path):
             "mkvar": f.get("mkvar"),
             "enabled": f.get("enabled", "false") == "true",
             "needs_dtb_cpu": f.get("needs-dtb-cpu"),
+            "dtb_memory_size": f.get("dtb-memory-size"),
         }
 
     devices = []
@@ -259,6 +260,37 @@ def reorder_virtio_nodes(dtb_path, dry_run):
     print("[gen_config] DTB recompiled with virtio_mmio nodes in address order")
 
 
+def ensure_memory_size(dtb_path, dts_text, size_hex, dry_run):
+    """Keep the DTB's /memory node in step with STAGE2_DRAM_SIZE.
+
+    The guest learns how much RAM it has from this node and nothing rewrites it
+    at load time -- kload.c builds a kenv string but never touches /memory. So a
+    build with GUEST_DRAM_2G and a 1 GiB /memory node gives the guest a 2 GiB
+    stage-2 window it will never allocate out of, and the reverse gives it a
+    node promising memory stage-2 will fault on. Both halves are set from one
+    switch here for exactly the reason the cpu@N handling above exists."""
+    want = int(size_hex, 16)
+    cur = fdtget_ints(dtb_path, "/memory", "reg")
+    if cur is not None and len(cur) >= 2 and cur[1] == want:
+        print(f"[gen_config] /memory: size already {want:#x}, leaving as-is")
+        return
+    have = f"{cur[1]:#x}" if cur and len(cur) >= 2 else "unreadable"
+    print(f"[gen_config] /memory: size {have} -> {want:#x} "
+          f"({want >> 30} GiB), base left at 0x40000000")
+    fdtput(dtb_path, "/memory", "x", "reg", 0x40000000, want, dry_run=dry_run)
+
+
+def fdtget_ints(dtb_path, node, prop):
+    r = subprocess.run(["fdtget", str(dtb_path), node, prop],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        return [int(x) for x in r.stdout.split()]
+    except ValueError:
+        return None
+
+
 def remove_cpu_node(dtb_path, cpu_id, dry_run):
     node = f"cpu@{cpu_id}"
     path = f"/cpus/{node}"
@@ -325,6 +357,13 @@ def main():
     for name, f in features.items():
         if f["enabled"] and f["needs_dtb_cpu"]:
             ensure_cpu_node(dtb_path, dts_text, f["needs_dtb_cpu"], args.dry_run)
+
+    # /memory tracks whichever feature declares a dtb-memory-size; when none is
+    # enabled the node keeps whatever it has, which is the 1 GiB default.
+    for name, f in features.items():
+        if f["enabled"] and f["dtb_memory_size"]:
+            ensure_memory_size(dtb_path, dts_text, f["dtb_memory_size"],
+                               args.dry_run)
 
     # NOTE on ORDER, observed the same day: ensure_cpu_node() adds nodes with
     # `fdtput -p`, which PREPENDS. Arming vcpu2 therefore produced /cpus in the

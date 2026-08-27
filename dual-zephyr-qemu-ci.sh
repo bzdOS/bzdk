@@ -125,9 +125,15 @@ command -v "${CROSS}gcc" >/dev/null 2>&1 || { echo "dual-zephyr-qemu-ci: FAIL �
 # ---- 1. the hypervisor firmware (CPU0 skeleton + real dual-guest mechanism,
 # now with a CPU3 dispatch that can service real Zephyr's UART/GIC faults) --
 echo "dual-zephyr-qemu-ci: building $ELF ..."
-if ! make -s dual-zephyr-qemu >/dev/null 2>&1; then
-    echo "dual-zephyr-qemu-ci: FAIL — 'make dual-zephyr-qemu' did not build"
-    make dual-zephyr-qemu 2>&1 | tail -40
+# GUEST_DRAM_2G=0 explicitly: board-config.xml turns that flag ON tree-wide (the
+# guest needs the board's whole 2 GiB to build Mesa), and it is a COMPILE ERROR
+# in stage2_zephyr.h for any dual build, because Zephyr's guest slice lives in
+# the high GiB the flag hands to FreeBSD. The flag is a whole-tree build choice,
+# so the target that needs the opposite choice says so at its own build site
+# rather than relying on nobody having enabled it.
+if ! make GUEST_DRAM_2G=0 -s dual-zephyr-qemu >/dev/null 2>&1; then
+    echo "dual-zephyr-qemu-ci: FAIL — 'make GUEST_DRAM_2G=0 dual-zephyr-qemu' did not build"
+    make GUEST_DRAM_2G=0 dual-zephyr-qemu 2>&1 | tail -40
     exit 1
 fi
 [ -f "$ELF" ] || { echo "dual-zephyr-qemu-ci: FAIL — $ELF missing after build"; exit 1; }
