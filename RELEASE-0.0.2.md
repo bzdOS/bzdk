@@ -226,6 +226,11 @@ card."* Now:
   retry unless there is a specific reason reads are more reliable than writes —
   there wasn't one here, and assuming so is what caused this.
 
+The heading above is about the driver, and stands. It is not a claim that
+`/opt`'s filesystem itself has seen no further trouble since — it has, during
+the three-vCPU work later in this file; see "`/opt` corruption during the
+three-vCPU build" near the end.
+
 ## `gr1`/`sr1`: CPU1's vCPU is now readable — verified live
 
 CPU1's own guest register state had no reader at all; `gr`/`sr` deliberately
@@ -315,13 +320,18 @@ Everything in 0.0.1's list still stands except where noted, plus:
   check -s` said nothing because that package's file list in pkg's database is
   empty. Repaired from intact references already on the board; a sweep of every
   package with an exact-version cached reference found no further damage.
-- **The Mesa sources are staged and now building.** `/opt/src/mesa-26.2.0`
-  (399 MB, complete). `meson setup` completes on the board (`Gallium drivers:
-  lima`, EGL and GBM enabled) and `ninja` is working through 993 targets on two
-  slow vCPUs — resumable with `ninja -C /opt/build/mesa`, not restartable from
-  scratch. The verified option set is in `../bsdOS/hal/lima/mesa/FEASIBILITY.md`
-  — do not re-derive it. `PyYAML` and `ply` were missing and are staged under
-  `/opt` on `PYTHONPATH` rather than installed, so they cost no root write.
+- **The Mesa sources are staged and building, now on three vCPUs.**
+  `/opt/src/mesa-26.2.0` (399 MB, complete). `meson setup` completes on the
+  board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is working
+  through 993 targets — resumable with `ninja -C /opt/build/mesa`, not
+  restartable from scratch. The verified option set is in
+  `../bsdOS/hal/lima/mesa/FEASIBILITY.md` — do not re-derive it. `PyYAML` and
+  `ply` were missing and are staged under `/opt` on `PYTHONPATH` rather than
+  installed, so they cost no root write. This build is also the one that hit
+  the `/opt` filesystem panic below — recovered, cause not resolved.
+- **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
+  recovered, but the cause is not resolved.** See "`/opt` corruption during
+  the three-vCPU build" near the end of this file.
 - **The RSP channel goes dark in long GDB sessions** — still unfixed. Note that
   the EMAC channel death described earlier in this file was a *different*,
   now-fixed bug (`dbg_core_active`); do not treat that fix as covering this one.
@@ -610,3 +620,23 @@ nothing more. Disarming vcpu2 mid-session therefore left `cpu@2` in the DTB
 with `VCPU2=0` — FreeBSD would enumerate a third core, ask for it by PSCI, and
 EL2 would refuse. A note you have to notice is not a safeguard; it removes the
 node now.
+
+## `/opt` corruption during the three-vCPU build — cause not resolved
+
+Ten minutes into building Mesa on three cores, the guest panicked:
+`ffs_valloc: dup alloc` on `/opt`, the SD card described in "The microSD story
+is finished" above. `fsck` recovered 1555 orphaned files.
+
+The likely cause is mine, not the hardware's: the board was reset four times
+that day with `/opt` mounted read-write under an active build, and it was
+never checked for damage afterward — the classic shape of an unclean unmount.
+**But it cannot be cleanly attributed.** Some of the damaged inodes carry
+mtimes from *during* the three-vCPU run itself, which keeps three-way
+concurrency on the `vblk_sd` path alive as a second, unexcluded suspect — a
+different device and a different lock from the eMMC contention risk named
+above, but the same shape of bug this project has hit before. Stated as an open
+question on purpose, not resolved in either direction here.
+
+The experiment that would separate them is named, not run yet: a build that
+goes start-to-finish with zero resets, then checking `/opt` for damage
+afterward.
