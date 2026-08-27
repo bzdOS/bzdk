@@ -337,6 +337,19 @@ __attribute__((weak)) int vcpu1_request(uint64_t entry_pa, uint64_t context_id)
 	return 0;
 }
 
+/* Fourth guest vCPU (vcpu3.c) — see vcpu3.h. Same weak-fallback pattern as
+ * dbg_vcpu1/dbg_vcpu2 above: every target without vcpu3.o linked (in
+ * particular the `dual` target, which links zguest_cpu3.o instead — see
+ * vcpu3.h's link-time mutual-exclusion note) keeps refusing affinity 3, the
+ * pre-existing ALREADY_ON behaviour, unchanged. */
+__attribute__((weak)) volatile uint32_t dbg_vcpu3;
+
+__attribute__((weak)) int vcpu3_request(uint64_t entry_pa, uint64_t context_id)
+{
+	(void)entry_pa; (void)context_id;
+	return 0;
+}
+
 /* Event-trace ring (trace.c) and PC-sample profiler (profiler.c), linked only
  * into the `dbg` target. Weak fallbacks, same pattern as gic_timer_irq above,
  * so every other target links unchanged and pays one call to an empty
@@ -729,6 +742,17 @@ static int psci_guest_filter(uint64_t fnid, uint64_t x1, uint64_t x2,
 		 * the guest still only ever picks where its OWN vCPU starts, at
 		 * its own exception level. */
 		if (aff0 == 1ull && vcpu1_request(x2, x3)) {
+			*ret = PSCI_RET_SUCCESS;
+			return 1;
+		}
+
+		/* Affinity 3 — see vcpu3.h. Same shape and same argument as
+		 * affinities 1/2 above: vcpu3_request() alone decides, gated on
+		 * dbg_vcpu3, and vcpu3.c is link-time mutually exclusive with the
+		 * `dual` target's zguest_cpu3.c, so this branch and that target's
+		 * Zephyr guest never coexist in one binary (see vcpu3.h's
+		 * bzdos_cpu3_owner note). */
+		if (aff0 == 3ull && vcpu3_request(x2, x3)) {
 			*ret = PSCI_RET_SUCCESS;
 			return 1;
 		}

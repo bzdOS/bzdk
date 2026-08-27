@@ -741,6 +741,19 @@ _Static_assert(HVMAP_VBLK_SD_BC >= HVMAP_VBLK_SD_LOCK + HVMAP_VBLK_SD_LOCK_SIZE,
 _Static_assert(HVMAP_VBLK_SD_BC_END <= 0x50100000UL,
                "vblk_sd breadcrumbs run into emac.c's DMA scratch (0x50100000)");
 
+/* ---- fourth guest vCPU on CPU3 (vcpu3.c) --------------------------------
+ * Same shape as HVMAP_VCPU1_BC/HVMAP_VCPU2_BC above. Placed past
+ * HVMAP_VBLK_SD_BC, the current top of this block, same pattern as every
+ * other lane here — asserted against its actual neighbour, not eyeballed. */
+#define HVMAP_VCPU3_BC        0x5009E400UL
+#define HVMAP_VCPU3_BC_SIZE   0x00000100UL
+#define HVMAP_VCPU3_BC_END    (HVMAP_VCPU3_BC + HVMAP_VCPU3_BC_SIZE)
+
+_Static_assert(HVMAP_VCPU3_BC >= HVMAP_VBLK_SD_BC_END,
+               "vcpu3 breadcrumbs overlap the vblk_sd breadcrumb lane");
+_Static_assert(HVMAP_VCPU3_BC_END <= 0x50100000UL,
+               "vcpu3 breadcrumbs run into emac.c's DMA scratch (0x50100000)");
+
 #define HVMAP_WDT_DEBUG_HOLD_SIZE  0x10UL   /* one word used, room to grow */
 
 _Static_assert(HVMAP_WDT_DEBUG_HOLD >= HVMAP_VGICD_BC + HVMAP_VGICD_BC_SIZE,
