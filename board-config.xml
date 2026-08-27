@@ -96,10 +96,10 @@
          one board cycle at a time" idiom. -->
     <feature name="guest_usb_host1"   dtb-only="true" enabled="true"/>
     <feature name="guest_wifi_sdio"   dtb-only="true" enabled="false"/>
-    <feature name="guest_audio_codec" dtb-only="true" enabled="false"/>
+    <feature name="guest_audio_codec" dtb-only="true" enabled="true"/>
     <feature name="guest_mipi_dsi"    dtb-only="true" enabled="false"/>
     <feature name="guest_mipi_csi"    dtb-only="true" enabled="false"/>
-    <feature name="guest_ir"          dtb-only="true" enabled="false"/>
+    <feature name="guest_ir"          dtb-only="true" enabled="true"/>
   </features>
   <!-- Deliberately NOT a feature: a "guest_usb_host0" for usb@1c1a000/
        usb@1c1a400 (EHCI0/OHCI0). Both sit on PHY0 ("pmu0"), the SAME silicon
