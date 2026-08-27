@@ -455,3 +455,71 @@ counts. `PyYAML` and `ply` were missing outright and are staged under `/opt` on
 Proven by the task rather than by version strings: `meson setup` now completes
 on the board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is
 building all 993 targets.
+
+## A third guest vCPU: the old wall is gone, a new one is named
+
+Tried on hardware 2026-08-27, because the board is now the project's own build
+host and two cores make that slow.
+
+`vcpu2.c` had sat in the tree since 2026-08-21 doing the hard parts right —
+`stage2_arm_secondary()` against the banked `VTTBR_EL2`, the banked
+`HCR_EL2` IMO/FMO/TSC bits — and missing the two things that made vcpu1 work:
+it never called `vgic_init()`, and it never unmasked EL2 IRQ/FIQ. Under this
+build's `IMO=1` policy the only route from a physical interrupt to a guest core
+is a GICH List Register, and GICH is banked per-PE: a core that skipped its own
+`vgic_init()` has `nr_lr == 0`, so everything it takes — including the
+rendezvous IPI FreeBSD sends immediately after `Release APs` — queues into a
+list nothing drains. **0.0.1 recorded exactly this symptom for CPU2 and 0.0.2
+root-caused it for CPU1; the fix was applied to `vcpu1.c` and never carried
+across.** Two calls, derived from a hardware-proven pattern.
+
+**It works, for what it was aimed at.** The guest enumerated three cores and
+printed the line every previous attempt died before:
+
+```
+CPU  0: ARM Cortex-A53 r0p4 affinity:  0.
+CPU  1: ARM Cortex-A53 r0p4 affinity:  2.
+CPU  2: ARM Cortex-A53 r0p4 affinity:  1.
+gic0: using for IPIs.
+Release APs...done.
+```
+
+(The affinity order is not a bug: `gen_config.py` adds nodes with `fdtput -p`,
+which PREPENDS, so `/cpus` read `cpu@2 cpu@1 cpu@0` and FreeBSD's logical
+numbering followed DTB order rather than MPIDR. Same prepend footgun that once
+swapped `vtbd0`/`vtbd1`.)
+
+**Then it stalled at root mount, and not in the way anyone predicted.** Not the
+eMMC-lock contention the trade was expected to risk — the console stayed alive,
+EL2 kept ticking, the isolation self-check passed, `g_ioerrs` was 0 and the
+block lock was free. What `triage.py` found:
+
+```
+INTID 137  en=1 pend=0 act=1 cfg=EDGE   virtio-blk (SPI 105)
+GICH_LR0:  vINTID=27 state=1(pending) HW=0
+```
+
+**`act=1`.** Something read IAR for virtio-blk's SPI and nothing ever
+deactivated it, and an Active SPI is never delivered again — hence exactly two
+disk reads (`g_reads=2`, the last being the GPT backup header) and then silence
+forever. `GICH_LR0` separately held an unconsumed pending virtual timer. So the
+failure is an interrupt that stops completing its lifecycle once a third vCPU
+exists, and the obvious place to look is who owns the deactivate when GICD is
+passed through to the guest while the guest acknowledges through GICV.
+
+Disarmed rather than chased live, since the board is a working build host; the
+state is preserved in `crash-20260827-133425/`. **`vcpu3.c` exists and is wired
+(PSCI filter, dispatch, breadcrumb window, `VCPU3` flag, a `vcpu3` dbgmon
+command) and is deliberately NOT armed** — it is the same mechanism one core
+further out, so arming it before the CPU2 stall is understood would stack one
+unknown on another. Its exclusivity with `dual`'s Zephyr-on-CPU3 is a **link
+error**, not a comment: both files define `bzdos_cpu3_owner` incompatibly, and
+linking the two objects together fails on purpose — verified directly, not
+asserted.
+
+One tooling gap closed on the way out. `gen_config.py` knew about both
+directions of the DTB/build-flag mismatch it exists to prevent and only acted
+on one: a `cpu@N` node left behind by a disabled feature got a printed NOTE and
+nothing more. Disarming vcpu2 therefore left `cpu@2` in the DTB with `VCPU2=0`
+— FreeBSD would enumerate a third core, ask for it by PSCI, and EL2 would
+refuse. A note you have to notice is not a safeguard; it removes the node now.
