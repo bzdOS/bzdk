@@ -35,6 +35,7 @@
 #include "wdt.h"            /* wdt_note_progress / wdt_pet — keep the HW WDOG fed */
 #include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO/FLTR_K_IRQ, ...) */
 #include "cntpct.h"
+#include "stage2.h"        /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -207,12 +208,13 @@ static inline uint8_t *bounce(void) { return (uint8_t *)(uintptr_t)&g_bounce_q[0
  *
  * Bounds: guest DRAM is stage-2-identity-mapped over
  * [STAGE2_DRAM_BASE, STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE) — see stage2.h
- * (0x40000000 / 0x40000000, i.e. [0x40000000, 0x80000000), 1 GiB, as of this
- * writing). Duplicated here as plain constants (not #include "stage2.h") per
- * this file's self-containment convention — the same one that already
- * duplicates gmem_cmo/gmem_read/gmem_write against vnet_emac.c rather than
- * sharing a common header. MUST stay in lockstep with stage2.h's
- * STAGE2_DRAM_BASE/STAGE2_DRAM_SIZE if either ever changes.
+ * DERIVED from stage2.h, no longer duplicated. This used to be a pair of plain
+ * constants here, justified by this file's self-containment convention and
+ * carrying the instruction "MUST stay in lockstep with stage2.h if either ever
+ * changes". It did not stay in lockstep: STAGE2_DRAM_SIZE was widened and this
+ * copy was not, so a guest buffer above the old ceiling was rejected as
+ * "outside DRAM" and the guest panicked. An instruction in a comment is not a
+ * mechanism; the include is.
  *
  * IMPORTANT — what this does NOT do: it does NOT protect the hv-image
  * (0x42000000+) or hv-scratch/breadcrumb (0x50000000+) windows carved out of
@@ -223,8 +225,22 @@ static inline uint8_t *bounce(void) { return (uint8_t *)(uintptr_t)&g_bounce_q[0
  * scope for this fix, which only catches PAs that are clearly, unambiguously
  * outside ALL of guest DRAM (e.g. a wild pointer at 0x0 or 0x1_00000000).
  * ------------------------------------------------------------------ */
-#define GUEST_DRAM_BASE   0x40000000ULL
-#define GUEST_DRAM_SIZE   0x40000000ULL
+/* Derived from stage2.h, not copied. These used to be hardcoded 0x40000000
+ * pairs in five separate files (vblk_emmc.c, vblk_sd.c, vinput.c, vnet_emac.c
+ * and scanout.c, the last under its own spelling), each carrying a comment
+ * saying it MUST stay in lockstep with stage2.h -- which is a request, not a
+ * mechanism. On 2026-08-27 STAGE2_DRAM_SIZE was widened to 2 GiB and none of
+ * them followed: the guest addressed a buffer above 0x80000000, gpa_in_range()
+ * rejected the descriptor as "outside DRAM", virtio-blk returned S_IOERR, and
+ * the guest panicked with `Going nowhere without my init!` after two
+ * `vtbd0: hard error` lines. Measured, not inferred -- g_gmem_oob and
+ * g_ioerr_badpa both read 2.
+ *
+ * Same disease soc_a64.h was created to cure earlier the same day: one value,
+ * several spellings, and changing one silently breaks the rest. Local names are
+ * kept so no use site changes. */
+#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
+#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
 #define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
 
 static uint32_t g_gmem_oob;    /* count of rejected out-of-range accesses */

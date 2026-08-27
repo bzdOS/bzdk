@@ -77,7 +77,7 @@
          GiB only because snapshot.c copies guest DRAM eagerly; a copy-on-write
          implementation would cost ~2 MiB of page tables per GiB instead and
          retire this trade entirely. -->
-    <feature name="guest_dram_2g" mkvar="GUEST_DRAM_2G" enabled="false" dtb-memory-size="0x80000000"/>
+    <feature name="guest_dram_2g" mkvar="GUEST_DRAM_2G" enabled="false" dtb-memory-size="0x78000000"/>
 
     <!-- Guest hardware-enablement features (2026-08-27 survey of the "dark"
          A64 peripheral list, docs/guest-hw-enablement.md). Each flips ONLY a

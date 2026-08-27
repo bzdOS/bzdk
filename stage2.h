@@ -110,7 +110,42 @@
  * removes a stale cpu@N node: a build flag whose DTB half was not applied is
  * exactly the half-configured state that has cost this project board time. */
 #if defined(GUEST_DRAM_2G) && GUEST_DRAM_2G
-#define STAGE2_DRAM_SIZE   0x80000000UL   /* 2 GiB (0x40000000..0xC0000000) */
+/* The FULL 2 GiB, deliberately -- and deliberately NOT the same number the
+ * guest is told about. Two constraints pull in opposite directions and the
+ * only clean answer is to let them:
+ *
+ * 1. This map is built from whole 1 GiB level-1 blocks. stage2_init() computes
+ *    `nblocks = STAGE2_DRAM_SIZE / STAGE2_BLOCK_SIZE`, so anything that is not
+ *    a multiple of 1 GiB is silently TRUNCATED. Setting 0x78000000 here gave
+ *    nblocks == 1 and left everything above 0x80000000 unmapped -- measured, as
+ *    a guest write to IPA 0xB7FF1000 taking a level-1 translation fault with
+ *    stage2_l1[0][2] still zero. The header comment above ("fills however many
+ *    contiguous 1 GiB blocks that implies") was exactly right and exactly the
+ *    trap.
+ * 2. The guest must not touch the top ~113 MiB. U-Boot's own bdinfo on this
+ *    board reports DRAM as [0x40000000-0xbfffffff] but reserves
+ *    [0xb8f18770-0xbfffffff] no-overwrite, with its MMU translation tables at
+ *    TLB addr = 0xbfff0000 and its relocated self at 0xbdf44000. FreeBSD
+ *    allocates downward from the top of the memory it is told it has, so
+ *    handing it 0xC0000000 hands it U-Boot's page tables. That attempt left the
+ *    board unreachable.
+ *
+ * So: stage-2 maps 2 GiB in whole blocks (satisfying 1), while the DTB's
+ * /memory node stops at 0xB8000000 (satisfying 2) -- see board-config.xml's
+ * dtb-memory-size, which gen_config.py applies. Mapping more than the guest is
+ * told about costs nothing: the guest never generates those addresses, and if
+ * it ever did, a mapped page is a safer failure than a fault storm.
+ *
+ * The alternative -- teaching stage2_init() to split a partial trailing block
+ * into an L2 table -- is real work on the boot path for no benefit here, and is
+ * not done.
+ *
+ * One correction while here, since it is what sent me looking in the wrong
+ * place: hv_addrmap.h says 0xC0000000 is "the last byte of real, installed
+ * DRAM (confirmed live)", citing a dram_copy() fault. That fault was under
+ * QEMU. The board's real usable ceiling for a guest was established for the
+ * first time by the bdinfo read above. */
+#define STAGE2_DRAM_SIZE   0x80000000UL   /* 2 GiB mapped (0x40000000..0xC0000000) */
 #else
 #define STAGE2_DRAM_SIZE   0x40000000UL   /* 1 GiB by default (0x40000000..0x80000000) */
 #endif
