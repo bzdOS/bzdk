@@ -33,6 +33,25 @@ cores — immediately after FreeBSD printed `Release APs...done.`
 | Parallel throughput, idle guest | one job **3.95 s** wall / 3.89 s CPU; two jobs **3.92 s** wall / **7.80 s** CPU — two jobs in one job's wall time, ~1.92x |
 | Continuous uptime with the debug plane still responsive | 4 h 09 m and counting |
 
+**Superseded the same day.** This table is the historical record of the first
+jump, from 1 vCPU to 2 — it is not what a fresh boot of this tree reports
+today. CPU2 joined as a genuine third vCPU later on 2026-08-27: `hw.ncpu=3`,
+`kern.smp.cpus=3`, and it is now armed in the default build alongside CPU1.
+See "A third guest vCPU, hardware-proven" below for the fixes it took, what it
+cost, and a correction of my own that belongs on the record.
+
+**And CPU1's own tick cost the guest something worth measuring separately: its
+network.** `vnet_emac.c` states the guest's virtio-net RX is fed exclusively
+from inside `emac_poll()` on CPU1 — true before this release (a tight loop)
+and true after it (now `dbgmon_service()` called once per 10 ms EL2 tick,
+`gic_timer.c`'s tick handler). A packet that arrives just after a tick fires
+waits up to one full period before the guest's ring sees it. Measured: 40/40
+ICMP packets to the guest, zero loss, RTT 0.47–9.4 ms, mean 4.2 ms — against
+0.17–1.6 ms for the LAN gateway over the same link, for comparison. Not noise:
+the spread is the shape a 10 ms polling period produces. This bounds guest
+network latency, and probably throughput, architecturally — it is not a bug to
+fix so much as a cost of the tick design to know about.
+
 ### Why it used to wedge
 
 `vcpu1_run()` never called `vgic_init()` on CPU1. Under this project's live
@@ -226,6 +245,11 @@ card."* Now:
   retry unless there is a specific reason reads are more reliable than writes —
   there wasn't one here, and assuming so is what caused this.
 
+The heading above is about the driver, and stands. It is not a claim that
+`/opt`'s filesystem itself has seen no further trouble since — it has, during
+the three-vCPU work later in this file; see "`/opt` corruption during the
+three-vCPU build" near the end.
+
 ## `gr1`/`sr1`: CPU1's vCPU is now readable — verified live
 
 CPU1's own guest register state had no reader at all; `gr`/`sr` deliberately
@@ -285,16 +309,34 @@ both, `wrong_core` counters flat at 0, CPU1 taking INTID 119 with
 **Two measurements that did not come out as hoped:**
 
 - **MUSB genuinely storms**: ~646 interrupts/s on a completely idle CDC-ACM
-  console, exhausting the 32-per-tick budget ~29 times/s. So that budget is
-  containing a real defect in `usbacm_poll()`'s source de-assertion, not
-  hypothetical hardening. Bounded and harmless where it is, but it is a real
-  open bug in `musb.c`/`usbacm.c`, not a clean path.
+  console, exhausting the 32-per-tick budget ~29 times/s. **Root-caused since:
+  it is not inherited hardware behaviour, it is this release's own
+  regression.** Commit `6cf4215` (arming CPU1 as vcpu1) enabled
+  `REG_INTTXE`/`REG_INTRXE` so an IRQ-driven `usbacm_poll()` could see EP0/EP1
+  activity — and nothing in this tree had ever read the matching status
+  registers, `REG_INTTX`/`REG_INTRX`; the driver polls CSR-level bits
+  directly instead. A latched endpoint bit — guaranteed during enumeration —
+  holds the single OR'd "mc" SPI line asserted, and `gic_timer_irq()`'s
+  EOI-then-recheck sequence re-presents it at once. Fixed by draining and
+  writing back both registers in `musb.c`. **NOT hardware-validated, and the
+  arithmetic does not fully close**: 646/s against a 32-per-tick ceiling at a
+  100 Hz tick does not cleanly fit a permanently-asserted line. The mechanism
+  is established from the code; the size of the effect still needs the
+  measurement.
 - **The vblank arrives at ~18 Hz, not the ~60 Hz** the old tight-loop polling
   measured (0.0.1 reported 60.04 Hz). NOT a throttle artifact —
   `hdmi_throttles` stays 0 and the ceiling is 3200/s. Unexplained. The most
   plausible candidate is the guest's own KMS/lima driver, which also reads
   `TCON_INT0` and may be consuming latches. **Do not treat vblank pacing as a
-  finished 60 Hz feature.**
+  finished 60 Hz feature.** The two counters cited to rule out the CPU1-side
+  causes (`hdmi_wrong_core`, `hdmi_throttles`) had no live export — CPU1's
+  vblank SPI and `IRQ_COUNTER_BC_BASE`'s CPU0-only window meant the numbers
+  above were a one-off nobody could re-take. Both are now published from
+  CPU1's tick into `BC_HDMI_BASE` words 13/14, diagnostic only. The leading
+  explanation for the ~18 Hz figure is now same-GIC-priority contention on
+  CPU1: INTID 119, 103 and 30 all sit at `TIMER_PRIORITY`, and a same-priority
+  IRQ cannot preempt on GICv2, against a status bit that latches rather than
+  counts.
 
 One assumption remains unproven by construction: `TCON_INT0` bit30 as the
 TCON1 vblank *enable* bit. It reads back as 1 and interrupts do arrive, which is
@@ -315,13 +357,18 @@ Everything in 0.0.1's list still stands except where noted, plus:
   check -s` said nothing because that package's file list in pkg's database is
   empty. Repaired from intact references already on the board; a sweep of every
   package with an exact-version cached reference found no further damage.
-- **The Mesa sources are staged and now building.** `/opt/src/mesa-26.2.0`
-  (399 MB, complete). `meson setup` completes on the board (`Gallium drivers:
-  lima`, EGL and GBM enabled) and `ninja` is working through 993 targets on two
-  slow vCPUs — resumable with `ninja -C /opt/build/mesa`, not restartable from
-  scratch. The verified option set is in `../bsdOS/hal/lima/mesa/FEASIBILITY.md`
-  — do not re-derive it. `PyYAML` and `ply` were missing and are staged under
-  `/opt` on `PYTHONPATH` rather than installed, so they cost no root write.
+- **The Mesa sources are staged and building, now on three vCPUs.**
+  `/opt/src/mesa-26.2.0` (399 MB, complete). `meson setup` completes on the
+  board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is working
+  through 993 targets — resumable with `ninja -C /opt/build/mesa`, not
+  restartable from scratch. The verified option set is in
+  `../bsdOS/hal/lima/mesa/FEASIBILITY.md` — do not re-derive it. `PyYAML` and
+  `ply` were missing and are staged under `/opt` on `PYTHONPATH` rather than
+  installed, so they cost no root write. This build is also the one that hit
+  the `/opt` filesystem panic below — recovered, cause not resolved.
+- **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
+  recovered, but the cause is not resolved.** See "`/opt` corruption during
+  the three-vCPU build" near the end of this file.
 - **The RSP channel goes dark in long GDB sessions** — still unfixed. Note that
   the EMAC channel death described earlier in this file was a *different*,
   now-fixed bug (`dbg_core_active`); do not treat that fix as covering this one.
@@ -386,24 +433,47 @@ binary is byte-for-byte identical**, same md5 before and after — plus the full
 board-free gate, plus a boot on hardware.
 
 Done now rather than after the pause for a specific reason: it is a
-44-file mechanical change on a bare-metal image where a wrong address means a
+23-file mechanical change on a bare-metal image where a wrong address means a
 board that does not boot, and physical access to press reset is the one resource
 that disappears during a months-long pause. The green board-free gate is what
-made it reviewable at all.
+made it reviewable at all. (23 files actually touched to re-point at the
+canonical addresses; the 44-file, 48-`#define` figure above is how many files
+carried a duplicate copy of one — a different count, easy to conflate with the
+size of the fix itself.)
 
 **Still hardcoded, and named rather than quietly left:** the load address
 (`0x42000000`) and DRAM window in `link.ld`/`stage2.h`; RSB/AXP803 register
 knowledge; the GIC SPI numbers, which stay with the drivers that cite them from
 the DTB; and the HDMI/DE2 pipeline's assumption of an HDMI sink.
 
-## Core allocation in the default build — CHANGED
+## Core allocation in the default build — CHANGED AGAIN
 
 **CPU0** guest vCPU0 · **CPU1** guest vCPU1 *(was: debug/watchdog plane)*, with
 the watchdog kick and dbgmon moved onto its unmaskable 10 ms tick · **CPU2**
-async eMMC I/O · **CPU3** idle, or a concurrent Zephyr guest in `make dual`.
+**guest vCPU2** *(was: async eMMC I/O offload)*, hardware-proven 2026-08-27 ·
+**CPU3** idle, or a concurrent Zephyr guest in `make dual`, or (wired but
+**not** armed on hardware) a fourth FreeBSD vCPU via `vcpu3.c`.
 
-Giving the guest all four cores is still not done: CPU2's async I/O is
-load-bearing, and CPU3 is architecturally exclusive with the second-guest build.
+`board-config.xml` now ships `vcpu1` and `vcpu2` both `enabled="true"` — the
+guest is SMP across **three** cores by default, not two. CPU3 is the only core
+still withheld, and for a specific, named reason: the three fixes that made
+CPU2 work (`vgic_init()`+IRQ/FIQ unmask, CPU2's own tick, `own_cpu_mask()`
+learning about every armed core generically) are all generic now, so CPU3 is
+*expected* to behave the same way — but expected is not measured, and it is
+mutually exclusive at link time with the `dual` build's Zephyr-on-CPU3 guest
+regardless.
+
+The trade CPU2 made: it no longer offloads eMMC I/O asynchronously.
+`vblk_async_post()` gates on `g_vblk_async_ready`, and the board has always run
+the synchronous fallback when that offload isn't available, so this is a
+performance regression, not a correctness one. The risk to watch is
+contention: three vCPUs can now all reach the synchronous eMMC path and
+serialize on one unfair test-and-set lock, and two-way contention there has
+already cost this project a root filesystem once. The mitigating fact for the
+immediate use case is that root lives on eMMC read-only, while the Mesa build
+below writes through `vblk_sd` (the SD card) instead — a different device, a
+different lock. See "/opt corruption during the three-vCPU build" below for
+why that distinction matters and is not, on its own, a full alibi.
 
 ## The board's own build environment: repaired, and a false alarm worth recording
 
@@ -456,10 +526,13 @@ Proven by the task rather than by version strings: `meson setup` now completes
 on the board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is
 building all 993 targets.
 
-## A third guest vCPU: the old wall is gone, a new one is named
+## A third guest vCPU, hardware-proven — three fixes, found in this order
 
 Tried on hardware 2026-08-27, because the board is now the project's own build
-host and two cores make that slow.
+host and two cores make that slow. It took three fixes, landed as three
+separate attempts, and is now armed in the default build.
+
+### Fix 1: the same `vgic_init()` gap vcpu1 already had
 
 `vcpu2.c` had sat in the tree since 2026-08-21 doing the hard parts right —
 `stage2_arm_secondary()` against the banked `VTTBR_EL2`, the banked
@@ -473,8 +546,8 @@ list nothing drains. **0.0.1 recorded exactly this symptom for CPU2 and 0.0.2
 root-caused it for CPU1; the fix was applied to `vcpu1.c` and never carried
 across.** Two calls, derived from a hardware-proven pattern.
 
-**It works, for what it was aimed at.** The guest enumerated three cores and
-printed the line every previous attempt died before:
+**This got the guest past the point every previous attempt died at.** Three
+cores enumerated, and the line no earlier attempt had reached:
 
 ```
 CPU  0: ARM Cortex-A53 r0p4 affinity:  0.
@@ -492,7 +565,8 @@ swapped `vtbd0`/`vtbd1`.)
 **Then it stalled at root mount, and not in the way anyone predicted.** Not the
 eMMC-lock contention the trade was expected to risk — the console stayed alive,
 EL2 kept ticking, the isolation self-check passed, `g_ioerrs` was 0 and the
-block lock was free. What `triage.py` found:
+block lock was free. What `triage.py` found (preserved in
+`crash-20260827-133425/`):
 
 ```
 INTID 137  en=1 pend=0 act=1 cfg=EDGE   virtio-blk (SPI 105)
@@ -502,24 +576,107 @@ GICH_LR0:  vINTID=27 state=1(pending) HW=0
 **`act=1`.** Something read IAR for virtio-blk's SPI and nothing ever
 deactivated it, and an Active SPI is never delivered again — hence exactly two
 disk reads (`g_reads=2`, the last being the GPT backup header) and then silence
-forever. `GICH_LR0` separately held an unconsumed pending virtual timer. So the
-failure is an interrupt that stops completing its lifecycle once a third vCPU
-exists, and the obvious place to look is who owns the deactivate when GICD is
-passed through to the guest while the guest acknowledges through GICV.
+forever. Disarmed rather than chased live at that point, since the board was a
+working build host and this was not yet understood.
 
-Disarmed rather than chased live, since the board is a working build host; the
-state is preserved in `crash-20260827-133425/`. **`vcpu3.c` exists and is wired
-(PSCI filter, dispatch, breadcrumb window, `VCPU3` flag, a `vcpu3` dbgmon
-command) and is deliberately NOT armed** — it is the same mechanism one core
-further out, so arming it before the CPU2 stall is understood would stack one
-unknown on another. Its exclusivity with `dual`'s Zephyr-on-CPU3 is a **link
-error**, not a comment: both files define `bzdos_cpu3_owner` incompatibly, and
-linking the two objects together fails on purpose — verified directly, not
-asserted.
+### Fix 2: CPU2 had no periodic tick of its own
+
+`vtimer_mask_watchdog()` — the rescue for FreeBSD's CNTV mask self-latch —
+runs exclusively from the TIMER_INTID arm of `gic_timer_irq()`, which only
+fires on a core that has armed its own CNTP comparator. CPU0 gets one from
+`main_dbg.c`, CPU1 from `vcpu1.c`; `vcpu2.c` had neither, so its vCPU had no
+path to that rescue at all. That is what left virtio-blk's SPI stuck `act=1`
+above: without the rescue, CPU2's vCPU stopped servicing and the HW=1 List
+Register it held was never EOI'd. Ported `vcpu1.c`'s
+`gic_timer_arm_preserving_cntvoff()` arm verbatim (same 10 ms period, same
+ordering — after `vgic_init()`, before `daifclr`).
+
+Re-armed with this fix, `act=1` was gone (`act=0`), which also confirmed the
+mechanism. But the guest still didn't finish booting — a new failure appeared
+in its place, recorded live in `crash-20260827-vcpu2-livelock/finding.md`
+along with a new breadcrumb window (`HVMAP_VGIC_BC_HI`) giving CPU2/CPU3 their
+own vgic lanes for the first time, without which the next measurement could
+not have been taken at all.
+
+### Fix 3, and the one worth remembering: `own_cpu_mask()` never learned about CPU2
+
+CPU2's new lane showed ~1174 vgic injections/second, every one succeeding,
+zero drops, empty pending queue. **My first read of that number was wrong, and
+the correction belongs on the record rather than being quietly folded in.** I
+called it a livelock caused by CPU2, and went looking for a `CNTVOFF_EL2`
+timebase disagreement between CPU0 and CPU2 to explain a storm. The hypothesis
+was refuted by reading the source, not by burning a board cycle: `vgic_init()`
+zeroes `CNTVOFF_EL2` unconditionally on every core that calls it — CPU0, CPU1
+and CPU2 all do — and `gic_timer_arm_preserving_cntvoff()` only preserves
+whatever was already there, which is already zero. There was no timebase to
+disagree about.
+
+The real cause was in `vgicd.c`. `own_cpu_mask()` — the function that polices
+every guest write to `GICD_SGIR`/`GICD_ITARGETSR`, the only two paths that can
+cross a core boundary — was extended on 2026-08-25 so CPU0/CPU1's rendezvous
+IPIs could reach each other, and it hardcoded that exact pair. CPU2 became a
+real third vCPU two days later and this function was never told: a rendezvous
+SGI aimed at CPU2 still computed `{0,1}`, so **CPU2's bit was stripped from the
+target list before the write ever reached the real distributor, in both
+directions.** CPU2 was never spinning in a storm — it was running a perfectly
+healthy per-CPU clock at a normal rate, simply cut off from the other two, which
+were the ones actually stuck: CPU0 and CPU1, parked in `smp_rendezvous_action()`
+waiting for an acknowledgement from a core nobody was able to ask. Their low
+injection counts (71 and 3) were the real signature of "parked", exactly as
+suspected — the reason was just on the other side of the wall.
+
+**The lesson generalises past this one bug**: a busy core running normally next
+to two parked ones should prompt "who cannot talk to it", not "the busy core is
+the problem." Every number in the original measurement was correct; the story
+built on top of it was not. Fixed by generalizing `own_cpu_mask()` to compute
+its "same guest" group from every core's own `dbg_vcpuN` gate instead of a
+hardcoded pair — CPU0 is always in the group, CPU1/2/3 join iff their own gate
+is armed, and a build with nothing beyond CPU0 armed reduces to the old
+behaviour byte-for-byte. This also covers `vcpu3.c` generically, without
+touching the `dual` build's CPU3-as-Zephyr isolation.
+
+### Result
+
+**Hardware-proven, 2026-08-27, and armed in the default build**: `hw.ncpu=3`,
+`kern.smp.cpus=3`, `cpu2:rendezvous` nonzero in `vmstat -i` (the counter that
+was structurally impossible before — no cross-core SGI could reach CPU2 at
+all), and three parallel spinners each completing identical work in the same
+wall clock, which two cores cannot do.
+
+`vcpu3.c` exists and is wired (PSCI filter, dispatch, breadcrumb window,
+`VCPU3` flag, a `vcpu3` dbgmon command) and is **deliberately NOT armed**. All
+three fixes above are generic now, so CPU3 is *expected* to work the same way
+— but expected is not measured, and vcpu3 has no hardware track record at all
+yet, unlike vcpu1/vcpu2 going into their respective fixes. Its exclusivity
+with `dual`'s Zephyr-on-CPU3 is a **link error**, not a comment: both files
+define `bzdos_cpu3_owner` incompatibly, and linking the two objects together
+fails on purpose — verified directly (`ld --unresolved-symbols=ignore-all`
+against both `.o` files), not asserted.
 
 One tooling gap closed on the way out. `gen_config.py` knew about both
 directions of the DTB/build-flag mismatch it exists to prevent and only acted
 on one: a `cpu@N` node left behind by a disabled feature got a printed NOTE and
-nothing more. Disarming vcpu2 therefore left `cpu@2` in the DTB with `VCPU2=0`
-— FreeBSD would enumerate a third core, ask for it by PSCI, and EL2 would
-refuse. A note you have to notice is not a safeguard; it removes the node now.
+nothing more. Disarming vcpu2 mid-session therefore left `cpu@2` in the DTB
+with `VCPU2=0` — FreeBSD would enumerate a third core, ask for it by PSCI, and
+EL2 would refuse. A note you have to notice is not a safeguard; it removes the
+node now.
+
+## `/opt` corruption during the three-vCPU build — cause not resolved
+
+Ten minutes into building Mesa on three cores, the guest panicked:
+`ffs_valloc: dup alloc` on `/opt`, the SD card described in "The microSD story
+is finished" above. `fsck` recovered 1555 orphaned files.
+
+The likely cause is mine, not the hardware's: the board was reset four times
+that day with `/opt` mounted read-write under an active build, and it was
+never checked for damage afterward — the classic shape of an unclean unmount.
+**But it cannot be cleanly attributed.** Some of the damaged inodes carry
+mtimes from *during* the three-vCPU run itself, which keeps three-way
+concurrency on the `vblk_sd` path alive as a second, unexcluded suspect — a
+different device and a different lock from the eMMC contention risk named
+above, but the same shape of bug this project has hit before. Stated as an open
+question on purpose, not resolved in either direction here.
+
+The experiment that would separate them is named, not run yet: a build that
+goes start-to-finish with zero resets, then checking `/opt` for damage
+afterward.
