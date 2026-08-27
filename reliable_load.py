@@ -30,6 +30,59 @@ import chimpd as C
 from hvdbg import HV
 import bzd_board as B
 
+
+# ── staleness guard ────────────────────────────────────────────────────────────
+HV_UIMG = "/opt/bzdos/tftpboot/microkernel-dbg.uimg"
+HV_BIN  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "microkernel-dbg.bin")
+
+
+def check_uimg_fresh():
+    """Refuse to load while the TFTP uImage is older than the built binary.
+
+    `make dbg` does NOT refresh microkernel-dbg.uimg -- `hv-uimage` is a
+    separate .PHONY target, and it has to be, because it depends on the `dbg`
+    TARGET so HV_HDMI's target-specific CFLAGS actually propagate (see the
+    Makefile comment there). The consequence is a nasty failure mode that cost
+    real time on 2026-08-27:
+
+    uboot_setup.py programs the board's own saved bootcmd as
+    `tftpboot 0x48000000 microkernel-dbg.uimg && bootm`, so EVERY reset the
+    board performs by itself -- a watchdog recovery, a chimpd reload -- fetches
+    that uImage. A warm reset also preserves DRAM, so a hypervisor already
+    resident at 0x42000000 can keep running and keep publishing ITS OWN
+    build-id breadcrumb. The result is a board quietly executing an older
+    hypervisor while the tree says otherwise, and the only thing that catches
+    it is triage.py's build-identity section -- which is why that section is
+    printed first and says "check this FIRST, always".
+
+    The DTB, by contrast, is TFTP'd fresh every boot. So a stale uImage next to
+    a freshly widened /memory node is a guest faulting on memory its
+    hypervisor never mapped: observed as a level-1 translation fault at IPA
+    0xBFFF0000. Two halves of one change arriving at different times.
+
+    Cheap to check, so check it here instead of trusting anyone to remember.
+    """
+    try:
+        u = os.path.getmtime(HV_UIMG)
+        b = os.path.getmtime(HV_BIN)
+    except OSError as e:
+        print("[reliable] WARNING: cannot compare uImage to binary (%s) -- "
+              "proceeding, but check the build identity after boot" % e)
+        return
+    if u < b:
+        import datetime as _dt
+        fmt = lambda t: _dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+        print("[reliable] REFUSING TO LOAD: the TFTP uImage is older than the "
+              "built binary.")
+        print("           %s  %s" % (fmt(u), HV_UIMG))
+        print("           %s  %s" % (fmt(b), HV_BIN))
+        print("           The board's own bootcmd fetches that uImage on every "
+              "self-reset, so loading now risks running a stale hypervisor.")
+        print("           Fix:  make hv-uimage    (then re-run this)")
+        sys.exit(2)
+
+
 GUEST_TTY = B.GUEST_ACM_TTY
 ROOT_MOUNTFROM = B.ROOT_MOUNTFROM
 
@@ -364,6 +417,7 @@ def _elf_sha():
 
 def reliable_load(expect_vbk=False, max_cycles=5, boot_to_shell=False,
                   ledger_source="reliable_load"):
+    check_uimg_fresh()
     for cyc in range(1, max_cycles + 1):
         C.slog(f"━━━ reliable cycle #{cyc}/{max_cycles} ━━━")
         if not ensure_uboot():
