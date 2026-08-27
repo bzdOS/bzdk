@@ -64,7 +64,7 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
 
 ## Core layout
 
-> **CHANGED 2026-08-26 (v0.0.2-prealpha).** CPU1 is a GUEST vCPU in the default
+> **CHANGED 2026-08-26, again 2026-08-27 (v0.0.2-prealpha).** CPU1 AND CPU2 are GUEST vCPUs in the default
 > build now, not the debug plane. The description below is the pre-0.0.2 layout
 > and is kept only because most of the tree's comments still assume it. Read
 > `RELEASE-0.0.2.md` and `vcpu1.h` before reasoning about core roles.
@@ -79,11 +79,22 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
   That tradeoff is now live by default; `vcpu1.h` states it in full, and
   flipping one attribute in `board-config.xml` (plus `gen_config.py`) restores
   the old dedicated-debug-core behaviour.
-- **CPU2** — async eMMC I/O offload.
-- **CPU3** — idle (WFI) in the default `dbg`/`gdb`/`fbsd` builds. In the
-  `dual` build it runs a genuine second guest (Zephyr) concurrently with
-  FreeBSD on CPU0, under its own disjoint stage-2 table — see
-  `docs/dual-guest.md`.
+- **CPU2** — **now the guest's third vCPU** (`vcpu2.c`, armed by default via
+  `board-config.xml`), hardware-proven 2026-08-27: `hw.ncpu=3`,
+  `cpu2:rendezvous` nonzero, three parallel spinners completing identical work.
+  It no longer runs `vblk_async.c`'s async eMMC I/O offload — `smp.c`'s `cpu==2`
+  dispatch tries `vcpu2_run()` first and falls back to the offload only while
+  the feature is off. That trade is deliberate: the offload is a performance
+  path, not a correctness one (`vblk_async_post()` gates on
+  `g_vblk_async_ready`, and the `gdb` target has always run the synchronous
+  fallback on hardware).
+- **CPU3** — idle (WFI) in the default `dbg`/`gdb`/`fbsd` builds. `vcpu3.c`
+  exists and is wired for a FOURTH vCPU but is deliberately unarmed — no
+  hardware run yet. In the `dual` build CPU3 runs a genuine second guest
+  (Zephyr) concurrently with FreeBSD on CPU0, under its own disjoint stage-2
+  table — see `docs/dual-guest.md`. `vcpu3` and that Zephyr guest are mutually
+  exclusive at LINK TIME (a duplicate `bzdos_cpu3_owner` symbol), not merely by
+  convention.
 
 ## Talking to the guest
 
