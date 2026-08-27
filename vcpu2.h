@@ -79,6 +79,15 @@
  *     (GICD_CTLR/GICC_PMR/GICC_CTLR); it does not touch GICH at all.
  *   - EL1 configuration: guest_config() is core-agnostic and already reused
  *     verbatim by main_zephyr.c and zguest_cpu3.c.
+ *   - A periodic CNTP tick of its own (added 2026-08-27, alongside the
+ *     vgic_init() fix above, same citation). Without one, gic_timer.c's
+ *     vtimer_mask_watchdog() -- the recovery for the CNTV mask self-latch
+ *     documented in main_dbg.c's header, which once cost CPU0 its entire
+ *     timebase for the rest of a boot (2026-07-30) -- never runs on this
+ *     core, because it is called exclusively from the physical-tick arm of
+ *     gic_timer_irq(). Irrelevant while CPU2 ran no guest code; live the
+ *     instant it does, since FreeBSD's per-CPU event timer uses CNTV
+ *     identically on every vCPU.
  *
  * So this file is a park-and-enter sequence, structurally identical to
  * zguest_cpu3.c, and deliberately written to look like it.

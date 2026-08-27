@@ -47,6 +47,13 @@
 #endif
 volatile uint32_t dbg_vcpu2 = VCPU2_DEFAULT_ON;
 
+/* Tick period for CPU2's own CNTP arm (added 2026-08-27, see the call site
+ * below for why). Matches vcpu1.c's VCPU1_TICK_PERIOD_US/main_dbg.c's 10 ms
+ * choice -- no reason for this core's recovery cadence to differ, and
+ * reusing the already-measured period means no new jitter/timing unknowns
+ * to characterize. */
+#define VCPU2_TICK_PERIOD_US 10000u
+
 static volatile uint32_t g_req;         /* set by vcpu2_request(), consumed once */
 static volatile uint64_t g_entry;
 static volatile uint64_t g_ctxid;
@@ -220,6 +227,50 @@ void vcpu2_run(void)
 	 * deliberately: two vCPUs of one SMP guest must share one virtual
 	 * timebase, and main_dbg.c already zeroes CPU0's copy explicitly. */
 	vgic_init();
+
+	/* SECOND FIX, added the same day as vgic_init() above and for a related
+	 * but distinct reason (2026-08-27, found investigating a hardware stall
+	 * with vcpu1+vcpu2 both armed for the first time -- crash-20260827-133425
+	 * in the tree). Without this core's own periodic CNTP tick, CPU2 has NO
+	 * call path into vtimer_mask_watchdog() (gic_timer.c), ever: that function
+	 * runs exclusively from the TIMER_INTID arm of gic_timer_irq(), which only
+	 * fires on a core that has armed its own physical tick. CPU0 gets this for
+	 * free from main_dbg.c; CPU1 gets it from vcpu1.c's own
+	 * VCPU1_TICK_PERIOD_US arm (see that file, and its header's now-corrected
+	 * claim that this core needed none). Before today CPU2 never ran guest
+	 * code at all -- it either idled or ran vblk_async's offload loop -- so
+	 * the guest's CNTV (banked per PE, gic_timer.c's own state inventory)
+	 * never existed on this core and the gap was unreachable. It is reachable
+	 * the instant this function hands CPU2 a real vCPU: FreeBSD's per-CPU
+	 * event timer uses CNTV on every core identically, gic_timer_irq()'s
+	 * software-vtimer path (VGIC_CNTV_HW=0, the default) masks the physical
+	 * comparator on EVERY injection and relies on either the guest's own ISR
+	 * or vtimer_mask_watchdog()'s grace-period rescue to unmask it again --
+	 * and this file supplied neither. The known failure mode this reopens
+	 * (main_dbg.c's own header, "CNTV mask self-latching") is not
+	 * hypothetical: it silently cost CPU0 its entire timebase for the rest of
+	 * one boot on 2026-07-30, mid-ldconfig, with a perfectly healthy kernel
+	 * spinning in WFI forever, before the watchdog this arm restores existed.
+	 * Board-unverified whether it is what stalled THIS boot -- the crash
+	 * bundle above only has visibility into CPU1's own banked GICH (per-PE,
+	 * read over the debug channel, which is serviced by CPU1 -- see
+	 * vtimer_mask_watchdog()'s own comment on exactly this trap), and that
+	 * same bundle's GICH_LR0 shows CPU1's OWN virtual-timer PPI (INTID 27)
+	 * sitting pending and un-EOI'd, which is the guest-not-servicing-
+	 * interrupts symptom this whole class of bug produces -- CPU2's
+	 * equivalent state is simply unread, not absent. Landing this closes a
+	 * real, provable gap either way: CPU2 running real guest code with no
+	 * rescue for a bug already found once is not something to leave open
+	 * while investigating whether it explains this specific stall.
+	 *
+	 * ORDERING: after vgic_init() (this function must be able to publish
+	 * flightrec/vtimer state the same way CPU0/CPU1 do) and before
+	 * daifclr below, same constraint as every other piece of this core's
+	 * setup -- see vgic_init()'s own comment just above. Preserving-CNTVOFF
+	 * variant, same as main_dbg.c's and vcpu1.c's own arms: this core's guest
+	 * vCPU shares the SMP guest's one virtual timebase, untouched by whatever
+	 * CNTVOFF_EL2 this core happened to boot with. */
+	gic_timer_arm_preserving_cntvoff(VCPU2_TICK_PERIOD_US);
 
 	/* Publish what THIS core's banked registers actually hold, read on this
 	 * core. They cannot be checked from anywhere else: a read over the debug
