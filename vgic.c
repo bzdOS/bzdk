@@ -243,6 +243,10 @@ static inline void write_cntvoff_el2(uint64_t v)
 #define VGIC_BC_BASE   0x50001c00UL
 _Static_assert(VGIC_BC_BASE == HVMAP_LOW_VGIC_BC,
                "VGIC_BC_BASE drifted from hv_addrmap.h -- the map owns this address");
+/* Lanes for CPU2/CPU3, in their own window; see hv_addrmap.h's rationale. */
+#define VGIC_BC_HI_BASE 0x5009e500UL
+_Static_assert(VGIC_BC_HI_BASE == HVMAP_VGIC_BC_HI,
+               "VGIC_BC_HI_BASE drifted from hv_addrmap.h -- the map owns this address");
 #define VGIC_BC_MAGIC  0x56474943u   /* "VGIC" */
 
 /* PER-CORE BREADCRUMB LANES (added 2026-08-26, when vcpu1.c started calling
@@ -286,18 +290,25 @@ static inline void vg_bc(int i, uint32_t v)
 	 * wrong conclusions, which is a failure mode this project has already
 	 * paid for more than once.
 	 *
-	 * Silence beats somebody else's data. Giving CPU2/CPU3 real lanes needs
-	 * HVMAP_LOW_VGIC_BC grown past its currently-saturated 2 * 0x80, which
-	 * shifts every window after it in hv_addrmap.h -- deliberately deferred
-	 * (see breadcrumb-window-hygiene), not forgotten. Until then a vGIC
-	 * breadcrumb read for CPU2/CPU3 is absent, and absent is legible. */
-	uint32_t lane = smp_cpu_id();
+	 * Silence beat somebody else's data, and it was the right first move --
+	 * but it left the newest, most suspect core unobservable, which was felt
+	 * within the hour while chasing a stuck HW=1 List Register that could
+	 * only be held by CPU0 or CPU2. So CPU2/CPU3 now have real lanes after
+	 * all, in their own window (HVMAP_VGIC_BC_HI) at the top of the map
+	 * rather than by growing the saturated low one and shifting every window
+	 * behind it. CPU0 and CPU1 keep their exact addresses, so every host-side
+	 * reader is untouched. */
+	uint32_t cpu = smp_cpu_id();
 	volatile uint32_t *p;
+	unsigned long base;
 
-	if (lane > 1u)
+	if (cpu <= 1u)
+		base = VGIC_BC_BASE + cpu * VGIC_BC_STRIDE;
+	else if (cpu <= 3u)
+		base = VGIC_BC_HI_BASE + (cpu - 2u) * VGIC_BC_STRIDE;
+	else
 		return;
-	p = (volatile uint32_t *)(VGIC_BC_BASE +
-	    lane * VGIC_BC_STRIDE + (uint32_t)i * 4u);
+	p = (volatile uint32_t *)(base + (unsigned long)i * 4u);
 	*p = v;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
