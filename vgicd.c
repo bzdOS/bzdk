@@ -122,23 +122,53 @@ static void gicd_wr(uint32_t off, uint32_t v, uint32_t sas)
  * a cross-core interrupt-affinity write between CPU0 and CPU1 was equally
  * broken, not just SGIs.
  *
- * dbg_vcpu1 (weak: 0 in any build that doesn't link vcpu1.o) is the ONLY
- * thing that changes: CPU0 and CPU1 become one shared "same guest" group
- * exactly when it's armed, and ONLY for CPU0/CPU1 — CPU2 (never a guest
- * vCPU) and CPU3 (idle, or in the `dual` build a genuinely SEPARATE Zephyr
- * guest that still needs real isolation from this one) are UNCHANGED: a
- * write from or targeting either of them still masks to that core alone,
- * exactly as before. When dbg_vcpu1 is 0 (the default, and every build
- * that has never linked vcpu1.o), this function is byte-for-byte the old
- * behavior. */
+ * EXTENDED 2026-08-27 (crash-20260827-vcpu2-livelock): the fix above only
+ * ever merged CPU0/CPU1, hardcoded, because CPU2 was not a guest vCPU yet
+ * when it was written. It has been one since `vcpu2.c` started calling
+ * `vgic_init()` (commit 3a5e5e2), and this function was never told: with
+ * `dbg_vcpu1` and `dbg_vcpu2` both armed, a rendezvous SGI or an
+ * ITARGETSR write issued by CPU0 (or CPU1) still computed
+ * `own_cpu_mask() == {0,1}` — CPU2's bit was stripped from the target list
+ * before it ever reached the real distributor, in BOTH directions between
+ * CPU2 and {CPU0,CPU1}. That reproduces the exact measured signature: CPU2
+ * never receives (or can send) a cross-core IPI, so it sits outside the
+ * rendezvous entirely and just keeps taking its own local CNTV ticks at a
+ * normal, healthy rate forever (~1174/s measured — FreeBSD's ordinary
+ * per-CPU clock load, not a storm), while {CPU0,CPU1} block inside
+ * `smp_rendezvous_action()` waiting for an ack from a core that was never
+ * asked. See crash-20260827-vcpu2-livelock/finding.md for the measurement
+ * that led here; the "livelock" it describes on CPU2 is this core running
+ * completely normally, just cut off from the other two.
+ *
+ * Generalized rather than hardcoding a third case: the "same guest" group is
+ * now every core whose own dbg_vcpuN gate is armed (CPU0 is always in it —
+ * it is the guest's vCPU0 unconditionally), each read through a weak symbol
+ * (0 in any build that does not link that core's vcpuN.o) exactly like
+ * dbg_vcpu1 already was. This covers vcpu3.c's CPU3-as-a-fourth-vCPU mode
+ * too, WITHOUT touching the `dual` build's CPU3-as-Zephyr isolation: the two
+ * are link-time exclusive (vcpu3.c's own header), so in a `dual` build
+ * vcpu3.o is never linked, dbg_vcpu3 stays weak-0, and CPU3 keeps a
+ * self-only mask exactly as before — the isolation this file exists for is
+ * untouched.
+ *
+ * When no dbg_vcpuN beyond CPU0 itself is armed (the default build, and
+ * every build that predates this change), `group` reduces to `{0}` and this
+ * function is byte-for-byte the old behavior for every core. */
 __attribute__((weak)) volatile uint32_t dbg_vcpu1;
+__attribute__((weak)) volatile uint32_t dbg_vcpu2;
+__attribute__((weak)) volatile uint32_t dbg_vcpu3;
 
 static inline uint32_t own_cpu_mask(void)
 {
 	uint32_t me = smp_cpu_id() & 7u;
 	uint32_t mask = 1u << me;
-	if (dbg_vcpu1 && (me == 0u || me == 1u))
-		mask |= (1u << 0u) | (1u << 1u);
+	uint32_t group = (1u << 0u) |
+	                  (dbg_vcpu1 ? (1u << 1u) : 0u) |
+	                  (dbg_vcpu2 ? (1u << 2u) : 0u) |
+	                  (dbg_vcpu3 ? (1u << 3u) : 0u);
+
+	if (group & (1u << me))
+		mask = group;
 	return mask;
 }
 
