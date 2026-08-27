@@ -110,10 +110,17 @@ GUEST_LOW_ADDR=0x4E000000
 # established -- Zephyr's stage-2 slice sits in the high GiB, which only
 # physically exists with >=2 GiB of QEMU RAM, and all 4 cores must be
 # online for CPU3 to exist at all.
-TIMEOUT=90
+#
+# IDLE_TIMEOUT/ABS_TIMEOUT replace the old flat TIMEOUT=90: see
+# qemu-patient-run.sh for why a fixed wall-clock budget flaked under host
+# load (this is one of the two scripts that measurably did, 2026-08-27) and
+# what replaces it.
+IDLE_TIMEOUT=60
+ABS_TIMEOUT=450
 
 command -v "$QEMU" >/dev/null 2>&1 || { echo "dual-zephyr-qemu-ci: FAIL — $QEMU not installed"; exit 1; }
 command -v "${CROSS}gcc" >/dev/null 2>&1 || { echo "dual-zephyr-qemu-ci: FAIL — ${CROSS}gcc not installed"; exit 1; }
+. "$(dirname "$(readlink -f "$0")")/qemu-patient-run.sh"
 
 # ---- 1. the hypervisor firmware (CPU0 skeleton + real dual-guest mechanism,
 # now with a CPU3 dispatch that can service real Zephyr's UART/GIC faults) --
@@ -189,25 +196,29 @@ run_pass() {
     load_addr=$2
     expect=$3
 
-    echo "dual-zephyr-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, guest at $load_addr (timeout ${TIMEOUT}s) ..."
-    OUT=$(timeout "$TIMEOUT" "$QEMU" \
+    echo "dual-zephyr-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, guest at $load_addr (idle timeout ${IDLE_TIMEOUT}s, absolute ceiling ${ABS_TIMEOUT}s) ..."
+    qemu_patient_run OUT "$IDLE_TIMEOUT" "$ABS_TIMEOUT" -- \
+            "$QEMU" \
             -machine virt,gic-version=2,virtualization=on \
             -cpu cortex-a53 -m 2048 -smp 4 -nographic \
             -kernel "$ELF" \
-            -device "loader,file=$GUEST,addr=$load_addr,force-raw=on" 2>&1)
+            -device "loader,file=$GUEST,addr=$load_addr,force-raw=on"
 
-    # A firmware FAIL line is fatal for "concurrent" but is the EXPECTED outcome
-    # for "wiped"; a fault/panic is never acceptable either way.
-    if echo "$OUT" | grep -qiE "CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled"; then
-        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — fault/panic in output:"
-        echo "$OUT" | grep -iE "CPU3 FAULT|UNEXPECTED TRAP|panic|Unhandled" | head
-        echo "dual-zephyr-qemu-ci: full output:"
-        echo "$OUT"
-        return 1
-    fi
-    if [ "$expect" = "concurrent" ] && echo "$OUT" | grep -qi "DUAL-ZEPHYR-QEMU-CI: FAIL"; then
-        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — error line in output:"
-        echo "$OUT" | grep -i "DUAL-ZEPHYR-QEMU-CI: FAIL" | head
+    # A fault/panic is never acceptable, in either pass. Firmware wording note:
+    # el2_exc_dual_zephyr_qemu.c no longer prints "DUAL-ZEPHYR-QEMU-CI: FAIL"
+    # for a cpu0/cpu3/marker-did-not-advance outcome (it can't tell
+    # "concurrent" from "wiped" -- see that file's own comment on the
+    # branch); it prints "DUAL-ZEPHYR-QEMU-CI: OUTCOME ..." instead, and this
+    # script decides PASS/FAIL below from the parsed before=/after=/marker
+    # values, per "expect". The things that can still print literal
+    # "DUAL-ZEPHYR-QEMU-CI: FAIL" are genuine, expectation-independent
+    # failures -- PSCI CPU_ON bring-up not completing
+    # (main_dual_zephyr_qemu.c) or CPU0 itself faulting
+    # (el2_exc_dual_zephyr_qemu.c's report_fault_cpu0()) -- which is why this
+    # check is unconditional (not gated on "expect").
+    if echo "$OUT" | grep -qiE "CPU3 FAULT|DUAL-ZEPHYR-QEMU-CI: FAIL|UNEXPECTED TRAP|panic|Unhandled"; then
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — fault/panic/bring-up error in output:"
+        echo "$OUT" | grep -iE "CPU3 FAULT|DUAL-ZEPHYR-QEMU-CI: FAIL|UNEXPECTED TRAP|panic|Unhandled" | head
         echo "dual-zephyr-qemu-ci: full output:"
         echo "$OUT"
         return 1
@@ -215,7 +226,7 @@ run_pass() {
 
     VERDICT=$(echo "$OUT" | grep "DUAL-ZEPHYR-QEMU-CI: cpu0 before=" | tail -1)
     if [ -z "$VERDICT" ]; then
-        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — never saw the 'DUAL-ZEPHYR-QEMU-CI: cpu0 before=...' sample line within ${TIMEOUT}s. Full output:"
+        echo "dual-zephyr-qemu-ci: FAIL [$pass_name] — never saw the 'DUAL-ZEPHYR-QEMU-CI: cpu0 before=...' sample line (qemu exited early, or was killed after ${IDLE_TIMEOUT}s with no new output / ${ABS_TIMEOUT}s total). Full output:"
         echo "$OUT"
         return 1
     fi
