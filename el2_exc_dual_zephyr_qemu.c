@@ -532,14 +532,24 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 						           "CPU3's REAL Zephyr image both advanced concurrently, "
 						           "AND the real 'heartbeat 1' banner text was confirmed)\n");
 					} else {
-						pl011_puts("DUAL-ZEPHYR-QEMU-CI: FAIL (");
-						if (!cpu0_advanced)
-							pl011_puts("cpu0 did not advance ");
-						if (!cpu3_advanced)
-							pl011_puts("cpu3 console bytes did not advance ");
-						if (!g_zephyr_marker_seen)
-							pl011_puts("zephyr 'heartbeat 1' marker never seen ");
-						pl011_puts(")\n");
+						/* NOT "FAIL": same reasoning as
+						 * el2_exc_dual2_qemu.c's identical branch. This
+						 * firmware cannot tell dual-zephyr-qemu-ci.sh's
+						 * pass A (where cpu3 not advancing IS a failure)
+						 * from its pass B (where cpu3 NOT advancing, and
+						 * the marker NEVER being seen, is the correct,
+						 * expected outcome of the stale-image wipe). Report
+						 * the bare facts with a word that cannot be
+						 * mistaken for a verdict; the caller decides. */
+						pl011_puts("DUAL-ZEPHYR-QEMU-CI: OUTCOME cpu0_advanced=");
+						pl011_puts(cpu0_advanced ? "1" : "0");
+						pl011_puts(" cpu3_advanced=");
+						pl011_puts(cpu3_advanced ? "1" : "0");
+						pl011_puts(" zephyr_marker_seen=");
+						pl011_puts(g_zephyr_marker_seen ? "1" : "0");
+						pl011_puts(" (not a verdict -- see "
+						           "dual-zephyr-qemu-ci.sh's 'expect' "
+						           "parameter)\n");
 					}
 					dual_zephyr_qemu_poweroff();
 				}
