@@ -89,42 +89,46 @@ reproduced at will — the PHY has trained on every warm reset so far.
 
 Not yet committed: `el2_exc.c` (fix) + `board-config.xml` (vcpu3 on).
 
-### 3b. A bigger guest window — one real bug fixed, one left
+### 3b. A bigger guest window — DONE on hardware (2026-08-27)
 
-The guest has 1 GiB because `snapshot.c` claims the high GiB as a verbatim
-mirror. `GUEST_DRAM_2G` in `board-config.xml` takes the trade the other way
-(guest gets more, snapshot is not linked). It is **off**.
+`guest_dram_2g` is **on** (`board-config.xml`, `dtb-memory-size=0x78000000`):
+the guest sees `hw.realmem = 0x78000000` (1920 MiB), boots to multiuser with
+4 vCPUs, network end-to-end green. The window that made it work, all measured:
 
-Established, and all of it measured:
+- The board really has 2 GiB (`bdinfo memory[0] [0x40000000-0xbfffffff]`), but
+  the guest must not be told about the top: U-Boot reserves
+  `[0xb8f18770-0xbfffffff]` no-overwrite (self at 0xbdf44000, TLB at
+  0xbfff0000) and FreeBSD allocates downward — hence map 2 GiB, tell
+  `0xB8000000`.
+- The old early-userland stop ("after the regulator shutdowns") is ROOT-CAUSED
+  and fixed: it was NOT regulators and NOT the block path. FreeBSD allocates
+  userland from the TOP of RAM, i.e. the second GiB — which stage2_init left
+  as a flat XN 1 GiB block (needs_split gated tables to the first GiB only),
+  and `stage2_wx_flip()` rejected any IPA with `l2_idx >= 512`. The first
+  userland exec fault (ESR `0x8200000d`, permission fault L2; ELR `0x274618`,
+  a user VA — read straight off the per-core window from commit 4931822) had
+  no owner, and the guest span that one instruction at ~45 kHz on CPU3
+  forever. Fix: every DRAM 1 GiB block now gets its own `stage2_l2_dram[]`
+  row (`STAGE2_DRAM_L1_BLOCKS`), `needs_split` is gone, and `stage2_wx_flip()`
+  indexes block-then-entry. The five hardcod window copies were already
+  unified by `45ac193`.
+- The stale `hv_addrmap.h` claim that `0xC0000000` was "confirmed live" on the
+  board is corrected: the confirming fault was under QEMU; on the board the
+  top ~7 MiB is U-Boot's.
+- Ops hardening from the same night: `emac_link_watchdog()` now also heals
+  "link dropped AFTER boot traffic flowed" (the old "one RX frame ever =
+  healthy" test went permanently blind to that), re-arms itself after giving
+  up, and resets its attempt budget on a successful re-kick; and the per-core
+  fault window is zeroed at boot (it lives in DRAM and survived WDOG resets,
+  showing a phantom 33M-count storm on a healthy boot). One WDOG-reset boot
+  did still land EMAC-dark and needed the USB-ACM break-glass
+  (`\x00~BZRST\x00`); with the watchdog fixes such a boot should now
+  self-heal within ~a minute.
 
-- The board really has 2 GiB: U-Boot's `bdinfo` reports
-  `memory[0] [0x40000000-0xbfffffff]`.
-- **But the guest must not be told about the top.** U-Boot reserves
-  `[0xb8f18770-0xbfffffff]` `no-overwrite`, relocates itself to `0xbdf44000`,
-  and puts its own MMU translation tables at `TLB addr = 0xbfff0000`. FreeBSD
-  allocates downward from the top of the memory it is told it has, so handing it
-  `0xC0000000` hands it U-Boot's page tables. The first attempt did exactly
-  that and the board went unreachable.
-- `stage2_init()` builds whole 1 GiB level-1 blocks:
-  `nblocks = STAGE2_DRAM_SIZE / STAGE2_BLOCK_SIZE`, so a non-multiple is
-  silently **truncated**. `0x78000000` gave `nblocks == 1`. Hence the current
-  shape: **map the full 2 GiB, tell the guest 0xB8000000.** Those two numbers
-  differ on purpose and both are commented at their definitions.
-- **Five files carried the window as hardcoded constants** — `vblk_emmc.c`,
-  `vblk_sd.c`, `vinput.c`, `vnet_emac.c`, and `scanout.c` under its own spelling
-  — each with a comment asking whoever changed `stage2.h` to keep it in
-  lockstep. None did. The guest addressed a buffer above the old ceiling,
-  `gpa_in_range()` rejected it as "outside DRAM", virtio-blk answered `S_IOERR`,
-  and the guest died with `panic: Going nowhere without my init!`. All five now
-  derive from `stage2.h`. Commit `0eece3c`.
-- **What remains**: with all of the above fixed the guest gets past `start_init`
-  with no I/O error, then stops in early userland after the regulator
-  shutdowns. That is the open question. It is *not* the block path any more.
-
-`hv_addrmap.h` still claims `0xC0000000` is "the last byte of real, installed
-DRAM (confirmed live)". That citation is a fault under **QEMU**, not this board.
-Corrected in `stage2.h`'s comment; the original line is still there and worth
-fixing.
+Residual, pre-existing, unchanged: W^X flips race if two guest vCPUs fault
+into the same 2 MiB block concurrently (stage2.c's CONCURRENCY NOTE still
+says "only CPU0" — stale since vcpu1). Not observed; worth a real
+interlocked path if W^X ever becomes load-bearing.
 
 **Why anyone cares**: the board is its own build host, and a single Mesa NIR
 generator peaks at **648 MB** (measured, `time -l`, `max RSS 663020 KB`, 740 s,

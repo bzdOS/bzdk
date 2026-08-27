@@ -221,6 +221,12 @@ int main(void)
 	profiler_init();
 	dbgmon_init();
 	bmc_init();                /* lay down BMC1 breadcrumb + first health record */
+	/* Zero the per-core fault-attribution window (el2_exc.c's pcore_bc): it
+	 * lives in ordinary DRAM, so without this a WDOG warm reset leaves the
+	 * previous boot's storm counts in place, looking live — bit us
+	 * 2026-08-27 reading a stale 33M-count "storm" off a healthy 2G boot. */
+	for (unsigned i = 0; i < 16u; i++)
+		*(volatile uint32_t *)(HVMAP_VCPU3_BC + 0x80u + i * 4u) = 0u;
 	DBG_BC(1, 3);
 
 	/* Arm the dead-man's-switch watchdog EARLY — before any of the risky

@@ -174,6 +174,18 @@ stage2_block_desc(uint64_t pa, unsigned memattr, unsigned sh, unsigned xn)
  * consistent automatically.
  * ------------------------------------------------------------------ */
 #define STAGE2_L2_ENTRIES     512u
+/* How many 1 GiB DRAM L1 blocks the window covers — each gets its OWN row
+ * of stage2_l2_dram[] (its own L2 table) so the W^X flip machinery works
+ * uniformly across the whole window, not just the first GiB. Derived from
+ * STAGE2_DRAM_SIZE: 1 by default, 2 with GUEST_DRAM_2G. Generalized
+ * 2026-08-27 after the 2G guest died in a 45 kHz instruction-abort storm:
+ * FreeBSD allocates userland from the TOP of RAM, its first userland exec
+ * fault landed in the second GiB — then mapped only as a flat XN 1 GiB
+ * block, whose IPAs stage2_wx_flip() rejected (l2_idx >= 512), leaving the
+ * fault unowned and the guest spinning on the same instruction forever. */
+#define STAGE2_DRAM_L1_BLOCKS  (unsigned)(STAGE2_DRAM_SIZE / STAGE2_BLOCK_SIZE)
+_Static_assert(STAGE2_DRAM_SIZE % STAGE2_BLOCK_SIZE == 0,
+               "STAGE2_DRAM_SIZE must be a whole number of 1 GiB blocks");
 #define STAGE2_L2_BLOCK_SIZE  0x200000UL   /* 2 MiB */
 #define STAGE2_L2_BLOCK_SHIFT 21
 
@@ -451,7 +463,7 @@ stage2_build_mmio_tables(void)
 #define VEC_L2_IDX  ((unsigned)((GUEST_VECTOR_IPA >> STAGE2_L2_BLOCK_SHIFT) % STAGE2_L2_ENTRIES))
 #define VEC_L3_IDX  ((unsigned)((GUEST_VECTOR_IPA & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT))
 
-static uint64_t stage2_l2_dram[STAGE2_L2_ENTRIES]
+static uint64_t stage2_l2_dram[STAGE2_DRAM_L1_BLOCKS][STAGE2_L2_ENTRIES]
 	__attribute__((aligned(STAGE2_L2_ENTRIES * 8u)));
 static uint64_t stage2_l3_vec[STAGE2_L3_ENTRIES]
 	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
@@ -617,15 +629,20 @@ _Static_assert(HVMAP_FB_BUF1_BASE == HVFB_BUF0_END,
 #define STAGE2_DRAM_XN_DEFAULT ((unsigned)STAGE2_WX_DYNAMIC)
 
 /* Build the level-2 DRAM table for the 1 GiB block starting at `block_base`
- * into stage2_l2_dram[]: identity Normal-WB 2 MiB blocks everywhere, EXCEPT
- * the hv-image/hv-scratch entries, left INVALID (all-zero). Only called for
- * the DRAM block that actually contains those windows (see
- * stage2_dram_block_needs_split()) — a block with neither stays the simple
- * flat 1 GiB descriptor, unchanged from before this milestone. Returns
- * stage2_l2_dram[]'s PA for the caller to install. */
+ * into that block's row of stage2_l2_dram[]: identity Normal-WB 2 MiB
+ * blocks everywhere, EXCEPT the hv-image/hv-scratch entries, left INVALID
+ * (all-zero) — those windows only exist in the FIRST DRAM block, which the
+ * block_base == STAGE2_DRAM_BASE tests below key on. Called for EVERY DRAM
+ * 1 GiB block (stage2_init()), not just the one holding HV windows: the W^X
+ * flip machinery needs a per-block L2 table it can split, wherever the
+ * guest ends up executing from. Returns the built row's PA for the caller
+ * to install. */
 static uint64_t
 stage2_build_dram_table(uint64_t block_base)
 {
+	unsigned b = (unsigned)((block_base - STAGE2_DRAM_BASE)
+	                        >> STAGE2_BLOCK_SHIFT);
+
 	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
 		if (block_base == STAGE2_DRAM_BASE &&
 		    (i == HVIMG_L2_IDX || i == HVSCR_L2_IDX
@@ -633,7 +650,7 @@ stage2_build_dram_table(uint64_t block_base)
 		     || (i >= HVFB_L2_IDX && i < HVFB_L2_IDX + HVFB_L2_COUNT)
 #endif
 		    )) {
-			stage2_l2_dram[i] = 0;   /* INVALID: HV image / scratch / framebuffer */
+			stage2_l2_dram[b][i] = 0;   /* INVALID: HV image / scratch / framebuffer */
 			continue;
 		}
 
@@ -646,7 +663,7 @@ stage2_build_dram_table(uint64_t block_base)
 		 * shared framebuffer wants. */
 		if (block_base == STAGE2_DRAM_BASE &&
 		    i > HVFB_SPLIT_L2_IDX && i < HVFB_L2_IDX + HVFB_L2_COUNT) {
-			stage2_l2_dram[i] = 0;   /* INVALID: BUF1 / spare */
+			stage2_l2_dram[b][i] = 0;   /* INVALID: BUF1 / spare */
 			continue;
 		}
 		if (block_base == STAGE2_DRAM_BASE && i == HVFB_SPLIT_L2_IDX) {
@@ -661,35 +678,23 @@ stage2_build_dram_table(uint64_t block_base)
 					S2_MEMATTR_NORMAL_WB, S2_SH_INNER,
 					/*xn=*/1);   /* framebuffer: never executable */
 			}
-			stage2_l2_dram[i] = stage2_table_desc(
+			stage2_l2_dram[b][i] = stage2_table_desc(
 				(uint64_t)(uintptr_t)&stage2_l3_hvfb[0]);
 			continue;
 		}
 #endif
 		uint64_t pa = block_base + (uint64_t)i * STAGE2_L2_BLOCK_SIZE;
-		stage2_l2_dram[i] = stage2_l2_block_desc(pa,
+		stage2_l2_dram[b][i] = stage2_l2_block_desc(pa,
 			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 	}
-	return (uint64_t)(uintptr_t)&stage2_l2_dram[0];
+	return (uint64_t)(uintptr_t)&stage2_l2_dram[b][0];
 }
 
-/* Does the 1 GiB block at `block_base` contain either excluded window?
- * Both windows are known to fit inside a single 1 GiB block each (their L2
- * indices above are computed relative to STAGE2_DRAM_BASE specifically),
- * so this is only ever true for the block starting at STAGE2_DRAM_BASE
- * itself today; written as a real range check (not a hardcoded block
- * index) so it stays correct if STAGE2_DRAM_SIZE grows to cover more
- * blocks later. */
-static int
-stage2_dram_block_needs_split(uint64_t block_base)
-{
-	uint64_t block_end = block_base + STAGE2_BLOCK_SIZE;
-	if (HVIMG_BASE >= block_base && HVIMG_BASE < block_end)
-		return 1;
-	if (HVSCR_BASE >= block_base && HVSCR_BASE < block_end)
-		return 1;
-	return 0;
-}
+/* (Historical: stage2_dram_block_needs_split() used to gate WHICH DRAM
+ * blocks got an L2 table — only the one holding the HV windows, the rest
+ * stayed flat 1 GiB descriptors. Removed 2026-08-27 when GUEST_DRAM_2G
+ * made the flat case live and it turned out un-flippable under
+ * STAGE2_WX_DYNAMIC; every block now gets a table, see stage2_init().) */
 
 void
 stage2_unmap_guest_vector(void)
@@ -716,22 +721,20 @@ stage2_unmap_guest_vector(void)
 			S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
 	}
 
-	/* A1 NOTE: stage2_l2_dram[] was already fully built by stage2_init()
-	 * (via stage2_build_dram_table(), called because this 1 GiB block
-	 * contains hv-image/hv-scratch) BEFORE this function ever runs — see
-	 * its own comment above. Replacing all 512 entries here, as an
-	 * earlier version of this function did, would silently re-identity-map
-	 * (and thus un-protect) the HVIMG_L2_IDX/HVSCR_L2_IDX exclusions. Only
-	 * this ONE entry (VEC_L2_IDX=52, disjoint from both) is touched. */
-	stage2_l2_dram[VEC_L2_IDX] =
+	/* A1 NOTE: the first DRAM block's stage2_l2_dram[0][] row was already
+	 * fully built by stage2_init() (via stage2_build_dram_table(), which
+	 * every DRAM block gets) BEFORE this function ever runs — see its own
+	 * comment above. Replacing all 512 entries here, as an earlier version
+	 * of this function did, would silently re-identity-map (and thus
+	 * un-protect) the HVIMG_L2_IDX/HVSCR_L2_IDX exclusions. Only this ONE
+	 * entry (VEC_L2_IDX=52, disjoint from both) is touched. */
+	stage2_l2_dram[0][VEC_L2_IDX] =
 		stage2_table_desc((uint64_t)(uintptr_t)&stage2_l3_vec[0]);
 
-	/* stage2_l1[0][VEC_L1_IDX] already points at stage2_l2_dram[] — that
-	 * install happened in stage2_init() (either as a table descriptor, if
-	 * this block needed the A1 split, or — see stage2_dram_block_needs_
-	 * split() — this function is only ever armed on the block that DOES
-	 * need it, since GUEST_VECTOR_IPA and HVIMG_BASE/HVSCR_BASE all sit in
-	 * the same 1 GiB span today). Just flush the combined stage-1+2 TLB so
+	/* stage2_l1[0][VEC_L1_IDX] already points at that row — the install
+	 * happened in stage2_init(), which gives EVERY DRAM block a table
+	 * descriptor (GUEST_VECTOR_IPA and HVIMG_BASE/HVSCR_BASE all sit in
+	 * the same first 1 GiB span). Just flush the combined stage-1+2 TLB so
 	 * the walker picks up the level-3 split before the guest runs. */
 	stage2_tlb_flush();
 }
@@ -926,33 +929,23 @@ stage2_init(void)
 		ndesc++;
 	}
 
-	/* Index 1..N: DRAM as contiguous 1 GiB Normal WB blocks. N is derived
-	 * from STAGE2_DRAM_SIZE so bumping that one #define is enough to
-	 * map more RAM later. XN is STAGE2_DRAM_XN_DEFAULT: 0 (executable —
-	 * guest code lives here) unless STAGE2_WX_DYNAMIC opts into starting
-	 * writable-but-XN instead (see that macro's comment and
-	 * docs/wx-enforcement.md) — today STAGE2_DRAM_SIZE == STAGE2_BLOCK_SIZE
-	 * so this flat-block branch is never actually taken (the one DRAM block
-	 * always needs the A1 split below), but it is kept correct for when
-	 * DRAM ever grows past 1 GiB.
-	 *
-	 * A1: a block that overlaps the hv-image or hv-scratch DTB-reserved
-	 * windows gets a TABLE descriptor down to a level-2 table (built by
-	 * stage2_build_dram_table(), with those two windows left INVALID)
-	 * instead of a single flat BLOCK — every other block is unaffected,
-	 * identical to before this milestone. */
+	/* Index 1..N: EVERY DRAM 1 GiB block gets a TABLE descriptor down to
+	 * its own level-2 table (that block's row of stage2_l2_dram[], built
+	 * by stage2_build_dram_table()). There is deliberately no flat 1 GiB
+	 * block any more: with STAGE2_WX_DYNAMIC the leaves start RW+XN, and a
+	 * flat 1 GiB descriptor cannot be flipped per-region — measured live
+	 * 2026-08-27, the first 2G guest's userland exec fault (FreeBSD
+	 * allocates from the top of RAM, i.e. the second GiB) had no owner and
+	 * stormed at 45 kHz. Identity Normal-WB everywhere, XN default from
+	 * STAGE2_DRAM_XN_DEFAULT, HV windows left INVALID inside the first
+	 * block's row by stage2_build_dram_table() itself. */
 	{
-		unsigned nblocks = (unsigned)(STAGE2_DRAM_SIZE / STAGE2_BLOCK_SIZE);
+		unsigned nblocks = STAGE2_DRAM_L1_BLOCKS;
 		unsigned base_idx = (unsigned)(STAGE2_DRAM_BASE >> STAGE2_BLOCK_SHIFT);
 		for (unsigned b = 0; b < nblocks; b++) {
 			uint64_t pa = STAGE2_DRAM_BASE + (uint64_t)b * STAGE2_BLOCK_SIZE;
-			if (stage2_dram_block_needs_split(pa)) {
-				uint64_t l2_pa = stage2_build_dram_table(pa);
-				stage2_l1[0][base_idx + b] = stage2_table_desc(l2_pa);
-			} else {
-				stage2_l1[0][base_idx + b] = stage2_block_desc(pa,
-					S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/STAGE2_DRAM_XN_DEFAULT);
-			}
+			uint64_t l2_pa = stage2_build_dram_table(pa);
+			stage2_l1[0][base_idx + b] = stage2_table_desc(l2_pa);
 			ndesc++;
 		}
 	}
@@ -1471,11 +1464,12 @@ stage2_wx_selfcheck(void)
  * docs/wx-enforcement.md Q2/Q4 for the numbers behind the pool size and why
  * "never freed" is the deliberately simple, bounded-risk choice.
  *
- * SCOPE NOTE: only ever touches stage2_l2_dram[] — the ONE L2 table for the
- * ONE DRAM L1 block that exists today (STAGE2_DRAM_SIZE == STAGE2_BLOCK_
- * SIZE; see stage2_build_dram_table()'s own comment). If STAGE2_DRAM_SIZE
- * ever grows past 1 GiB this narrows to "only the first 1 GiB block" and
- * would need generalizing — flagged here, not silently assumed.
+ * SCOPE NOTE: touches one row of stage2_l2_dram[] per 1 GiB DRAM block —
+ * every DRAM block HAS such a row since 2026-08-27 (before that the array
+ * was a single 1 GiB table and the second GiB of a GUEST_DRAM_2G window
+ * was a flat un-flippable XN block, which is exactly what stormed). The
+ * row is selected by the block index, the entry within it by the 2 MiB
+ * index — see the raw/b/l2_idx split in stage2_wx_flip().
  *
  * CONCURRENCY NOTE: only CPU0 ever runs the FreeBSD guest and takes its
  * traps (smp.c's design; the `dual` target's second guest on CPU3 has its
@@ -1548,9 +1542,9 @@ wxd_publish(uint64_t last_ipa)
 	wxd_bc(4, (uint32_t)last_ipa);
 }
 
-/* Split-or-reuse-then-flip ONE 4 KiB leaf inside the 1 GiB DRAM window's L2
- * table (stage2_l2_dram[] — see the SCOPE NOTE above). `ipa` must already
- * be known to lie inside guest DRAM and outside both HV windows —
+/* Split-or-reuse-then-flip ONE 4 KiB leaf inside the covering 1 GiB DRAM
+ * block's row of stage2_l2_dram[] (see the SCOPE NOTE above). `ipa` must
+ * already be known to lie inside guest DRAM and outside both HV windows —
  * stage2_wx_fault() below is the only caller and checks that first.
  * `want_exec` selects the direction: 1 = an execute (instruction-fetch)
  * fault, flip to RO+X; 0 = a write fault on a currently-RO+X leaf, flip
@@ -1560,14 +1554,17 @@ static int
 stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 {
 	uint64_t block_ipa = ipa & STAGE2_L2_ADDR_MASK;
-	unsigned l2_idx = (unsigned)((block_ipa - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT);
+	unsigned raw = (unsigned)((block_ipa - STAGE2_DRAM_BASE)
+	                          >> STAGE2_L2_BLOCK_SHIFT);
+	unsigned b = raw / STAGE2_L2_ENTRIES;      /* which 1 GiB block's row   */
+	unsigned l2_idx = raw % STAGE2_L2_ENTRIES; /* entry within that row     */
 	uint64_t l2d;
 	uint64_t *l3;
 
-	if (l2_idx >= STAGE2_L2_ENTRIES)
+	if (raw >= STAGE2_DRAM_L1_BLOCKS * STAGE2_L2_ENTRIES)
 		return 0;   /* defensive: unreachable given stage2_wx_fault()'s range check */
 
-	l2d = stage2_l2_dram[l2_idx];
+	l2d = stage2_l2_dram[b][l2_idx];
 
 	if ((l2d & 0x3ull) == S2_DESC_VALID_TABLE) {
 		/* Already split — a previous flip of this same block, or (if
@@ -1587,7 +1584,7 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 			 * Degrade this one 2 MiB region to plain RW+X (today's
 			 * unconditional behavior) and let the guest proceed; never
 			 * deny the fetch. */
-			stage2_l2_dram[l2_idx] = stage2_l2_block_desc(block_ipa,
+			stage2_l2_dram[b][l2_idx] = stage2_l2_block_desc(block_ipa,
 				S2_MEMATTR_NORMAL_WB, S2_SH_INNER, /*xn=*/0);
 			stage2_wx_pool_exhausted++;
 			wxd_publish(block_ipa);
@@ -1607,7 +1604,7 @@ stage2_wx_flip(uint64_t ipa, unsigned want_exec)
 			l3[k] = stage2_page_desc(pa, S2_MEMATTR_NORMAL_WB,
 				S2_SH_INNER, /*xn=*/1);
 		}
-		stage2_l2_dram[l2_idx] = stage2_table_desc((uint64_t)(uintptr_t)l3);
+		stage2_l2_dram[b][l2_idx] = stage2_table_desc((uint64_t)(uintptr_t)l3);
 	} else {
 		return 0;   /* invalid — unreachable given stage2_wx_fault()'s
 		             * HV-window check, but never guess here */
