@@ -153,7 +153,7 @@ all **off**. Design and per-device findings: `docs/guest-hw-enablement.md`.
 
 | Device | Reality | Verdict |
 |---|---|---|
-| **USB host port 1** | `generic_ehci_fdt`/`generic_ohci`/`aw_usbphy` all compiled in; `awusbphy0` already attaches live | **try first.** First measurement is the **GIC SPI-74 / INTID-106 rate**, not whether `uhub` appears — that SPI is a documented storm source here, once at ~145 kHz |
+| **USB host port 1** | `generic_ehci_fdt`/`generic_ohci`/`aw_usbphy` all compiled in; `awusbphy0` already attaches live | **DONE 2026-08-27.** One DTB flip (`guest_usb_host1`): `ehci0` attaches (irq 24), `usbus0`/`usbus1` up, and a real plugged **Terminus Technology hub enumerates at 480 Mbps** (`ugen0.2`). The feared INTID-106 storm did NOT appear (storm-BC zero, no kHz-rate counter in the g_gt sweep, MUSB word 37 stays `0x2`) — with the driver attached, the guest services the line and the old 145 kHz no-driver storm cannot form. Port 0 correctly stayed disabled (`no driver attached`) |
 | **USB host port 0** | shares PHY0 with MUSB | **no switch exists.** MUSB carries the CDC-ACM console and the break-glass reset; a hard `validate()` error in `FORBIDDEN_DTB_NODES` refuses it |
 | **Audio** | real drivers, already compiled (`pcm0` attaches today) | **DTB problem, not a driver problem.** Attach-only landed; the third (DAI) node is the live path to an unguarded DMA engine and is deliberately excluded |
 | **IR** | `aw_cir` compiled in, binds via a *fallback* compat string | cheapest to verify |
@@ -167,20 +167,21 @@ Each of these needs one board cycle. None is armed by default except where noted
 - **MUSB storm fix** (`745b58d`, in the default build): the storm was **our own
   regression** from `6cf4215` — endpoint interrupt enables were added and their
   status registers `REG_INTTX`/`REG_INTRX` were never read, on a level-high
-  aggregate line. Validation: `irq_counter[103]` and `musb_throttles` before and
-  after; breadcrumb word 37 (`0x50000094`) latches the last nonzero
-  `(INTRX<<16)|INTTX`. **Also confirm the break-glass channel survives** by
-  writing the marker to `/dev/ttyACM0` and seeing the watchdog reset in ~16 s.
+  aggregate line. **VALIDATED live 2026-08-27** on the 4-vCPU 2G board:
+  breadcrumb word 37 (`0x50000094`) latches only `0x2` (the benign EP0 TX bit),
+  the storm-BC window reads all zeros, no counter in a full `g_gt[]` sweep
+  moves faster than the 100 Hz tick, and the CDC-ACM console ran flawlessly
+  through an entire night of interactive use. The **break-glass channel** was
+  exercised for real twice (two `\x00~BZRST\x00` WDOG resets, both recovered
+  the board) — validated.
 - **HDMI vblank counters** (`97b16e1`): `hdmi_wrong_core` and `hdmi_throttles`
   now published in `BC_HDMI_BASE` words 13/14 — they existed but had no live
   export, so the numbers previously used to rule those causes out were a
-  snapshot nobody could re-take. The guest was **exonerated** as a second
-  consumer: `bzkms.c` reads an EL2-published count through a doorbell and never
-  touches TCON1 MMIO. Leading explanation is now same-GIC-priority contention on
-  CPU1 (INTIDs 119, 103 and 30 all sit at `TIMER_PRIORITY`, and a same-priority
-  IRQ cannot preempt on GICv2) against a status bit that latches rather than
-  counts. **If the MUSB fix works, the vblank rate should move toward 60 Hz on
-  its own** — one measurement tests both.
+  snapshot nobody could re-take. **VALIDATED live 2026-08-27**: vblank rate
+  measured **60.8 Hz** with `hdmi_wrong_core=0` and `hdmi_throttles=0` —
+  exactly the "if the MUSB fix works, the vblank rate should move toward
+  60 Hz on its own" prediction (same-GIC-priority contention on CPU1
+  exonerated as resolved).
 - **GDB**: the "channel goes dark" root cause is fixed — `command_loop_ex()`
   kicked a **16-second** hardware watchdog once per complete RSP packet, so any
   human pause between commands reset the board. Same cause as
