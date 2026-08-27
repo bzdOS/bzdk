@@ -52,7 +52,7 @@ property):
 | eMMC/MMC2 (`0x1c11000`) | okay | **yes** (IDMAC) | **yes** — this is the exact aw_mmc IDMAC-coherency device `el2_ncmap.c`/`docs/el2-nc-guest-dram.md` already treats specially |
 | EMAC (`0x1c30000`) | okay | **yes** (TX/RX descriptor rings) | ambiguous — HV's OWN debug console (`emac.c`) polls this hardware directly; whether the guest's own DTB-declared EMAC driver also attaches is the same class of dual-ownership risk already flagged for MUSB (see `usbacm.h`) — NOT independently re-verified here |
 | Crypto engine "CE" (`0x1c15000`) | **okay (no `status` property at all → defaults enabled)** | **yes** — Allwinner CE is descriptor/DMA-driven (AES/hash source+dest buffers) | **unconfirmed** — no evidence in this tree that the boot FreeBSD kernel carries a `sun8i-ce`-equivalent driver; FreeBSD's Allwinner arm64 support is comparatively thin. Cannot rule out. |
-| System DMA controller "dma-controller@1c02000" | **disabled** | **yes** — general-purpose memory-to-memory DMA, the most dangerous block in the list | **no** — see below, all its clients are also disabled |
+| System DMA controller "dma-controller@1c02000" | **okay (implicit — no `status` property at all)** | **yes** — general-purpose memory-to-memory DMA, the most dangerous block in the list | **no** — see below, all its clients are also disabled |
 | SPDIF/I2S0-2/audio codec (`0x1c21000`-`0x1c22e00`) | disabled | only via the system DMA controller above (`dmas = <0x30 ...>`) | no |
 | SPI0/SPI1 (`0x1c68000`/`0x1c69000`) | disabled | only via the system DMA controller above | no |
 | Display Engine DE2 + mixer + rotate (`0x1000000`-`0x1400000`) | disabled | yes, large multimedia DMA | no |
@@ -64,16 +64,33 @@ directly — `grep -n 'status = "disabled"'` around each node's line range in
 
 ## Verifying the one clean case: the system DMA controller
 
-`dma-controller@1c02000` (`compatible = "allwinner,sun50i-a64-dma"`,
-`phandle = <0x30>`) is `status = "disabled"`. Grepping the whole DTS for
-`dmas = <0x30` (the only way any OTHER node could reach it) finds exactly six
-consumers — SPDIF, I2S0, I2S1, I2S2, the `codec-i2s` DAI, SPI0, SPI1 — and
-**every single one of them is independently `status = "disabled"`** too. That
-means: with this exact DTB, there is no code path (not even an accidental
-one via a sibling driver) through which the FreeBSD guest would ever issue a
-CPU access to `0x1c02000-0x1c02fff`. This is the one block in the table above
-that is both (a) a genuinely dangerous general-purpose DMA engine and (b)
-provably unused, not just "probably unused".
+**CORRECTED 2026-08-27** (`docs/guest-hw-enablement.md`'s hardware-enablement
+survey caught this): `dma-controller@1c02000` (`compatible =
+"allwinner,sun50i-a64-dma"`, `phandle = <0x30>`) has **no `status` property at
+all** — `okay` by spec default, not `"disabled"` as this section originally
+claimed. Re-checked directly against a scratch `dtc -I dtb -O dts` decompile
+of the live `bananapi-min.dtb`: the node's block runs straight from
+`compatible` to `phandle` with no `status` line. The "provably unused"
+conclusion below still holds, just for the narrower reason that survives the
+correction — every consumer, not the controller itself, is what is disabled.
+
+Grepping the whole DTS for `dmas = <0x30` (the only way any node could reach
+this controller) finds exactly seven consumers — SPDIF, I2S0, I2S1, I2S2, the
+`codec-i2s` DAI (`dai@1c22c00`), SPI0, SPI1 — and **every single one of them
+is independently `status = "disabled"`** too. That means: with this exact
+DTB, there is no code path (not even an accidental one via a sibling driver)
+through which the FreeBSD guest would ever issue a CPU access to
+`0x1c02000-0x1c02fff`. This is the one block in the table above that is both
+(a) a genuinely dangerous general-purpose DMA engine, enabled itself, and (b)
+provably unused, not just "probably unused" — because every consumer that
+could arm it is off. `gen_config.py`'s `FORBIDDEN_DTB_NODES`
+(`docs/guest-hw-enablement.md`) now enforces the consumer half of this
+structurally: `dai@1c22c00` — the only consumer with any live path to being
+re-enabled through this project's own tooling — cannot be flipped back to
+`"okay"` without a hard `validate()` error, precisely so this paragraph's
+"provably unused" claim cannot be silently invalidated by a future
+`board-config.xml` edit the way the controller's own `status` value already
+was by whatever produced this file's original (wrong) claim.
 
 This 4 KiB page happens to sit inside the SAME 2 MiB block
 (`UART_L2_IDX == 14`, IPA `0x1c00000-0x1dfffff`) that `stage2.c` already
@@ -88,8 +105,10 @@ real hardware (the UART trap has been working since well before this pass).
 
 ```c
 /* in stage2_build_mmio_tables()'s L3-building loop, alongside UART_L3_IDX: */
-#define DMA_CTRL_BASE   0x01C02000UL   /* dma-controller@1c02000, DTB-disabled,
-                                         * zero enabled consumers (see
+#define DMA_CTRL_BASE   0x01C02000UL   /* dma-controller@1c02000, DTB-enabled
+                                         * (no status property, okay by
+                                         * default) but zero enabled
+                                         * consumers (see
                                          * docs/dma-bypass-stage2.md) */
 #define DMA_CTRL_L3_IDX ((unsigned)((DMA_CTRL_BASE & (STAGE2_L2_BLOCK_SIZE - 1u)) \
                                      >> STAGE2_L3_PAGE_SHIFT))   /* == 2 */
