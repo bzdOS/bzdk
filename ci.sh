@@ -69,29 +69,44 @@ set -u
 cd "$(dirname "$(readlink -f "$0")")"
 
 fail=0
+# Machine-readable summary bookkeeping: one (name, verdict) pair per stage,
+# verdict is exactly PASS/FAIL/SKIP -- see the final "ci: SUMMARY" line.
+# Added so a red run is diagnosable from its own last few lines without
+# scrolling back through the whole (multi-minute) transcript, or re-running
+# the entire gate a second time just to capture output to a file -- both
+# things a red run cost in practice on 2026-08-27.
+stage_names=()
+stage_verdicts=()
+record_stage() { stage_names+=("$1"); stage_verdicts+=("$2"); }
 
 echo "════════ ci: hosted unit tests (make test) ════════"
 if make test; then
     echo "ci: hosted unit tests PASS"
+    record_stage "hosted-unit-tests" PASS
 else
     echo "ci: hosted unit tests FAIL"
     fail=1
+    record_stage "hosted-unit-tests" FAIL
 fi
 
 echo "════════ ci: QEMU-virt second target (qemu-ci.sh) ════════"
 if ./qemu-ci.sh; then
     echo "ci: qemu second target PASS"
+    record_stage "qemu-ci" PASS
 else
     echo "ci: qemu second target FAIL"
     fail=1
+    record_stage "qemu-ci" FAIL
 fi
 
 echo "════════ ci: vGIC interrupt virtualization on QEMU-virt (vgic-qemu-ci.sh) ════════"
 if ./vgic-qemu-ci.sh; then
     echo "ci: vgic interrupt-virtualization target PASS"
+    record_stage "vgic-qemu-ci" PASS
 else
     echo "ci: vgic interrupt-virtualization target FAIL"
     fail=1
+    record_stage "vgic-qemu-ci" FAIL
 fi
 
 echo "════════ ci: Zephyr guest on QEMU-virt (zephyr-qemu-ci.sh) ════════"
@@ -104,10 +119,13 @@ echo "$zout"
 if [ "$zrc" -ne 0 ]; then
     echo "ci: zephyr guest target FAIL"
     fail=1
+    record_stage "zephyr-qemu-ci" FAIL
 elif echo "$zout" | grep -q "zephyr-qemu-ci: SKIP"; then
     echo "ci: zephyr guest target SKIPPED (no Zephyr tree — not a regression)"
+    record_stage "zephyr-qemu-ci" SKIP
 else
     echo "ci: zephyr guest target PASS"
+    record_stage "zephyr-qemu-ci" PASS
 fi
 
 echo "════════ ci: Linux guest on QEMU-virt (linux-qemu-ci.sh) ════════"
@@ -119,27 +137,34 @@ echo "$lout"
 if [ "$lrc" -ne 0 ]; then
     echo "ci: linux guest target FAIL"
     fail=1
+    record_stage "linux-qemu-ci" FAIL
 elif echo "$lout" | grep -q "linux-qemu-ci: SKIP"; then
     echo "ci: linux guest target SKIPPED (no Linux tree — not a regression)"
+    record_stage "linux-qemu-ci" SKIP
 else
     echo "ci: linux guest target PASS"
+    record_stage "linux-qemu-ci" PASS
 fi
 
 echo "════════ ci: snapshot/restore round trip on QEMU-virt (snapshot-qemu-ci.sh) ════════"
 if ./snapshot-qemu-ci.sh; then
     echo "ci: snapshot/restore target PASS"
+    record_stage "snapshot-qemu-ci" PASS
 else
     echo "ci: snapshot/restore target FAIL"
     fail=1
+    record_stage "snapshot-qemu-ci" FAIL
 fi
 
 echo "════════ ci: PSCI CPU_ON bring-up of all 4 cores (smp-qemu-ci.sh) ════════"
 # Dual-guest Step 0. No SKIP path: needs only the cross-compiler and QEMU.
 if ./smp-qemu-ci.sh; then
     echo "ci: smp bring-up target PASS"
+    record_stage "smp-qemu-ci" PASS
 else
     echo "ci: smp bring-up target FAIL"
     fail=1
+    record_stage "smp-qemu-ci" FAIL
 fi
 
 echo "════════ ci: two guests concurrently on CPU0+CPU3 (dual-qemu-ci.sh) ════════"
@@ -148,9 +173,11 @@ echo "════════ ci: two guests concurrently on CPU0+CPU3 (dual-qe
 # a warm reset made necessary (see zstage_invalidate_dest()). No SKIP path.
 if ./dual-qemu-ci.sh; then
     echo "ci: dual-guest concurrency target PASS"
+    record_stage "dual-qemu-ci" PASS
 else
     echo "ci: dual-guest concurrency target FAIL"
     fail=1
+    record_stage "dual-qemu-ci" FAIL
 fi
 
 echo "════════ ci: retry after zunhalt re-arm (dual-rearm-qemu-ci.sh) ════════"
@@ -159,9 +186,11 @@ echo "════════ ci: retry after zunhalt re-arm (dual-rearm-qemu-c
 # reaches kload_enter is not a retry that runs. No SKIP path.
 if ./dual-rearm-qemu-ci.sh; then
     echo "ci: dual-guest retry target PASS"
+    record_stage "dual-rearm-qemu-ci" PASS
 else
     echo "ci: dual-guest retry target FAIL"
     fail=1
+    record_stage "dual-rearm-qemu-ci" FAIL
 fi
 
 echo "════════ ci: real Zephyr as the 2nd guest (dual-zephyr-qemu-ci.sh) ════════"
@@ -174,10 +203,13 @@ echo "$dzout"
 if [ "$dzrc" -ne 0 ]; then
     echo "ci: dual-guest real-Zephyr target FAIL"
     fail=1
+    record_stage "dual-zephyr-qemu-ci" FAIL
 elif echo "$dzout" | grep -q "dual-zephyr-qemu-ci: SKIP"; then
     echo "ci: dual-guest real-Zephyr target SKIPPED (no Zephyr tree — not a regression)"
+    record_stage "dual-zephyr-qemu-ci" SKIP
 else
     echo "ci: dual-guest real-Zephyr target PASS"
+    record_stage "dual-zephyr-qemu-ci" PASS
 fi
 
 echo "════════════════════════════════════════════════════"
@@ -186,4 +218,25 @@ if [ "$fail" -eq 0 ]; then
 else
     echo "ci: FAILURES ABOVE ❌"
 fi
+
+# Machine-readable summary: counts plus the names of any FAILed stages, so a
+# red run is diagnosable from its own tail without scrolling back through a
+# multi-minute transcript. Deliberately short (one line) and grep-friendly
+# (`ci: SUMMARY`). SKIPped stages are listed separately from FAILed ones --
+# a SKIP is a missing input, not a regression (see the stages above), and
+# must never read like a failure here either.
+n_pass=0 n_fail=0 n_skip=0
+failed_list=""
+skipped_list=""
+for i in "${!stage_names[@]}"; do
+    case "${stage_verdicts[$i]}" in
+        PASS) n_pass=$((n_pass + 1)) ;;
+        FAIL) n_fail=$((n_fail + 1))
+              failed_list="${failed_list:+$failed_list,}${stage_names[$i]}" ;;
+        SKIP) n_skip=$((n_skip + 1))
+              skipped_list="${skipped_list:+$skipped_list,}${stage_names[$i]}" ;;
+    esac
+done
+echo "ci: SUMMARY stages=${#stage_names[@]} pass=$n_pass fail=$n_fail skip=$n_skip failed=[${failed_list}] skipped=[${skipped_list}]"
+
 exit "$fail"
