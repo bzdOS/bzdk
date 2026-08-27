@@ -1171,6 +1171,10 @@ int emac_init(void)
 /* where it gives up — so the caller may escalate (e.g. opt-in reboot);  */
 /* 0 on every other call.                                                */
 /* ------------------------------------------------------------------ */
+/* Updated 2026-08-27: "sick" now ALSO means "link currently down" (not
+ * just "no RX frame ever arrived"), giving up re-arms itself the moment
+ * real health is observed, and a successful re-kick resets the attempt
+ * budget — see the inline notes in the body. */
 #define LINK_WD_CHECK_PERIOD_S   8u   /* how often we re-check             */
 #define LINK_WD_MAX_ATTEMPTS     6u   /* ~48 s of retries before giving up */
 
@@ -1188,16 +1192,36 @@ int emac_link_watchdog(void)
         freq = 24000000ull;
     period_ticks = freq * (uint64_t)LINK_WD_CHECK_PERIOD_S;
 
-    if (g_wd_gave_up)
-        return 0;
+    if (g_wd_gave_up) {
+        /* Not terminal after all (changed 2026-08-27): a board that went
+         * dark on one bad boot used to stay watchdog-dead for the rest of
+         * that boot even after the link recovered. Re-arm the moment real
+         * health (link up AND traffic) is observed, so the NEXT episode
+         * gets a fresh budget. */
+        if (g_link_up && g_rx_count) {
+            g_wd_gave_up = 0;
+            g_wd_attempts = 0;
+            bc(1, BC_STAGE_LOOP);
+        } else {
+            return 0;
+        }
+    }
     if (g_wd_last_check_ticks == 0)
         g_wd_last_check_ticks = now;      /* first call: establish baseline */
     if (now - g_wd_last_check_ticks < period_ticks)
         return 0;                         /* not due yet — cheap common path */
     g_wd_last_check_ticks = now;
 
-    if (g_rx_count != 0)
-        return 0;           /* healthy: at least one frame has ever arrived */
+    if (g_rx_count != 0 && g_link_up)
+        return 0;   /* healthy: traffic flows and the link is up now. The old
+                     * test was "at least one frame has EVER arrived", which
+                     * went permanently blind to a link that DROPPED after
+                     * boot traffic (measured 2026-08-27: a WDOG-reset boot
+                     * sat EMAC-dark with the watchdog satisfied forever).
+                     * Re-kicking with the link down is as safe as the
+                     * original zero-RX case: no RX can be in flight over a
+                     * down link, and tx_frame_raw() drops TX on link-down
+                     * before it ever touches the rings. */
 
     g_wd_attempts++;
     bc(18, g_wd_attempts);
@@ -1218,6 +1242,7 @@ int emac_link_watchdog(void)
         if (linked) {
             bc(5, g_speed);
             adjust_link(duplex_full);
+            g_wd_attempts = 0;   /* episode over: full budget for the next one */
         }
         rings_init();
         setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
