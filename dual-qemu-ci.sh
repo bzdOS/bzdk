@@ -103,10 +103,21 @@ LOW_ADDR=0x4E000000
 # (0x80000000-0xC0000000), which only physically exists with at least 2 GiB
 # of QEMU RAM -- same requirement snapshot-qemu-ci.sh already established for
 # the same high-GiB window (see that script's own comment).
-TIMEOUT=30
+#
+# IDLE_TIMEOUT/ABS_TIMEOUT replace the old flat TIMEOUT=30: see
+# qemu-patient-run.sh for why a fixed wall-clock budget flaked under host
+# load and what replaces it. IDLE_TIMEOUT is generous against real scheduling
+# delay (the run normally reaches its verdict in a couple of seconds, and a
+# deliberately-provoked 40s scheduling gap in testing still passed cleanly --
+# see the verification notes this shipped with); ABS_TIMEOUT is the backstop
+# against a run that keeps producing output forever without ever reaching
+# its sample target.
+IDLE_TIMEOUT=60
+ABS_TIMEOUT=300
 
 command -v "$QEMU" >/dev/null 2>&1 || { echo "dual-qemu-ci: FAIL — $QEMU not installed"; exit 1; }
 command -v "${CROSS}gcc" >/dev/null 2>&1 || { echo "dual-qemu-ci: FAIL — ${CROSS}gcc not installed"; exit 1; }
+. "$(dirname "$(readlink -f "$0")")/qemu-patient-run.sh"
 
 # ---- 1. the hypervisor firmware (CPU0 skeleton + real dual-guest mechanism) -
 echo "dual-qemu-ci: building $ELF ..."
@@ -171,26 +182,27 @@ run_pass() {
     load_addr=$2
     expect=$3
 
-    echo "dual-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, payload at $load_addr (timeout ${TIMEOUT}s) ..."
-    OUT=$(timeout "$TIMEOUT" "$QEMU" \
+    echo "dual-qemu-ci: [$pass_name] running under $QEMU -M virt -smp 4 -m 2048, payload at $load_addr (idle timeout ${IDLE_TIMEOUT}s, absolute ceiling ${ABS_TIMEOUT}s) ..."
+    qemu_patient_run OUT "$IDLE_TIMEOUT" "$ABS_TIMEOUT" -- \
+            "$QEMU" \
             -machine virt,gic-version=2,virtualization=on \
             -cpu cortex-a53 -m 2048 -smp 4 -nographic \
             -kernel "$ELF" \
-            -device "loader,file=$PAYLOAD_ELF,addr=$load_addr,force-raw=on" 2>&1)
+            -device "loader,file=$PAYLOAD_ELF,addr=$load_addr,force-raw=on"
 
-    # A firmware FAIL line is fatal for the "concurrent" expectation but is the
-    # EXPECTED outcome for "wiped" -- there, the only acceptable FAIL is
-    # precisely "cpu3 did not advance", and a fault/panic still is not.
-    if echo "$OUT" | grep -qiE "DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort"; then
-        echo "dual-qemu-ci: FAIL [$pass_name] — fault/panic in output:"
-        echo "$OUT" | grep -iE "DUAL-QEMU-CI2: FAULT|UNEXPECTED TRAP|panic|Unhandled|abort" | head
-        echo "dual-qemu-ci: full output:"
-        echo "$OUT"
-        return 1
-    fi
-    if [ "$expect" = "concurrent" ] && echo "$OUT" | grep -qi "DUAL-QEMU-CI2: FAIL"; then
-        echo "dual-qemu-ci: FAIL [$pass_name] — error line in output:"
-        echo "$OUT" | grep -i "DUAL-QEMU-CI2: FAIL" | head
+    # A fault/panic is never acceptable, in either pass. Firmware wording note:
+    # el2_exc_dual2_qemu.c no longer prints "DUAL-QEMU-CI2: FAIL" for a
+    # cpu0/cpu3-did-not-advance outcome (it can't tell "concurrent" from
+    # "wiped" -- see that file's own comment on the branch); it prints
+    # "DUAL-QEMU-CI2: OUTCOME cpu0_advanced=.. cpu3_advanced=.." instead, and
+    # this script decides PASS/FAIL below from the parsed before=/after=
+    # numbers, per "expect". The ONLY things that can still print literal
+    # "DUAL-QEMU-CI2: FAIL" are genuine, expectation-independent failures --
+    # PSCI CPU_ON bring-up not completing (main_dual2_qemu.c) -- which is why
+    # this check is unconditional (not gated on "expect").
+    if echo "$OUT" | grep -qiE "DUAL-QEMU-CI2: FAULT|DUAL-QEMU-CI2: FAIL|UNEXPECTED TRAP|panic|Unhandled|abort"; then
+        echo "dual-qemu-ci: FAIL [$pass_name] — fault/panic/bring-up error in output:"
+        echo "$OUT" | grep -iE "DUAL-QEMU-CI2: FAULT|DUAL-QEMU-CI2: FAIL|UNEXPECTED TRAP|panic|Unhandled|abort" | head
         echo "dual-qemu-ci: full output:"
         echo "$OUT"
         return 1
@@ -198,7 +210,7 @@ run_pass() {
 
     VERDICT=$(echo "$OUT" | grep "DUAL-QEMU-CI2: cpu0 before=" | tail -1)
     if [ -z "$VERDICT" ]; then
-        echo "dual-qemu-ci: FAIL [$pass_name] — never saw the 'DUAL-QEMU-CI2: cpu0 before=...' sample line within ${TIMEOUT}s. Full output:"
+        echo "dual-qemu-ci: FAIL [$pass_name] — never saw the 'DUAL-QEMU-CI2: cpu0 before=...' sample line (qemu exited early, or was killed after ${IDLE_TIMEOUT}s with no new output / ${ABS_TIMEOUT}s total). Full output:"
         echo "$OUT"
         return 1
     fi

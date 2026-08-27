@@ -251,12 +251,28 @@ el2_trap(struct el2_frame *frame, unsigned long kind)
 					           "progress is the fault-observed vconsole channel-1 byte "
 					           "counter, not a DRAM word read from another core)\n");
 				} else {
-					pl011_puts("DUAL-QEMU-CI2: FAIL (");
-					if (!cpu0_advanced)
-						pl011_puts("cpu0 did not advance ");
-					if (!cpu3_advanced)
-						pl011_puts("cpu3 did not advance ");
-					pl011_puts(")\n");
+					/* NOT "FAIL": this firmware has no idea which of the
+					 * two callers is running it, or what THEY expect. Both
+					 * dual-qemu-ci.sh's pass A and dual-rearm-qemu-ci.sh
+					 * need cpu3_advanced==1 here (a real failure), but
+					 * dual-qemu-ci.sh's pass B *requires*
+					 * cpu3_advanced==0 (the stale-image wipe refusing a
+					 * destination-only image is the whole point of that
+					 * pass) -- see dual-qemu-ci.sh's run_pass()/"expect".
+					 * Printing "FAIL" unconditionally here previously read
+					 * as a gate verdict even on pass B's correct refusal,
+					 * right next to the script's own "PASS" a few lines
+					 * later, and cost real debugging time. So: report the
+					 * bare facts only, with a word that cannot be mistaken
+					 * for a verdict; the caller who knows what was expected
+					 * decides PASS/FAIL from the before=/after= line above. */
+					pl011_puts("DUAL-QEMU-CI2: OUTCOME cpu0_advanced=");
+					pl011_puts(cpu0_advanced ? "1" : "0");
+					pl011_puts(" cpu3_advanced=");
+					pl011_puts(cpu3_advanced ? "1" : "0");
+					pl011_puts(" (not a verdict -- see dual-qemu-ci.sh's "
+					           "'expect' parameter for whether cpu3 NOT "
+					           "advancing is the correct outcome here)\n");
 				}
 				dual2_qemu_poweroff();
 			}
