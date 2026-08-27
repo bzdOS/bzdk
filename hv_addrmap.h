@@ -754,6 +754,33 @@ _Static_assert(HVMAP_VCPU3_BC >= HVMAP_VBLK_SD_BC_END,
 _Static_assert(HVMAP_VCPU3_BC_END <= 0x50100000UL,
                "vcpu3 breadcrumbs run into emac.c's DMA scratch (0x50100000)");
 
+/* ---- vGIC breadcrumb lanes for CPU2/CPU3 (vgic.c) ------------------------
+ * HVMAP_LOW_VGIC_BC down in the low block holds exactly two 0x80 lanes, for
+ * CPU0 and CPU1, and is saturated: its own _Static_assert pins it at 0x100.
+ * Growing it in place would shift HVMAP_LOW_VGST_BC and every window after it,
+ * which is real layout risk for a diagnostic.
+ *
+ * So the extra lanes live here instead, at the top of the map where there is
+ * room, and CPU0/CPU1 keep their existing addresses byte-for-byte so every
+ * host-side reader (triage.py, hvdbg, vgic_qemu_ci.h) is unaffected.
+ *
+ * Why this exists at all: arming vcpu2 made CPU2 run vgic_init(), and vg_bc()
+ * had been CLAMPING every core above CPU1 onto CPU0's lane. That was corrected
+ * to write nothing rather than corrupt CPU0's data -- correct, but it left the
+ * newest and most suspect core completely unobservable, which was immediately
+ * felt while diagnosing a stuck HW=1 List Register that could only be on CPU0
+ * or CPU2. Silence was the right first move; this is the follow-through.
+ *
+ * Two lanes of VGIC_BC_STRIDE (0x80): index 0 = CPU2, index 1 = CPU3. */
+#define HVMAP_VGIC_BC_HI       0x5009E500UL
+#define HVMAP_VGIC_BC_HI_SIZE  0x00000100UL
+#define HVMAP_VGIC_BC_HI_END   (HVMAP_VGIC_BC_HI + HVMAP_VGIC_BC_HI_SIZE)
+
+_Static_assert(HVMAP_VGIC_BC_HI >= HVMAP_VCPU3_BC_END,
+               "CPU2/CPU3 vgic breadcrumb lanes overlap vcpu3's own lane");
+_Static_assert(HVMAP_VGIC_BC_HI_END <= 0x50100000UL,
+               "CPU2/CPU3 vgic breadcrumb lanes run into emac.c's DMA scratch");
+
 #define HVMAP_WDT_DEBUG_HOLD_SIZE  0x10UL   /* one word used, room to grow */
 
 _Static_assert(HVMAP_WDT_DEBUG_HOLD >= HVMAP_VGICD_BC + HVMAP_VGICD_BC_SIZE,
