@@ -63,3 +63,51 @@ next question is which INTID `inject_count` is counting.
 "preserving" tick variant and `vgic_init()`'s zeroing are actually consistent
 for a *secondary* core, or only for CPU0 where the original ordering was
 designed.
+
+---
+
+## CORRECTION, same day: the hypothesis above is wrong, and so is the word "livelock"
+
+`CNTVOFF_EL2` is not involved. `vgic_init()` writes it to zero
+**unconditionally on every core that calls it** — CPU0 (`main_dbg.c:329`),
+CPU1 (`vcpu1.c:259`) and CPU2 (`vcpu2.c:229`) all do. And
+`gic_timer_arm_preserving_cntvoff()` only preserves whatever the register
+already holds, which is already zero because it runs strictly after
+`vgic_init()` in both `vcpu1.c` and `vcpu2.c`. There is no timebase
+disagreement to find. The hypothesis was plausible and it was refuted by
+reading the source, which is the cheapest way this could have gone.
+
+**The actual cause is `own_cpu_mask()` in `vgicd.c`** — the function that
+polices every guest write to `GICD_SGIR` and `GICD_ITARGETSR`, the only two
+paths that can cross a core boundary. On 2026-08-25 it was extended so
+FreeBSD's `smp_rendezvous()` IPI could reach CPU1, and it hardcoded that pair:
+
+```c
+if (dbg_vcpu1 && (me == 0u || me == 1u))
+    mask |= (1u << 0u) | (1u << 1u);
+```
+
+CPU2 became a real third vCPU two days later and this function was never told.
+With both gates armed, a rendezvous SGI issued by CPU0 or CPU1 and aimed at
+CPU2 still computed `{0,1}`, so **CPU2's bit was stripped from the target list
+before the write ever reached the real distributor**, in both directions.
+
+So "livelock" was the wrong word for what the numbers showed. CPU2 is not
+spinning in a storm — it is running an entirely healthy per-CPU clock at a
+normal rate (~1174/s is plausibly FreeBSD's ordinary hardclock plus statclock
+through the SW-mode CNTV path), and it is simply **cut off**. What is stuck is
+CPU0 and CPU1, blocked in `smp_rendezvous_action()` waiting for an
+acknowledgement from a core nobody was able to ask. Their low injection counts
+(71 and 3) are the signature of parked cores, exactly as suspected — but the
+reason was on the other side of the wall.
+
+Worth keeping as a lesson about the measurement, not just the bug: every number
+in the section above is correct, and the story built on top of them was not.
+"CPU2 is busy" was read as "CPU2 is the problem", when a busy core running
+normally next to two parked ones should have raised the opposite question —
+*who is failing to talk to it.*
+
+One honest gap the fix carries: `inject_count` is shared across every injection
+path, so the code alone cannot prove the 1174/s is entirely CNTV. A
+`last_vintid` word was added to the per-core lane (index 24) to settle that on
+the next cycle rather than argue about it.
