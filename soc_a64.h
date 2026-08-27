@@ -70,6 +70,23 @@
 #define SOC_A64_WDOG_CTRL        0x01C20CB0UL
 #define SOC_A64_WDOG_CFG         0x01C20CB4UL
 #define SOC_A64_WDOG_MODE        0x01C20CB8UL
+/* The watchdog's DTB node (`watchdog@1c20ca0`, `reg = <0x1c20ca0 0x20>` — read
+ * from the live tftpboot DTB, `dtc -I dtb -O dts bananapi-min.dtb`) claims a
+ * wider span than the 3 registers above: it also covers WDOG_IRQ_EN/IRQ_STA at
+ * 0x1C20CA0/0x1C20CA4, which wdt.c never touches but which still arm/observe
+ * the same hardware reset lever. That node is deliberately `status =
+ * "disabled"` in this project's DTB (see PROGRESS.md's "Watchdog Disable in
+ * DTB" entry, 2026-07-15 — FreeBSD's aw_wdog(4) attaches to an enabled node
+ * and disables the hardware watchdog on purpose, which would have silently
+ * defeated the whole auto-recovery story) precisely so no in-tree FreeBSD
+ * driver ever probes here. A DTB `status` is a convention the driver
+ * framework honours, not a permission bit stage-2 enforces — a root shell
+ * that opens `/dev/mem` (or any custom module) and touches this physical
+ * range directly is not stopped by the disabled node at all. This span is
+ * the boundary a stage-2 trap would need to deny; see soc_a64.h's own
+ * porting note and docs/wdog-ccu-pio-stage2.md for the full design. */
+#define SOC_A64_WDOG_NODE_BASE   0x01C20CA0UL
+#define SOC_A64_WDOG_NODE_SIZE   0x00000020UL
 #define SOC_A64_SRAMC_BASE       0x01C00000UL  /* `syscon@1c00000`         */
 #define SOC_A64_SYSCON_EMAC      0x01C00030UL  /* EMAC clock/mode register */
 

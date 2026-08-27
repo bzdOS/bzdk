@@ -129,7 +129,7 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -144,6 +144,7 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_gdbstub_wdt_kick
 	./test_vgic_pendq
 	./test_vgicd
+	./test_wdogtrap
 	./test_sd_bio_addr
 	./test_snapshot_fmt
 	./test_bmc_arm_gate
@@ -214,6 +215,9 @@ test_vgic_pendq: test_vgic_pendq.c
 test_vgicd: test_vgicd.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
+test_wdogtrap: test_wdogtrap.c
+	gcc -Wall -Wextra -O2 -o $@ $<
+
 test_coredump_elf: test_coredump_elf.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
@@ -253,7 +257,7 @@ $(NET_BIN): $(NET_ELF)
 # REPL pokes at (mi/mp/mpN). start.o + main_repl.o + repl.o + emac.o + musb.o
 # + wdt.o, linked at 0x42000000 via link.ld.
 REPL_OBJS := start.o main_repl.o repl.o emac.o musb.o wdt.o exceptions.o el2_exc.o \
-             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o vgicd.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o rsb.o
+             timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o vgicd.o wdogtrap.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o rsb.o
 $(REPL_ELF): $(REPL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(REPL_OBJS)
 	$(SIZE) $@
@@ -360,7 +364,7 @@ CFLAGS += -DHDMI_MODE_1080P
 endif
 dbg: $(DBG_BIN)
 
-DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
+DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o el2_ncmap.o snapshot.o flightrec.o coredump.o \
@@ -422,7 +426,7 @@ DUAL_BIN   := microkernel-dual.bin
 
 dual: $(DUAL_BIN)
 
-DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
+DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
              emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o el2_ncmap.o flightrec.o coredump.o \
@@ -441,7 +445,7 @@ $(DUAL_BIN): $(DUAL_ELF)
 # header comment). NEW target — does not touch/replace `dbg`. ---
 gdb: $(GDB_BIN)
 
-GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
+GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o dbgtools.o
@@ -453,7 +457,7 @@ $(GDB_BIN): $(GDB_ELF)
 
 fbsd: $(FBSD_BIN)
 
-FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
+FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
 $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(FBSD_OBJS)
@@ -470,7 +474,7 @@ $(FBSD_BIN): $(FBSD_ELF)
 # kernel ELF. ---
 zephyr: $(ZEPHYR_BIN)
 
-ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o guest.o \
+ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
                gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgmon.o bmc.o dbgtools.o rsb.o axp803.o vinput.o
 $(ZEPHYR_ELF): $(ZEPHYR_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(ZEPHYR_OBJS)
@@ -888,4 +892,4 @@ clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
 	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart \
-	      test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd
+	      test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap
