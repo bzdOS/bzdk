@@ -125,10 +125,14 @@ the guest sees `hw.realmem = 0x78000000` (1920 MiB), boots to multiuser with
   (`\x00~BZRST\x00`); with the watchdog fixes such a boot should now
   self-heal within ~a minute.
 
-Residual, pre-existing, unchanged: W^X flips race if two guest vCPUs fault
-into the same 2 MiB block concurrently (stage2.c's CONCURRENCY NOTE still
-says "only CPU0" — stale since vcpu1). Not observed; worth a real
-interlocked path if W^X ever becomes load-bearing.
+Residual — CLOSED same day (commit after de9695f): the W^X mutators now
+hold a cross-core test-and-set (`stage2_wx_lock`, emac_tx_trylock idiom,
+zeroed in stage2_init with the EMAC WDT-warm-reset discipline) across
+edit+publish+flush; a bounded-acquire failure declines the flip instead
+of hanging a guest trap. Live-verified on the 4-vCPU 2G board: 3205
+serialized flips through a full boot, pool intact, no tick stall, ssh
+green. The stale "only CPU0 ever takes traps" CONCURRENCY NOTE is
+rewritten.
 
 **Why anyone cares**: the board is its own build host, and a single Mesa NIR
 generator peaks at **648 MB** (measured, `time -l`, `max RSS 663020 KB`, 740 s,
