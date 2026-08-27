@@ -53,7 +53,7 @@
          write the matching cpu@N node (or, symmetrically, warns if a cpu@N
          node exists in the DTB but its feature is disabled here, since that
          means a core the guest can ask for but the build won't hand over). -->
-    <feature name="vcpu2" mkvar="VCPU2" enabled="false" needs-dtb-cpu="2"/>
+    <feature name="vcpu2" mkvar="VCPU2" enabled="true" needs-dtb-cpu="2"/>
     <feature name="vcpu1" mkvar="VCPU1" enabled="true" needs-dtb-cpu="1"/>
   </features>
 

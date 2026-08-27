@@ -67,6 +67,16 @@
  *   - Interrupts: vgic.c is already per-core (struct vg_percpu g_vg[] indexed
  *     by smp_cpu_id()), and gic_timer_cpuif_init() was factored out precisely
  *     so a caller can open one core's GIC CPU interface. Both predate this file.
+ *     CORRECTION (2026-08-27): "already per-core" describes the STATE, not
+ *     the INITIALIZATION -- per-core storage existing does not help if
+ *     vgic_init() (which populates it: GICH_HCR.En, nr_lr from GICH_VTR,
+ *     VMCR, CNTVOFF=0) is never called on that core. This file did not call
+ *     it for a full release cycle; see vcpu2.c's fix and its citation of
+ *     RELEASE-0.0.2.md, which documents this exact core never getting past
+ *     `Release APs...done.` on hardware -- the same symptom CPU1 had for the
+ *     same reason. gic_timer_cpuif_init() alone (the other bullet here) only
+ *     opens the shared, non-hypervisor CPU-interface registers
+ *     (GICD_CTLR/GICC_PMR/GICC_CTLR); it does not touch GICH at all.
  *   - EL1 configuration: guest_config() is core-agnostic and already reused
  *     verbatim by main_zephyr.c and zguest_cpu3.c.
  *
