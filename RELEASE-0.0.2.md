@@ -369,9 +369,12 @@ Everything in 0.0.1's list still stands except where noted, plus:
 - **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
   recovered, but the cause is not resolved.** See "`/opt` corruption during
   the three-vCPU build" near the end of this file.
-- **The RSP channel goes dark in long GDB sessions** — still unfixed. Note that
-  the EMAC channel death described earlier in this file was a *different*,
-  now-fixed bug (`dbg_core_active`); do not treat that fix as covering this one.
+- **The RSP channel goes dark in long GDB sessions** — status changed
+  2026-08-27: the root mechanism (watchdog fed once per RSP packet, starved
+  during a blocking wait) is fixed and the stub now runs from the vcpu1 tick
+  with frame-carried SP (see "The fourth vCPU lands"). A long-session soak
+  has NOT been re-run against the new wiring — treat as fixed-by-design,
+  unproven-by-duration.
 - **`holdtest` TEST B is INCONCLUSIVE**, unchanged: a documented QEMU-TCG
   self-modifying-code artifact on an already-executed page, not expected on real
   silicon. That target is not part of `ci.sh`; `run_holdtest.sh` runs it.
@@ -686,7 +689,55 @@ The experiment that would separate them is named, not run yet: a build that
 goes start-to-finish with zero resets, then checking `/opt` for damage
 afterward.
 
+## The fourth vCPU lands — the 2 GiB night (2026-08-27, late)
+
+Supersedes "The last hours" below: every attempt listed there LANDED the same
+night it was written down. The default build is now a FOUR-vCPU host.
+
+| | |
+|---|---|
+| `hw.ncpu` | **4** (`vcpu3` armed; freeze root-caused and fixed) |
+| guest DRAM window | **0x78000000** (1920 MB; `guest_dram_2g` on; map 2 GiB, tell 0xB8000000 — U-Boot's no-overwrite top stays out) |
+| guest USB host port 1 | `ehci0`/`ohci1` attach; a real Terminus hub enumerated at 480 Mbps |
+| guest audio | `sun8icodec0` + `a64codec0` + `pcm0` attach-only (DAI node deliberately excluded) |
+| source-level GDB | RSP stub serviced from the vcpu1 tick; `sp_el1` travels in the frame; `rsp_bridge.py` + real gdb-aarch64: registers, symbols, Z0 at `hardclock` placed/hit/delivered |
+| EMAC-dark lifeline | `~BZDBG<line>` over the USB console drives the full dbgmon (`b44f815`) |
+| HDMI vblank | back to **60.8 Hz** (`wrong_core=0`, `throttles=0`) once the MUSB fix proved out |
+
+**The freeze root cause, and the diagnostic that caught it.** `el2_exc.c`
+routed every CPU3 data abort into the `dual` build's Zephyr handler set; with
+vcpu3 armed those faults fell through unowned and CPU3 stormed at EL2. The
+per-core fault-attribution window added with this fix (count/esr/elr per core,
+VCPU3_BC tail) read `esr=0x8200000d, elr=0x274618` off the live board in one
+shot — and did the same trick for 3b below.
+
+**The 2 GiB window's own bug.** FreeBSD allocates userland from the TOP of
+RAM; stage2_init had left every DRAM block past the first as a flat XN 1 GiB
+descriptor the W^X flip machinery could never promote — the first userland
+exec fault (same per-core window: instruction permission fault L2, a user VA)
+spun at ~45 kHz on CPU3 until each 1 GiB block got its own L2 table. The W^X
+mutators now also hold a cross-core test-and-set: four concurrently-faulting
+vCPUs serialized 3205 flips through a boot with zero contention fallout.
+
+**Two debug-channel layers added**, because the channel itself was the
+night's biggest time sink: the EMAC link watchdog moved into the vcpu1 tick
+with self-rearm (heals link-drop-after-traffic), and `~BZDBG` brings the
+whole monitor up over USB when the wire is dark anyway. One cold boot still
+landed dark enough to need the break-glass; `emac_init` now retries a full
+PHY training pass once — the lottery needs a live repro to call closed.
+
+**Known open after the night**: WiFi and IR need a guest kernel rebuild
+(brcmfmac is not in the source tree at all — the survey's "source present"
+claim retracted; `aw_cir` likewise absent from the booting image), the BZDBG
+capture covers dbgmon-internal output only, and the cold-boot PHY lottery is
+mitigated in two layers but not proven closed.
+
 ## The last hours: two attempts that did not land, and why that is on record
+
+**Superseded the same night — the fourth vCPU DID land; see "The fourth vCPU
+lands" above.** Kept verbatim because the write-down is what made the fix
+session fast: the root cause was found by reading this section's assumption
+against the per-core window, not by re-deriving it.
 
 Both are switched off in `board-config.xml` and both got far enough to be worth
 writing down rather than deleting.
