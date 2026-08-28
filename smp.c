@@ -82,15 +82,21 @@ volatile uint32_t dbg_core_enable = 1;
  * ever desired. */
 volatile uint32_t dbg_usbacm = 1;
 
-/* OPT-IN escalation (default OFF): once emac_link_watchdog() gives up
- * (bounded self-heal exhausted, EMAC has NEVER accepted a single RX frame
- * despite ~6 retries over ~48 s), setting this to 1 makes CPU1 set
- * wdt_debug_hold — which (with wdt_pet() now honoring it too, see wdt.c)
- * stops BOTH watchdog-pet paths and lets the HW WDOG reboot the board to
- * U-Boot within ~16 s, where the persistent chimpd auto-reloads. Turns
- * "every dead-EMAC boot costs a physical power-cycle" into an automatic
- * bounded recovery. Left opt-in until the self-heal path is trusted live. */
-volatile uint32_t dbg_emac_watchdog_reboot = 0;
+/* ESCALATION, DEFAULT ON since 2026-08-27: once emac_link_watchdog() gives
+ * up (bounded self-heal exhausted, EMAC has NEVER accepted a single RX frame
+ * despite ~6 retries over ~48 s), CPU1 sets wdt_debug_hold — which (with
+ * wdt_pet() now honoring it too, see wdt.c) stops BOTH watchdog-pet paths
+ * and lets the HW WDOG reboot the board to U-Boot within ~16 s, where the
+ * persistent chimpd auto-reloads. Turns "every dead-EMAC boot costs a
+ * physical power-cycle" into an automatic bounded recovery. Was opt-in
+ * until the self-heal path was trusted live; the trust evidence arrived
+ * [MEASURED 2026-08-27: a cold-boot PHY-lottery boot stayed EMAC-dark
+ * through the full retry budget and only the (then-manual) break-glass
+ * recovered it], so the default flipped: a cable-left-unplugged board now
+ * reboots on a visible ~90 s cycle instead of sitting dark until a human
+ * notices. Togglable to 0 over the net if a quiet dark board is ever
+ * preferred. */
+volatile uint32_t dbg_emac_watchdog_reboot = 1;
 
 /* HDMI PHY re-lock defense (HV_HDMI builds), DEFAULT ON. hdmi_init() brings the
  * pipeline up with the PHY locked, but ~1 s into guest boot FreeBSD's axp8xx

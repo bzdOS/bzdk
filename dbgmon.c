@@ -76,6 +76,8 @@ __attribute__((weak)) void emmc_bio_fault_inject(uint32_t every, uint32_t min_lb
  * ------------------------------------------------------------------ */
 extern int  console_getc(void);
 extern void console_putc(int c);
+extern void console_capture_start(char *buf, int cap);
+extern int  console_capture_end(char **out);
 extern void console_poll(void);
 extern void console_flush(void);
 
@@ -159,25 +161,19 @@ extern int fbdump_send(uint32_t pa, uint32_t len);
  * an independent copy -- dbgmon.c does not include or call repl.c).
  * ------------------------------------------------------------------ */
 
-/* BZDBG capture sink. When g_capture_len >= 0, every dbgmon-produced
- * output byte lands in g_capture_buf instead of the console: this is how
- * a `~BZDBG <line>` command arriving over USB-ACM gets its answer routed
- * back over USB rather than out the EMAC console (the whole point is to
- * work when that EMAC is dark). Only dbgmon's OWN output is captured --
- * helpers that print straight to console_putc outside this file are not
- * reachable from exec_line. [MEASURED 2026-08-27: exec_line's answer path
- * is entirely cputs/newline/print-hex helpers inside this file.] */
-static char  g_capture_buf[1024];
-static int   g_capture_len = -1;   /* -1 = capture off */
+/* BZDBG capture sink. The sink itself lives in main_dbg.c's console_putc
+ * (console_capture_start/end): capturing at THAT level grabs output from
+ * other modules too (bmc_dispatch's `help` tree), not just this file's
+ * helpers -- the 2026-08-27 first-cut limitation. dc_putc remains as the
+ * call-site wrapper so all 49 console_putc call sites here route through
+ * one place; with the sink armed the console layer captures, and with it
+ * disarmed console_putc lands on the EMAC TX path as always. */
+static char  g_capture_buf[4096];
+static int   g_capture_on;         /* 0 = off */
 
 static void dc_putc(int c)
 {
-	if (g_capture_len >= 0) {
-		if (g_capture_len < (int)sizeof(g_capture_buf) - 1)
-			g_capture_buf[g_capture_len++] = (char)c;
-		return;
-	}
-	console_putc(c);   /* NOT dc_putc: the capture-off path lands on the real console */
+	console_putc(c);   /* capture, when armed, happens inside console_putc */
 }
 
 static void cputs(const char *s)
@@ -1930,9 +1926,12 @@ const char         *bzdbg_reply_buf = g_capture_buf;
 
 void dbgmon_bzdbg_poll(void)
 {
+	char *out;
+	int   len;
+
 	if (!bzdbg_pending)
 		return;
-	if (g_capture_len >= 0)
+	if (g_capture_on)
 		return;   /* never re-enter while capturing */
 	{
 		static volatile uint32_t *bc =
@@ -1942,22 +1941,17 @@ void dbgmon_bzdbg_poll(void)
 		__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(&bc[1]) : "memory");
 	}
 
-	g_capture_len = 0;
+	console_capture_start(g_capture_buf, (int)sizeof(g_capture_buf) - 1);
 	{
 		/* Same snapshot discipline as the tick path's dbgmon_service call:
 		 * a consistent copy of CPU0's last guest frame, so gr/sr/gva keep
 		 * their meaning regardless of which core is guesting. */
 		struct el2_frame snap;
-		uint32_t n;
 		el2_snapshot_guest_frame(&snap);
 		exec_line(bzdbg_line, &snap);
-		for (n = 0; g_capture_buf[n]; n++)
-			;   /* freestanding strlen */
-		bzdbg_reply_len = n;
 	}
-	g_capture_buf[bzdbg_reply_len < sizeof(g_capture_buf)
-	              ? bzdbg_reply_len : sizeof(g_capture_buf) - 1] = '\0';
-	g_capture_len = -1;
+	len = console_capture_end(&out);
+	bzdbg_reply_len = (uint32_t)len;
 
 	__asm__ volatile("dsb sy" ::: "memory");
 	{
