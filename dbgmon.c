@@ -159,16 +159,37 @@ extern int fbdump_send(uint32_t pa, uint32_t len);
  * an independent copy -- dbgmon.c does not include or call repl.c).
  * ------------------------------------------------------------------ */
 
+/* BZDBG capture sink. When g_capture_len >= 0, every dbgmon-produced
+ * output byte lands in g_capture_buf instead of the console: this is how
+ * a `~BZDBG <line>` command arriving over USB-ACM gets its answer routed
+ * back over USB rather than out the EMAC console (the whole point is to
+ * work when that EMAC is dark). Only dbgmon's OWN output is captured --
+ * helpers that print straight to console_putc outside this file are not
+ * reachable from exec_line. [MEASURED 2026-08-27: exec_line's answer path
+ * is entirely cputs/newline/print-hex helpers inside this file.] */
+static char  g_capture_buf[1024];
+static int   g_capture_len = -1;   /* -1 = capture off */
+
+static void dc_putc(int c)
+{
+	if (g_capture_len >= 0) {
+		if (g_capture_len < (int)sizeof(g_capture_buf) - 1)
+			g_capture_buf[g_capture_len++] = (char)c;
+		return;
+	}
+	console_putc(c);   /* NOT dc_putc: the capture-off path lands on the real console */
+}
+
 static void cputs(const char *s)
 {
 	while (*s)
-		console_putc((int)(unsigned char)*s++);
+		dc_putc((int)(unsigned char)*s++);
 }
 
 static void newline(void)
 {
-	console_putc('\r');
-	console_putc('\n');
+	dc_putc('\r');
+	dc_putc('\n');
 }
 
 static char hexdig(unsigned v)
@@ -179,8 +200,8 @@ static char hexdig(unsigned v)
 
 static void print_hex8(uint8_t v)
 {
-	console_putc(hexdig(v >> 4));
-	console_putc(hexdig(v));
+	dc_putc(hexdig(v >> 4));
+	dc_putc(hexdig(v));
 }
 
 static void print_hex32(uint32_t v)
@@ -477,15 +498,15 @@ static void cmd_gr(struct el2_frame *f)
 		return;
 	}
 	for (i = 0; i < 31; i++) {
-		console_putc('x');
+		dc_putc('x');
 		if (i >= 10)
-			console_putc('0' + (i / 10));
-		console_putc('0' + (i % 10));
-		console_putc('=');
+			dc_putc('0' + (i / 10));
+		dc_putc('0' + (i % 10));
+		dc_putc('=');
 		print_hex64(f->x[i]);
-		console_putc(((i % 3) == 2) ? '\r' : ' ');
+		dc_putc(((i % 3) == 2) ? '\r' : ' ');
 		if ((i % 3) == 2)
-			console_putc('\n');
+			dc_putc('\n');
 	}
 	newline();
 	cputs("elr(pc)="); print_hex64(f->elr);
@@ -551,15 +572,15 @@ static void cmd_gr1(void)
 	}
 	el2_snapshot_guest_frame_cpu1(&f);
 	for (i = 0; i < 31; i++) {
-		console_putc('x');
+		dc_putc('x');
 		if (i >= 10)
-			console_putc('0' + (i / 10));
-		console_putc('0' + (i % 10));
-		console_putc('=');
+			dc_putc('0' + (i / 10));
+		dc_putc('0' + (i % 10));
+		dc_putc('=');
 		print_hex64(f.x[i]);
-		console_putc(((i % 3) == 2) ? '\r' : ' ');
+		dc_putc(((i % 3) == 2) ? '\r' : ' ');
 		if ((i % 3) == 2)
-			console_putc('\n');
+			dc_putc('\n');
 	}
 	newline();
 	cputs("elr(pc)="); print_hex64(f.elr);
@@ -655,9 +676,9 @@ static void cmd_read_words(unsigned long addr, uint32_t n)
 			if (i)
 				newline();
 			print_addr(addr + (unsigned long)i * 4u);
-			console_putc(':');
+			dc_putc(':');
 		}
-		console_putc(' ');
+		dc_putc(' ');
 		dbg_read_fresh(addr + (unsigned long)i * 4u);
 		print_hex32(*(volatile uint32_t *)(addr + (unsigned long)i * 4u));
 	}
@@ -674,9 +695,9 @@ static void cmd_read_bytes(unsigned long addr, uint32_t n)
 			if (i)
 				newline();
 			print_addr(addr + i);
-			console_putc(':');
+			dc_putc(':');
 		}
-		console_putc(' ');
+		dc_putc(' ');
 		dbg_read_fresh(addr + i);
 		print_hex8(*(volatile uint8_t *)(addr + i));
 	}
@@ -692,21 +713,21 @@ static void cmd_dump(unsigned long addr, uint32_t len)
 		uint32_t j;
 
 		print_addr(addr + i);
-		console_putc(':');
-		console_putc(' ');
+		dc_putc(':');
+		dc_putc(' ');
 		for (j = 0; j < BYTES_PER_LINE; j++) {
 			if (i + j < len)
 				print_hex8(*(volatile uint8_t *)(addr + i + j));
 			else
 				cputs("  ");
-			console_putc(' ');
+			dc_putc(' ');
 		}
-		console_putc('|');
+		dc_putc('|');
 		for (j = 0; j < BYTES_PER_LINE && i + j < len; j++) {
 			uint8_t b = *(volatile uint8_t *)(addr + i + j);
-			console_putc((b >= 0x20 && b < 0x7f) ? (int)b : '.');
+			dc_putc((b >= 0x20 && b < 0x7f) ? (int)b : '.');
 		}
-		console_putc('|');
+		dc_putc('|');
 		newline();
 	}
 }
@@ -831,9 +852,9 @@ static void cmd_t(void)
 	cputs(" esr=");        print_hex32(e[3]);
 	newline();
 	cputs("EXC   elr=");   print_hex32(e[4]);
-	console_putc(':'); print_hex32(e[5]);
+	dc_putc(':'); print_hex32(e[5]);
 	cputs(" far=");        print_hex32(e[6]);
-	console_putc(':'); print_hex32(e[7]);
+	dc_putc(':'); print_hex32(e[7]);
 	newline();
 
 	{
@@ -842,8 +863,8 @@ static void cmd_t(void)
 
 		cputs("FFL1  magic="); print_hex32(ff[0]);
 		cputs(" valid=");      print_hex32(ff[1]);
-		cputs(" elr=");        print_hex32(ff[7]); console_putc(':'); print_hex32(ff[6]);
-		cputs(" far=");        print_hex32(ff[9]); console_putc(':'); print_hex32(ff[8]);
+		cputs(" elr=");        print_hex32(ff[7]); dc_putc(':'); print_hex32(ff[6]);
+		cputs(" far=");        print_hex32(ff[9]); dc_putc(':'); print_hex32(ff[8]);
 		newline();
 		cputs("SST1  magic="); print_hex32(ss[0]);
 		cputs(" steps=");      print_hex32(ss[1]);
@@ -926,15 +947,15 @@ static void cmd_ff(void)
 	cputs("  SPSR_EL1="); print_hex64(spsr); newline();
 	for (i = 0; i < 31u; i++) {
 		uint64_t v = ((uint64_t)f[14u + i * 2u + 1u] << 32) | f[14u + i * 2u];
-		console_putc('x');
+		dc_putc('x');
 		if (i >= 10)
-			console_putc('0' + (i / 10));
-		console_putc('0' + (i % 10));
-		console_putc('=');
+			dc_putc('0' + (i / 10));
+		dc_putc('0' + (i % 10));
+		dc_putc('=');
 		print_hex64(v);
-		console_putc(((i % 3) == 2) ? '\r' : ' ');
+		dc_putc(((i % 3) == 2) ? '\r' : ' ');
 		if ((i % 3) == 2)
-			console_putc('\n');
+			dc_putc('\n');
 	}
 	newline();
 }
@@ -954,7 +975,7 @@ static void cmd_pt(unsigned long ttbr_pa, unsigned long va)
 		unsigned long idx = (va >> shift) & 0x1ffUL;
 		uint64_t desc = *(volatile uint64_t *)(table + idx * 8u);
 
-		cputs("L"); console_putc((char)('0' + level));
+		cputs("L"); dc_putc((char)('0' + level));
 		cputs(" idx="); print_hex32((uint32_t)idx);
 		cputs(" desc="); print_hex64(desc);
 		newline();
@@ -1146,7 +1167,7 @@ static void cmd_bp(unsigned long va, struct el2_frame *f)
 	if (slot < 0) { err("no free breakpoint slot (bpc to clear)"); return; }
 	if (hwbp_set(slot, (uint64_t)va, 0)) { err("hwbp_set failed"); return; }
 	if (f) f->spsr &= ~(1ull << 9);   /* unmask guest PSTATE.D, like `ss` */
-	cputs("bp["); console_putc('0' + slot); cputs("] @ ");
+	cputs("bp["); dc_putc('0' + slot); cputs("] @ ");
 	print_addr(va); cputs(" armed\r\n");
 }
 
@@ -1162,7 +1183,7 @@ static void cmd_wp(unsigned long va, struct el2_frame *f)
 	if (slot < 0) { err("no free watchpoint slot (bpc to clear)"); return; }
 	if (hwbp_set(slot, (uint64_t)va, 1)) { err("hwbp_set failed"); return; }
 	if (f) f->spsr &= ~(1ull << 9);
-	cputs("wp["); console_putc('0' + slot); cputs("] write @ ");
+	cputs("wp["); dc_putc('0' + slot); cputs("] write @ ");
 	print_addr(va); cputs(" armed\r\n");
 }
 
@@ -1182,11 +1203,11 @@ static void cmd_bpl(void)
 	int i;
 
 	for (i = 0; i < nbp; i++) {
-		cputs("bp["); console_putc('0' + i); cputs("] ");
+		cputs("bp["); dc_putc('0' + i); cputs("] ");
 		cputs(ben[i] ? "EN  " : "--  "); print_hex64(bva[i]); newline();
 	}
 	for (i = 0; i < nwp; i++) {
-		cputs("wp["); console_putc('0' + i); cputs("] ");
+		cputs("wp["); dc_putc('0' + i); cputs("] ");
 		cputs(wen[i] ? "EN  " : "--  "); print_hex64(wva[i]);
 		cputs(wen[i] ? " (write)\r\n" : "\r\n");
 	}
@@ -1249,15 +1270,15 @@ static void cmd_ffv(void)
 	cputs("  SP_EL1=");   print_hex64(sp);   newline();
 	for (i = 0; i < 31u; i++) {
 		uint64_t v = ((uint64_t)f[14u + i * 2u + 1u] << 32) | f[14u + i * 2u];
-		console_putc('x');
+		dc_putc('x');
 		if (i >= 10)
-			console_putc('0' + (i / 10));
-		console_putc('0' + (i % 10));
-		console_putc('=');
+			dc_putc('0' + (i / 10));
+		dc_putc('0' + (i % 10));
+		dc_putc('=');
 		print_hex64(v);
-		console_putc(((i % 3) == 2) ? '\r' : ' ');
+		dc_putc(((i % 3) == 2) ? '\r' : ' ');
 		if ((i % 3) == 2)
-			console_putc('\n');
+			dc_putc('\n');
 	}
 	newline();
 }
@@ -1857,6 +1878,100 @@ static inline void dbgmon_phase(uint32_t ph, uint32_t cmd4)
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
 }
 
+/* ------------------------------------------------------------------ *
+ * BZDBG -- HV dbgmon lines arriving over USB-ACM (`~BZDBG<line>` from the
+ * host, usbacm.c queues them). dbgmon_service() drains the queue BEFORE
+ * its own console poll so the two input sources never interleave a line,
+ * runs each line through the normal exec_line with the capture sink on,
+ * and hands the captured text back to usbacm for the ~BZDBG< return path.
+ * This is the EMAC-dark lifeline: the monitor stays fully drivable over
+ * the USB console when the wire is down.
+ * ------------------------------------------------------------------ */
+#define BZDBG_LINE_MAX   DBGMON_LINE_MAX
+/* BZDBG pipeline breadcrumbs, VCPU3_BC free tail @0x5009E4C0 (the pcore
+ * attribution block ends at +0xC0): [0]=posted [1]=executed [2]=replies
+ * handed to usbacm [3]=last stage stuck at (1=posted 2=executed 3=reply).
+ * Readable over EMAC while the board lives -- this is how the BZDBG path
+ * is debugged without printf access to itself. */
+#define BZDBG_BC_BASE    (HVMAP_VCPU3_BC + 0xC0u)
+static void bzdbg_bc(int i, uint32_t v)
+{
+	volatile uint32_t *p = (volatile uint32_t *)(BZDBG_BC_BASE + i * 4u);
+	*p = v;
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+static char    bzdbg_line[BZDBG_LINE_MAX];
+static volatile int bzdbg_pending = 0;
+
+void dbgmon_bzdbg_post(const char *line)
+{
+	int i;
+	for (i = 0; line[i] && i < BZDBG_LINE_MAX - 1; i++)
+		bzdbg_line[i] = line[i];
+	bzdbg_line[i] = '\0';
+	__asm__ volatile("dsb sy" ::: "memory");
+	bzdbg_pending = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	{
+		static volatile uint32_t *bc =
+		    (volatile uint32_t *)(BZDBG_BC_BASE + 0u);
+		bc[0]++;
+		bc[3] = 1;
+		__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(&bc[0]) : "memory");
+	}
+}
+
+/*usbacm.c reads these to drain the answer into the ACM TX ring. */
+extern void el2_snapshot_guest_frame(struct el2_frame *out);  /* seqlock read (H8), el2_exc.c */
+volatile int        bzdbg_reply_ready = 0;
+volatile uint32_t   bzdbg_reply_len = 0;
+const char         *bzdbg_reply_buf = g_capture_buf;
+
+void dbgmon_bzdbg_poll(void)
+{
+	if (!bzdbg_pending)
+		return;
+	if (g_capture_len >= 0)
+		return;   /* never re-enter while capturing */
+	{
+		static volatile uint32_t *bc =
+		    (volatile uint32_t *)(BZDBG_BC_BASE + 0u);
+		bc[1]++;
+		bc[3] = 2;
+		__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(&bc[1]) : "memory");
+	}
+
+	g_capture_len = 0;
+	{
+		/* Same snapshot discipline as the tick path's dbgmon_service call:
+		 * a consistent copy of CPU0's last guest frame, so gr/sr/gva keep
+		 * their meaning regardless of which core is guesting. */
+		struct el2_frame snap;
+		uint32_t n;
+		el2_snapshot_guest_frame(&snap);
+		exec_line(bzdbg_line, &snap);
+		for (n = 0; g_capture_buf[n]; n++)
+			;   /* freestanding strlen */
+		bzdbg_reply_len = n;
+	}
+	g_capture_buf[bzdbg_reply_len < sizeof(g_capture_buf)
+	              ? bzdbg_reply_len : sizeof(g_capture_buf) - 1] = '\0';
+	g_capture_len = -1;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	{
+		static volatile uint32_t *bc =
+		    (volatile uint32_t *)(BZDBG_BC_BASE + 0u);
+		bc[2]++;
+		bc[3] = 3;
+		__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(&bc[2]) : "memory");
+	}
+	bzdbg_reply_ready = 1;
+	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+	bzdbg_pending = 0;
+}
+
 void dbgmon_service(struct el2_frame *guest_frame)
 {
 	static char line[DBGMON_LINE_MAX];
@@ -1864,6 +1979,7 @@ void dbgmon_service(struct el2_frame *guest_frame)
 	int drained = 0;
 
 	dbgmon_phase(1, 0);
+	dbgmon_bzdbg_poll();
 	console_poll();
 	dbgmon_phase(2, 0);
 

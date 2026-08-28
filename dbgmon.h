@@ -51,4 +51,18 @@ void dbgmon_init(void);
  * bad command or bad hex -- reports an error and re-prompts instead. */
 void dbgmon_service(struct el2_frame *guest_frame);
 
+/* BZDBG -- USB-ACM dbgmon lifeline (usbacm.c queues, dbgmon_service drains).
+ * dbgmon_bzdbg_post(line): called from usbacm_poll on CPU1 when a
+ * `~BZDBG<line>` has arrived; overwrites any still-pending line (the host
+ * retries anyway). dbgmon_bzdbg_poll(): called first thing inside
+ * dbgmon_service, runs the line through exec_line with output captured.
+ * After it, bzdbg_reply_ready==1 and bzdbg_reply_buf/len hold the answer
+ * text for usbacm to drain into the ACM TX ring; usbacm clears
+ * bzdbg_reply_ready when done. */
+void dbgmon_bzdbg_post(const char *line);
+void dbgmon_bzdbg_poll(void);
+extern volatile int      bzdbg_reply_ready;
+extern volatile uint32_t bzdbg_reply_len;
+extern const char       *bzdbg_reply_buf;
+
 #endif /* BZDOS_DBGMON_H */
