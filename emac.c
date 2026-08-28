@@ -1115,6 +1115,20 @@ int emac_init(void)
      * is harmless — nothing moves until the PHY links), so a late-training
      * link is picked up for free by link_recheck()/emac_link_watchdog(). */
     linked = phy_startup(&duplex_full);
+    if (!linked) {
+        /* Cold-boot PHY lottery [MEASURED 2026-08-27: one boot in a series
+         * trained no link at phy_startup, stayed EMAC-dark, and the runtime
+         * re-kicks below could not recover it -- only a full reload did].
+         * The first phy_startup may land while the external PHY is still in
+         * its own power-on sequence no matter how long we waited for the ID
+         * reads; give it ONE more full pass (ID + BMCR reset + advertise +
+         * autoneg + forced fallback are all bounded and WDT-petted inside)
+         * before declaring "no link" and letting the runtime watchdog own
+         * it. */
+        wdt_pet();
+        udelay_spin(200000);
+        linked = phy_startup(&duplex_full);
+    }
     bc(4, linked ? 1 : 0);
     if (linked) {
         bc(5, g_speed);
