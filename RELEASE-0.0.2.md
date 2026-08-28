@@ -357,15 +357,21 @@ Everything in 0.0.1's list still stands except where noted, plus:
   check -s` said nothing because that package's file list in pkg's database is
   empty. Repaired from intact references already on the board; a sweep of every
   package with an exact-version cached reference found no further damage.
-- **The Mesa sources are staged and building, now on three vCPUs.**
-  `/opt/src/mesa-26.2.0` (399 MB, complete). `meson setup` completes on the
-  board (`Gallium drivers: lima`, EGL and GBM enabled) and `ninja` is working
-  through 993 targets — resumable with `ninja -C /opt/build/mesa`, not
-  restartable from scratch. The verified option set is in
-  `../bsdOS/hal/lima/mesa/FEASIBILITY.md` — do not re-derive it. `PyYAML` and
-  `ply` were missing and are staged under `/opt` on `PYTHONPATH` rather than
-  installed, so they cost no root write. This build is also the one that hit
-  the `/opt` filesystem panic below — recovered, cause not resolved.
+- **The Mesa sources were DELETED 2026-08-29 and restore is INCOMPLETE.**
+  An agent `rm -rf /opt/src` swept `/opt/src/mesa-26.2.0` (399 MB) during a
+  cleanup. The build state `/opt/build/mesa` (ninja, 43/993 targets) survived,
+  but the *source tree is gone*, so `ninja -C /opt/build/mesa` cannot continue
+  until it is restored. Restore was started (`fetch` of
+  `archive.mesa3d.org/mesa-26.2.0.tar.xz` into `/tmp`, unpack to
+  `/opt/src/mesa-26.2.0`) but the tarball was wiped by the same tmpfs-clearing
+  WDOG resets that interrupted the kernel build — **re-fetch and re-unpack
+  needed** (fetched over the guest, ~48 MB before interruption; re-verify
+  checksum and full unpack). The `mesa-2phase.sh`, `/opt/pylibs`,
+  `/opt/mesa-setup.sh`/`mesa-setup.log` artifacts are intact. Option set was
+  verified (`Gallium drivers: lima`, EGL/GBM, `meson setup` completes on the
+  board) — in `../bsdOS/hal/lima/mesa/FEASIBILITY.md`, do not re-derive it.
+  `PyYAML`/`ply` staged under `/opt` on `PYTHONPATH`. The `/opt` filesystem
+  panic below is recovered but cause unresolved.
 - **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
   recovered, but the cause is not resolved.** See "`/opt` corruption during
   the three-vCPU build" near the end of this file.
@@ -731,6 +737,14 @@ PHY training pass once — the lottery needs a live repro to call closed.
 claim retracted; `aw_cir` likewise absent from the booting image), the BZDBG
 capture covers dbgmon-internal output only, and the cold-boot PHY lottery is
 mitigated in two layers but not proven closed.
+
+**CLOSED 2026-08-29 (guest kernel `BPI64` built on the guest and deployed as
+the TFTP kernel)**: the IR item above is done — `aw_ir0` attaches live and
+`/dev/input/eventN` exist, `hw.ncpu=4`/`hw.realmem=0x78000000` intact. WiFi
+(brmcfmac source absent from this lineage) and the BZDBG-internal-only capture
+remain; the **cold-boot PHY lottery is still the one open tail before
+tag/push** — the escalation+retry wants one live dark boot to observe
+self-heal.
 
 ## The last hours: two attempts that did not land, and why that is on record
 

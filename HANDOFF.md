@@ -1,4 +1,4 @@
-# Handoff — 2026-08-27, updated end of the 4-vCPU night
+# Handoff — 2026-08-29, guest kernel rebuilt + IR lands (the v0.0.2-prealpha close-out session)
 
 Written at the end of a long session. Read this, then `SESSION-RULES.md`, then
 `RELEASE-0.0.2.md`. Everything below is either measured or explicitly labelled as
@@ -8,16 +8,45 @@ a hypothesis.
 
 ## 1. The board, right now
 
-**Known-good and running the 2026-08-27 night build** (commits
-`4931822..4555364`): FOUR guest vCPUs, 2 GiB guest window (`guest_dram_2g` on),
-USB host port 1 + audio handed to the guest, EMAC link watchdog in the
-vcpu1 tick, stage-2 W^X flips under a cross-core lock. ssh reachable at
+**Known-good, running fully up the v0.0.2 feature list** (HV commits
+`4931822..55c2dbc`; **guest kernel `BPI64`** = GENERIC + `device evdev` +
+`device aw_cir`, built ON the guest and deployed as the board's TFTP kernel):
+FOUR guest vCPUs, 2 GiB guest window (`guest_dram_2g` on), USB host port 1 +
+audio + **IR all handed to the guest**, EMAC link watchdog in the vcpu1 tick
+with give-up→auto-reload escalation, stage-2 W^X flips under a cross-core lock,
+GDB RSP wired into the tick, BZDBG lifeline. ssh reachable at
 `ssh -i ~/.ssh/chimp_ed25519 root@192.168.88.82`.
+
+**2026-08-29 session — guest kernel rebuild, the last hardware tail:**
+the IR node needed a guest kernel that had the driver compiled in, and it is
+now live and proven:
+- Built **`BPI64`** (GENERIC + `device evdev` + `device aw_cir`) from
+  `freebsd-src-earlyboot-wt` on the guest itself: `KERNCONF` BPI64,
+  `make` **without `-g`** (`DEBUG=-O2`) to stay off the swap-induced OOM that
+  killed the first (-g) attempt, `/tmp` tmpfs for src+obj, `sys/contrib`
+  moved to `/opt` (`g_vblk_async`-style) to keep the build under ~2.4 GB.
+  `KMAKE3_EXIT=0`, kernel image 17.9 MB.
+- Deployed to `/opt/bzdos/tftpboot/kernel` (old kernel kept as
+  `tftpboot/kernel.pre-awcir`). WDOG reset → TFTP reload → verified live:
+  `aw_ir0: <Allwinner CIR controller> mem 0x1f02000-0x1f023ff irq 68
+  on simplebus0`, `/dev/input/event0/1/2` present, `hw.ncpu=4`,
+  `hw.realmem=0x78000000` — no regression from the new image.
 
 ```
 hw.ncpu    = 4
 hw.realmem = 2013265920   (0x78000000 — the 2 GiB window, top at 0xB8000000)
+kernel     = tftpboot/kernel  (BPI64 custom; guest's LOCAL /boot/kernel is a
+                                stale genereric image — board boots via TFTP)
 ```
+
+Cold-boot PHY lottery: **NOT yet observed closing live.** Mitigations armed
+(link watchdog heals drop-after-traffic; `emac_init` runs a second full
+`phy_startup` on first failure; default `dbg_emac_watchdog_reboot=1` gives up
+→ `wdt_debug_hold` → HW WDOG reboot into TFTP). The board is back on its
+regular TFTP track and has booted dark twice this session's predecessor; the
+escalation+retry wants **one live dark boot to observe self-heal**. Logged as
+open below (§3a) — do not tag-and-push hard until a live cold boot either
+self-heals or is proven out.
 
 Board boot chain measured this session: guest `reboot` (PSCI SYSTEM_RESET) or
 the USB-ACM break-glass marker (`\x00~BZRST\x00` to /dev/ttyACM0) → WDOG →
@@ -28,6 +57,44 @@ still needed break-glass before that fix landed — the sequence is proven).
 
 Nothing is pushed to any remote. `v0.0.2-prealpha` is **not** tagged — that was
 deferred to the owner and is still theirs to call.
+
+**2026-08-29 close-out — remaining context, in order of work:**
+
+0. **Mesa source restore is the next concrete task.** `/opt/src/mesa-26.2.0`
+   (399 MB) was deleted by an agent and restore is half-done (§RELEASE Known
+   broken — Mesa row). Re-fetch `mesa-26.2.0.tar.xz` on the guest (to `/opt`,
+   NOT `/tmp` — tmpfs dies on WDOG reset), verify checksum, unpack to
+   `/opt/src/mesa-26.2.0`, then resume `ninja -C /opt/build/mesa`.
+1. **Cold-boot PHY lottery is the release gate.** Escalation + retry are
+   deployed; the board must survive **one live dark cold boot** (physical
+   power-cycle equivalent) that self-heals. Do not tag/push hard before that
+   is observed or deliberately waived.
+2. **Then tag `v0.0.2-prealpha` + push.** Update the tag-not-made note in this
+   file and `RELEASE-0.0.2.md` title, `git push origin master:main`, push the
+   tag. Commit author per the tree convention (Bodrov).
+3. **Performance-invention ideas (this session's design pass)**, in desired
+   order — "we own both the HV and its guest, so these are ours to do":
+   - **TLBI by-IPA instead of TLBI-ALL** in `stage2_wx_flip()` — cheapest,
+     multiplies across every exec fault (~3205/boot). Day.
+   - **VGIC_CNTV_HW** (hardware virtual timer, code already behind the flag):
+     kills the 2-3 EL2 round-trips per guest tick on all 4 cores.
+   - **Paravirt steal-time** to the guest (FreeBSD `PARAVIRT`): feed
+     EL2-known steal from the tick so the guest scheduler stops bullshitting
+     itself.
+   - **Lazy / event-driven tick**: EMAC RX and USB already have real IRQs —
+     stop waking CPU1 every 10 ms (100/s); WDT kick to 1 s (HW WDT is 16 s).
+   - **Cached EL2 view** of guest DRAM w/ explicit `dc cvac` around DMA instead
+     of blanket `el2_ncmap` (every HV copy today is uncached).
+   - **DMA-direct vblk** via the eMMC IDMAC: validate guest GPAs, feed them to
+     IDMAC descriptors → zero-copy block.
+   - All of the above get a **cycles-per-trap counter in the BC** before
+     claiming a win — the tree's rule is measure-margin-prove, not feel.
+   Positioning (why our own HV vs KVM/Xen/VMware/Citrix on this board): no
+   IOMMU/SMMU on A64 → those hypervisors have no safe device assignment here;
+   we get DMA safety *by design* (HV validates every DMA'd buffer). ~200 KB
+   auditable TCB vs a full Linux; 3 s boot, no host OS, determinism; and full
+   control of both stages lets us ship the ideas above in days, where upstream
+   KVM would take years. VMware/Citrix are x86-only; Xen has no sun50i DOM0.
 
 **Before you believe anything you read off the board, run `python3 triage.py`
 and read the BUILD IDENTITY block.** It is printed first and says "check this
@@ -169,7 +236,7 @@ all **off**. Design and per-device findings: `docs/guest-hw-enablement.md`.
 | **USB host port 1** | `generic_ehci_fdt`/`generic_ohci`/`aw_usbphy` all compiled in; `awusbphy0` already attaches live | **DONE 2026-08-27.** One DTB flip (`guest_usb_host1`): `ehci0` attaches (irq 24), `usbus0`/`usbus1` up, and a real plugged **Terminus Technology hub enumerates at 480 Mbps** (`ugen0.2`). The feared INTID-106 storm did NOT appear (storm-BC zero, no kHz-rate counter in the g_gt sweep, MUSB word 37 stays `0x2`) — with the driver attached, the guest services the line and the old 145 kHz no-driver storm cannot form. Port 0 correctly stayed disabled (`no driver attached`) |
 | **USB host port 0** | shares PHY0 with MUSB | **no switch exists.** MUSB carries the CDC-ACM console and the break-glass reset; a hard `validate()` error in `FORBIDDEN_DTB_NODES` refuses it |
 | **Audio** | real drivers, already compiled (`pcm0` attaches today) | **DONE 2026-08-27, attach-only by design.** One DTB flip (`guest_audio_codec`, both nodes): `sun8icodec0` (irq 38) + `a64codec0` attach, `pcm0: <simple-audio-card>` is created, and `pcm0: cpu node is missing` is exactly the deliberate shape — the DAI (`dai@1c22c00`, the unguarded system-DMA path) stays excluded. No storm after the flip |
-| **IR** | `aw_cir` compiled in, binds via a *fallback* compat string | **DTB side DONE 2026-08-27; driver ABSENT from this kernel image.** The node enables cleanly (`ir@1f02000`, irq 68, pinctrl processed, both compat strings present) but nothing binds — `strings /boot/kernel/kernel` has zero `*-a31-ir`/`-a64-ir` hits. Same class as WiFi: needs a guest kernel rebuild, not a switch |
+| **IR** | `aw_cir` compiled in, binds via a *fallback* compat string | **DONE 2026-08-29 — guest kernel rebuilt and driver live.** DTB flip + a guest kernel that has the driver (`device aw_cir` in `BPI64`) = `aw_ir0: <Allwinner CIR controller> mem 0x1f02000-0x1f023ff irq 68 on simplebus0` attaching on the live board, `evdev` device nodes in `/dev/input/`. This was the final item that needed a guest kernel rebuild — see §1 |
 | **WiFi** | source present but shipped `BRCMFMAC_SDIO=0`, `BRCMFMAC_OF=0`; firmware absent from FreeBSD, though the exact board-matched blob exists in the host's Linux tree | needs a **guest kernel rebuild**, not a switch |
 | **Bluetooth / MIPI-DSI / MIPI-CSI** | no driver anywhere in FreeBSD (`sys/netgraph/bluetooth/drivers` has only USB transports; no DSI or camera driver for this SoC) | **closed as absent**, with the absence checks cited. Stop planning for them |
 
