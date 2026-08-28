@@ -92,8 +92,56 @@ __attribute__((weak)) void zguest_stage_copyin(void) { }
 
 /* Debug console rides the EMAC network channel (raw 0x88B5), same as the REPL.
  * dbgmon.c calls these extern hooks. */
+
+/* BZDBG capture sink (see dbgmon.c's capture notes): when armed, EVERY
+ * console_putc byte lands in the caller's buffer instead of the EMAC TX
+ * path -- including prints from other modules (bmc_dispatch's `help`
+ * output) that dbgmon's own dc_putc wrapper cannot reach. Single-owner by
+ * construction: armed only between dbgmon_bzdbg_poll's start/end, on the
+ * one core that services dbgmon. */
+static char *g_con_cap_buf;
+static int   g_con_cap_len;
+static int   g_con_cap_cap;
+static int   g_con_cap_dropped;
+volatile int g_con_capture_on;
+
+void console_capture_start(char *buf, int cap)
+{
+	g_con_cap_buf = buf;
+	g_con_cap_cap = cap;
+	g_con_cap_len = 0;
+	g_con_cap_dropped = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_con_capture_on = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+int console_capture_end(char **out)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_con_capture_on = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	if (g_con_cap_buf && g_con_cap_len < g_con_cap_cap)
+		g_con_cap_buf[g_con_cap_len] = '\0';
+	*out = g_con_cap_buf;
+	return g_con_cap_len;   /* caller can read g_con_cap_dropped via the
+				 * getter below if it cares about truncation */
+}
+
+int console_capture_dropped(void) { return g_con_cap_dropped; }
+
 int  console_getc(void)   { return emac_getc(); }
-void console_putc(int c)  { emac_putc(c); }
+void console_putc(int c)
+{
+	if (g_con_capture_on) {
+		if (g_con_cap_len < g_con_cap_cap)
+			g_con_cap_buf[g_con_cap_len++] = (char)c;
+		else
+			g_con_cap_dropped++;
+		return;
+	}
+	emac_putc(c);
+}
 void console_poll(void)   { emac_poll(); }
 void console_flush(void)  { emac_flush(); }
 
