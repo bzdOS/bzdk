@@ -1,4 +1,4 @@
-# Handoff — 2026-08-27
+# Handoff — 2026-08-27, updated end of the 4-vCPU night
 
 Written at the end of a long session. Read this, then `SESSION-RULES.md`, then
 `RELEASE-0.0.2.md`. Everything below is either measured or explicitly labelled as
@@ -8,14 +8,23 @@ a hypothesis.
 
 ## 1. The board, right now
 
-**Known-good and running.** Build id `handoff-known-good`, three guest vCPUs,
-1 GiB guest window, root read-only, ssh reachable at
+**Known-good and running the 2026-08-27 night build** (commits
+`4931822..4555364`): FOUR guest vCPUs, 2 GiB guest window (`guest_dram_2g` on),
+USB host port 1 + audio handed to the guest, EMAC link watchdog in the
+vcpu1 tick, stage-2 W^X flips under a cross-core lock. ssh reachable at
 `ssh -i ~/.ssh/chimp_ed25519 root@192.168.88.82`.
 
 ```
-hw.physmem = 1033682944   (986 MB — the 1 GiB window)
-hw.ncpu    = 3
+hw.ncpu    = 4
+hw.realmem = 2013265920   (0x78000000 — the 2 GiB window, top at 0xB8000000)
 ```
+
+Board boot chain measured this session: guest `reboot` (PSCI SYSTEM_RESET) or
+the USB-ACM break-glass marker (`\x00~BZRST\x00` to /dev/ttyACM0) → WDOG →
+U-Boot → TFTP reload of whatever `tftpboot/` holds. The EMAC dbg channel
+survives full boots with the guest active; a cold boot whose PHY fails to
+train is self-healed by the link watchdog since `bc2d531` (one such boot
+still needed break-glass before that fix landed — the sequence is proven).
 
 Nothing is pushed to any remote. `v0.0.2-prealpha` is **not** tagged — that was
 deferred to the owner and is still theirs to call.
@@ -202,6 +211,15 @@ Each of these needs one board cycle. None is armed by default except where noted
   CPU1's own guest's `SP_EL1`: a plausible wrong answer, worse than obvious
   garbage. Needs the queue-and-let-CPU0-apply-it pattern `gdb_hw_op_pending`
   already uses.
+  **2026-08-27 assessment (do not start blind)**: the wiring is exactly three
+  new op codes on the existing `gdb_hw_op_*` rail (SP_GET/SP_SET plus an
+  MDSCR/MDCR enable-disable pair — CPU0 already services queued ops inside its
+  parked-stop wfe loop, `el2_exc.c` ~1134, so the transport exists) PLUS the
+  dbg-build `gdb_channel` arbitration so tick-routed RSP bytes stop being
+  eaten by dbgmon's line parser. Blocked on verification tooling, not code:
+  there is no RSP client wired to the board tonight, and a plausible-wrong-SP
+  regression is undetectable without one. First step when picked up: bring up
+  an RSP client (host `gdb`/`gdb-multiarch` to TCP), THEN wire, THEN A/B.
   Note also `Z0` and `Z1` breakpoints were **already fixed** on 2026-08-21
   (`3c28d5e`) — older notes calling them broken are stale.
 - **`wdogtrap.c`**: policy for the page holding CCU, PIO and the watchdog
@@ -223,7 +241,12 @@ Each of these needs one board cycle. None is armed by default except where noted
   and all other writes pass through. Full per-guest GICD virtualization (enable,
   priority, group state) is **multi-week** and is what a second guest with real
   devices needs. The CCU is the hard one — machine-wide, no narrow fix found,
-  its own design pass. PIO is the one cheap win (one field). RSB's
+  its own design pass. PIO's "one cheap win" is **already implemented** —
+  `wdogtrap.c` ships the full page policy (WDOG refused first-refusal with a
+  `_Static_assert` pinning the window, PIO PC5 one-field byte-partial
+  correction, everything else passthrough-by-design) and is unit-tested
+  (`test_wdogtrap` in `make test`); the only open knob is its default-off
+  stage-2 arm flag. RSB's
   "one bit for dldo1" is deceptive: it is a serial bus protocol, so a stage-2
   trap can only see "the guest touched the controller", not "the guest is about
   to clear DLDO1" — that hack stays regardless. See `docs/wdog-ccu-pio-stage2.md`.
