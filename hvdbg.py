@@ -588,6 +588,20 @@ class HV:
             s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                socket.htons(self.DBGRAW_ETHERTYPE))
             s.bind((self.iface, self.DBGRAW_ETHERTYPE))
+            # Promiscuous membership [MEASURED 2026-08-27: tcpdump saw the
+            # board's DBGRAW replies on this iface while a protocol-bound
+            # AF_PACKET socket never received them]. The board answers from
+            # its own MAC to whatever source it saw; if that frame classifies
+            # as PACKET_OTHERHOST the kernel delivers it ONLY to promiscuous
+            # sockets -- which is exactly what tcpdump enables and a plain
+            # raw socket does not. Membership makes the socket tcpdump-equivalent.
+            import struct as _s
+            SOL_PACKET = 263        # bits/socket.h; not exported by python's socket module
+            PACKET_ADD_MEMBERSHIP = 1   # linux/if_packet.h:39
+            PACKET_MR_PROMISC = 1       # linux/if_packet.h:316
+            mreq = _s.pack("IHH8s", 1, socket.if_nametoindex(self.iface),
+                           PACKET_MR_PROMISC, b"")
+            s.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
             self._dbgraw_sock = s
         sock = self._dbgraw_sock
         frame = (BCAST + self.src_mac +
