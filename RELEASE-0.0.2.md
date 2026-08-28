@@ -357,18 +357,21 @@ Everything in 0.0.1's list still stands except where noted, plus:
   check -s` said nothing because that package's file list in pkg's database is
   empty. Repaired from intact references already on the board; a sweep of every
   package with an exact-version cached reference found no further damage.
-- **The Mesa sources were DELETED 2026-08-29 and restore is INCOMPLETE.**
-  An agent `rm -rf /opt/src` swept `/opt/src/mesa-26.2.0` (399 MB) during a
-  cleanup. The build state `/opt/build/mesa` (ninja, 43/993 targets) survived,
-  but the *source tree is gone*, so `ninja -C /opt/build/mesa` cannot continue
-  until it is restored. Restore was started (`fetch` of
-  `archive.mesa3d.org/mesa-26.2.0.tar.xz` into `/tmp`, unpack to
-  `/opt/src/mesa-26.2.0`) but the tarball was wiped by the same tmpfs-clearing
-  WDOG resets that interrupted the kernel build — **re-fetch and re-unpack
-  needed** (fetched over the guest, ~48 MB before interruption; re-verify
-  checksum and full unpack). The `mesa-2phase.sh`, `/opt/pylibs`,
-  `/opt/mesa-setup.sh`/`mesa-setup.log` artifacts are intact. Option set was
-  verified (`Gallium drivers: lima`, EGL/GBM, `meson setup` completes on the
+- **The Mesa sources were DELETED 2026-08-29 and restore is BLOCKED on the
+  guest environment.** An agent `rm -rf /opt/src` swept `/opt/src/mesa-26.2.0`
+  (399 MB) during a cleanup. The build state `/opt/build/mesa` (ninja, 43/993
+  targets) survived, but the *source tree is gone*. The tarball is back,
+  complete and valid: `/opt/mesa-26.2.0.tar.xz` (68461648 bytes, `fetch` exit 0,
+  `xz -t` exit 0). **Unpacking it kills the guest** — `xz -dc --memlimit=256MiB |
+  tar -xf - -C /opt/src` (and to `/tmp`) dies deterministically at the 34th
+  top-level entry entering `src/`; the daemon'd job is SIGKILLed before writing
+  its exit code, `/opt` stays `rw` with no fs panic and no OOM in `dmesg`, but
+  sshd resets under the load — RAM/IO saturation of the constrained guest
+  working set. Leave it off the v0.0.2 path; to unblock: extract on the host
+  and push the tree, or chunked extract, or more guest RAM. The `mesa-2phase.sh`,
+  `/opt/pylibs`, `/opt/mesa-setup.sh`/`mesa-setup.log` artifacts are intact.
+  Option set was verified (`Gallium drivers: lima`, EGL/GBM, `meson setup`
+  completes on the
   board) — in `../bsdOS/hal/lima/mesa/FEASIBILITY.md`, do not re-derive it.
   `PyYAML`/`ply` staged under `/opt` on `PYTHONPATH`. The `/opt` filesystem
   panic below is recovered but cause unresolved.

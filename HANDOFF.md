@@ -60,11 +60,24 @@ deferred to the owner and is still theirs to call.
 
 **2026-08-29 close-out — remaining context, in order of work:**
 
-0. **Mesa source restore is the next concrete task.** `/opt/src/mesa-26.2.0`
-   (399 MB) was deleted by an agent and restore is half-done (§RELEASE Known
-   broken — Mesa row). Re-fetch `mesa-26.2.0.tar.xz` on the guest (to `/opt`,
-   NOT `/tmp` — tmpfs dies on WDOG reset), verify checksum, unpack to
-   `/opt/src/mesa-26.2.0`, then resume `ninja -C /opt/build/mesa`.
+0. **Mesa source restore — BLOCKED on the guest environment (not a HV-release
+   blocker).** `/opt/src/mesa-26.2.0` was deleted by an agent. The tarball IS
+   back, complete and valid: `/opt/mesa-26.2.0.tar.xz` (68461648 bytes,
+   `fetch` exit 0, `xz -t` exit 0 — full + intact). But **extracting it kills the
+   guest**: `xz -dc --memlimit=256MiB … | tar -xf - -C /opt/src` (also tried
+   `/tmp`) dies deterministically at the 34th top-level entry, i.e. the instant
+   it starts descending into `src/` (~the bulk of the 400 MB tree). The daemon'd
+   job is SIGKILLed before it can write its exit code; `/opt` stays `rw`, no fs
+   panic and no OOM in `dmesg`, but the guest's sshd resets connections under the
+   load — points at RAM/IO saturation (the 2 G window leaves the guest a
+   constrained working set; 400 MB of extracted pages + xz dict push it into
+   swap-thrash on the slow SD). Tried: background, `daemon -f`, `nohup`, memlimit,
+   `/tmp` vs `/opt` — all die at the same point. **What would unblock it**: (a)
+   extract on the host and push the tree to the guest (host has RAM/disk to
+   spare; ~400 MB over the flaky guest egress is slow but reliable), or (b) a
+   mesa-2phase-style chunked extract, or (c) more guest RAM. The build state
+   `/opt/build/mesa` (ninja, 43/993) is intact and will resume once the source
+   tree exists at `/opt/src/mesa-26.2.0`. Leave it; it is not on the v0.0.2 path.
 1. **Cold-boot PHY lottery is the release gate.** Escalation + retry are
    deployed; the board must survive **one live dark cold boot** (physical
    power-cycle equivalent) that self-heals. Do not tag/push hard before that
