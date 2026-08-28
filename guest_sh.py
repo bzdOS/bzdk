@@ -60,7 +60,19 @@ def ensure_shell(fd, tries=3):
             return True
         if "login:" in out:
             _send(fd, "root\r")
-            # The MOTD plus getty's terminal-size probe make this chatty.
+            # Marker-driven, not silence-driven [MEASURED 2026-08-27: two
+            # reload-night failures had `reboot` land at the Password prompt
+            # because a fixed quiet-gap elapsed while getty was still
+            # printing the MOTD]. getty echoes "Password:" when it wants the
+            # (empty) password; wait for THAT, not for a clock.
+            pw = _drain_quiet(fd, quiet_for=0.8, cap=25.0)
+            if b"Password:" not in pw:
+                # Some images skip the password prompt entirely on empty
+                # password; only treat silence as success if a prompt showed.
+                if b"# " not in pw:
+                    continue
+            else:
+                _send(fd, "\r")
             got = _drain_quiet(fd, quiet_for=0.8, cap=25.0).decode("utf-8", "replace")
             if "# " in got:
                 _echo_off = False       # fresh shell: its echo is on again
