@@ -614,10 +614,13 @@ void smp_secondary_main(uint64_t cpuid)
 				__asm__ volatile("dc civac, %0\n\tdsb sy"
 				                  :: "r"(hb) : "memory");
 			}
-			/* ISOLATION TEST: dbgmon_service() TEMPORARILY DISABLED to prove
-			 * whether the EMAC poll path is what wedges CPU1. If the board now
-			 * stays resident forever (word5 huge, no reset), the wedge is in
-			 * dbgmon_service; restore it once confirmed. */
+			/* Runtime kill-switch (default 0): when dbg_isolate_no_emac is
+			 * set, dbgmon_service()/emac_poll() are skipped but the loop
+			 * keeps running (usbacm below still drains the vconsole rings).
+			 * NOT an experiment-in-flight: the isolation test this once
+			 * served has concluded long ago; the flag survives as a
+			 * diagnostic lever for "is the EMAC poll path itself the
+			 * wedge?" questions. */
 			if (&gdb_channel && gdb_channel) {
 				/* GDB mode (ROADMAP B2): the `gdb` command routed this channel
 				 * to the RSP stub. Two service points: (a) CPU0 parked in

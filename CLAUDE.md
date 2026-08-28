@@ -88,9 +88,12 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
   path, not a correctness one (`vblk_async_post()` gates on
   `g_vblk_async_ready`, and the `gdb` target has always run the synchronous
   fallback on hardware).
-- **CPU3** — idle (WFI) in the default `dbg`/`gdb`/`fbsd` builds. `vcpu3.c`
-  exists and is wired for a FOURTH vCPU but is deliberately unarmed — no
-  hardware run yet. In the `dual` build CPU3 runs a genuine second guest
+- **CPU3** — **FOURTH guest vCPU since 2026-08-27** (`vcpu3` armed in
+  `board-config.xml`, hardware-proven: `hw.ncpu=4`, `cpu3:rendezvous`
+  nonzero, guest network end-to-end green). The root cause of the original
+  4-vCPU freeze (CPU3 data aborts routed into `dual`'s Zephyr handler set)
+  is fixed in `el2_exc.c` (gate on `!dbg_vcpu3`). In the `dual` build CPU3
+  instead runs a genuine second guest
   (Zephyr) concurrently with FreeBSD on CPU0, under its own disjoint stage-2
   table — see `docs/dual-guest.md`. `vcpu3` and that Zephyr guest are mutually
   exclusive at LINK TIME (a duplicate `bzdos_cpu3_owner` symbol), not merely by
@@ -103,11 +106,13 @@ python3 guest_sh.py 'uname -a'          # console, works even with no network
 ssh -i /root/.ssh/chimp_ed25519 root@192.168.88.82   # once /etc/rc has run
 ```
 
-The guest is **also a build host**: it has `/usr/bin/cc` and ~4.7 GB free, so a
-misbehaving base tool is usually faster to rebuild there than to debug. To copy
-files *in*, the **guest listens and the host connects** (`nc -l` on the guest) —
-inbound TCP to this host is firewalled, so fetching from a host HTTP server
-fails with "Connection refused". Helper: `push.py` pattern in the scratchpad.
+The guest is **also a build host** — but note the 2026-08-25 layout: `/` is
+mounted read-only *by design* (fstab `ro`), the build area is **`/opt`
+(vtbd1p2, ~44 GB free, rw)** with `/var` (8 GB) beside it; `/tmp` is a ~2.4 GB
+tmpfs and fits a kernel-source unpack + build. `/usr/src` does NOT exist in
+the guest; the FreeBSD trees live on the host (`/opt/bzdos/freebsd-src`,
+`/opt/bzdos/freebsd-src-earlyboot-wt` — the latter is the dirty lineage the
+running guest kernel was built from). `nc -l` pattern for pushing files in.
 
 Never change the guest's MAC: it must stay `02:bd:05:00:00:01` or networking
 dies instantly (the guest relies on `VIRTIO_NET_F_MAC`).
