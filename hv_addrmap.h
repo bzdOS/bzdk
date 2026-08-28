@@ -278,11 +278,12 @@ _Static_assert(HVMAP_LOW_VCONSOLE_BUF + HVMAP_LOW_VCONSOLE_BUF_SZ
  * a header on top of a full 1:1 mirror. The original layout placed the 64
  * KiB struct snapshot_hdr at the FRONT of that window and started the mirror
  * SNAP_META_SIZE bytes later — which pushed the mirror's END the same amount
- * past 0xC0000000, the last byte of DRAM QEMU's `-m 2048` backs. The
- * confirming dram_copy() fault (FAR=0xC0000000) was observed under QEMU,
- * NOT on the board: the real board's DRAM does end at the same 0xC0000000,
- * but its top ~7 MiB is U-Boot's no-overwrite region (self at 0xbdf44000,
- * TLB at 0xbfff0000), which is why the guest's window is told to stop at
+ * past 0xC0000000, the last byte of DRAM QEMU's `-m 2048` backs [QEMU-ONLY:
+ * the confirming dram_copy() fault, FAR=0xC0000000, was observed under
+ * QEMU, NOT on the board]. The real board's DRAM does end at the same
+ * 0xC0000000, but its top ~7 MiB is U-Boot's no-overwrite region (self at
+ * 0xbdf44000, TLB at 0xbfff0000) [MEASURED 2026-08-27: U-Boot bdinfo],
+ * which is why the guest's window is told to stop at
  * 0xB8000000 — see stage2.h's GUEST_DRAM_2G comment and HANDOFF 3b.
  *
  * FIX: the header moves out of the high GiB entirely, into this lane, so the

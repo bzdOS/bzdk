@@ -727,7 +727,8 @@ write_hcr_el2(uint64_t v)
  * per-core view is the only honest one). Historically this window was
  * CPU0-only in practice; since vcpu1/2/3 every guest vCPU arms its own CNTP
  * tick and calls this handler on its own core, so the "today only CPU0"
- * framing below is RETIRED (2026-08-27) -- the window now shows whichever
+ * framing below is RETIRED [RETRACTED 2026-08-27: measured per-core tick
+ * activity on CPU1 via g_gt[] sweep] -- the window now shows whichever
  * core's interface answered, and CPU0's slice is no longer the whole story.
  * Exposed via breadcrumb at 0x00018300+. */
 #define IRQ_COUNTER_BC_BASE 0x00018300UL
