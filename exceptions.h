@@ -25,8 +25,10 @@ struct el2_frame {
 	uint64_t elr;        /* 0x100: ELR_EL2  (faulting/return PC) */
 	uint64_t spsr;       /* 0x108: SPSR_EL2                      */
 	uint64_t esr;        /* 0x110: ESR_EL2  (syndrome)          */
-	uint64_t far;        /* 0x118: FAR_EL2  (fault address)     */
-	uint64_t sp_at_entry;/* 0x120                               */
+	uint64_t far;        /* 0x118: FAR_EL2  (fault address)      */
+	uint64_t sp_el1;     /* 0x120: guest SP_EL1 (banked; saved/restored
+	                      * explicitly -- gdbstub g/p packets use it) */
+	uint64_t sp_at_entry;/* 0x128: EL2 SP before pushing the frame */
 };
 
 /* Install / restore our EL2 vector table (implemented in exceptions.S).

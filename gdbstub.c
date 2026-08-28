@@ -434,11 +434,12 @@ static uint64_t reg_get(struct el2_frame *g, int n)
 {
 	if (n >= 0 && n <= 30)
 		return g->x[n];
-	if (n == REG_SP) {
-		uint64_t v;
-		__asm__ volatile("mrs %0, sp_el1" : "=r"(v));
-		return v;
-	}
+	if (n == REG_SP)
+		return g->sp_el1;   /* frame-carried [core-independent since
+			             * exceptions.S started saving SP_EL1 --
+			             * the old raw `mrs sp_el1` read THIS core's
+			             * bank, which in the 4-vCPU world is the
+			             * wrong guest's SP] */
 	if (n == REG_PC)
 		return g->elr;
 	if (n == REG_CPSR)
@@ -451,7 +452,7 @@ static void reg_set(struct el2_frame *g, int n, uint64_t v)
 	if (n >= 0 && n <= 30)
 		g->x[n] = v;
 	else if (n == REG_SP)
-		__asm__ volatile("msr sp_el1, %0" :: "r"(v));
+		g->sp_el1 = v;      /* applied by el2_common's restore on resume */
 	else if (n == REG_PC)
 		g->elr = v;
 	else if (n == REG_CPSR)

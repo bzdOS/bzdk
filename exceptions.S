@@ -25,8 +25,11 @@
  *   0x108         elr_el2            (faulting / return PC)
  *   0x110         spsr_el2
  *   0x118         esr_el2            (syndrome: cause of the exception)
- *   0x120         far_el2            (faulting virtual address)
- *   0x128         sp_at_entry        (SP before we pushed the frame)
+ *   0x120         sp_el1             (the GUEST's own stack pointer -- banked
+ *                                     per-PE; saved/restored explicitly so
+ *                                     gdbstub's g/p packets are core-
+ *                                     independent in the 4-vCPU world)
+ *   0x128         sp_at_entry        (EL2 SP before we pushed the frame)
  * total 0x130 (304) -> round to 0x140 (320) for 16-byte alignment.
  */
 
@@ -109,8 +112,12 @@ el2_common:
 	mrs	x1, esr_el2
 	mrs	x2, far_el2
 	stp	x1, x2, [sp, #0x110]	/* esr, far                    */
+	mrs	x1, sp_el1		/* the GUEST's own stack pointer --
+					 * banked per-PE: save it on the
+					 * trapping core, never trust another */
+	str	x1, [sp, #0x120]	/* sp_el1                      */
 	add	x1, sp, #FRAME_SIZE	/* SP as it was at entry       */
-	str	x1, [sp, #0x120]
+	str	x1, [sp, #0x128]
 
 	/* el2_trap(frame = sp, kind). */
 	mov	x0, sp
@@ -118,10 +125,15 @@ el2_common:
 	bl	el2_trap
 
 	/* Restore ELR/SPSR (el2_trap may have advanced ELR to skip a faulting
-	 * instruction, or left it to re-run / to eret into a scheduled task). */
+	 * instruction, or left it to re-run / to eret into a scheduled task).
+	 * SP_EL1 too: gdbstub's P-packet may have retargeted the guest SP via
+	 * the frame -- write back whatever the frame now holds. For an
+	 * unmutated frame this restores exactly what this entry saved. */
 	ldp	x1, x2, [sp, #0x100]
 	msr	elr_el2, x1
 	msr	spsr_el2, x2
+	ldr	x1, [sp, #0x120]
+	msr	sp_el1, x1
 
 	/* Restore x1..x30, then x0, then pop and eret. */
 	ldp	x1,  x2,  [sp, #0x008]

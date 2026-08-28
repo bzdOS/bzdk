@@ -211,15 +211,19 @@ Each of these needs one board cycle. None is armed by default except where noted
   CPU1's own guest's `SP_EL1`: a plausible wrong answer, worse than obvious
   garbage. Needs the queue-and-let-CPU0-apply-it pattern `gdb_hw_op_pending`
   already uses.
-  **2026-08-27 assessment (do not start blind)**: the wiring is exactly three
-  new op codes on the existing `gdb_hw_op_*` rail (SP_GET/SP_SET plus an
-  MDSCR/MDCR enable-disable pair — CPU0 already services queued ops inside its
-  parked-stop wfe loop, `el2_exc.c` ~1134, so the transport exists) PLUS the
-  dbg-build `gdb_channel` arbitration so tick-routed RSP bytes stop being
-  eaten by dbgmon's line parser. Blocked on verification tooling, not code:
-  there is no RSP client wired to the board tonight, and a plausible-wrong-SP
-  regression is undetectable without one. First step when picked up: bring up
-  an RSP client (host `gdb`/`gdb-multiarch` to TCP), THEN wire, THEN A/B.
+  **2026-08-27 WIRED AND LIVE-VERIFIED (commit after 4555364)**: the vcpu1
+  tick block now arbitrates on `gdb_channel` exactly like the old SMP_DEBUG_CPU
+  loop did (stub service points vs dbgmon_service), the exceptions.S frame
+  saves/restores **SP_EL1** (new `sp_el1` field at 0x120; `sp_at_entry` moved
+  to 0x128) so gdbstub's reg_get/reg_set are core-independent, and the el2_exc
+  stop-divert gate (`smp_cpu_id()==0 + gdbstub_attached()`) needed no change.
+  Verified end-to-end over a new host bridge (`rsp_bridge.py`: TCP:12345 <->
+  EMAC console bytes, `--switch-gdb` flips the channel): real gdb (aarch64)
+  connects, `qSupported` handshake answers, guest registers read with correct
+  guest-KVA SP/PC (`lock_delay`), kernel symbols resolve, a Z0 breakpoint at
+  `hardclock` was set, hit, and delivered a stop to the host. The dbg build's
+  `gdb` command is therefore no longer a no-op. Legacy text below kept for the
+  design rationale.
   Note also `Z0` and `Z1` breakpoints were **already fixed** on 2026-08-21
   (`3c28d5e`) — older notes calling them broken are stale.
 - **`wdogtrap.c`**: policy for the page holding CCU, PIO and the watchdog
