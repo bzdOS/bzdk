@@ -546,6 +546,19 @@ static uint64_t hdmi_last_relock_tick;
  * build without dbgmon.o (the `gdb` target links gdbstub.c instead) still
  * link — dbgmon.o's real definition overrides it wherever both are linked. */
 __attribute__((weak)) volatile uint32_t dbg_vcpu1;
+
+/* GDB-channel wiring (see the tick block's comment): gdbstub.c defines
+ * gdb_channel non-weak and its service entry points strong; el2_exc.c
+ * defines the stop/resume handshake words. Weak here so targets without
+ * gdbstub.o/el2_exc.o variants still link. */
+__attribute__((weak)) volatile uint32_t gdb_channel;
+__attribute__((weak)) volatile uint32_t gdb_stop_pending;
+__attribute__((weak)) volatile uint32_t gdb_resume_act;
+__attribute__((weak)) volatile uint32_t gdb_stop_signal;
+__attribute__((weak)) struct el2_frame g_last_guest_frame;
+__attribute__((weak)) int  gdbstub_poll(struct el2_frame *guest);
+__attribute__((weak)) void gdbstub_on_debug_event(struct el2_frame *guest,
+                                                  int signal);
 __attribute__((weak)) void dbgmon_service(struct el2_frame *guest_frame)
 {
 	(void)guest_frame;
@@ -1621,10 +1634,42 @@ gic_timer_irq(struct el2_frame *frame)
 #endif
 
 		{
-			struct el2_frame snap;
+			/* Channel arbitration, mirroring the old SMP_DEBUG_CPU loop
+			 * (smp.c:621) exactly: when the operator's `gdb` command has
+			 * flipped gdb_channel, THIS tick hosts the RSP stub instead of
+			 * the text monitor -- same transport (the shared EMAC console
+			 * byte channel), same two service points (parked-stop command
+			 * loop; bounded async poll), same handshake ownership
+			 * (CPU0 sets gdb_stop_pending, this side clears it BEFORE
+			 * raising gdb_resume_act). The banked-register hazard that
+			 * kept this unwired is closed as of the sp_el1-in-frame fix
+			 * (exceptions.S/exceptions.h: the guest SP now travels in the
+			 * frame, so reg_get/reg_set are core-independent; MDCR/MDSCR
+			 * arming was already CPU0's job via the gdb_hw_op rail and
+			 * el2_exc's own ss_set_mdscr) [HW-PROVEN pending: first live
+			 * RSP session]. gdbstub.o/gdbstub_hw.o link in every build,
+			 * and dbgmon's `gdb` command sets the flag; until then this
+			 * branch is inert and dbgmon runs as usual. */
+			if (&gdb_channel && gdb_channel) {
+				struct el2_frame snap;
 
-			el2_snapshot_guest_frame(&snap);
-			dbgmon_service(&snap);
+				el2_snapshot_guest_frame(&snap);
+				if (gdb_stop_pending) {
+					if (gdbstub_on_debug_event)
+						gdbstub_on_debug_event(&g_last_guest_frame,
+						                       (int)gdb_stop_signal);
+					gdb_stop_pending = 0u;
+					gdb_resume_act = 1u;
+					__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+				} else if (gdbstub_poll) {
+					gdbstub_poll(&g_last_guest_frame);
+				}
+			} else {
+				struct el2_frame snap;
+
+				el2_snapshot_guest_frame(&snap);
+				dbgmon_service(&snap);
+			}
 		}
 		/* EMAC link self-heal, relocated from the SMP_DEBUG_CPU tight loop
 		 * (smp.c:660) — dead code whenever vcpu1 is armed, and without a
