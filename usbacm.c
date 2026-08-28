@@ -8,6 +8,7 @@
 #include "usbacm.h"
 #include "musb.h"
 #include "vconsole.h"
+#include "dbgmon.h"      /* dbgmon_bzdbg_post / bzdbg_reply_* -- BZDBG lifeline */
 #include "wdt.h"        /* wdt_debug_hold -- fixed-address macro, see wdt.h */
 
 /* Bounded per-poll drain limits, so a single usbacm_poll() call can never
@@ -29,6 +30,8 @@
  * regardless of how much either ring has queued. */
 #define USBACM_RX_DRAIN_MAX  32
 #define USBACM_TX_DRAIN_MAX  16
+#define USBACM_BZDBG_DRAIN_MAX 48  /* reply bytes per poll: musb_putc drops
+                                    * on a full ring, so chunk the reply */
 
 /* ── Break-glass reset over the USB console ──────────────────────────────
  * The one wedge with NO remote recovery used to be: EMAC/dbgmon dark (so no
@@ -55,6 +58,100 @@ static void usbacm_breakglass(uint8_t b)
 	} else {
 		/* restart; also handle the first byte re-matching */
 		bg_pos = (b == bg_seq[0]) ? 1 : 0;
+	}
+}
+
+/* ── BZDBG: HV dbgmon over the USB console ───────────────────────────────
+ * The EMAC-dark lifeline's other half: when the wire is down, the monitor
+ * is still fully drivable over the USB console. Host sends
+ * `~BZDBG<line>\n` into /dev/ttyACM0; this matcher (same rolling-machine
+ * shape as break-glass, plus a line buffer) captures the line and hands it
+ * to dbgmon_bzdbg_post(); dbgmon_service drains it with its output
+ * CAPTURED (not printed to the EMAC console), and the answer drains back
+ * out here, each line prefixed `~BZDBG< ` so the host can tell monitor
+ * output apart from guest console traffic. Line-oriented: the guest's own
+ * typed input can never form the prefix (it starts with a tilde+capital
+ * sequence nobody types), and partial lines time nothing out -- a line
+ * simply completes whenever its last byte arrives.
+ * 2026-08-27: closes the "EMAC dark, board alive, HV unreadable" gap. */
+static const uint8_t bz_pre[] = { '~', 'B', 'Z', 'D', 'B', 'G' };
+static uint32_t bz_pos;
+static uint8_t  bz_seen[8];          /* matched-prefix bytes, replayed on break */
+static char     bz_line[128];
+static uint32_t bz_len;
+
+static void usbacm_bzdbg_feed(uint8_t b)
+{
+	if (bz_pos < (uint32_t)sizeof(bz_pre)) {
+		if (b == bz_pre[bz_pos]) {
+			bz_seen[bz_pos++] = b;   /* still matching: hold the byte */
+			return;
+		}
+		/* Break: replay what we held (a guest typing '~' must see it),
+		 * then re-check THIS byte as a potential prefix start. */
+		for (uint32_t k = 0; k < bz_pos; k++)
+			vconsole_rx_push(bz_seen[k]);
+		bz_pos = 0;
+		if (b == bz_pre[0]) {
+			bz_seen[0] = b;
+			bz_pos = 1;
+			return;
+		}
+		vconsole_rx_push(b);
+		return;
+	}
+	if (bz_pos == (uint32_t)sizeof(bz_pre)) {
+		bz_pos++;                    /* separator byte -- consumed silently */
+		return;
+	}
+	/* inside the line body */
+	if (b == '\r' || b == '\n') {
+		bz_line[bz_len] = '\0';
+		dbgmon_bzdbg_post(bz_line);
+		bz_len = 0;
+		bz_pos = 0;
+		return;                      /* line is ours; nothing reaches the guest */
+	}
+	if (bz_len < sizeof(bz_line) - 1)
+		bz_line[bz_len++] = (char)b;
+	/* else: drop silently -- DBGMON drops overlong lines too */
+}
+
+static uint32_t bz_reply_off;        /* drain cursor into the reply buffer */
+
+static void usbacm_bzdbg_tx_drain(void)
+{
+	/* Push the pending reply into the ACM TX ring, COURSORNED: musb_putc
+	 * drops bytes on a full ring, so at most USBACM_BZDBG_DRAIN_MAX bytes
+	 * per poll call and resume from bz_reply_off next tick. Each line is
+	 * prefixed `~BZDBG< ` so the host can frame monitor output apart from
+	 * the guest console stream sharing this pipe. */
+	static const char tag[] = "~BZDBG< ";
+	uint32_t budget;
+
+	if (!bzdbg_reply_ready)
+		return;
+	if (bz_reply_off == 0) {
+		for (uint32_t k = 0; k < sizeof(tag) - 1; k++)
+			musb_putc((int)tag[k]);          /* first line's prefix */
+	}
+	budget = USBACM_BZDBG_DRAIN_MAX;
+	while (bz_reply_off < bzdbg_reply_len && budget--) {
+		char ch = bzdbg_reply_buf[bz_reply_off++];
+		if (ch == '\n') {
+			musb_putc('\r');
+			musb_putc('\n');
+			for (uint32_t k = 0; k < sizeof(tag) - 1; k++)
+				musb_putc((int)tag[k]);
+		} else if (ch != '\r') {
+			musb_putc((int)ch);
+		}
+	}
+	if (bz_reply_off >= bzdbg_reply_len) {
+		musb_putc('\r');
+		musb_putc('\n');
+		bz_reply_off = 0;
+		bzdbg_reply_ready = 0;
 	}
 }
 
@@ -89,11 +186,15 @@ usbacm_poll(void)
 	 * ring already has into the guest's virtual UART0 RX ring. musb_getc()
 	 * itself also bounds this (it drains exactly what's already buffered,
 	 * never blocks) -- the explicit cap here is belt-and-suspenders so a
-	 * host paste-flood can't extend a single poll call indefinitely. */
+	 * host paste-flood can't extend a single poll call indefinitely.
+	 * Bytes that match a `~BZDBG` prefix are diverted to the monitor
+	 * queue and never reach the guest; a byte that BREAKS a match replays
+	 * the buffered prefix first, then the byte -- so a guest user typing a
+	 * literal tilde sees every keystroke exactly once. */
 	n = 0;
 	while (n < USBACM_RX_DRAIN_MAX && (c = musb_getc()) >= 0) {
-		vconsole_rx_push((uint8_t)c);
 		usbacm_breakglass((uint8_t)c);
+		usbacm_bzdbg_feed((uint8_t)c);
 		n++;
 	}
 
@@ -102,7 +203,9 @@ usbacm_poll(void)
 	 * so a guest producing console output faster than USB can carry it
 	 * doesn't turn one usbacm_poll() call into an unbounded (or merely
 	 * very large) loop -- the remainder just waits in the tee ring for the
-	 * next call. */
+	 * next call. Any pending BZDBG reply goes FIRST (it is short, and the
+	 * host is polling for it). */
+	usbacm_bzdbg_tx_drain();
 	n = 0;
 	while (n < USBACM_TX_DRAIN_MAX && vconsole_tx_tee_getc(&b)) {
 		musb_putc((int)b);
