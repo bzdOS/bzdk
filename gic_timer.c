@@ -723,9 +723,13 @@ write_hcr_el2(uint64_t v)
 /* INTID counter for interrupt storm diagnostics (internal task). Lives in
  * struct gt_percpu now (per-core — see the inventory above: GICC_IAR is
  * banked per PE, so this was never really a global fact). This window still
- * reports only the CALLING core's counts, which is byte-identical to before
- * since only CPU0 ever calls gic_timer_irq() today (see the breadcrumb note
- * above). Exposed via breadcrumb at 0x00018300+. */
+ * reports only the CALLING core's counts (GICC_IAR is banked per PE, so a
+ * per-core view is the only honest one). Historically this window was
+ * CPU0-only in practice; since vcpu1/2/3 every guest vCPU arms its own CNTP
+ * tick and calls this handler on its own core, so the "today only CPU0"
+ * framing below is RETIRED (2026-08-27) -- the window now shows whichever
+ * core's interface answered, and CPU0's slice is no longer the whole story.
+ * Exposed via breadcrumb at 0x00018300+. */
 #define IRQ_COUNTER_BC_BASE 0x00018300UL
 
 /* Report to the shared jitter window (0x50000500) every this many ticks -

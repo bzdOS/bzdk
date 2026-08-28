@@ -26,10 +26,12 @@
  *     zero length on QueueNotify(1). Nothing to act on for a keyboard with
  *     no LEDs; not draining it would stall the driver's output path forever.
  *
- * CROSS-CORE: same split as vnet_emac.c. CPU0 runs the guest and owns ALL
- * register emulation (vinput_mmio_fault -> vinput_reg_read/write) because
- * only CPU0 ever takes a guest trap. vinput_send_key() is called from CPU1
- * (dbgmon.c, on an operator command) — the exact same cross-core shape as
+ * CROSS-CORE: CPU0 runs the guest's primary vCPU and owns ALL register
+ * emulation (vinput_mmio_fault -> vinput_reg_read/write); since vcpu1/2/3
+ * the OTHER three cores take guest traps too and reach the same emulation
+ * (the tables and ring state are shared, not banked). vinput_send_key() is
+ * called from CPU1 (dbgmon.c, on an operator command) — the exact same
+ * cross-core shape as
  * vnet_emac_rx_frame() being called from CPU1's emac_poll() loop, so the
  * same reasoning applies: steady-state per-queue ring state (desc/avail/
  * used/last_avail) is safe because only CPU1 ever walks the eventq (queue 0)
