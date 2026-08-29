@@ -60,20 +60,26 @@ deferred to the owner and is still theirs to call.
 
 **2026-08-29 close-out — remaining context, in order of work:**
 
-0. **Mesa source restore — DONE (2026-08-29, after a false alarm).**
-   `/opt/src/mesa-26.2.0` was deleted by an agent; the tarball was re-fetched
-   complete + valid (`/opt/mesa-26.2.0.tar.xz`, 68461648 B, `xz -t` OK) and
-   extracted to `/opt/src/mesa-26.2.0` (396 MB, `tar` exited 0). The build dir
-   `/opt/build/mesa` (ninja, 43/993) is intact; `ninja -j2` resumed. **Lesson from
-   the wild-goose chase**: `tar` on this guest is `bsdtar` — `pgrep -c tar`
-   returns 0 even while it runs, so "tar is dead" was a measurement artifact, and
-   the 400 MB extract over xz + slow eMMC just takes ~15 min (don't poll with
-   `pgrep tar`; watch `du -sh` / the extract log's `EXIT=`). Investigated
-   exhaustively first (HV per-core fault window = 0, EMAC BC stage=11/link=1
-   stable = no board reset, guest 1.1 GB free / no swap / no OOM, no UFS panic,
-   no `exited on signal` in dmesg, console silent) — all clean. So it was never
-   crashing; only slow + mis-polled. The standalone Mesa build is NOT on the
-   v0.0.2 path but is unblocked now.
+0. **Mesa source restore + build — DONE (2026-08-29).** Source tree
+   `/opt/src/mesa-26.2.0` re-fetched + extracted (396 MB, `tar` exited 0; the
+   earlier "extract kills the guest" was a false alarm — `bsdtar` vs `pgrep
+   tar`, plus a slow ~15 min xz+eMMC extract). `ninja -j1` then **completed**:
+   final link `[28/28] dri_gbm.so`, `BUILD_DONE`, artifacts present
+   (`libEGL_mesa.so.0.0.0` 339 KB, `libgbm.so.1.0.0`, `dri_gbm.so`, 4 `.so`
+   total — config is EGL/GBM + lima per `mesa-setup.sh`). **Build blocker found
+   + worked around**: python3.12 intermittently SIGSEGVs (signal 11, core
+   dumped — dmesg-confirmed) during the XML codegen steps (glapi marshal,
+   egl dispatch). It is NON-DETERMINISTIC: the very target that failed in a bulk
+   run (`src/egl/g_egldispatchstubs.c`) builds clean on a solo `ninja` retry, and
+   a bounded ninja retry-loop (`/opt/ninja-loop.sh`, 12 attempts) converged on
+   attempt 1. Signature = a guest-side C-extension (expat/pyexpat) allocator
+   non-determinism under variance, NOT a hard HV stage-2 hole: failures occurred
+   at healthy free memory (629 MB) and succeeded on retry, and the HV per-core
+   fault window stayed 0 during the extract. Definitive HV discriminator (in case
+   it recurs deterministically) = the flight-recorder data-abort ring
+   (`FLTR_K_DABT`, el2_exc.c:1046) — a spurious stage-2→stage-1 abort there would
+   implicate the HV. Standalone Mesa build is NOT on the v0.0.2 path; it is
+   complete now.
 1. **Cold-boot PHY lottery is the release gate.** Escalation + retry are
    deployed; the board must survive **one live dark cold boot** (physical
    power-cycle equivalent) that self-heals. Do not tag/push hard before that

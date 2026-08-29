@@ -357,15 +357,25 @@ Everything in 0.0.1's list still stands except where noted, plus:
   check -s` said nothing because that package's file list in pkg's database is
   empty. Repaired from intact references already on the board; a sweep of every
   package with an exact-version cached reference found no further damage.
-- **The Mesa sources were DELETED 2026-08-29 and are RESTORED (2026-08-29).**
-  An agent `rm -rf /opt/src` swept `/opt/src/mesa-26.2.0` (399 MB) during a
-  cleanup. The build state `/opt/build/mesa` (ninja, 43/993 targets) survived.
-  The tarball was re-fetched complete + valid (`/opt/mesa-26.2.0.tar.xz`,
-  68461648 B, `xz -t` OK) and extracted to `/opt/src/mesa-26.2.0` (396 MB,
-  `tar` exited 0); `ninja -j2` resumed. The earlier "extract kills the guest"
-  read was a false alarm — `tar` is `bsdtar` (so `pgrep tar` misses it) and the
-  400 MB extract over xz + slow eMMC simply takes ~15 min; HV fault window, EMAC
-  BC, guest free memory and dmesg were all clean. The `mesa-2phase.sh`,
+- **The Mesa sources were DELETED 2026-08-29, RESTORED (2026-08-29), and the
+  standalone build is now COMPLETE (2026-08-29).** An agent `rm -rf /opt/src`
+  swept `/opt/src/mesa-26.2.0` (399 MB) during a cleanup. The build state
+  `/opt/build/mesa` (ninja, 43/993 targets) survived. The tarball was re-fetched
+  complete + valid (`/opt/mesa-26.2.0.tar.xz`, 68461648 B, `xz -t` OK) and
+  extracted (396 MB, `tar` exited 0). `ninja -j1` then finished: final link
+  `[28/28] dri_gbm.so`, `BUILD_DONE`, artifacts present (`libEGL_mesa.so.0.0.0`
+  339 KB, `libgbm.so.1.0.0`, `dri_gbm.so`, 4 `.so` total — config is EGL/GBM +
+  lima per `mesa-setup.sh`). **Build blocker:** python3.12 intermittently
+  SIGSEGVs (signal 11, core dumped — dmesg-confirmed) during the XML codegen
+  steps (glapi marshal, egl dispatch). Non-deterministic: the same target fails
+  in a bulk run yet builds clean on a solo retry, and a bounded ninja retry-loop
+  (`/opt/ninja-loop.sh`) converged on attempt 1. Signature = guest-side
+  expat/pyexpat allocator non-determinism, NOT a hard HV stage-2 hole (failures
+  at 629 MB free, succeed on retry, HV per-core fault window 0 during extract).
+  Definitive HV discriminator if it recurs: the flight-recorder data-abort ring
+  (`FLTR_K_DABT`, el2_exc.c:1046). The earlier "extract kills the guest" read was
+  a false alarm — `tar` is `bsdtar` (so `pgrep tar` misses it) and the 400 MB
+  extract over xz + slow eMMC simply takes ~15 min. The `mesa-2phase.sh`,
   `/opt/pylibs`, `/opt/mesa-setup.sh`/`mesa-setup.log` artifacts are intact.
   Option set was verified (`Gallium drivers: lima`, EGL/GBM, `meson setup`
   completes on the
