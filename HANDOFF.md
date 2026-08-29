@@ -80,7 +80,48 @@ deferred to the owner and is still theirs to call.
    (`FLTR_K_DABT`, el2_exc.c:1046) — a spurious stage-2→stage-1 abort there would
    implicate the HV. Standalone Mesa build is NOT on the v0.0.2 path; it is
    complete now.
-1. **Cold-boot PHY lottery is the release gate.** Escalation + retry are
+ 0b. **Custom driver stack (lima/bzkms/bzfb) rebuilt + loaded + EGL/GBM render
+    verified — DONE (2026-08-29, this session).** The Mesa userspace above is
+    only half: it needs the three out-of-tree kernel modules that give the guest
+    a real GPU + KMS device. All three were cross-built on the host against
+    `freebsd-src-earlyboot-wt` + `drm-kmod` (the SAME tree `drm.ko` came from,
+    with `dma_buf_mmap` applied — a mismatched tree would KBI-panic), deployed to
+    the guest `/opt/modules/`, and loaded live:
+    - `lima.ko` (rebuilt fresh this session) → `[drm] Initialized lima 1.1.0
+      ... on minor 0` → `/dev/dri/card0` + `/dev/dri/renderD128` (Mali-400
+      render). KBI matched the running kernel — the fresh module loaded with no
+      version complaint, so the kernel tree HEAD is unchanged since the board's
+      kernel was built.
+    - `bzkms.ko` → `[drm] Initialized bzkms 1.0.0 20260820 ... KMS device
+      registered`, window 1120x276, doorbell mapped → `/dev/dri/card1`.
+    The project's own `bsdOS/hal/bzfb/tests/limakms.c` was built natively on the
+    guest (`-ldrm -lEGL -lGLESv2 -lgbm -lm`, `-I/usr/local/include/libdrm`) and
+    run: **`EGL 1.5  renderer: Mali-400 via lima`** — accelerated rendering
+    through the custom Mali driver is PROVEN (~130 fps `eglSwapBuffers`), and
+    bzkms enumerates as a KMS device (connector 35, crtc 33, mode 1120x276@59).
+    **The KMS page-flip present is gated by DRM-master (EPERM) in a headless ssh
+    session** — the guest `vt` holds master on `card1`, so a non-console client
+    cannot `drmModeSetCrtc`/`PageFlip` (`drmSetMaster` itself returns EPERM,
+    `isMaster=0`). That is an environment/session gate, NOT a driver failure:
+    the same doorbell-present path is already proven via the `bzfb` ioctl
+    (`hal/bzfb`, 1047 fps), and a real Wayland/X compositor running on the active
+    VT would be master and present fine. **Upstream patches:
+    `bsdOS/hal/lima/patches/SUBMISSION-KIT.md` is "ready to send"** — 10 patches,
+    three destinations (drm-kmod / freebsd-src / freebsd-ports), every claim
+    carrying a measured number; the build from the patched trees validates them.
+    Mesa userspace was installed system-wide to `/usr/local` (the guest `/` is ro
+    by design, so it was `mount -u -o rw /`'d first; `libEGL_mesa.so.0.0.0` is
+    the lima build, `50_mesa.json` points glvnd at it).
+
+    **FLAG — IR claim may be stale.** §1 above and §3c say `aw_ir0` attaches
+    live ("IR all handed to the guest", "live and proven"). On the running board
+    this session, `dmesg` showed NO `aw_ir0` attach and `config -x /boot/kernel`
+    reported a stale GENERIC+evdev image with no `aw_cir` — i.e. the running TFTP
+    kernel does NOT carry the driver. The deployed `tftpboot/kernel` may differ
+    from what is actually loaded, or `aw_cir` failed to attach silently. Re-verify
+    IR after the next TFTP reload before trusting the "proven" status.
+
+ 1. **Cold-boot PHY lottery is the release gate.** Escalation + retry are
    deployed; the board must survive **one live dark cold boot** (physical
    power-cycle equivalent) that self-heals. Do not tag/push hard before that
    is observed or deliberately waived.
