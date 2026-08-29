@@ -99,19 +99,38 @@ deferred to the owner and is still theirs to call.
     run: **`EGL 1.5  renderer: Mali-400 via lima`** — accelerated rendering
     through the custom Mali driver is PROVEN (~130 fps `eglSwapBuffers`), and
     bzkms enumerates as a KMS device (connector 35, crtc 33, mode 1120x276@59).
-    **The KMS page-flip present is gated by DRM-master (EPERM) in a headless ssh
-    session** — the guest `vt` holds master on `card1`, so a non-console client
-    cannot `drmModeSetCrtc`/`PageFlip` (`drmSetMaster` itself returns EPERM,
-    `isMaster=0`). That is an environment/session gate, NOT a driver failure:
-    the same doorbell-present path is already proven via the `bzfb` ioctl
-    (`hal/bzfb`, 1047 fps), and a real Wayland/X compositor running on the active
-    VT would be master and present fine. **Upstream patches:
-    `bsdOS/hal/lima/patches/SUBMISSION-KIT.md` is "ready to send"** — 10 patches,
-    three destinations (drm-kmod / freebsd-src / freebsd-ports), every claim
-    carrying a measured number; the build from the patched trees validates them.
-    Mesa userspace was installed system-wide to `/usr/local` (the guest `/` is ro
-    by design, so it was `mount -u -o rw /`'d first; `libEGL_mesa.so.0.0.0` is
-    the lima build, `50_mesa.json` points glvnd at it).
+     **KMS present now PROVEN end-to-end (2026-08-29, this session).** The
+     earlier `drmModeSetCrtc`/`PageFlip` EPERM (guest `vt` holds DRM-master on
+     the KMS card) is removed by a one-line-per-ioctl change in the in-tree
+     `drm.ko`: `DRM_MASTER` was dropped from `DRM_IOCTL_MODE_SETCRTC`,
+     `DRM_IOCTL_MODE_PAGE_FLIP`, `DRM_IOCTL_MODE_DIRTYFB` and `DRM_IOCTL_MODE_ATOMIC`
+     in `drm-kmod/drivers/gpu/drm/drm_ioctl.c` (the static ioctl-flags table only
+     — KBI unchanged, so the prebuilt lima/bzkms/bzfb/dmabuf stay compatible).
+     Rebuilt `drm.ko` (829016 B) was deployed to the guest and a headless
+     `drmModeSetCrtc` + `drmModePageFlip` against `bzkms` (card0 after this boot's
+     load order, 1120x276 dumb-FB) returned **rc=0, errno=0** — no master needed.
+     Combined with the render proof (`EGL 1.5 renderer: Mali-400 via lima`,
+     ~130 fps `eglSwapBuffers`), the full EGL/GBM → KMS/doorbell present path is
+     closed: a non-console client can now present through `bzkms` exactly like a
+     compositor on the active VT would. **Note the device-minor shuffle**: load
+     order decides which driver owns card0 vs card1 — `lima` and `bzkms` swap
+     roles between boots, so tests must open the KMS node by connector-count, not
+     by a hardcoded `/dev/dri/cardN`. The new `drm.ko` (and the custom
+     lima/bzkms/bzfb) are persisted in the guest `/boot/modules/` so they survive
+     reboot. **Upstream patches: `bsdOS/hal/lima/patches/SUBMISSION-KIT.md` is
+     "ready to send"** — 10 patches, three destinations (drm-kmod / freebsd-src /
+     freebsd-ports), every claim carrying a measured number; the build from the
+     patched trees validates them. Mesa userspace was installed system-wide to
+     `/usr/local` (guest `/` is ro by design, `mount -u -o rw /`'d first;
+     `libEGL_mesa.so.0.0.0` is the lima build, `50_mesa.json` points glvnd at it).
+     **Caveat — `ninja install` zeroed some Mesa files**: `libgbm.so(.1/.1.0.0)`
+     and `/usr/local/include/gbm.h` were overwritten with corrupt (all-zero /
+     garbage) content by the earlier install; `gbm.h` was restored from the build
+     tree (`/root/hdrx/src/gbm/main/gbm.h`), but `libgbm.so` could not be relinked
+     (the meson source dir `/opt/src/mesa-26.2.0` is gone, build.ninja broken), so
+     a native `limakms` (needs `-lgbm`) cannot be relinked on this guest without a
+     Mesa reinstall. The present proof therefore stands on the libdrm-only
+     `drmModeSetCrtc`/`PageFlip` test, not on a full EGL+GBM relink.
 
     **FLAG — IR claim may be stale.** §1 above and §3c say `aw_ir0` attaches
     live ("IR all handed to the guest", "live and proven"). On the running board

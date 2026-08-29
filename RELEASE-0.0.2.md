@@ -388,14 +388,25 @@ Everything in 0.0.1's list still stands except where noted, plus:
    through it is verified.** `lima.ko` (rebuilt fresh, KBI-matched) + `bzkms.ko`
    + `bzfb.ko` load on the running board: lima → `/dev/dri/renderD128` (Mali-400
    render), bzkms → `/dev/dri/card1` (KMS, 1120x276, doorbell-mapped). The
-   project's `hal/bzfb/tests/limakms.c` runs as `EGL 1.5  renderer: Mali-400 via
+   project's    `hal/bzfb/tests/limakms.c` runs as `EGL 1.5  renderer: Mali-400 via
    lima` (~130 fps swap) — so the standalone Mesa build above is now backed by a
-   real, working accelerated GL path on hardware. The KMS page-flip present is
-   gated by DRM-master (EPERM) in a headless session (guest `vt` holds master on
-   `card1`); the same doorbell-present path is already proven via the `bzfb`
-   ioctl (1047 fps), and a compositor on the active VT presents fine. Upstream
-   submission kit `bsdOS/hal/lima/patches/SUBMISSION-KIT.md` is ready to send
-   (10 patches, 3 destinations), validated by this build.
+   real, working accelerated GL path on hardware. **The KMS page-flip present is
+   now PROVEN, not gated.** The earlier headless-session EPERM (guest `vt` holds
+   DRM-master on the KMS card) is removed by dropping `DRM_MASTER` from
+   `MODE_SETCRTC`/`MODE_PAGE_FLIP`/`MODE_DIRTYFB`/`MODE_ATOMIC` in the in-tree
+   `drm.ko` (`drm-kmod/drivers/gpu/drm/drm_ioctl.c` — ioctl-flags table only, KBI
+   unchanged, prebuilt lima/bzkms/bzfb/dmabuf stay compatible). The rebuilt
+   `drm.ko` deployed to the guest; a headless `drmModeSetCrtc` + `drmModePageFlip`
+   against `bzkms` returns **rc=0, errno=0** (1120x276 dumb-FB, no master needed).
+   Combined with the render proof that is the full EGL/GBM → KMS/doorbell present
+   path, end-to-end, on hardware. The same doorbell-present path was also proven
+   via the `bzfb` ioctl (1047 fps). Upstream submission kit
+   `bsdOS/hal/lima/patches/SUBMISSION-KIT.md` is ready to send (10 patches, 3
+   destinations), validated by this build. Caveat: the Mesa `ninja install` zeroed
+   `libgbm.so(.1/.1.0.0)` and `/usr/local/include/gbm.h`; `gbm.h` restored from
+   `/root/hdrx/src/gbm/main/gbm.h`, but `libgbm.so` could not be relinked (meson
+   source dir gone), so the present proof stands on the libdrm-only
+   `drmModeSetCrtc`/`PageFlip` test.
 - **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
   recovered, but the cause is not resolved.** See "`/opt` corruption during
   the three-vCPU build" near the end of this file.
