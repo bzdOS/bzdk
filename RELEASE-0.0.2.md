@@ -357,18 +357,15 @@ Everything in 0.0.1's list still stands except where noted, plus:
   check -s` said nothing because that package's file list in pkg's database is
   empty. Repaired from intact references already on the board; a sweep of every
   package with an exact-version cached reference found no further damage.
-- **The Mesa sources were DELETED 2026-08-29 and restore is BLOCKED on the
-  guest environment.** An agent `rm -rf /opt/src` swept `/opt/src/mesa-26.2.0`
-  (399 MB) during a cleanup. The build state `/opt/build/mesa` (ninja, 43/993
-  targets) survived, but the *source tree is gone*. The tarball is back,
-  complete and valid: `/opt/mesa-26.2.0.tar.xz` (68461648 bytes, `fetch` exit 0,
-  `xz -t` exit 0). **Unpacking it kills the guest** — `xz -dc --memlimit=256MiB |
-  tar -xf - -C /opt/src` (and to `/tmp`) dies deterministically at the 34th
-  top-level entry entering `src/`; the daemon'd job is SIGKILLed before writing
-  its exit code, `/opt` stays `rw` with no fs panic and no OOM in `dmesg`, but
-  sshd resets under the load — RAM/IO saturation of the constrained guest
-  working set. Leave it off the v0.0.2 path; to unblock: extract on the host
-  and push the tree, or chunked extract, or more guest RAM. The `mesa-2phase.sh`,
+- **The Mesa sources were DELETED 2026-08-29 and are RESTORED (2026-08-29).**
+  An agent `rm -rf /opt/src` swept `/opt/src/mesa-26.2.0` (399 MB) during a
+  cleanup. The build state `/opt/build/mesa` (ninja, 43/993 targets) survived.
+  The tarball was re-fetched complete + valid (`/opt/mesa-26.2.0.tar.xz`,
+  68461648 B, `xz -t` OK) and extracted to `/opt/src/mesa-26.2.0` (396 MB,
+  `tar` exited 0); `ninja -j2` resumed. The earlier "extract kills the guest"
+  read was a false alarm — `tar` is `bsdtar` (so `pgrep tar` misses it) and the
+  400 MB extract over xz + slow eMMC simply takes ~15 min; HV fault window, EMAC
+  BC, guest free memory and dmesg were all clean. The `mesa-2phase.sh`,
   `/opt/pylibs`, `/opt/mesa-setup.sh`/`mesa-setup.log` artifacts are intact.
   Option set was verified (`Gallium drivers: lima`, EGL/GBM, `meson setup`
   completes on the
