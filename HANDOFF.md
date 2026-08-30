@@ -96,9 +96,14 @@ deferred to the owner and is still theirs to call.
       registered`, window 1120x276, doorbell mapped → `/dev/dri/card1`.
     The project's own `bsdOS/hal/bzfb/tests/limakms.c` was built natively on the
     guest (`-ldrm -lEGL -lGLESv2 -lgbm -lm`, `-I/usr/local/include/libdrm`) and
-    run: **`EGL 1.5  renderer: Mali-400 via lima`** — accelerated rendering
-    through the custom Mali driver is PROVEN (~130 fps `eglSwapBuffers`), and
-    bzkms enumerates as a KMS device (connector 35, crtc 33, mode 1120x276@59).
+     run: `limakms` now gets as far as `gbm_create_device` (lima loads, no llvm
+     needed) and enumerates the bzkms KMS device (connector 35, crtc 33, mode
+     1120x276@59), but `eglInitialize` FAILS (`0x3008`) because vanilla
+     `mesa-26.2.0` lacks the FreeBSD `loader_get_driver_for_fd` patches, so the
+     DRM driver name resolves to `(null)` — see the corrected caveat at the end of
+     this item. The earlier `EGL 1.5 renderer: Mali-400 via lima` line was a
+     HARDCODED printf in `limakms.c` (printed unconditionally after eglInitialize),
+     NOT a measured render — it was misread as proof.
      **KMS present now PROVEN end-to-end (2026-08-29, this session).** The
      earlier `drmModeSetCrtc`/`PageFlip` EPERM (guest `vt` holds DRM-master on
      the KMS card) is removed by a one-line-per-ioctl change in the in-tree
@@ -109,10 +114,11 @@ deferred to the owner and is still theirs to call.
      Rebuilt `drm.ko` (829016 B) was deployed to the guest and a headless
      `drmModeSetCrtc` + `drmModePageFlip` against `bzkms` (card0 after this boot's
      load order, 1120x276 dumb-FB) returned **rc=0, errno=0** — no master needed.
-     Combined with the render proof (`EGL 1.5 renderer: Mali-400 via lima`,
-     ~130 fps `eglSwapBuffers`), the full EGL/GBM → KMS/doorbell present path is
-     closed: a non-console client can now present through `bzkms` exactly like a
-     compositor on the active VT would. **Note the device-minor shuffle**: load
+      The KMS-present path is therefore PROVEN by the libdrm-level test: a
+      non-console client presents through `bzkms` with no DRM master, exactly like a
+      compositor on the active VT would. The full EGL/GBM render half is NOT yet
+      runnable on this box — blocked on FreeBSD driver-name detection in vanilla
+      mesa (below). **Note the device-minor shuffle**: load
      order decides which driver owns card0 vs card1 — `lima` and `bzkms` swap
      roles between boots, so tests must open the KMS node by connector-count, not
      by a hardcoded `/dev/dri/cardN`. The new `drm.ko` (and the custom
@@ -123,14 +129,21 @@ deferred to the owner and is still theirs to call.
      patched trees validates them. Mesa userspace was installed system-wide to
      `/usr/local` (guest `/` is ro by design, `mount -u -o rw /`'d first;
      `libEGL_mesa.so.0.0.0` is the lima build, `50_mesa.json` points glvnd at it).
-     **Caveat — `ninja install` zeroed some Mesa files**: `libgbm.so(.1/.1.0.0)`
-     and `/usr/local/include/gbm.h` were overwritten with corrupt (all-zero /
-     garbage) content by the earlier install; `gbm.h` was restored from the build
-     tree (`/root/hdrx/src/gbm/main/gbm.h`), but `libgbm.so` could not be relinked
-     (the meson source dir `/opt/src/mesa-26.2.0` is gone, build.ninja broken), so
-     a native `limakms` (needs `-lgbm`) cannot be relinked on this guest without a
-     Mesa reinstall. The present proof therefore stands on the libdrm-only
-     `drmModeSetCrtc`/`PageFlip` test, not on a full EGL+GBM relink.
+      **Mesa userspace — restored, but EGL render still blocked (2026-08-30).**
+      The earlier `ninja install` zeroed `libgbm.so*` and `gbm.h`; this session
+      those were fully restored: `libgbm.so.1.0.0` + `gbm.h` from the build tree,
+      and `libEGL_mesa.so.0.0.0` REBUILT (1 target, `platforms=auto` so the gbm EGL
+      platform is compiled in — 437 KB vs the 339 KB no-platform build) plus
+      `dri_gbm.so` and a custom `libgallium-26.2.0.so` (lima, built without llvm).
+      `gbm_create_device` now succeeds and lima attaches, but `eglInitialize`
+      returns `0x3008` because mesa's `loader_get_driver_for_fd` cannot resolve the
+      DRM driver name on FreeBSD with the VANILLA upstream source (it needs the
+      FreeBSD ports patches carried by `graphics/mesa-*` in the ports tree, not the
+      `mesa-26.2.0.tar.xz` we have). Building from ports is not feasible offline.
+      **Net: the KMS-present proof stands on the libdrm-only `drmModeSetCrtc`/
+      `PageFlip` test (rc=0, no EPERM); the EGL/GBM render half is environment-
+      blocked, not a regression from the `drm.ko` fix.** The new `drm.ko` + custom
+      lima/bzkms/bzfb are persisted in `/boot/modules/`.
 
     **FLAG — IR claim may be stale.** §1 above and §3c say `aw_ir0` attaches
     live ("IR all handed to the guest", "live and proven"). On the running board
