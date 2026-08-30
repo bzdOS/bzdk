@@ -76,6 +76,11 @@
                     * naked seconds-long wait here would trip the watchdog. */
 #include "timer.h" /* timer_now()/timer_freq() — emac_link_watchdog()'s own
                     * rate limit; same timebase the CPU1 loop already uses. */
+#include "hv_addrmap.h" /* HVMAP_WDEP_BASE — the watchdog EPISODE record
+                    * window (see the map in hv_addrmap.h; written ONLY by
+                    * the watchdog/poll paths below, never by emac_init(),
+                    * so it survives a recovery reboot and still describes
+                    * the episode). */
 
 /* ------------------------------------------------------------------ */
 /* Physical bases (DTS-verified)                                       */
@@ -516,6 +521,59 @@ static uint32_t g_first_rx_latched;   /* one-shot: has ANY frame ever arrived */
  * emac.h comment on emac_wd_test_mode(). */
 static uint32_t g_wd_test_mode;
 static uint32_t g_wd_test_skips;
+
+/* ---- Watchdog EPISODE record ("WDEP" @ HVMAP_WDEP_BASE) ----------------
+ * Survives WDOG warm resets; written ONLY here (watchdog, link_recheck,
+ * emac_poll), never by emac_init(), so after a recovery reboot it still
+ * describes what happened DURING the dark episode. Layout in hv_addrmap.h.
+ * The bss "booted" flag gives per-boot semantics: the first stamp in a boot
+ * bumps the seq word and clears the per-boot counters. */
+#define WDEP_MAGIC   0x57444550u   /* "WDEP" */
+static uint32_t g_wdep_booted;
+static uint32_t g_wdep_ring_idx;
+static uint32_t g_wdep_poll_cnt;
+static uint32_t g_wdep_giveups;
+static uint32_t g_wdep_rekicks;
+static uint32_t g_wdep_sickx;
+
+static void wdep_write(unsigned i, uint32_t v)
+{
+    volatile uint32_t *p = (volatile uint32_t *)(HVMAP_WDEP_BASE + i * 4u);
+    *p = v;
+    __asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+}
+
+static uint32_t wdep_read(unsigned i)
+{
+    volatile uint32_t *p = (volatile uint32_t *)(HVMAP_WDEP_BASE + i * 4u);
+    uint32_t v = *p;
+    __asm__ volatile("dc ivac, %0\n\tdsb sy" :: "r"(p) : "memory");
+    return v;
+}
+
+/* Once-per-boot stamp: bump the seq. Deliberately clears NOTHING: every
+ * counter/sampling word is written on-CHANGE only (see below), so the
+ * values written during a dark episode survive the recovery boot and are
+ * still readable afterwards — the 2026-08-30 experiments lost their
+ * forensics precisely because a fresh boot re-initialised the window. */
+static void wdep_boot(void)
+{
+    if (g_wdep_booted)
+        return;
+    g_wdep_booted = 1;
+    wdep_write(1, wdep_read(1) + 1u);
+    wdep_write(0, WDEP_MAGIC);
+}
+
+/* Write-on-change: only touch DRAM when the value differs from what the
+ * window already holds, so steady-state healthy traffic (BMSR 0x796d,
+ * link up, ...) stops writing and the LAST DIFFERENT values — i.e. the
+ * tail of the previous episode — stay readable after any reboot. */
+static void wdep_wc(unsigned i, uint32_t v)
+{
+    if (wdep_read(i) != v)
+        wdep_write(i, v);
+}
 
 /* emac_poll() throttling/debounce constants for live link monitoring. */
 #define LINK_CHECK_INTERVAL     256   /* polls between MDIO BMSR reads (power
@@ -991,6 +1049,39 @@ static void link_recheck(void)
      * treat it exactly like a read failure. */
     up = (bmsr >= 0) && (bmsr != 0xffff) && (bmsr & BMSR_LSTATUS);
 
+    /* [FOUND LIVE 2026-08-30, phycut DC1SW-cut experiment, episode record
+     * @ HVMAP_WDEP_BASE] BMSR alone LIES after a PHY power cycle: the
+     * RTL8211E retrains with the switch using its POR-default advertisement
+     * (gigabit capable — our restricted EMAC_AN_ADVERT died with the rail),
+     * so the link comes up at 1000FD against a MAC still programmed for
+     * 100FD. BMSR truthfully reports CARRIER; every frame is garbage; the
+     * console AND the guest's vtnet are dead while the watchdog sees
+     * "healthy". Cross-check the RESOLVED speed/duplex (PHYSR, reg 0x11)
+     * against the speed/duplex the MAC is actually programmed for: a
+     * mismatch counts as down, which routes the episode into the existing
+     * sick -> re-kick path (whose phy_startup re-programs the restricted
+     * advertisement and retrains at 100FD). Also guards the plain case of
+     * a remote reconfig (far end forced to a different speed). */
+    int physr = mdio_read(PHY_ADDR, RTL_PHYSR);
+    wdep_wc(14, (uint32_t)(physr & 0xffff));
+    if (up) {
+        uint32_t sp = ((uint32_t)physr >> PHYSR_SPEED_SHIFT) & PHYSR_SPEED_MASK;
+        uint32_t plink_sp = (sp == 2) ? 1000u : (sp == 1) ? 100u : 10u;
+        int pd = (physr & PHYSR_DUPLEX) ? 1 : 0;
+        up = (physr >= 0) && (physr != 0xffff) && (physr & PHYSR_LINK) &&
+             (plink_sp == g_speed) && (pd == ((rd(EMAC_CTL0) & EMAC_CTL0_FULL_DUPLEX) ? 1 : 0));
+    }
+
+    /* Episode-record: raw sample + link verdict (see HVMAP_WDEP_BASE). The
+     * ring of RAW values is the discriminator between "BMSR lies up",
+     * "reads 0xffff", and "sampling died" — the three theories the
+     * 2026-08-30 session could not separate without this record. */
+    wdep_boot();
+    wdep_wc(4, (uint32_t)(bmsr & 0xffff));
+    g_wdep_ring_idx = (g_wdep_ring_idx + 1u) % 3u;
+    wdep_write(9u + g_wdep_ring_idx, (uint32_t)(bmsr & 0xffff));
+    wdep_wc(5, (uint32_t)(up ? 1 : 0));
+
     if (up) {
         g_link_down_streak = 0;
         if (!g_link_up) {
@@ -1295,6 +1386,16 @@ int emac_link_watchdog(void)
         return 0;                         /* not due yet — cheap common path */
     g_wd_last_check_ticks = now;
 
+    wdep_boot();
+    {
+        /* healthy->sick transition counter for the episode record */
+        static uint32_t prev_healthy;
+        uint32_t healthy = (g_rx_count != 0 && g_link_up && !g_wd_test_mode);
+        if (prev_healthy && !healthy)
+            wdep_write(8, ++g_wdep_sickx);
+        prev_healthy = healthy;
+    }
+
     if (g_rx_count != 0 && g_link_up && !g_wd_test_mode)
         return 0;   /* healthy: traffic flows and the link is up now. The old
                      * test was "at least one frame has EVER arrived", which
@@ -1308,9 +1409,11 @@ int emac_link_watchdog(void)
 
     g_wd_attempts++;
     bc(18, g_wd_attempts);
+    wdep_write(2, g_wd_attempts);
     if (g_wd_attempts > LINK_WD_MAX_ATTEMPTS) {
         g_wd_gave_up = 1;
         bc(1, BC_STAGE_WD_GAVEUP);
+        wdep_write(3, ++g_wdep_giveups);
         return 1;           /* one-shot: tell the caller to consider escalating */
     }
 
@@ -1338,7 +1441,9 @@ int emac_link_watchdog(void)
         /* QUICK context — see phy_startup_ctx()/LINK_WAIT_PASSES_QUICK: the
          * tick owns all board I/O, so the re-kick must finish in seconds,
          * not minutes. */
+        wdep_write(6, ++g_wdep_rekicks);
         int linked = phy_startup_ctx(&duplex_full, 1);
+        wdep_write(7, (uint32_t)(linked ? 1 : 0));
         bc(4, linked ? 1 : 0);
         if (linked) {
             bc(5, g_speed);
@@ -1603,6 +1708,12 @@ void emac_poll(void)
 {
     bc(1, BC_STAGE_LOOP);
     bc(8, rd(EMAC_INT_STA));
+
+    /* Episode-record heartbeat: proves (after a recovery reboot) whether
+     * polling kept running through a dark episode, and roughly how long.
+     * One DRAM write per 256 polls — negligible. */
+    if ((++g_wdep_poll_cnt & 0xffu) == 0)
+        wdep_write(12, g_wdep_poll_cnt >> 8);
 
     /* Throttled live link check: MDIO transactions are relatively slow
      * (tens of us each), so we don't want one on every single poll — but we
