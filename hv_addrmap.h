@@ -177,6 +177,34 @@
 #define HVMAP_DBGTOOLS_SIZE         0x40UL            /* generous, room to grow */
 #define HVMAP_DBGTOOLS_END          (HVMAP_DBGTOOLS_BASE + HVMAP_DBGTOOLS_SIZE)
 
+/* ---- 0x50022000 watchdog EPISODE record ("WDEP", emac.c) --------------
+ * Written ONLY by emac.c's link-watchdog / link_recheck / emac_poll paths,
+ * NEVER by emac_init() — so the record survives the recovery reboot and
+ * still describes the EPISODE (the 0x50000100 EMAC bc window gets
+ * overwritten by the fresh boot's emac_init, which is exactly why the
+ * 2026-08-30 cold-boot experiments could not tell "the ladder never fired"
+ * from "the ladder fired and the evidence was scrubbed"). Layout:
+ *   [0]  0x57444550 "WDEP" magic
+ *   [1]  boot seq — incremented once per boot at the first stamp; a delta
+ *        of 2 across an episode proves the board rebooted mid-episode
+ *   [2]  link-watchdog attempts (live, last written)
+ *   [3]  give-up count this boot
+ *   [4]  last raw BMSR sampled by link_recheck
+ *   [5]  g_link_up at the last sample
+ *   [6]  re-kick count this boot
+ *   [7]  last re-kick phy_startup result (1 = link trained)
+ *   [8]  healthy->sick transitions this boot
+ *   [9]  BMSR sample ring slot 0   (rotating 3-sample history of the raw
+ *   [10] BMSR sample ring slot 1    values link_recheck has seen — the
+ *   [11] BMSR sample ring slot 2    discriminator between "BMSR lies up",
+ *                                    "reads 0xffff", and "sampling died")
+ *   [12] emac_poll() heartbeat (call counter, written every 256 calls)
+ * Next free page after this one: 0x50023000. */
+#define HVMAP_WDEP_BASE             0x50022000UL
+#define HVMAP_WDEP_SIZE             0x40UL
+#define HVMAP_WDEP_END              (HVMAP_WDEP_BASE + HVMAP_WDEP_SIZE)
+
+
 /* ---- Compile-time non-overlap proof (address-ordered chain) ------------- */
 _Static_assert(HVMAP_VBLK_BC + HVMAP_VBLK_BC_SIZE <= HVMAP_EMMC_LOCK,
                "vblk breadcrumbs overlap the eMMC lock word");
