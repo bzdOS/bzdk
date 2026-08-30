@@ -81,6 +81,13 @@ extern int  console_capture_end(char **out);
 extern void console_poll(void);
 extern void console_flush(void);
 
+/* emac.c's cold-boot PHY-lottery test lever (emac.h — externs, not an
+ * include, because dbgmon.c stays deliberately self-contained and some
+ * targets that link it do not link emac.o; those targets never execute the
+ * wdtest command, so the reference only needs to RESOLVE at link time in
+ * the builds that can reach it — same pattern as console_flush above). */
+extern void emac_wd_test_mode(int on);
+
 /* Guest single-step toggle, implemented in el2_exc.c (linked into the same
  * debugger build). Returns the new enabled state (1=on, 0=off). Passing the
  * live guest frame lets it arm PSTATE.SS on the eret that resumes the guest. */
@@ -1145,6 +1152,8 @@ static void cmd_help(void)
 	cputs("  bmc <verb> ...     software-BMC mgmt plane (bmc help)\r\n");
 	cputs("  hold               arm pause-before-guest-entry (takes effect NEXT warm reset)\r\n");
 	cputs("  release            release a currently-held pause-before-guest-entry\r\n");
+	cputs("  phycycle           DISABLED (EL2 RSB races the guest's iichb1 — use guest-side phycut)\r\n");
+	cputs("  wdtest on|off      software 'PHY never trains' — exercises the give-up/escalation ladder\r\n");
 	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
 	cputs("  zstage             re-run the 2nd guest's copy-in from the landing window\r\n");
 	cputs("  zunhalt            re-arm CPU3 after a failed zboot (0xBAD1/0xBAD2), no reload\r\n");
@@ -1429,6 +1438,35 @@ static void exec_line(char *line, struct el2_frame *frame)
 		 * kload_enter(). No-op if nothing is currently held. */
 		dbgtools_release_set();
 		cputs("release signaled (HVMAP_DBGTOOLS_RELEASE=1)\r\n");
+		return;
+	}
+	if (streq(cmd, "phycycle")) {
+		/* DISABLED 2026-08-30 — see emac.c's note. ANY EL2 RSB access
+		 * races the guest's iichb1/axp8xx driver (the guest owns the
+		 * bus); the one live attempt wedged the guest's interrupt path
+		 * (vtnet dead, cpu3 frozen). The physical PHY power-cut repro
+		 * lives guest-side now: /tmp/phycut.c over /dev/iic1. */
+		cputs("phycycle: disabled -- EL2 must not touch the RSB while the "
+		      "guest owns it (measured wedge 2026-08-30). Use the guest-"
+		      "side phycut (I2CRDWR /dev/iic1) instead.\r\n");
+		return;
+	}
+	if (streq(cmd, "wdtest")) {
+		/* Watchdog give-up/escalation ladder test: software "PHY refuses
+		 * to train" — attempts 1..7 (~48 s), BC_STAGE_WD_GAVEUP, one-shot
+		 * return 1 -> dbg_emac_watchdog_reboot -> wdt_debug_hold -> WDOG
+		 * reboot -> U-Boot -> TFTP. The console NEVER goes down (MDIO is
+		 * never touched), so the whole ladder is observable live and
+		 * cancellable with `wdtest off` up to the give-up. */
+		if (nt >= 2 && streq(tok[1], "off")) {
+			emac_wd_test_mode(0);
+			cputs("wdtest: off -- watchdog and phy_startup back to normal\r\n");
+			return;
+		}
+		emac_wd_test_mode(1);
+		cputs("wdtest: ON -- phy_startup now fails in software; the link "
+		      "watchdog will re-kick 6x (~48 s), give up, and reboot via "
+		      "WDOG+TFTP. Cancel with `wdtest off`.\r\n");
 		return;
 	}
 	if (streq(cmd, "vcpu2")) {

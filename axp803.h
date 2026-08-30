@@ -107,4 +107,36 @@ int axp803_init(void);
  * stay 0 / chip_ok stays 0 rather than reporting a stale or garbage value. */
 void axp803_read_health(struct axp803_health *out);
 
+/* Drive the DC1SW output ("vcc-phy" — the RTL8211E Ethernet PHY's supply on
+ * this board, per the DTB's emac node `phy-supply = <&reg_dc1sw>` with
+ * regulator-name "vcc-phy"). This is the only lever in the system that
+ * power-cycles the PHY without touching board power, i.e. the software
+ * reproduction of the cold-boot PHY-lottery condition (see HANDOFF.md §1).
+ *
+ * *** WARNING — MEASURED 2026-08-30 ***: in the standard build the GUEST
+ * owns the RSB bus (iichb1 + axp8xx_pmu0 in FreeBSD). Calling this from
+ * EL2 while the guest is up races the guest's driver and can wedge its
+ * interrupt path (measured: vtnet dead, cpu3 frozen). The DC1SW cut must
+ * therefore be done GUEST-SIDE (/tmp/phycut.c over /dev/iic1); this
+ * function remains for builds where no guest PMIC driver exists, and as
+ * the register-map documentation.
+ *
+ *   on = 0  -> clear OUTPUT_CTRL2.SW_EN (rail off, PHY loses power entirely)
+ *   on != 0 -> set OUTPUT_CTRL2.SW_EN  (rail back on, PHY runs its own POR)
+ *
+ * The register/bit citation is the SAME confidence class as the register map
+ * note above: AXP803 is register-compatible with AXP818 here, and U-Boot's
+ * include/axp818.h pins it down exactly:
+ *     AXP818_OUTPUT_CTRL2        0x12
+ *     AXP818_OUTPUT_CTRL2_SW_EN  (1 << 7)
+ * The function only ever read-modify-writes BIT 7 of register 0x12 — no
+ * voltage register is touched, and DC1SW's input rail (DCDC1, "vcc-3v3",
+ * always-on in the DTB) is left alone. Every write is verified by readback.
+ *
+ * Returns 0 on success (state written AND read back as requested), negative
+ * on an RSB read/write failure or a readback mismatch (state NOT trusted to
+ * have changed — caller must treat the rail state as unknown). *prev, when
+ * non-NULL, receives the register value seen before any write. */
+int axp803_dc1sw(int on, uint8_t *prev);
+
 #endif /* BZDOS_AXP803_H */

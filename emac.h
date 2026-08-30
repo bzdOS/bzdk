@@ -96,4 +96,22 @@ int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
  * returns 0 on every other call. */
 int emac_link_watchdog(void);
 
+/* Watchdog-ladder test mode ("PHY refuses to train" in software): while on,
+ * (a) emac_link_watchdog()'s healthy short-circuit is bypassed and (b)
+ * phy_startup() fails immediately WITHOUT touching MDIO — so the re-kick
+ * ladder attempts 1..7 -> BC_STAGE_WD_GAVEUP -> one-shot return 1 ->
+ * dbg_emac_watchdog_reboot -> wdt_debug_hold -> WDOG reboot runs its full
+ * course with the EMAC console perfectly alive throughout (the link is
+ * never actually down; the console can cancel with wdtest off at any
+ * point). This is the give-up/escalation half of the cold-boot gate,
+ * testable with zero channel risk. Breadcrumb [26] latches the state.
+ *
+ * NOTE on the PHYSICAL repro (actually cutting the PHY's power): do it
+ * FROM THE GUEST (/tmp/phycut.c — I2CRDWR over the guest's own iichb1
+ * adapter), NEVER from EL2: the guest owns the RSB bus in the standard
+ * build, and any EL2 RSB access races its driver (measured 2026-08-30:
+ * one EL2 poke wedged the guest's interrupt path, killed vtnet and froze
+ * cpu3). See HANDOFF.md §1. */
+void emac_wd_test_mode(int on);
+
 #endif /* BZDOS_EMAC_H */

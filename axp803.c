@@ -155,3 +155,43 @@ void axp803_read_health(struct axp803_health *out)
 	axp1_bc(6, out->idischg_ma);
 	axp1_bc(7, out->status);
 }
+
+/* ------------------------------------------------------------------ */
+/* DC1SW ("vcc-phy") control — see axp803.h for the full citation and    */
+/* safety contract. ONLY bit 7 of OUTPUT_CTRL2 (0x12) is ever written,   */
+/* read-modify-write, with a readback verify after every write.          */
+/* ------------------------------------------------------------------ */
+#define AXP803_REG_OUTPUT_CTRL2  0x12u
+#define AXP803_OUT_CTRL2_SW_EN   0x80u
+
+int axp803_dc1sw(int on, uint8_t *prev)
+{
+	uint8_t ctl = 0;
+
+	/* Defensive: re-assign the runtime address mapping (idempotent) so the
+	 * verb works even if axp803_init() never ran on this boot. */
+	if (rsb_set_device_address((uint16_t)AXP803_HWADDR,
+	                           (uint8_t)AXP803_RUNTIME) != 0)
+		return -1;
+	if (rsb_read((uint8_t)AXP803_RUNTIME, AXP803_REG_OUTPUT_CTRL2, &ctl) != 0)
+		return -2;
+	if (prev)
+		*prev = ctl;
+
+	{
+		uint8_t want = (uint8_t)(on ? (ctl | AXP803_OUT_CTRL2_SW_EN)
+		                            : (ctl & ~AXP803_OUT_CTRL2_SW_EN));
+		if (want == ctl)
+			return 0;                       /* already in the asked state */
+		if (rsb_write((uint8_t)AXP803_RUNTIME, AXP803_REG_OUTPUT_CTRL2,
+		              want) != 0)
+			return -3;
+		ctl = 0;
+		if (rsb_read((uint8_t)AXP803_RUNTIME, AXP803_REG_OUTPUT_CTRL2,
+		             &ctl) != 0)
+			return -4;
+		if (ctl != want)
+			return -5;                      /* readback mismatch */
+	}
+	return 0;
+}
