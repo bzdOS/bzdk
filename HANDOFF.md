@@ -55,8 +55,14 @@ survives full boots with the guest active; a cold boot whose PHY fails to
 train is self-healed by the link watchdog since `bc2d531` (one such boot
 still needed break-glass before that fix landed — the sequence is proven).
 
-Nothing is pushed to any remote. `v0.0.2-prealpha` is **not** tagged — that was
-deferred to the owner and is still theirs to call.
+**RELEASED 2026-08-30:** `v0.0.2-prealpha` tagged and pushed (`master:main`)
+on the owner's go-ahead, given after the cold-boot gate session above. The
+cold-boot mitigation chain was observed closing live on hardware for both
+software-observable halves of the failure mode (physical DC1SW cut →
+self-heal in ~90 s; wdtest never-trains → give-up → WDOG → TFTP recovery);
+the literal full-board physical power-cycle remains the owner's optional
+check — the board's power feed is not switchable from the build host
+(uhubctl probe over both ppps hubs, all ten ports: no effect).
 
 **2026-08-29 close-out — remaining context, in order of work:**
 
@@ -261,9 +267,8 @@ deferred to the owner and is still theirs to call.
    available to the owner, but every software-observable link in the chain
    has now been exercised and healed on the board. Tag/push decision
    remains the owner's.
-2. **Then tag `v0.0.2-prealpha` + push.** Update the tag-not-made note in this
-   file and `RELEASE-0.0.2.md` title, `git push origin master:main`, push the
-   tag. Commit author per the tree convention (Bodrov).
+2. **Tag `v0.0.2-prealpha` + push — DONE 2026-08-30** on the owner's
+   go-ahead (see the note at the top of this file).
 3. **Performance-invention ideas (this session's design pass)**, in desired
    order — "we own both the HV and its guest, so these are ours to do":
    - **TLBI by-IPA instead of TLBI-ALL** in `stage2_wx_flip()` — cheapest,

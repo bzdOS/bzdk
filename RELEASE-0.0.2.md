@@ -778,9 +778,16 @@ mitigated in two layers but not proven closed.
 the TFTP kernel)**: the IR item above is done — `aw_ir0` attaches live and
 `/dev/input/eventN` exist, `hw.ncpu=4`/`hw.realmem=0x78000000` intact. WiFi
 (brmcfmac source absent from this lineage) and the BZDBG-internal-only capture
-remain; the **cold-boot PHY lottery is still the one open tail before
-tag/push** — the escalation+retry wants one live dark boot to observe
-self-heal.
+remain. **The cold-boot PHY lottery closed 2026-08-30** (was "the one open
+tail before tag/push"): the live-repro tooling exposed three watchdog defects
+(BMSR 0xffff blindness, rings_init under live traffic, tick-starving budgets)
+plus the real mechanism — a re-powered RTL8211E retrains on its POR-default
+advert and comes up at the wrong speed/duplex against the MAC — all fixed;
+the self-heal chain was then observed closing live on hardware for both
+halves of the failure mode (DC1SW cut → healed in ~90 s without a reboot;
+software never-trains → give-up → WDOG → TFTP, channel alive). Full record
+in `HANDOFF.md` §1; the literal full-board physical power-cycle remains the
+owner's optional check (the board's power feed is not host-switchable).
 
 ## The last hours: two attempts that did not land, and why that is on record
 
