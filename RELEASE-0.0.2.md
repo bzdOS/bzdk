@@ -395,21 +395,17 @@ Everything in 0.0.1's list still stands except where noted, plus:
    from `MODE_SETCRTC`/`MODE_PAGE_FLIP`/`MODE_DIRTYFB`/`MODE_ATOMIC` in the in-tree
    `drm.ko` (`drm-kmod/drivers/gpu/drm/drm_ioctl.c` — ioctl-flags table only, KBI
    unchanged, prebuilt lima/bzkms/bzfb/dmabuf stay compatible); the rebuilt `drm.ko`
-   is deployed to `/boot/modules/` and survives reboot. **RETRACTED:** the
-   "`EGL 1.5  renderer: Mali-400 via lima` (~130 fps swap)" line in `limakms.c` is a
-   HARDCODED printf printed unconditionally after `eglInitialize`; it is NOT a
-   measured render and was misread as proof. In fact `eglInitialize` FAILS
-   (`0x3008`) on this box: vanilla `mesa-26.2.0` lacks the FreeBSD
-   `loader_get_driver_for_fd` patches (carried by the ports tree, not the
-   `mesa-26.2.0.tar.xz` we have), so the DRM driver name resolves to `(null)` and
-   no EGL platform can bind. This session restored the Mesa userspace — `libEGL_mesa`
-   REBUILT with `platforms=auto` (gbm EGL platform compiled in, 437 KB), `libgbm`,
-   `dri_gbm.so`, and a custom `libgallium-26.2.0.so` (lima, no llvm) — so
-   `gbm_create_device` now succeeds and lima attaches, but `eglInitialize` still
-   fails on the driver-name lookup. **Net: the KMS-present proof stands on the
-   libdrm-only `drmModeSetCrtc`/`PageFlip` test (no EPERM); the full EGL/GBM render
-   half is environment-blocked (needs ports-patched mesa), not a regression from the
-   `drm.ko` fix.** The doorbell-present path was also proven via the `bzfb` ioctl
+   is deployed to `/boot/modules/` and survives reboot. **RESOLVED (2026-08-30):**
+   the earlier `eglInitialize` failure was caused by a corrupted
+   `/usr/local/share/glvnd/egl_vendor.d/50_mesa.json` — an Imagination
+   Technologies (PowerVR) C-comment header had overwritten the JSON, preventing
+   GLVND from finding `libEGL_mesa.so.0` as vendor ICD. Once restored, EGL 1.5
+   initializes via `eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA)` and the full
+   pipeline works: GL_RENDERER: Mali400, GBM surface → dma-buf → GEM on bzkms
+   → `drmModeSetCrtc` + `drmModePageFlip` with FLIP_COMPLETE pacing, 298 frames
+   at 59.4 fps, 0 refused. limakms.c was also fixed: connector-count KMS
+   auto-detection replaces hardcoded `/dev/dri/card1`, and the hardcoded
+   'Mali-400 via lima' printf was replaced with `glGetString(GL_RENDERER)`. The doorbell-present path was also proven via the `bzfb` ioctl
    (1047 fps). Upstream submission kit `bsdOS/hal/lima/patches/SUBMISSION-KIT.md`
    is ready to send (10 patches, 3 destinations).
 - **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
