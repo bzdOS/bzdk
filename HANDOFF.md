@@ -159,6 +159,72 @@ deferred to the owner and is still theirs to call.
    deployed; the board must survive **one live dark cold boot** (physical
    power-cycle equivalent) that self-heals. Do not tag/push hard before that
    is observed or deliberately waived.
+
+   **2026-08-30 session — the repro now exists, and the deployed mitigation
+   turned out to have three real defects (all fixed, commit `1f3f1ee`); the
+   gate is still OPEN, and the next session's first item is recorded below.**
+
+   *The repro.* `phycut_guest.c` (guest-side) cuts AXP803 DC1SW — "vcc-phy",
+   the RTL8211E's only supply, per the DTB's `phy-supply` — for N ms and
+   restores it, every step readback-verified, over the guest's own iichb1
+   adapter (I2CRDWR, serialized by the guest's locks). Verified on hardware:
+   100 ms..1500 ms windows; cut and restore both land (run.log: "rail
+   restored after 1500 ms, tries=1"). Build it on the guest:
+   `cc -O2 -o /var/log/phycut/phycut phycut_guest.c` (NOT /tmp — tmpfs dies
+   with every reload). EL2 must NOT touch the RSB: the guest owns the bus
+   (iichb1 + axp8xx_pmu0), and one EL2 poke measurably wedged the guest's
+   interrupt path (vtnet dead, cpu3 frozen); the dbgmon `phycycle` verb is
+   disabled for that reason. `wdtest` (software "PHY never trains") is in
+   but NOT yet exercised — run it FIRST next session; it tests the
+   give-up→escalation ladder with zero channel risk.
+
+   *Defect 1 — BMSR 0xffff blindness.* An unpowered PHY leaves MDIO pulled
+   up; mdio_read returns 0xffff; BMSR_LSTATUS (0x4) is SET in 0xffff, so
+   link_recheck and the watchdog believed the link was UP while the wire was
+   provably dead (the guest's own pinger logged WIRE_DOWN straight through
+   it). No re-kick, no give-up, no escalation — console dead for that whole
+   boot. All-ones is now treated as no-link everywhere.
+
+   *Defect 2 — rings_init under live traffic.* The re-kick's unconditional
+   rings_init() violated its own "only while g_rx_count==0" contract ever
+   since the sick test was widened on 2026-08-27: one re-kick tore the rings
+   out from under CPU0's vnet TX and the RX ring stayed dead for the rest of
+   the boot. The re-arm now happens only when g_rx_count==0.
+
+   *Defect 3 — tick-starving budgets.* The re-kick used boot-time budgets
+   inside the tick that owns all board I/O: measured ~8 min total blackout
+   per episode (BMCR self-clear wait alone is 100000×~2 ms). phy_startup_ctx
+   (quick=1) bails on invalid ID / all-ones BMCR reads, uses a ~10 s link
+   budget, skips the fallback pass. The ladder now reaches give-up in ~1 min
+   of real attempts.
+
+   *New hardware fact:* the RTL8211E does NOT restart autoneg by itself
+   after a power cycle — after a verified cut+restore the wire stayed DOWN
+   indefinitely (guest-side pinger proof) until something MDIO-kicks it.
+   U-Boot does exactly that during a real cold boot's TFTP, which is why
+   real cold boots train.
+
+   *The remaining hole (next session, first item).* After ANY DC1SW cycle
+   (even 200 ms), the HV console never recovers that boot AND the board
+   never escalates to a WDOG reboot — so the watchdog never went sick nor
+   gave up, yet the console stays dead; with the wire down, the guest's
+   vtnet and ssh also stay dead. The tick must still be running (no WDOG
+   reset happens), so this is an interlock between link state sampling and
+   the console/re-kick paths that the current breadcrumbs cannot see: the
+   EMAC bc window gets overwritten by the fresh boot's emac_init after every
+   recovery, destroying the forensic values (bc[18] attempts would settle
+   "ladder fired or not"). Plan: (a) dedicate a scratch window (e.g.
+   0x50000200, outside every fresh-boot overwrite set) that ONLY the
+   watchdog writes (attempts, give-up, last BMSR raw, last 3 link_recheck
+   samples); (b) poll `bzdctl status` with FULL output capture every 2 s
+   during the experiment (the earlier greps silently missed malformed
+   output); (c) re-run phycut 200/1500 and read the episode record after
+   the marker recovery (`\x00~BZRST\x00` to /dev/ttyACM0 — proven three
+   times); (d) only then decide: fix the interlock, or waive the gate with
+   the physical cold-boot test.
+
+   Board recovered and healthy after every experiment (marker + TFTP, no
+   user action needed). Nothing pushed to any remote.
 2. **Then tag `v0.0.2-prealpha` + push.** Update the tag-not-made note in this
    file and `RELEASE-0.0.2.md` title, `git push origin master:main`, push the
    tag. Commit author per the tree convention (Bodrov).
