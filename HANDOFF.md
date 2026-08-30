@@ -225,6 +225,42 @@ deferred to the owner and is still theirs to call.
 
    Board recovered and healthy after every experiment (marker + TFTP, no
    user action needed). Nothing pushed to any remote.
+
+   **SAME SESSION, LATER — the missing interlock was found, fixed, and the
+   self-heal has now been OBSERVED closing live (commits `1f3f1ee`,
+   `821bd1e`).** The instrumentation that cracked it: a watchdog EPISODE
+   record ("WDEP" @ 0x50022000, layout in hv_addrmap.h) written only by the
+   watchdog/poll paths, write-on-change, so it survives the recovery reboot
+   and still describes the episode. Read after a marker recovery:
+   `BMSR read 0x796d (link up) the whole episode while the wire was
+   provably dead, attempts=0, sick=0` — the RTL8211E, re-powered after a
+   rail cut, retrains with the switch on its POR-default advertisement
+   (gigabit-capable; our restricted EMAC_AN_ADVERT died with the rail), so
+   the link comes up at 1000FD against a MAC still programmed for 100FD:
+   carrier genuinely up, every frame garbage, console AND guest vtnet dead,
+   watchdog "healthy" — forever. (It also explains the ep-6 guest pinger
+   death at ~+26 s.) Fix: link_recheck cross-checks the RESOLVED
+   speed/duplex (RTL8211E PHYSR reg 0x11) against what EMAC_CTL0 is
+   programmed for; mismatch counts as down -> existing sick -> re-kick path
+   re-programs the restricted advert and retrains 100FD.
+
+   Observed live after the fix (phycut 200 ms, readback-verified): cut ->
+   wire dark -> sick -> re-kick (BMCR kick with the restricted advert; the
+   ~10 s quick window expired before the wire finished training — recorded
+   honestly as result=0) -> link completed training at 100FD ->
+   link_recheck up+match -> console AND guest vtnet back. **Full recovery
+   ~90 s, NO reboot needed.** Episode record: attempts=1 sick=1
+   rekicks=1 physr=0x6c42 (100FD link up).
+
+   **Gate status: the self-heal chain has now been observed closing live on
+   hardware for BOTH halves of the failure mode** — (a) "PHY lost power
+   and retrained wrong" via the physical DC1SW cut (physical-power-cycle
+   equivalent for the suspect subsystem), and (b) "PHY never trains" via
+   wdtest (attempts 1..7 -> give-up -> WDOG -> TFTP reboot, channel alive
+   throughout). A literal full-board physical power-cycle run remains
+   available to the owner, but every software-observable link in the chain
+   has now been exercised and healed on the board. Tag/push decision
+   remains the owner's.
 2. **Then tag `v0.0.2-prealpha` + push.** Update the tag-not-made note in this
    file and `RELEASE-0.0.2.md` title, `git push origin master:main`, push the
    tag. Commit author per the tree convention (Bodrov).
