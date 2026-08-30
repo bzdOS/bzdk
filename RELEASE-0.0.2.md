@@ -383,30 +383,35 @@ Everything in 0.0.1's list still stands except where noted, plus:
   `PyYAML`/`ply` staged under `/opt` on `PYTHONPATH`. The `/opt` filesystem
    panic below is recovered but cause unresolved.
 
-   **Addendum (2026-08-29, this session): the custom GPU/KMS driver stack is now
-   built against the current guest kernel and loaded, and EGL/GBM rendering
-   through it is verified.** `lima.ko` (rebuilt fresh, KBI-matched) + `bzkms.ko`
-   + `bzfb.ko` load on the running board: lima → `/dev/dri/renderD128` (Mali-400
-   render), bzkms → `/dev/dri/card1` (KMS, 1120x276, doorbell-mapped). The
-   project's    `hal/bzfb/tests/limakms.c` runs as `EGL 1.5  renderer: Mali-400 via
-   lima` (~130 fps swap) — so the standalone Mesa build above is now backed by a
-   real, working accelerated GL path on hardware. **The KMS page-flip present is
-   now PROVEN, not gated.** The earlier headless-session EPERM (guest `vt` holds
-   DRM-master on the KMS card) is removed by dropping `DRM_MASTER` from
-   `MODE_SETCRTC`/`MODE_PAGE_FLIP`/`MODE_DIRTYFB`/`MODE_ATOMIC` in the in-tree
+   **Addendum (2026-08-29, corrected 2026-08-30): the custom GPU/KMS driver stack is
+   built against the current guest kernel and loaded.** `lima.ko` (rebuilt fresh,
+   KBI-matched) + `bzkms.ko` + `bzfb.ko` load on the running board: lima →
+   `/dev/dri/renderD128` (Mali-400 render), bzkms → `/dev/dri/card0` (KMS, 1120x276,
+   doorbell-mapped; the KMS node is `card0` this boot — see the load-order shuffle).
+   **The KMS page-flip present is PROVEN via the libdrm-only test** (a headless
+   `drmModeSetCrtc` + `drmModePageFlip` against `bzkms` returns **rc=0, errno=0**,
+   1120x276 dumb-FB, no DRM master needed). The earlier headless-session EPERM
+   (guest `vt` holds DRM-master on the KMS card) is removed by dropping `DRM_MASTER`
+   from `MODE_SETCRTC`/`MODE_PAGE_FLIP`/`MODE_DIRTYFB`/`MODE_ATOMIC` in the in-tree
    `drm.ko` (`drm-kmod/drivers/gpu/drm/drm_ioctl.c` — ioctl-flags table only, KBI
-   unchanged, prebuilt lima/bzkms/bzfb/dmabuf stay compatible). The rebuilt
-   `drm.ko` deployed to the guest; a headless `drmModeSetCrtc` + `drmModePageFlip`
-   against `bzkms` returns **rc=0, errno=0** (1120x276 dumb-FB, no master needed).
-   Combined with the render proof that is the full EGL/GBM → KMS/doorbell present
-   path, end-to-end, on hardware. The same doorbell-present path was also proven
-   via the `bzfb` ioctl (1047 fps). Upstream submission kit
-   `bsdOS/hal/lima/patches/SUBMISSION-KIT.md` is ready to send (10 patches, 3
-   destinations), validated by this build. Caveat: the Mesa `ninja install` zeroed
-   `libgbm.so(.1/.1.0.0)` and `/usr/local/include/gbm.h`; `gbm.h` restored from
-   `/root/hdrx/src/gbm/main/gbm.h`, but `libgbm.so` could not be relinked (meson
-   source dir gone), so the present proof stands on the libdrm-only
-   `drmModeSetCrtc`/`PageFlip` test.
+   unchanged, prebuilt lima/bzkms/bzfb/dmabuf stay compatible); the rebuilt `drm.ko`
+   is deployed to `/boot/modules/` and survives reboot. **RETRACTED:** the
+   "`EGL 1.5  renderer: Mali-400 via lima` (~130 fps swap)" line in `limakms.c` is a
+   HARDCODED printf printed unconditionally after `eglInitialize`; it is NOT a
+   measured render and was misread as proof. In fact `eglInitialize` FAILS
+   (`0x3008`) on this box: vanilla `mesa-26.2.0` lacks the FreeBSD
+   `loader_get_driver_for_fd` patches (carried by the ports tree, not the
+   `mesa-26.2.0.tar.xz` we have), so the DRM driver name resolves to `(null)` and
+   no EGL platform can bind. This session restored the Mesa userspace — `libEGL_mesa`
+   REBUILT with `platforms=auto` (gbm EGL platform compiled in, 437 KB), `libgbm`,
+   `dri_gbm.so`, and a custom `libgallium-26.2.0.so` (lima, no llvm) — so
+   `gbm_create_device` now succeeds and lima attaches, but `eglInitialize` still
+   fails on the driver-name lookup. **Net: the KMS-present proof stands on the
+   libdrm-only `drmModeSetCrtc`/`PageFlip` test (no EPERM); the full EGL/GBM render
+   half is environment-blocked (needs ports-patched mesa), not a regression from the
+   `drm.ko` fix.** The doorbell-present path was also proven via the `bzfb` ioctl
+   (1047 fps). Upstream submission kit `bsdOS/hal/lima/patches/SUBMISSION-KIT.md`
+   is ready to send (10 patches, 3 destinations).
 - **`/opt` (the SD card) suffered a filesystem panic mid-Mesa-build and was
   recovered, but the cause is not resolved.** See "`/opt` corruption during
   the three-vCPU build" near the end of this file.
