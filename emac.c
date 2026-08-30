@@ -509,6 +509,14 @@ static uint32_t g_link_down_events;   /* up->down transition count */
 static uint32_t g_tx_drops;           /* frames dropped by tx_frame() */
 static uint32_t g_first_rx_latched;   /* one-shot: has ANY frame ever arrived */
 
+/* Watchdog-ladder TEST MODE (emac_wd_test_mode()/dbgmon `wdtest`): while on,
+ * phy_startup() fails instantly without touching MDIO and the link
+ * watchdog's healthy short-circuit is bypassed, so the full
+ * attempt->give-up->escalate ladder runs with the console alive. See the
+ * emac.h comment on emac_wd_test_mode(). */
+static uint32_t g_wd_test_mode;
+static uint32_t g_wd_test_skips;
+
 /* emac_poll() throttling/debounce constants for live link monitoring. */
 #define LINK_CHECK_INTERVAL     256   /* polls between MDIO BMSR reads (power
                                        * of two — used as a mask) */
@@ -715,9 +723,32 @@ static void mdio_write(int phy, int reg, uint16_t val)
  * WDT reset us. */
 #define LINK_WAIT_PASSES 120000
 
-static int phy_startup(int *duplex_full)
+/* Watchdog re-kick budget (phy_startup_ctx(quick=1)): the re-kick runs
+ * INSIDE the CPU1 tick, which owns emac_poll/console/BMC/usbacm — every
+ * second it grinds is a second the whole board's I/O is dead. Measured
+ * 2026-08-30 (phycut DC1SW-cut): the boot-budget wait turned one dark
+ * PHY episode into ~8+ minutes of total I/O blackout (LINK_WAIT_PASSES at
+ * ~2.1 ms/pass ~= 250 s, twice with the fallback pass, while the tick sat
+ * inside phy_startup). A healthy retrain completes in 2-4 s; ~10 s is a
+ * generous quick budget. The escalation ladder (6 attempts, 8 s apart)
+ * still owns the "PHY never trains" case — with SHORT attempts instead
+ * of minute-long ones, so give-up+reboot actually arrives in minutes. */
+#define LINK_WAIT_PASSES_QUICK 4500
+
+static int phy_startup_ctx(int *duplex_full, int quick)
 {
     int id1, id2, bmsr = 0, bmcr_rb;
+
+    /* Watchdog-ladder TEST MODE (emac_wd_test_mode): fail immediately and
+     * without a single MDIO transaction, simulating a PHY that never
+     * trains. The channel itself stays perfectly alive — that is the point
+     * of the test mode (watch the give-up/escalation ladder with zero
+     * channel risk). */
+    if (g_wd_test_mode) {
+        g_wd_test_skips++;
+        bc(27, g_wd_test_skips);
+        return 0;
+    }
 
     id1 = mdio_read(PHY_ADDR, MII_PHYID1);
     id2 = mdio_read(PHY_ADDR, MII_PHYID2);
@@ -736,6 +767,13 @@ static int phy_startup(int *duplex_full)
                     !(id1 == 0 && id2 == 0);
             if (valid)
                 break;
+            /* Quick (watchdog re-kick) context: a PHY that is not answering
+             * at all (rail off — all-ones or all-zeros ID) is a FAILED
+             * attempt, not something to program blind. Return now: the
+             * ladder re-runs us in 8 s, and burning the tick's seconds here
+             * starves all board I/O. */
+            if (quick)
+                return 0;
             wdt_pet();
             udelay_spin(2000);
             id1 = mdio_read(PHY_ADDR, MII_PHYID1);
@@ -753,6 +791,11 @@ static int phy_startup(int *duplex_full)
     for (int t = 0; t < 100000; t++) {
         int v = mdio_read(PHY_ADDR, MII_BMCR);
         wdt_pet();
+        /* All-ones = no PHY driving the bus (unpowered): the RESET bit will
+         * never clear because it was never set — bail instead of grinding
+         * the full 100000-iteration budget (~3+ min of dead tick). */
+        if (v == 0xffff)
+            break;
         if (v >= 0 && !(v & BMCR_RESET))
             break;
         udelay_spin(2000);
@@ -797,18 +840,23 @@ static int phy_startup(int *duplex_full)
      * as the primary condition — some switches raise link slightly before
      * the PHY latches aneg-complete; speed/duplex are then read from the
      * RTL8211E PHYSR. */
-    g_link_up = 0;
-    for (uint32_t t = 0; t < LINK_WAIT_PASSES; t++) {
-        wdt_pet();                                   /* keep the WDT at bay */
-        (void)mdio_read(PHY_ADDR, MII_BMSR);         /* clear the latch */
-        bmsr = mdio_read(PHY_ADDR, MII_BMSR);
-        if ((t & 0x3ffu) == 0)                       /* throttle the BC write */
-            bc(11, (uint32_t)(bmsr & 0xffff));
-        if (bmsr >= 0 && (bmsr & BMSR_LSTATUS)) {
-            g_link_up = 1;
-            break;
+    {
+        const uint32_t passes = quick ? LINK_WAIT_PASSES_QUICK
+                                      : LINK_WAIT_PASSES;
+        g_link_up = 0;
+        for (uint32_t t = 0; t < passes; t++) {
+            wdt_pet();                                   /* keep the WDT at bay */
+            (void)mdio_read(PHY_ADDR, MII_BMSR);         /* clear the latch */
+            bmsr = mdio_read(PHY_ADDR, MII_BMSR);
+            if ((t & 0x3ffu) == 0)                       /* throttle the BC write */
+                bc(11, (uint32_t)(bmsr & 0xffff));
+            /* All-ones = unpowered PHY lying about LSTATUS — never link. */
+            if (bmsr >= 0 && bmsr != 0xffff && (bmsr & BMSR_LSTATUS)) {
+                g_link_up = 1;
+                break;
+            }
+            udelay_spin(2000);
         }
-        udelay_spin(2000);
     }
     bc(11, (uint32_t)(bmsr & 0xffff));               /* final BMSR */
 
@@ -822,8 +870,11 @@ static int phy_startup(int *duplex_full)
      * speed/duplex rather than returning failure. That reinstates the duplex
      * mismatch this change exists to avoid, which is exactly why [22] records
      * that it happened -- a degraded-but-reachable board that says so is better
-     * than an unreachable one, and better than a silently degraded one. */
-    if (!g_link_up) {
+     * than an unreachable one, and better than a silently degraded one.
+     * SKIPPED in the quick (watchdog re-kick) context: the fallback's second
+     * full wait doubles the tick stall, and the ladder's next attempt (8 s
+     * later) already re-runs the whole bring-up — see LINK_WAIT_PASSES_QUICK. */
+    if (!g_link_up && !quick) {
         uint16_t bmcr_f = BMCR_DUPLEX_FULL;
         if (EMAC_FORCE_SPEED == 1000)     bmcr_f |= BMCR_SPEED_MSB;
         else if (EMAC_FORCE_SPEED == 100) bmcr_f |= BMCR_SPEED_LSB;
@@ -834,7 +885,7 @@ static int phy_startup(int *duplex_full)
             wdt_pet();
             (void)mdio_read(PHY_ADDR, MII_BMSR);
             bmsr = mdio_read(PHY_ADDR, MII_BMSR);
-            if (bmsr >= 0 && (bmsr & BMSR_LSTATUS)) {
+            if (bmsr >= 0 && bmsr != 0xffff && (bmsr & BMSR_LSTATUS)) {
                 g_link_up = 1;
                 break;
             }
@@ -891,6 +942,15 @@ static void write_hwaddr(void)
     wr(EMAC_ADDR0_LOW, lo);
 }
 
+/* Boot-context wrapper: the full LINK_WAIT budget + forced fallback are the
+ * RIGHT thing at emac_init() time (nothing else on the board is being
+ * starved, and the console must get every chance to train). Only the
+ * watchdog re-kick uses phy_startup_ctx(quick=1). */
+static int phy_startup(int *duplex_full)
+{
+    return phy_startup_ctx(duplex_full, 0);
+}
+
 static void adjust_link(int duplex_full)
 {
     uint32_t v = rd(EMAC_CTL0);
@@ -920,7 +980,16 @@ static void link_recheck(void)
                                                * throw away the stale read */
     bmsr = mdio_read(PHY_ADDR, MII_BMSR);
     bc(11, (uint32_t)(bmsr & 0xffff));
-    up = (bmsr >= 0) && (bmsr & BMSR_LSTATUS);
+    /* [FOUND LIVE 2026-08-30, phycut DC1SW-cut experiment] bmsr == 0xffff
+     * (all-ones) means the MDIO read returned the pulled-up bus with NO PHY
+     * driving it — i.e. the PHY is UNPOWERED (rail off / mid cold boot).
+     * 0xffff has BMSR_LSTATUS (0x4) SET, so the naive test reported "link
+     * up" for a PHY that is not even alive: g_link_up stayed 1, the link
+     * watchdog stayed "healthy", and a dark PHY made the whole console/BMC
+     * path dead for the rest of that boot with zero self-heal and zero
+     * escalation (observed three times). All-ones is never a valid BMSR —
+     * treat it exactly like a read failure. */
+    up = (bmsr >= 0) && (bmsr != 0xffff) && (bmsr & BMSR_LSTATUS);
 
     if (up) {
         g_link_down_streak = 0;
@@ -1226,7 +1295,7 @@ int emac_link_watchdog(void)
         return 0;                         /* not due yet — cheap common path */
     g_wd_last_check_ticks = now;
 
-    if (g_rx_count != 0 && g_link_up)
+    if (g_rx_count != 0 && g_link_up && !g_wd_test_mode)
         return 0;   /* healthy: traffic flows and the link is up now. The old
                      * test was "at least one frame has EVER arrived", which
                      * went permanently blind to a link that DROPPED after
@@ -1245,28 +1314,65 @@ int emac_link_watchdog(void)
         return 1;           /* one-shot: tell the caller to consider escalating */
     }
 
-    /* Bounded re-kick: re-run PHY bring-up, then unconditionally re-arm the
-     * rings and RX/TX/MAC enables — safe by construction, since this only
-     * ever runs while g_rx_count==0 (no in-flight traffic to clobber).
-     * phy_startup() pets the WDT throughout and is itself bounded. */
+    /* Bounded re-kick: re-run PHY bring-up; re-arm the rings and RX/TX/MAC
+     * enables ONLY in the never-had-traffic case (g_rx_count==0).
+     *
+     * [FOUND LIVE 2026-08-30, phycut DC1SW-cut experiment] The unconditional
+     * rings_init() here violated its own safety contract ever since the sick
+     * test was widened (2026-08-27) to include "link currently down": a boot
+     * that HAD traffic (g_rx_count>0) and then lost the link now reaches
+     * this code, and rings_init() tears the descriptor rings out from under
+     * CPU0's concurrent vnet TX path (the TX lock protects tx_frame_raw vs
+     * tx_frame_raw, NOT vs rings_init). Measured result of one such re-kick
+     * storm: the RX ring died for the REST of that boot (console deaf), while
+     * link_recheck kept reporting link up once the PHY retrained on its own —
+     * so the watchdog's healthy test (g_rx_count!=0 [a LIFETIME counter] &&
+     * g_link_up) never went sick again: no further re-kicks, no give-up, no
+     * escalation. The channel was dead forever with the watchdog content.
+     * When traffic has flowed, the rings/DMA/MAC were armed by emac_init()
+     * and NOTHING in this path tore them down — a dark window does not
+     * disarm them — so the only thing a re-kick may do there is retrain the
+     * PHY (phy_startup) and reprogram speed/duplex (adjust_link). */
     {
         int duplex_full = 1;
-        int linked = phy_startup(&duplex_full);
+        /* QUICK context — see phy_startup_ctx()/LINK_WAIT_PASSES_QUICK: the
+         * tick owns all board I/O, so the re-kick must finish in seconds,
+         * not minutes. */
+        int linked = phy_startup_ctx(&duplex_full, 1);
         bc(4, linked ? 1 : 0);
         if (linked) {
             bc(5, g_speed);
             adjust_link(duplex_full);
             g_wd_attempts = 0;   /* episode over: full budget for the next one */
         }
-        rings_init();
-        setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
-                              EMAC_RX_CTL1_RX_RUNT_FRM);
-        setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
-        setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
-        setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
-        __asm__ volatile("dsb sy" ::: "memory");
+        if (g_rx_count == 0) {
+            rings_init();
+            setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
+                                  EMAC_RX_CTL1_RX_RUNT_FRM);
+            setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
+            setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
+            setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
+            __asm__ volatile("dsb sy" ::: "memory");
+        }
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cold-boot PHY-lottery test mode — see emac.h for the full contract.   */
+/* NOTE: the EL2-side DC1SW cut (emac_phy_cold_cycle) that briefly lived */
+/* here was REMOVED 2026-08-30: ANY EL2 RSB access races the guest's own */
+/* iichb1/axp8xx driver (the guest OWNS the RSB in the standard build —  */
+/* measured: one EL2 set_device_address+read wedged the guest's          */
+/* interrupt path so badly that vtnet died and cpu3 froze). The safe     */
+/* repro is guest-side: /tmp/phycut.c over /dev/iic1 (I2CRDWR on the     */
+/* guest's own adapter, serialized by its locks), which cuts DC1SW with  */
+/* readback verification and retries on restore. See HANDOFF.md §1.      */
+/* ------------------------------------------------------------------ */
+void emac_wd_test_mode(int on)
+{
+    g_wd_test_mode = on ? 1u : 0u;
+    bc(26, g_wd_test_mode);
 }
 
 /* ------------------------------------------------------------------ */
