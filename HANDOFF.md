@@ -669,6 +669,17 @@ closed with earned rules; the one still-open investigation
 touch the boot path (guest uses virtio-blk, not MMC). Boot ledger: total=390,
 best_streak=130 — the 100-clean-boots gate long passed.
 
+**CORRECTION 2026-08-31 (owner's decision overruled the verdict):** the
+"gate clean" verdict above was WRONG — WiFi was not given to the guest, so
+the gate was NOT clean; the owner directed that WiFi must be part of
+v0.0.2-prealpha and the release will be re-issued after WiFi is proven on
+the board (tag untouched). Also retracted: the "cosmetic drift" finding was
+a MEASUREMENT ARTIFACT — a too-shallow `grep -A8` missed the `status` line
+inside decompiled nodes; `fdtget` on the pre-change DTB shows mmc@1c10000
+`disabled`, csi@1cb0000 `disabled`, ir@1f02000 `okay` — the artifact matched
+the declared config all along. Lesson applied: verify a DTB property with
+fdtget, not with grep line-windows over decompiled text.
+
 **Known cosmetic drift, recorded not fixed (changing the booting DTB for
 cosmetics is not a release move):** `mmc@1c10000` and `csi@1cb0000` carry no
 `status` property (FDT default enabled) while their flags say disabled —
