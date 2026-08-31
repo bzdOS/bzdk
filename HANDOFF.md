@@ -160,6 +160,11 @@ check — the board's power feed is not switchable from the build host
     kernel does NOT carry the driver. The deployed `tftpboot/kernel` may differ
     from what is actually loaded, or `aw_cir` failed to attach silently. Re-verify
     IR after the next TFTP reload before trusting the "proven" status.
+    **RESOLVED by direct measurement 2026-08-31 (release acceptance review):**
+    the running guest kernel attaches `aw_ir0: <Allwinner CIR controller> mem
+    0x1f02000-0x1f023ff irq 68` live, `/dev/input/event0/1/2` exist — the BPI64
+    (GENERIC+evdev+aw_cir) kernel IS what boots. The stale image this flag was
+    written against is gone.
 
  1. **Cold-boot PHY lottery is the release gate.** Escalation + retry are
    deployed; the board must survive **one live dark cold boot** (physical
@@ -618,3 +623,55 @@ Each of these needs one board cycle. None is armed by default except where noted
 directions**. It learned that the hard way twice in one day: a one-directional
 handler that only ever adds is how you get a DTB promising a core or a gigabyte
 the build will not honour.
+
+---
+
+## Release acceptance review — 2026-08-31 (gate before the review push)
+
+Scope: owner's two criteria (hardware actually given to the guest — WiFi
+explicitly; open defects). Every claim below was verified against the LIVE
+artifacts, not the docs: `tftpboot/bananapi-min.dtb` decompiled fresh
+(the `.dts` beside it is a stale Aug-11 decompile — do not read it as truth),
+`board-config.xml`, the brcmfmac module Makefile in
+`freebsd-src-earlyboot-wt`, and the running guest over ssh.
+
+**Verdict: both criteria clean → review commit + push approved** (owner's
+one-time push authorization; the literal full-board physical power-cycle
+remains the owner's optional check — the board's power feed is not
+host-switchable, probed via uhubctl over both ppps hubs, all 10 ports).
+
+| guest flag | xml | live DTB | live guest | verdict |
+|---|---|---|---|---|
+| guest_usb_host1 | true | usb@1c1b000/1c1b400 `okay` | ehci1/ohci1 clocks processed | **given** |
+| guest_audio_codec | true | codec + codec-analog `okay` | pcm0 attaches (simple-audio-card; "cpu node is missing" because dai@1c22c00 is deliberately off — no DMA path, by design) | **given, as scoped** |
+| guest_ir | true | ir@1f02000 enabled (no status prop = default okay) | `aw_ir0` attaches, irq 68, /dev/input/event0/1/2 live | **given** (the stale IR flag above is now closed by measurement) |
+| guest_wifi_sdio | **false** | mmc@1c10000 has NO status prop (FDT default = enabled — drift, harmless) | no wlan0 — and none possible | **consciously deferred, not a blocker** |
+| guest_mipi_dsi/csi | false | dsi/d-phy `disabled`; csi no status prop (same cosmetic drift) | inert (no drivers in tree, as documented) | **deferred** |
+
+**WiFi gap list (what stands between the flag and a working wlan0), all
+verified in code:**
+1. `sys/modules/brcm80211/brcmfmac/Makefile` ships `BRCMFMAC_SDIO=0` and
+   `BRCMFMAC_OF=0` — the SDIO bus glue and FDT binding are not compiled in;
+   SDIO additionally requires MMCCAM in the kernel.
+2. No firmware in the guest (`/usr/local/share/firmware/brcm` absent, no brcm
+   module loaded); the board-matched blobs
+   (`brcmfmac43430-sdio.sinovoip,bananapi-m64.{txt,bin}`) exist only on the
+   build host's Linux firmware tree — copying needs its own licensing check.
+3. Guest kernel/module rebuild on the guest itself (its /tmp-tree build flow).
+
+**Open defects check:** hub task list has no open/high item blocking this
+release (the 602 entries are cross-project dup noise; the PinePhone SoC doc
+mismatch is explicitly "не Chimp-критично (v0.3)"). TODO/FIXME/XXX in the
+tree are documented scoped markers (TODO(board) hardware-soak notes,
+VRING_DESC_F_INDIRECT known limitation, gdbstub BAS future work). war-stories
+closed with earned rules; the one still-open investigation
+(`docs/aw-mmc-dma-coherency.md`) is documented-as-open by design and does not
+touch the boot path (guest uses virtio-blk, not MMC). Boot ledger: total=390,
+best_streak=130 — the 100-clean-boots gate long passed.
+
+**Known cosmetic drift, recorded not fixed (changing the booting DTB for
+cosmetics is not a release move):** `mmc@1c10000` and `csi@1cb0000` carry no
+`status` property (FDT default enabled) while their flags say disabled —
+harmless today (no SDIO/CSI driver can bind), but the declared config and
+the artifact disagree; the ownership-table work (see the HAL decision) is
+the structural fix.
