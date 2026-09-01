@@ -129,6 +129,15 @@ toolchain-check:
 	esac; \
 	echo "toolchain: OK"
 
+# config-check: validate board-config.xml against board_bpi_m64.h / soc_a64.h
+# constants (ownership classes, SPI gaps, address ranges). Runs gen_config.py
+# --dry-run, which emits config.mk + performs the cross-check WITHOUT touching
+# the DTB. Fails the build on any mismatch — a pre-build gate so a
+# board-config.xml vs header drift is caught at `make` time, not on the board.
+.PHONY: config-check
+config-check:
+	python3 gen_config.py --dry-run
+
 test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement
 	./test_vblk_ring
 	./test_vblk_stitch
@@ -229,7 +238,7 @@ stage0: $(STAGE0_BIN)
 
 net: $(NET_BIN)
 
-repl: $(REPL_BIN)
+repl: config-check $(REPL_BIN)
 
 # --- Stage-0 (no USB): proves load/exec/return chain ---
 $(STAGE0_ELF): start.o main_stage0.o smp.o timer.o libmin.o link.ld
@@ -269,7 +278,7 @@ $(REPL_ELF): $(REPL_OBJS) link.ld
 $(REPL_BIN): $(REPL_ELF)
 	$(OBJCOPY) -O binary $< $@
 
-hdmi: $(HDMI_BIN)
+hdmi: config-check $(HDMI_BIN)
 
 HDMI_OBJS := start.o main_hdmi.o hdmi.o fb.o timer.o wdt.o libmin.o reboot.o smp.o
 $(HDMI_ELF): $(HDMI_OBJS) link.ld
@@ -382,7 +391,7 @@ ifeq ($(HDMI_MODE_1080P),1)
 # display, not of which image happens to be built.
 CFLAGS += -DHDMI_MODE_1080P
 endif
-dbg: $(DBG_BIN)
+dbg: config-check $(DBG_BIN)
 
 # snapshot.o/snapshot_net.o are conditional: GUEST_DRAM_2G hands the high GiB to
 # the guest, and that GiB is exactly snapshot's mirror window, so the two cannot
@@ -456,7 +465,7 @@ hv-uimage: dbg
 DUAL_ELF   := microkernel-dual.elf
 DUAL_BIN   := microkernel-dual.bin
 
-dual: $(DUAL_BIN)
+dual: config-check $(DUAL_BIN)
 
 DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
@@ -475,7 +484,7 @@ $(DUAL_BIN): $(DUAL_ELF)
 # --- GDB-stub build: same skeleton as `dbg`, but the tick-path debugger is
 # gdbstub.o + gdbstub_hw.o instead of dbgmon.o (see main_gdb.c / gdbstub.c's
 # header comment). NEW target — does not touch/replace `dbg`. ---
-gdb: $(GDB_BIN)
+gdb: config-check $(GDB_BIN)
 
 GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
@@ -487,7 +496,7 @@ $(GDB_ELF): $(GDB_OBJS) link.ld
 $(GDB_BIN): $(GDB_ELF)
 	$(OBJCOPY) -O binary $< $@
 
-fbsd: $(FBSD_BIN)
+fbsd: config-check $(FBSD_BIN)
 
 FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
@@ -504,7 +513,7 @@ $(FBSD_BIN): $(FBSD_ELF)
 # linked into this binary — it is a separate artifact this firmware loads
 # and jumps into at runtime, exactly like main_fbsd.c does for the FreeBSD
 # kernel ELF. ---
-zephyr: $(ZEPHYR_BIN)
+zephyr: config-check $(ZEPHYR_BIN)
 
 ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
                gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgmon.o bmc.o dbgtools.o rsb.o axp803.o vinput.o
