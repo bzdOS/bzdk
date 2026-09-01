@@ -142,12 +142,16 @@
        spi values must stay inside the documented free gap 0x68..0x73
        (docs/virtio-blk-dtb.md) and must not repeat — gen_config.py checks
        both before writing anything. -->
+  <!-- owner: per SPEC_chimp_hal §2 — hv (EL2 owns HW, guest sees via virtio),
+       guest (HW belongs to guest), none (not present). hv-rt = EL2 real-time
+       task (future: THS, watchdog pet). Shares attribute marks blocks sharing
+       silicon with an hv owner (e.g. shares="phy0" = same PHY as MUSB). -->
   <devices>
-    <virtio-mmio name="vblk_emmc" base="0x0A000000" spi="105" device-id="2"  always="true"/>
-    <virtio-mmio name="vnet_emac" base="0x0A001000" spi="106" device-id="1"  always="true"/>
-    <virtio-mmio name="scanout"   base="0x0A002000" spi="none" device-id="none" enabled-by="hv_hdmi" no-dtb-node="true"/>
-    <virtio-mmio name="vinput"    base="0x0A003000" spi="107" device-id="18" always="true"/>
-    <virtio-mmio name="vblk_sd"   base="0x0A004000" spi="108" device-id="2"  always="true"/>
+    <virtio-mmio name="vblk_emmc" base="0x0A000000" spi="105" device-id="2"  always="true" owner="hv"/>
+    <virtio-mmio name="vnet_emac" base="0x0A001000" spi="106" device-id="1"  always="true" owner="hv"/>
+    <virtio-mmio name="scanout"   base="0x0A002000" spi="none" device-id="none" enabled-by="hv_hdmi" no-dtb-node="true" owner="hv"/>
+    <virtio-mmio name="vinput"    base="0x0A003000" spi="107" device-id="18" always="true" owner="hv"/>
+    <virtio-mmio name="vblk_sd"   base="0x0A004000" spi="108" device-id="2"  always="true" owner="hv"/>
   </devices>
 
   <!-- Real A64 silicon nodes whose `status` gen_config.py flips to track one
@@ -163,15 +167,15 @@
        makes listing either here a hard validate() error, not just a review
        note. -->
   <soc-nodes>
-    <soc-node feature="guest_usb_host1"   path="/soc/usb@1c1b000"/>       <!-- EHCI1, PHY1 -->
-    <soc-node feature="guest_usb_host1"   path="/soc/usb@1c1b400"/>       <!-- OHCI1, PHY1 -->
-    <soc-node feature="guest_wifi_sdio"   path="/soc/mmc@1c10000"/>       <!-- SMHC1; wifi@1 (brcm,bcm4329-fmac) child has no status of its own, follows the parent -->
-    <soc-node feature="guest_audio_codec" path="/soc/codec@1c22e00"/>     <!-- digital codec, the "codec" side -->
-    <soc-node feature="guest_audio_codec" path="/soc/codec-analog@1f015c0"/>
-    <soc-node feature="guest_mipi_dsi"    path="/soc/dsi@1ca0000"/>
-    <soc-node feature="guest_mipi_dsi"    path="/soc/d-phy@1ca1000"/>
-    <soc-node feature="guest_mipi_csi"    path="/soc/csi@1cb0000"/>
-    <soc-node feature="guest_ir"          path="/soc/ir@1f02000"/>
+    <soc-node feature="guest_usb_host1"   path="/soc/usb@1c1b000"  owner="guest"/>   <!-- EHCI1, PHY1 (electrically independent) -->
+    <soc-node feature="guest_usb_host1"   path="/soc/usb@1c1b400"  owner="guest"/>   <!-- OHCI1, PHY1 -->
+    <soc-node feature="guest_wifi_sdio"   path="/soc/mmc@1c10000"  owner="none"/>    <!-- SMHC1; disabled per orchestrator — guest_wifi_sdio=false -->
+    <soc-node feature="guest_audio_codec" path="/soc/codec@1c22e00" owner="guest"/>  <!-- digital codec -->
+    <soc-node feature="guest_audio_codec" path="/soc/codec-analog@1f015c0" owner="guest"/>
+    <soc-node feature="guest_mipi_dsi"    path="/soc/dsi@1ca0000"  owner="guest"/>   <!-- no FreeBSD driver yet -->
+    <soc-node feature="guest_mipi_dsi"    path="/soc/d-phy@1ca1000" owner="guest"/>
+    <soc-node feature="guest_mipi_csi"    path="/soc/csi@1cb0000"  owner="guest"/>   <!-- no FreeBSD driver yet -->
+    <soc-node feature="guest_ir"          path="/soc/ir@1f02000"   owner="guest"/>
   </soc-nodes>
 
 </bzdk-config>
