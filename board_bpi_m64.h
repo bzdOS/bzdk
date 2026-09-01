@@ -94,5 +94,7 @@
  * block (vblk_emmc.h's "MMIO window"). Base addresses and SPI assignments
  * are board-level facts from board-config.xml; device IDs are SoC/guest-
  * side facts. Listed here for the porting overview. */
+#define BOARD_BPI_M64_VIRTIO_MMIO_BASE  0x0A000000UL  /* trapped 2 MiB block */
+#define BOARD_BPI_M64_VIRTIO_MMIO_SIZE  0x00200000UL  /* 2 MiB */
 
 #endif /* BZDOS_BOARD_BPI_M64_H */

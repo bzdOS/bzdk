@@ -100,6 +100,7 @@ def load_config(xml_path):
             "always": d.get("always", "false") == "true",
             "enabled_by": d.get("enabled-by"),
             "no_dtb_node": d.get("no-dtb-node", "false") == "true",
+            "owner": d.get("owner"),
         })
 
     soc_nodes = []
@@ -109,14 +110,37 @@ def load_config(xml_path):
             soc_nodes.append({
                 "feature": n.get("feature"),
                 "path": n.get("path"),
+                "owner": n.get("owner"),
             })
 
     return features, devices, soc_nodes
 
 
+VALID_OWNERS = {"hv", "guest", "none", "hv-rt"}
+
+
 def validate(features, devices, soc_nodes):
     """Cheap, load-bearing sanity checks before touching anything real."""
     errors = []
+
+    # --- owner attribute checks (SPEC_chimp_hal §2 ownership classes) ---
+    for d in devices:
+        o = d.get("owner")
+        if o is None:
+            errors.append(f"device {d['name']}: missing owner= attribute "
+                          f"(must be one of {sorted(VALID_OWNERS)})")
+        elif o not in VALID_OWNERS:
+            errors.append(f"device {d['name']}: owner={o!r} is not a valid "
+                          f"ownership class (must be one of {sorted(VALID_OWNERS)})")
+
+    for n in soc_nodes:
+        o = n.get("owner")
+        if o is None:
+            errors.append(f"soc-node path={n['path']}: missing owner= attribute")
+        elif o not in VALID_OWNERS:
+            errors.append(f"soc-node path={n['path']}: owner={o!r} is not valid")
+
+    # --- SPI uniqueness and gap checks ---
 
     seen_spi = {}
     for d in devices:
@@ -156,6 +180,140 @@ def validate(features, devices, soc_nodes):
         for e in errors:
             print(f"[gen_config] ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def cross_check_board_constants(devices, soc_nodes):
+    """Verify ownership classes are consistent with board_bpi_m64.h / soc_a64.h.
+
+    Reads #define constants from both headers and checks:
+    1. Every device with owner="guest" must NOT have a base address matching an
+       SoC address documented as EL2-critical (eMMC, EMAC, UART0, RSB, etc.)
+       in soc_a64.h — a guest device backed by EL2-owned silicon is a
+       ownership-class violation per SPEC_chimp_hal §2.
+    2. Every device with owner="hv" that has a base address must have that
+       address appear in board_bpi_m64.h or soc_a64.h — a hypervisor device
+       whose address isn't in any header is an undocumented constant.
+    3. Soc-nodes with owner="guest" must not reference paths that correspond
+       to EL2-essential peripherals (dma-controller, dai, watchdog, MUSB).
+    """
+    board_header = HERE / "board_bpi_m64.h"
+    soc_header = HERE / "soc_a64.h"
+    errors = []
+
+    # Parse #define NAME value from a header file
+    def parse_defines(path):
+        defines = {}
+        if not path.exists():
+            return defines
+        for line in path.read_text().splitlines():
+            m = re.match(r'^\s*#\s*define\s+(\S+)\s+(.+)', line)
+            if m:
+                name, val = m.group(1), m.group(2).strip()
+                # Strip trailing C comment
+                val = re.sub(r'/\*.*?\*/\s*$', '', val).strip()
+                # Extract numeric value (hex or decimal)
+                vm = re.match(r'^(0x[0-9a-fA-F]+|\d+)', val)
+                if vm:
+                    defines[name] = vm.group(1)
+        return defines
+
+    board_defs = parse_defines(board_header)
+    soc_defs = parse_defines(soc_header)
+
+    # EL2-critical addresses from soc_a64.h — a guest device must not back
+    # onto these (ownership conflict per SPEC §2).
+    EL2_CRITICAL_NAMES = {
+        "SOC_A64_GICD_BASE", "SOC_A64_GICC_BASE", "SOC_A64_GICH_BASE",
+        "SOC_A64_GICV_BASE", "SOC_A64_CCU_BASE", "SOC_A64_PIO_BASE",
+        "SOC_A64_WDOG_CTRL", "SOC_A64_WDOG_CFG", "SOC_A64_WDOG_MODE",
+        "SOC_A64_SRAMC_BASE", "SOC_A64_SYSCON_EMAC",
+        "SOC_A64_UART0_BASE", "SOC_A64_EMAC_BASE",
+        "SOC_A64_MUSB_BASE", "SOC_A64_USBPHY_CTRL_BASE",
+        "SOC_A64_THS_BASE",
+    }
+    el2_critical_addrs = set()
+    for name in EL2_CRITICAL_NAMES:
+        if name in soc_defs:
+            try:
+                el2_critical_addrs.add(int(soc_defs[name], 0))
+            except ValueError:
+                pass
+
+    # RSB/PMIC bases from board_bpi_m64.h — also EL2-owned per SPEC §2.
+    for name, val in board_defs.items():
+        if "RSB" in name or "PRCM" in name or "AXP803" in name:
+            try:
+                el2_critical_addrs.add(int(val, 0))
+            except ValueError:
+                pass
+
+    # Check devices
+    for d in devices:
+        o = d.get("owner")
+        if not o:
+            continue
+        if d.get("base"):
+            try:
+                base = int(d["base"], 0)
+            except ValueError:
+                continue
+            if o == "guest" and base in el2_critical_addrs:
+                errors.append(
+                    f"device {d['name']}: owner=guest but base={d['base']} "
+                    f"matches an EL2-critical address in soc_a64.h / "
+                    f"board_bpi_m64.h — ownership conflict per SPEC §2")
+            if o == "hv":
+                # Check if base falls within any known board-level range
+                # (virtio-mmio trapped block, etc.) or matches a known address.
+                known_ranges = []
+                virtio_base = board_defs.get("BOARD_BPI_M64_VIRTIO_MMIO_BASE")
+                virtio_size = board_defs.get("BOARD_BPI_M64_VIRTIO_MMIO_SIZE")
+                if virtio_base and virtio_size:
+                    try:
+                        vb = int(virtio_base, 0)
+                        vs = int(virtio_size, 0)
+                        known_ranges.append((vb, vb + vs))
+                    except ValueError:
+                        pass
+                in_range = any(lo <= base < hi for lo, hi in known_ranges)
+                all_known = set()
+                for v in board_defs.values():
+                    try:
+                        all_known.add(int(v, 0))
+                    except ValueError:
+                        pass
+                for v in soc_defs.values():
+                    try:
+                        all_known.add(int(v, 0))
+                    except ValueError:
+                        pass
+                if not in_range and base not in all_known and base not in el2_critical_addrs:
+                    errors.append(
+                        f"device {d['name']}: owner=hv but base={d['base']} "
+                        f"not found in board_bpi_m64.h or soc_a64.h — "
+                        f"undocumented constant")
+
+    # Check soc-nodes: guest-owned must not be EL2-essential peripherals
+    EL2_ESSENTIAL_PATHS = {
+        "/soc/dma-controller@1c02000",
+        "/soc/dai@1c22c00",
+        "/soc/watchdog@1c20ca0",
+        "/soc/usb@1c19000",      # MUSB
+    }
+    for n in soc_nodes:
+        o = n.get("owner")
+        p = n.get("path", "")
+        if o == "guest" and p in EL2_ESSENTIAL_PATHS:
+            errors.append(
+                f"soc-node path={p}: owner=guest but this is an EL2-essential "
+                f"peripheral — ownership conflict per SPEC §2")
+
+    if errors:
+        for e in errors:
+            print(f"[gen_config] OWNER CHECK: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[gen_config] owner cross-check: {len(devices)} devices, "
+          f"{len(soc_nodes)} soc-nodes — OK")
 
 
 def emit_makefile_fragment(features, dry_run):
@@ -421,6 +579,7 @@ def main():
 
     features, devices, soc_nodes = load_config(args.xml)
     validate(features, devices, soc_nodes)
+    cross_check_board_constants(devices, soc_nodes)
 
     emit_makefile_fragment(features, args.dry_run)
 
