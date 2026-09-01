@@ -37,6 +37,10 @@
 #include "cntpct.h"
 #include "stage2.h"        /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
+/* OWNER MARKER — linker-level mutual exclusion for the eMMC/virtio-blk
+ * block (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner). */
+const char *const bzdos_vblk_emmc_owner = "vblk_emmc";
+
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
  * vconsole.c (see its comments); duplicated here to keep this file

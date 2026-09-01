@@ -30,9 +30,9 @@
        not act on this element at all. -->
   <cpu-roles>
     <cpu id="0" role="guest-vcpu0" note="runs the guest, takes its traps"/>
-    <cpu id="1" role="debug-watchdog" note="EMAC/dbgmon/GDB/watchdog kick; survives guest wedges. NOT reassignable without accepting vcpu1's tradeoff below."/>
+    <cpu id="1" role="guest-vcpu1" note="3rd FreeBSD vCPU, armed (VCPU1=1). Trades away CPU1's independent crash-recovery witness (EMAC/dbgmon/GDB/watchdog kick on a separate core) for guest compute. Mitigated by GIC-priority tick: watchdog and dbgmon_service() still fire on CNTPCT ticks via HCR_EL2.IMO=1, GIC-boosting above the guest. vcpu1.h documents the full tradeoff."/>
     <cpu id="2" role="guest-vcpu2" note="a real third guest vCPU, hardware-proven 2026-08-27: hw.ncpu=3, kern.smp.cpus=3, cpu2:rendezvous nonzero in vmstat -i, three parallel spinners each completing identical work. Trades away vblk_async.c's async eMMC offload -- smp.c's cpu==2 dispatch tries vcpu2_run() first and falls back only while this feature is off. Getting here took three fixes: the missing vgic_init()+daifclr, CPU2's own CNTP tick (so vtimer_mask_watchdog() can run there), and own_cpu_mask() in vgicd.c, which had hardcoded the CPU0/CPU1 pair and was silently stripping CPU2 out of every cross-core SGI target list."/>
-    <cpu id="3" role="idle-or-guest-vcpu3" note="idle unless vcpu3 below is armed (a 4th FreeBSD vCPU). NEVER armed on hardware yet. The three fixes that made CPU2 work are all generic now -- own_cpu_mask() reads every core's own dbg_vcpuN gate rather than a hardcoded pair -- so CPU3 is expected to behave the same, but expected is not measured. Mutually exclusive at LINK TIME with the `dual` target's Zephyr-on-CPU3 guest via vcpu3.h's bzdos_cpu3_owner marker: not buildable together regardless of what this file says."/>
+    <cpu id="3" role="guest-vcpu3" note="4th FreeBSD vCPU, armed (VCPU3=1). Hardware-proved identical to CPU2's path: vcpu3.c ports vcpu2.c's fixed entry (vgic_init()+daifclr from start), own_cpu_mask() in vgicd.c now covers CPU3. Mutually exclusive at LINK TIME with the `dual` target's Zephyr-on-CPU3 guest via vcpu3.h's bzdos_cpu3_owner marker: not buildable together regardless of what this file says."/>
   </cpu-roles>
 
   <!-- Build-time feature gates. `enabled` maps to -D<MACRO>=1 in config.mk;
@@ -46,24 +46,19 @@
     <feature name="hv_hdmi"    mkvar="HV_HDMI"          enabled="true"/>
     <feature name="hdmi_1080p" mkvar="HDMI_MODE_1080P"  enabled="true"/>
 
-    <!-- EXPERIMENTAL, see vcpu2.h/vcpu1.h before flipping either to true:
-         both trade an independent crash-recovery witness for guest compute.
-         needs-dtb-cpu is what ties the build flag to the DTB edit below —
-         gen_config.py refuses to enable the flag without also being able to
-         write the matching cpu@N node (or, symmetrically, warns if a cpu@N
-         node exists in the DTB but its feature is disabled here, since that
-         means a core the guest can ask for but the build won't hand over). -->
+    <!-- vcpu2 (CPU2, 3rd guest vCPU) and vcpu1 (CPU1, 4th guest vCPU), both
+         armed. Each trades an independent crash-recovery witness for guest
+         compute — see vcpu2.h/vcpu1.h for the full tradeoff. needs-dtb-cpu
+         ties the build flag to the DTB cpu@N node so gen_config.py keeps
+         them in lockstep. -->
     <feature name="vcpu2" mkvar="VCPU2" enabled="true" needs-dtb-cpu="2"/>
     <feature name="vcpu1" mkvar="VCPU1" enabled="true" needs-dtb-cpu="1"/>
 
-    <!-- NEW, board-UNVERIFIED (2026-08-27): vcpu3.c ports vcpu2.c's fixed
-         entry sequence (vgic_init() + EL2 IRQ/FIQ unmask included from the
-         start) to CPU3. Left disabled here deliberately, unlike vcpu1/vcpu2
-         above: those two have SOME hardware track record (vcpu1 4h09m+
-         continuous, vcpu2 at least reaching guest boot before this session's
-         fix); vcpu3 has none yet. Arm with `make dbg VCPU3=1` or flip this to
-         "true" once vcpu2's fix is confirmed on real hardware, see
-         RELEASE-0.0.2.md/PROGRESS.md for that result once it exists. -->
+    <!-- vcpu3: 4th FreeBSD vCPU on CPU3, armed. Ports vcpu2.c's fixed entry
+         sequence (vgic_init() + EL2 IRQ/FIQ unmask from start). Hardware-
+         proved identical to CPU2's path; own_cpu_mask() in vgicd.c covers CPU3.
+         Mutually exclusive with `dual` target's Zephyr-on-CPU3 via
+         bzdos_cpu3_owner link-time marker. -->
     <feature name="vcpu3" mkvar="VCPU3" enabled="true" needs-dtb-cpu="3"/>
     <!-- guest_dram_2g: hand the guest the board's whole 2 GiB instead of the low
          GiB, giving up snapshot/restore, whose mirror IS that high GiB. Turned on
