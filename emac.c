@@ -85,7 +85,9 @@
 /* OWNER MARKER — linker-level mutual exclusion with any future alternative
  * EMAC driver (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner).
  * Non-weak: if two .o files both define this symbol, the link fails with
- * `multiple definition` instead of silently producing a broken binary. */
+ * `multiple definition` instead of silently producing a broken binary.
+ * Makefile exclusion: emac.o is in repl/fbsd/zephyr/dbg/dual targets but
+ * never alongside an alternative EMAC implementation (none exists today). */
 const char *const bzdos_emac_owner = "emac";
 
 /* ------------------------------------------------------------------ */

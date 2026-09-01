@@ -51,7 +51,9 @@ static int g_axp803_ok;   /* 1 once rsb_init + set_device_address + REG03H check
 /* OWNER MARKER — linker-level mutual exclusion for the PMIC/AXP803 block
  * (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner). EL2 owns
  * the AXP803 per SPEC_chimp_hal §2 — this marker catches any future
- * alternative PMIC driver linked alongside. */
+ * alternative PMIC driver linked alongside.
+ * Makefile exclusion: axp803.o is in repl/dbg/dual/zephyr targets but
+ * never alongside an alternative PMIC implementation. */
 const char *const bzdos_pmic_owner = "axp803";
 
 static void axp1_bc(unsigned i, uint32_t v)

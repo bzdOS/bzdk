@@ -22,7 +22,9 @@
 #include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
 /* OWNER MARKER — linker-level mutual exclusion for the HDMI/scanout block
- * (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner). */
+ * (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner).
+ * Makefile exclusion: scanout.o is only in the dbg target; other targets
+ * link hdmi.o/fb.o/hud.o without scanout.o. */
 const char *const bzdos_scanout_owner = "scanout";
 
 /* ------------------------------------------------------------------ *

@@ -38,7 +38,9 @@
 #include "stage2.h"        /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
 /* OWNER MARKER — linker-level mutual exclusion for the eMMC/virtio-blk
- * block (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner). */
+ * block (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner).
+ * Makefile exclusion: vblk_emmc.o is in repl/dbg/dual targets but never
+ * alongside an alternative eMMC block driver. */
 const char *const bzdos_vblk_emmc_owner = "vblk_emmc";
 
 /* ------------------------------------------------------------------ *
