@@ -91,4 +91,12 @@ void usbacm_poll(void);
  * /dev/ttyACM* is up on the host side. Thin wrapper over musb_ready(). */
 int usbacm_ready(void);
 
+/* Force the break-glass reset path programmatically (same effect as
+ * receiving bg_seq {0x00,'~','B','Z','R','S','T',0x00} over USB:
+ * sets wdt_debug_hold so the HW WDOG fires within ~16 s). Used by
+ * smp.c supervision loop to wire the EMAC-dark detector (internal-note/
+ * internal-note second half) to an autonomous reset without needing the
+ * host to type the sequence. Board-free, testable via hosted build. */
+void usbacm_force_breakglass(void);
+
 #endif /* BZDOS_USBACM_H */

@@ -665,9 +665,17 @@ void smp_secondary_main(uint64_t cpuid)
 				/* Self-heal for "EMAC never saw a frame": bounded +
 				 * rate-limited internally, ~one branch per iteration on
 				 * the healthy path. Escalation to a WDOG self-reboot is
-				 * opt-in (dbg_emac_watchdog_reboot above). */
-				if (emac_link_watchdog() && dbg_emac_watchdog_reboot)
+				 * opt-in (dbg_emac_watchdog_reboot above). internal-note
+				 * wires the EMAC-dark detector to the BZDBG break-glass
+				 * bg_seq {0x00,'~','B','Z','R','S','T',0x00} path
+				 * (usbacm_force_breakglass) so an autonomous board-side
+				 * EMAC-dark recovery needs no host typing. Both paths set
+				 * the same wdt_debug_hold gate; usbacm_force_breakglass
+				 * is the single chokepoint for break-glass semantics. */
+				if (emac_link_watchdog() && dbg_emac_watchdog_reboot) {
 					wdt_debug_hold = 1;
+					usbacm_force_breakglass();
+				}
 			}
 #ifdef HV_HDMI
 			/* Live HUD refresh on the physical monitor. CPU1 owns the display
