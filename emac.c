@@ -513,6 +513,7 @@ static uint32_t g_speed;         /* 10/100/1000 */
 static int      g_tx_slot;       /* next TX descriptor to use */
 static int      g_rx_slot;       /* next RX descriptor to inspect */
 static uint32_t g_tx_count, g_rx_count;
+static uint64_t g_last_rx_ticks;    /* CNTPCT of most recent emac_poll() RX */
 static uint32_t g_poll_calls;         /* throttles MDIO link-status polling */
 static int      g_link_down_streak;   /* consecutive "not up" reads while up,
                                        * OR consecutive polls while down
@@ -620,6 +621,7 @@ static void rx_push(uint8_t b)
 static inline void note_rx_frame(void)
 {
     bc(7, ++g_rx_count);
+    g_last_rx_ticks = timer_now();
     if (!g_first_rx_latched) {
         g_first_rx_latched = 1;
         bc(19, 1);
@@ -1359,10 +1361,38 @@ int emac_init(void)
  * budget — see the inline notes in the body. */
 #define LINK_WD_CHECK_PERIOD_S   8u   /* how often we re-check             */
 #define LINK_WD_MAX_ATTEMPTS     6u   /* ~48 s of retries before giving up */
+#define LINK_WD_RX_STALE_S       60u  /* no RX for this many seconds => dark */
 
 static uint64_t g_wd_last_check_ticks;
 static uint32_t g_wd_attempts;
 static uint32_t g_wd_gave_up;
+
+/* Recency predicate: returns 1 if at least one RX frame was received within
+ * the last LINK_WD_RX_STALE_S seconds, 0 if the link is dark (no traffic
+ * despite g_rx_count > 0 from pre-dark boot traffic). Uses the live
+ * g_last_rx_ticks timestamp rather than the lifetime g_rx_count, which never
+ * resets and therefore blinds the watchdog to a link that dropped AFTER boot. */
+static int emac_rx_recent(uint64_t freq, uint64_t now)
+{
+    if (g_rx_count == 0)
+        return 0;   /* never had any traffic */
+    uint64_t stale_ticks = freq * (uint64_t)LINK_WD_RX_STALE_S;
+    return (now - g_last_rx_ticks) < stale_ticks;
+}
+
+/* PHYSR cross-check: BMSR.LSTATUS (the only bit link_recheck() originally
+ * tested) is known to report link-up on some A64 PHYs even when no partner
+ * has negotiated or the wire is dark. If the resolved-link bit in PHYSR
+ * (RTL8211E reg 0x11, bit 11) is clear OR the read fails, the link is
+ * dark regardless of what BMSR says. Called from the watchdog health path
+ * only (rate-limited to LINK_WD_CHECK_PERIOD_S). */
+static int phy_physr_no_link(void)
+{
+    int physr = mdio_read(PHY_ADDR, RTL_PHYSR);
+    if (physr < 0 || physr == 0xffff)
+        return 1;   /* read failure / PHY unpowered => no link */
+    return !(physr & PHYSR_LINK);
+}
 
 int emac_link_watchdog(void)
 {
@@ -1376,11 +1406,11 @@ int emac_link_watchdog(void)
 
     if (g_wd_gave_up) {
         /* Not terminal after all (changed 2026-08-27): a board that went
-         * dark on one bad boot used to stay watchdog-dead for the rest of
-         * that boot even after the link recovered. Re-arm the moment real
-         * health (link up AND traffic) is observed, so the NEXT episode
-         * gets a fresh budget. */
-        if (g_link_up && g_rx_count) {
+          * dark on one bad boot used to stay watchdog-dead for the rest of
+          * that boot even after the link recovered. Re-arm the moment real
+          * health (link up AND recent traffic) is observed, so the NEXT
+          * episode gets a fresh budget. */
+        if (g_link_up && emac_rx_recent(freq, now)) {
             g_wd_gave_up = 0;
             g_wd_attempts = 0;
             bc(1, BC_STAGE_LOOP);
@@ -1398,18 +1428,20 @@ int emac_link_watchdog(void)
     {
         /* healthy->sick transition counter for the episode record */
         static uint32_t prev_healthy;
-        uint32_t healthy = (g_rx_count != 0 && g_link_up && !g_wd_test_mode);
+        uint32_t healthy = (emac_rx_recent(freq, now) && g_link_up
+                            && !g_wd_test_mode && !phy_physr_no_link());
         if (prev_healthy && !healthy)
             wdep_write(8, ++g_wdep_sickx);
         prev_healthy = healthy;
     }
 
-    if (g_rx_count != 0 && g_link_up && !g_wd_test_mode)
-        return 0;   /* healthy: traffic flows and the link is up now. The old
-                     * test was "at least one frame has EVER arrived", which
-                     * went permanently blind to a link that DROPPED after
-                     * boot traffic (measured 2026-08-27: a WDOG-reset boot
-                     * sat EMAC-dark with the watchdog satisfied forever).
+    if (emac_rx_recent(freq, now) && g_link_up && !g_wd_test_mode
+        && !phy_physr_no_link())
+        return 0;   /* healthy: recent RX traffic + link up. The old test was
+                     * "at least one frame has EVER arrived" (g_rx_count != 0),
+                     * which went permanently blind to a link that DROPPED
+                     * after boot traffic (measured 2026-08-27: a WDOG-reset
+                     * boot sat EMAC-dark with the watchdog satisfied forever).
                      * Re-kicking with the link down is as safe as the
                      * original zero-RX case: no RX can be in flight over a
                      * down link, and tx_frame_raw() drops TX on link-down
@@ -1440,6 +1472,8 @@ int emac_link_watchdog(void)
      * so the watchdog's healthy test (g_rx_count!=0 [a LIFETIME counter] &&
      * g_link_up) never went sick again: no further re-kicks, no give-up, no
      * escalation. The channel was dead forever with the watchdog content.
+     * With the recency fix (emac_rx_recent + phy_physr_no_link cross-check),
+     * a link that drops after boot traffic now correctly goes sick.
      * When traffic has flowed, the rings/DMA/MAC were armed by emac_init()
      * and NOTHING in this path tore them down — a dark window does not
      * disarm them — so the only thing a re-kick may do there is retrain the
