@@ -79,10 +79,24 @@ The spec's §3.3 step 2 says:
 
 > Добавить классы `hv`, `none` и `hv-rt`
 
-**Actual state:** All three classes exist in gen_config.py. `hv` and `guest`
-are actively used (5 hv + 9 guest). `none` was used for WiFi before the
-flip. `hv-rt` is valid but unused — reserved for WCET-task blocks.
+**Actual state:** All three classes exist in gen_config.py (VALID_OWNERS =
+{"hv", "guest", "none", "hv-rt"}). `hv` and `guest` are actively used
+(5 hv + 9 guest). `none` was used for WiFi before the flip. `hv-rt` is valid
+but unused — reserved for WCET-task blocks (§11.2).
 
-The spec's description of `shares="phy0"` attribute is NOT yet implemented
-in board-config.xml or gen_config.py. This is a future enhancement for
-blocks that share silicon (e.g. MUSB + USB host0 share PHY0).
+The spec's description of `shares="phy0"` attribute is NOW IMPLEMENTED.
+`board-config.xml` has a `<silicon-sharing>` section with two groups:
+- **phy0**: MUSB (hv) + EHCI0/OHCI0 (none) — these share USB0 PHY and MUST
+  stay forbidden from the guest DTB
+- **phy1**: EHCI1/OHCI1 (guest) — electrically independent, safe for guest
+
+`gen_config.py` functions:
+- `load_silicon_sharing()` — parses `<silicon-sharing>/<group>/<block>` entries
+- `validate_silicon_sharing()` — structural integrity (name=, path=, owner= attrs)
+- `derive_forbidden_from_sharing()` — computes paths that share silicon with
+  an hv/hv-rt block and must appear in FORBIDDEN_DTB_NODES
+- `validate()` — cross-checks derived-forbidden paths against
+  FORBIDDEN_DTB_NODES; missing entries are a hard error
+
+Additionally, `shares="phyN"` annotations were added to the EHCI1/OHCI1
+`soc-node` entries in board-config.xml for inline documentation.
