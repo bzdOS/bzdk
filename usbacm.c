@@ -61,6 +61,16 @@ static void usbacm_breakglass(uint8_t b)
 	}
 }
 
+/* Programmatic break-glass (internal-note): same endpoint as the byte
+ * matcher above, but callable from smp.c supervision loop when the
+ * EMAC-dark detector fires. Keeps the reset policy in one place
+ * (wdt_debug_hold) so both the host-typed bg_seq and the autonomous
+ * EMAC-dark wire converge. */
+void usbacm_force_breakglass(void)
+{
+	wdt_debug_hold = 1;
+}
+
 /* ── BZDBG: HV dbgmon over the USB console ───────────────────────────────
  * The EMAC-dark lifeline's other half: when the wire is down, the monitor
  * is still fully drivable over the USB console. Host sends
