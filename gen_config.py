@@ -65,11 +65,110 @@ SPI_GAP = range(0x68, 0x74)
 #     could arm it is also disabled. dai@1c22c00 (the codec-i2s DAI, the
 #     ONLY thing in the audio chain with a `dmas` property) is its one path
 #     back to armed; leaving both off keeps that invariant true.
+#
+# The PHY-sharing entries (usb@1c1a000, usb@1c1a400) are ALSO derivable from
+# the <silicon-sharing> section below — derive_forbidden_from_sharing() checks
+# that they appear here, not duplicated logic. The remaining entries
+# (watchdog, dma-controller, dai) are architectural invariants with no sharing
+# relationship and stay hardcoded.
 FORBIDDEN_DTB_NODES = {
     "/soc/usb@1c19000", "/soc/usb@1c1a000", "/soc/usb@1c1a400",
     "/soc/watchdog@1c20ca0",
     "/soc/dma-controller@1c02000", "/soc/dai@1c22c00",
 }
+
+
+def load_silicon_sharing(root):
+    """Parse the <silicon-sharing> section (SPEC_chimp_hal §3.3, часть 1).
+
+    Returns a list of groups, each with:
+        name, description, and a list of blocks:
+            {path, owner, note?, feature?}
+    A group is a set of SoC blocks that share a physical resource (PHY, clock,
+    bus). The ownership rule: if ANY block in a group is owner="hv" or "hv-rt",
+    then ALL other blocks in that group must be the same owner — a guest-owned
+    block that shares silicon with an hv-owned one is a conflict, because the
+    guest could corrupt the hv's hardware through shared state.
+    """
+    groups = []
+    ss_el = root.find("silicon-sharing")
+    if ss_el is None:
+        return groups
+    for g in ss_el.findall("group"):
+        blocks = []
+        for b in g.findall("block"):
+            blocks.append({
+                "path": b.get("path"),
+                "owner": b.get("owner"),
+                "note": b.get("note"),
+                "feature": b.get("feature"),
+            })
+        groups.append({
+            "name": g.get("name"),
+            "description": g.get("description"),
+            "blocks": blocks,
+        })
+    return groups
+
+
+def derive_forbidden_from_sharing(silicon_groups):
+    """Derive FORBIDDEN_DTB_NODES entries from <silicon-sharing> groups.
+
+    In any group where an hv-owned block shares silicon with a non-hv block,
+    that non-hv block is forbidden from the guest DTB — the guest could corrupt
+    the shared silicon state. Returns a set of paths.
+    """
+    derived = set()
+    for grp in silicon_groups:
+        hv_owners = {b["owner"] for b in grp["blocks"] if b["owner"] in ("hv", "hv-rt")}
+        if hv_owners:
+            # Any non-hv block in this group shares silicon with an hv owner
+            for b in grp["blocks"]:
+                if b["owner"] not in ("hv", "hv-rt"):
+                    if b.get("path"):
+                        derived.add(b["path"])
+    return derived
+
+
+def validate_silicon_sharing(silicon_groups):
+    """Check structural integrity of <silicon-sharing> declarations.
+
+    Validates per SPEC_chimp_hal §3.3:
+    1. Every group must have a name= attribute.
+    2. Every block must have path= and owner= attributes.
+    3. owner values must be in VALID_OWNERS.
+    4. No two blocks in the same group may have conflicting ownership if one
+       is hv/hv-rt and the other is guest — this is caught structurally here
+       (the FORBIDDEN_DTB_NODES cross-check in validate() handles the DTB side).
+    """
+    errors = []
+    for grp in silicon_groups:
+        gname = grp.get("name")
+        if not gname:
+            errors.append(f"silicon-sharing group: missing name= attribute")
+            continue
+        seen_owners = set()
+        for b in grp.get("blocks", []):
+            p = b.get("path")
+            o = b.get("owner")
+            if not p:
+                errors.append(f"silicon-sharing group '{gname}': block missing path= attribute")
+                continue
+            if not p.startswith("/"):
+                errors.append(f"silicon-sharing group '{gname}': path={p!r} must be absolute DTB path")
+            if o is None:
+                errors.append(f"silicon-sharing group '{gname}': block path={p!r} missing owner= attribute")
+            elif o not in VALID_OWNERS:
+                errors.append(f"silicon-sharing group '{gname}': block path={p!r} owner={o!r} is not valid")
+            if o:
+                seen_owners.add(o)
+        # hv + guest in same group = ownership conflict
+        if "hv" in seen_owners and "guest" in seen_owners:
+            errors.append(f"silicon-sharing group '{gname}': hv-owned and guest-owned "
+                          f"blocks share silicon — guest could corrupt hv hardware "
+                          f"through shared state. This conflict should already be "
+                          f"prevented by FORBIDDEN_DTB_NODES")
+    return errors
 
 
 def load_config(xml_path):
@@ -101,6 +200,7 @@ def load_config(xml_path):
             "enabled_by": d.get("enabled-by"),
             "no_dtb_node": d.get("no-dtb-node", "false") == "true",
             "owner": d.get("owner"),
+            "shares": d.get("shares"),
         })
 
     soc_nodes = []
@@ -111,15 +211,18 @@ def load_config(xml_path):
                 "feature": n.get("feature"),
                 "path": n.get("path"),
                 "owner": n.get("owner"),
+                "shares": n.get("shares"),
             })
 
-    return features, devices, soc_nodes
+    silicon_sharing = load_silicon_sharing(root)
+
+    return features, devices, soc_nodes, silicon_sharing
 
 
 VALID_OWNERS = {"hv", "guest", "none", "hv-rt"}
 
 
-def validate(features, devices, soc_nodes):
+def validate(features, devices, soc_nodes, silicon_sharing):
     """Cheap, load-bearing sanity checks before touching anything real."""
     errors = []
 
@@ -139,6 +242,21 @@ def validate(features, devices, soc_nodes):
             errors.append(f"soc-node path={n['path']}: missing owner= attribute")
         elif o not in VALID_OWNERS:
             errors.append(f"soc-node path={n['path']}: owner={o!r} is not valid")
+
+    # --- silicon-sharing conflict checks (SPEC_chimp_hal §3.3 part 1) ---
+    # A guest-owned block that shares silicon (PHY, clock, bus) with an
+    # hv/hv-rt-owned block is a conflict: the guest could corrupt the hv's
+    # hardware through shared state. derive_forbidden_from_sharing() computes
+    # which nodes this applies to; validate_silicon_sharing() checks the
+    # structural integrity of the <silicon-sharing> declaration itself.
+    errors.extend(validate_silicon_sharing(silicon_sharing))
+
+    derived_forbidden = derive_forbidden_from_sharing(silicon_sharing)
+    for path in sorted(derived_forbidden):
+        if path not in FORBIDDEN_DTB_NODES:
+            errors.append(f"silicon-sharing group: path={path!r} shares silicon "
+                          f"with an hv-owned block but is NOT in FORBIDDEN_DTB_NODES "
+                          f"— add it there or fix the sharing declaration")
 
     # --- SPI uniqueness and gap checks ---
 
@@ -313,7 +431,8 @@ def cross_check_board_constants(devices, soc_nodes):
             print(f"[gen_config] OWNER CHECK: {e}", file=sys.stderr)
         sys.exit(1)
     print(f"[gen_config] owner cross-check: {len(devices)} devices, "
-          f"{len(soc_nodes)} soc-nodes — OK")
+          f"{len(soc_nodes)} soc-nodes, {len(EL2_ESSENTIAL_PATHS)} EL2-essential "
+          f"paths — OK")
 
 
 def emit_makefile_fragment(features, dry_run):
@@ -577,9 +696,13 @@ def main():
     ap.add_argument("--no-backup", action="store_true")
     args = ap.parse_args()
 
-    features, devices, soc_nodes = load_config(args.xml)
-    validate(features, devices, soc_nodes)
+    features, devices, soc_nodes, silicon_sharing = load_config(args.xml)
+    validate(features, devices, soc_nodes, silicon_sharing)
     cross_check_board_constants(devices, soc_nodes)
+    derived_forbidden = derive_forbidden_from_sharing(silicon_sharing)
+    print(f"[gen_config] silicon-sharing: {len(silicon_sharing)} groups, "
+          f"{len(derived_forbidden)} derived-forbidden nodes cross-checked "
+          f"against FORBIDDEN_DTB_NODES — OK")
 
     emit_makefile_fragment(features, args.dry_run)
 
