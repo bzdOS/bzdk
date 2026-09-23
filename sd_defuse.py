@@ -28,7 +28,15 @@ became. read/write/lock/unlock are byte-identical there; sd_bio_init differs
 in exactly two instructions, an adrp/str pair addressing one global that
 moved, which does not affect the entry address.
 
-Rebuild that reference image with:
+The reference image is therefore NOT fixed: it must be whatever the board
+was actually loaded with, which changes every time it boots. After a TFTP
+reboot that is microkernel-dbg.uimg, not the tree and not the worktree below
+-- both report build-id d80c9e22ee8c+ and are still different binaries.
+Point BZDOS_REF_ELF at the ELF that produced the running image; the default
+matches the image the board was carrying on 2026-09-23 before it was reset.
+A wrong reference makes this refuse to run, which is the intended outcome.
+
+Rebuild that default with:
     git worktree add --detach <WT> 821bd1e && make -C <WT> dbg
 
 Run with the board powered and the HV alive (bzdctl.py status should answer).
@@ -50,10 +58,14 @@ from hvdbg import HV
 SCRATCH_PA = 0x50023000
 LOAD_BASE = 0x42000000
 BOOT_LBA = 16                    # BROM looks for eGON at byte 8192
-WT = ('/tmp/scratch'
-      '/scratchpad/wt-821bd1e')
-ELF = WT + '/microkernel-dbg.elf'
-BIN = WT + '/microkernel-dbg.bin'
+import os
+
+WT = os.environ.get(
+    'BZDOS_REF_DIR',
+    '/tmp/scratch'
+    '/scratchpad/wt-821bd1e')
+ELF = os.environ.get('BZDOS_REF_ELF', WT + '/microkernel-dbg.elf')
+BIN = os.environ.get('BZDOS_REF_BIN', WT + '/microkernel-dbg.bin')
 
 NEEDED = ('sd_bio_init', 'sd_bio_read', 'sd_bio_write',
           'vblk_sd_trylock', 'vblk_sd_unlock')
@@ -138,15 +150,17 @@ def main():
 
     head = sector(BOOT_LBA)
     print(f"sector {BOOT_LBA} before: {head.hex(' ')}")
-    if b'eGON' not in head and not any(head):
-        print("no eGON signature and the sector is clean — nothing to do")
-        return
     if b'eGON' not in head:
-        # Already defused, but not cleanly: an earlier run staged the block
-        # over the WDEP record and carried a couple of its words onto the
-        # card. Harmless where it sits (below the partition, which now starts
-        # at LBA 2048) but there is no reason to leave it.
-        print("signature already gone; clearing the residue")
+        # Write ONLY when the signature is actually there. Sector 16 is not
+        # spare space: LBA 2..33 is the GPT partition-entry array, so this
+        # block is either a boot signature or live partition table, never
+        # both. Blanking it on the strength of "it isn't zero" would destroy
+        # a healthy GPT -- which is also why writing the U-Boot image here
+        # corrupted the primary table in the first place, and why
+        # `gpart recover` is the other half of undoing that.
+        print("no eGON signature — nothing to defuse "
+              "(this sector is GPT entry data; leaving it alone)")
+        return
 
     # vblk_sd takes this lock on the guest-facing path; the debug core enters
     # sd_bio through a runtime call and is not hooked, so it must bracket its
