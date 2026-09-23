@@ -96,8 +96,30 @@ volatile uint32_t dbg_usbacm = 1;
  * recovered it], so the default flipped: a cable-left-unplugged board now
  * reboots on a visible ~90 s cycle instead of sitting dark until a human
  * notices. Togglable to 0 over the net if a quiet dark board is ever
- * preferred. */
-volatile uint32_t dbg_emac_watchdog_reboot = 1;
+ * preferred.
+ *
+ * DEFAULT FLIPPED BACK TO 0, 2026-09-24, on measured evidence.
+ *
+ * The argument for 1 was that a dark-EMAC board recovers automatically
+ * instead of sitting until a human notices. That holds only if the reboot
+ * actually brings the board back. Twice in a row it did not: the escalation
+ * fired, the board reset, and nothing ever enumerated again on any bus --
+ * hours dark, physical power-cycle required. The second of those went
+ * through the new clean-disconnect path (4084408), so it is not about the
+ * reset being unclean; the reset itself is the risk.
+ *
+ * Weigh the two outcomes as they actually are. EMAC dark with no reboot: the
+ * board is up, the USB console still answers, BZDBG still drives the monitor,
+ * and a human or chimpd can reset it deliberately. EMAC dark WITH the reboot:
+ * sometimes recovery, sometimes a board that is gone until someone pulls the
+ * plug. An automatic action that can cost the only remaining channel is worse
+ * than no automatic action, because the manual lever still exists in the
+ * first case and does not in the second.
+ *
+ * Turn it back on (`w <addr> 1` over the net, or here) once it is understood
+ * why a board that resets itself sometimes fails to come back at all. That is
+ * the open question -- see docs/sessions/2026-09-23-board-dark-root-cause.md. */
+volatile uint32_t dbg_emac_watchdog_reboot = 0;
 
 /* HDMI PHY re-lock defense (HV_HDMI builds), DEFAULT ON. hdmi_init() brings the
  * pipeline up with the PHY locked, but ~1 s into guest boot FreeBSD's axp8xx
