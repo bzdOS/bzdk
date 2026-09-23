@@ -104,8 +104,14 @@ the log; none of them is asserted as "the" proven final step.
 
 ## First things to do on the next power-up
 
-1. Read the WDEP record at `0x50022000` before anything else — it survives the
-   reboot and carries the episode counters from the boots that died.
+1. ~~Read the WDEP record at `0x50022000` — it carries the episode counters
+   from the boots that died.~~ **Wrong, and tried: it does not survive a
+   POWER-CYCLE.** WDEP is written only by emac.c's watchdog paths and never
+   by `emac_init()`, which makes it survive a warm reset — that is all it was
+   ever designed for. After the plug was pulled the magic was re-stamped by
+   the fresh boot but every counter read `0xFFFFFFFF`, i.e. uninitialised
+   DRAM. The evidence from the boots that died is gone. Any post-mortem that
+   needs to cross a power-cycle has to land somewhere other than DRAM.
 2. Arm the watchdog from `preboot`, ahead of the console switch, so a U-Boot
    hang self-recovers:
    `mw.l 0x1c20cb4 1 ; mw.l 0x1c20cb8 0xb1 ; mw.l 0x1c20cb0 0x14af ; setenv stdout usbacm,serial ; ...`
