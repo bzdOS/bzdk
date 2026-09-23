@@ -186,6 +186,73 @@ def wait_for_power_cycle(timeout=3600, log=print):
     return True
 
 
+def wait_for_reboot_emac(baseline=None, timeout=300, log=print):
+    """Wait for the board to reboot, over EMAC only -- no USB involved.
+
+    wait_for_power_cycle() above proves a reboot by watching the CDC-ACM node
+    disappear and come back. That works, but it makes the cable load-bearing
+    for something that has nothing to do with the cable, and the whole point
+    of docs/dropping-usb.md is to stop doing that.
+
+    The witness here is the hypervisor's own uptime counter going BACKWARDS.
+    Nothing but a reboot does that, and it needs only the debug channel.
+
+    Two failure modes this deliberately does NOT treat as death:
+
+      - A read that does not come back. chimpd's monitor polls EMAC on its own
+        schedule and the two steal each other's replies, so a single failed
+        read says nothing about the board (confirmed 2026-09-23: chimpd pulled
+        15 KB of console text in the same window a direct read failed). Only a
+        sustained silence counts, and even then this returns False rather than
+        claiming the board is gone.
+      - A record that has not been refreshed. The BMC1 window is a snapshot
+        that CPU1 rewrites only when asked, so health_raw() alone reports the
+        same uptime forever -- exactly the bug that made boot-watch declare a
+        visibly healthy board dead. health_fresh() is what asks.
+
+    baseline: uptime before the reset, from uptime_now(). Read it BEFORE
+    issuing the reset; passing None reads it here, which races the reset.
+    Returns True once a fresh record shows uptime below the baseline.
+    """
+    if baseline is None:
+        baseline = uptime_now()
+        if baseline is None:
+            _log("no baseline uptime -- board already unreachable", log)
+            baseline = 1 << 62      # any real uptime is below this
+    deadline = time.time() + timeout
+    misses = 0
+    while time.time() < deadline:
+        up = uptime_now()
+        if up is None:
+            misses += 1
+            if misses % 20 == 0:
+                _log(f"no answer for {misses} polls -- still waiting "
+                     f"(a quiet channel is not a dead board)", log)
+        else:
+            misses = 0
+            if up < baseline:
+                _log(f"uptime went backwards ({baseline} -> {up}) "
+                     f"-- reboot confirmed over EMAC", log)
+                return True
+        time.sleep(1.0)
+    _log(f"no reboot seen in {timeout}s (baseline uptime {baseline})", log)
+    return False
+
+
+def uptime_now():
+    """The hypervisor's uptime in arch-timer ticks, or None if the board did
+    not answer. Uses health_fresh() so the record is actually republished --
+    see its docstring for why health_raw() alone cannot judge liveness."""
+    try:
+        import bmc_client
+        h, fresh = bmc_client.BMC().health_fresh()
+    except Exception:
+        return None
+    if not h or not fresh:
+        return None
+    return h.get("uptime")
+
+
 def force_to_uboot(timeout=600, log=print):
     """Escalating recovery ladder to get the board to a caught U-Boot
     prompt, from WHATEVER state it's currently in. Logs which rung it's on
