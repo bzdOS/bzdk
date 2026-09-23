@@ -33,14 +33,87 @@ void usb_gadget_disconnect(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
-void reboot_clean(void)
+void usb_gadget_reconnect(void)
 {
-	usb_gadget_disconnect();
-	/* ~2s watchdog (MODE interval field 2), reset whole system, load it,
-	 * then spin without petting -> the host gets ~2s of clean disconnect
-	 * before U-Boot re-enumerates. */
+	volatile uint32_t *iscr  = (volatile uint32_t *)(MUSB_BASE + REG_ISCR);
+	volatile uint8_t  *power = (volatile uint8_t  *)(MUSB_BASE + REG_POWER);
+	uint32_t v;
+
+	v = *iscr & ~ISCR_CHANGE_DETECT;      /* same w1c care as disconnect */
+	*iscr = v | ISCR_DPDM_PULLUP_EN;
+	*power = (uint8_t)(*power | POWER_SOFTCONN);
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static inline uint64_t rd_cntpct(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t rd_cntfrq(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+	return v;
+}
+
+static void arm_watchdog(void)
+{
+	/* ~2s watchdog (MODE interval field 2), reset whole system, load it. */
 	*(volatile uint32_t *)WDOG_CFG  = 1u;
 	*(volatile uint32_t *)WDOG_MODE = 0x21u;
 	*(volatile uint32_t *)WDOG_CTRL = 0x14AFu;
-	for (;;) { }
+}
+
+void reboot_clean(void)
+{
+	uint64_t hz, t0;
+	unsigned long guard;
+
+	usb_gadget_disconnect();
+	arm_watchdog();
+
+	/* This used to be `for (;;) { }` -- arm the watchdog, spin, and trust it
+	 * to land. It normally does, in ~2 s, and the host gets a clean
+	 * disconnect before U-Boot re-enumerates.
+	 *
+	 * When it does NOT land, that spin is the worst possible place to be.
+	 * The pull-up is already down, so USB is gone; this path is reached from
+	 * the EMAC-dark escalation, so the wire is gone too. The board is then
+	 * executing, healthy, and completely invisible -- no console, no debug
+	 * channel, not even a BROM to talk to, because no reset ever happened.
+	 * Nothing software can reach it; it costs a physical power-cycle.
+	 *
+	 * Observed 2026-09-23: the hypervisor's gadget disconnected 101 s into a
+	 * boot and the board was never seen again on any channel for hours. That
+	 * is consistent with exactly this -- a reset that was asked for and not
+	 * delivered -- though the cause of the watchdog not firing was never
+	 * established, since by then there was nothing left to ask.
+	 *
+	 * So: wait a bounded time for the reset, and if it has not arrived, put
+	 * the gadget back and keep trying. The reset has failed either way; the
+	 * only thing in our gift is whether the board stays reachable while it
+	 * fails. Reconnecting cannot make a successful reset worse, because a
+	 * successful reset happens long before this deadline. */
+	hz = rd_cntfrq();
+	if (hz == 0u)
+		hz = 24000000u;                /* A64 arch timer, if CNTFRQ is unset */
+	t0 = rd_cntpct();
+	/* Belt and braces on the counter itself: it has been seen to run
+	 * backwards on this SoC, which would make the deadline unreachable and
+	 * put us right back in an unbounded spin. */
+	for (guard = 0; guard < 200000000ul; guard++) {
+		uint64_t now = rd_cntpct();
+		if (now < t0 || now - t0 > 5u * hz)
+			break;
+	}
+
+	usb_gadget_reconnect();
+	for (;;) {
+		arm_watchdog();                /* keep asking; stay visible meanwhile */
+		for (guard = 0; guard < 20000000ul; guard++)
+			__asm__ volatile("" ::: "memory");
+	}
 }

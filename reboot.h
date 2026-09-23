@@ -17,6 +17,11 @@
  * the (now unserviced) U-Boot gadget. Safe to call once we own the machine. */
 void usb_gadget_disconnect(void);
 
+/* Put the gadget back on the bus. Used by reboot_clean() when a watchdog
+ * reset it asked for never arrived: a board that failed to reset is
+ * recoverable, a board that failed to reset AND vanished is not. */
+void usb_gadget_reconnect(void);
+
 /* Clean reboot to U-Boot: disconnect the gadget, then arm a ~2s watchdog and
  * stop feeding it. Never returns. The 2s window lets the host register the
  * disconnect before U-Boot re-enumerates, avoiding the zombie. */
