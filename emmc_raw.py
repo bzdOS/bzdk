@@ -31,7 +31,13 @@ PART_START = 278562          # GPT p3 (freebsd-ufs "rootfs") first LBA --
 # 0x50030000 was silently racing/clobbering vnet diagnostics). Use the
 # confirmed-free gap after the dbgtools lane instead (0x50021040..
 # 0x50030000 -- see hv_addrmap.h's own grep-verified claim).
-SCRATCH_PA = 0x50022000
+# 0x50022000 is NOT free any more: emac.c's "WDEP" watchdog-episode record
+# (HVMAP_WDEP_BASE) sits there, and the link-watchdog rewrites words 4 and 5
+# of it whenever it samples the PHY. A block staged over it picks up the raw
+# BMSR and the link flag at byte offset 0x10 -- on the way to the device and
+# again in the read-back. Seen live 2026-09-23. hv_addrmap.h names 0x50023000
+# as the next free page; nothing else in the tree references it.
+SCRATCH_PA = 0x50023000
 
 # How many 512-byte sectors to stage into scratch before reading them back
 # in ONE bulk command. emmc_bio_read() is CMD17 (strictly single-block, see
