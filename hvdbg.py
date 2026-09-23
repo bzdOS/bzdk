@@ -599,8 +599,17 @@ class HV:
             SOL_PACKET = 263        # bits/socket.h; not exported by python's socket module
             PACKET_ADD_MEMBERSHIP = 1   # linux/if_packet.h:39
             PACKET_MR_PROMISC = 1       # linux/if_packet.h:316
-            mreq = _s.pack("IHH8s", 1, socket.if_nametoindex(self.iface),
-                           PACKET_MR_PROMISC, b"")
+            # struct packet_mreq is {int mr_ifindex; u_short mr_type;
+            # u_short mr_alen; u_char mr_address[8];} -- the ifindex comes
+            # FIRST. This used to pack (1, ifindex, PACKET_MR_PROMISC),
+            # i.e. mr_ifindex=1 (lo) and mr_type=<ifindex>; that only
+            # avoided EINVAL while the iface's index happened to be a valid
+            # mr_type (1..4), and started failing with
+            # "OSError: [Errno 22] Invalid argument" once br0 came up with a
+            # higher index -- taking every EMAC-based recovery path down
+            # with it.
+            mreq = _s.pack("IHH8s", socket.if_nametoindex(self.iface),
+                           PACKET_MR_PROMISC, 0, b"")
             s.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
             self._dbgraw_sock = s
         sock = self._dbgraw_sock
