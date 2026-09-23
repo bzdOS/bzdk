@@ -514,6 +514,10 @@ static int      g_tx_slot;       /* next TX descriptor to use */
 static int      g_rx_slot;       /* next RX descriptor to inspect */
 static uint32_t g_tx_count, g_rx_count;
 static uint64_t g_last_rx_ticks;    /* CNTPCT of most recent emac_poll() RX */
+static uint64_t g_emac_up_ticks;    /* CNTPCT at emac_init(); bounds the grace
+                                     * given to a link that has never yet
+                                     * carried a frame -- see the give-up
+                                     * block in emac_link_watchdog() */
 static uint32_t g_poll_calls;         /* throttles MDIO link-status polling */
 static int      g_link_down_streak;   /* consecutive "not up" reads while up,
                                        * OR consecutive polls while down
@@ -1363,16 +1367,15 @@ int emac_init(void)
 #define LINK_WD_CHECK_PERIOD_S   8u   /* how often we re-check             */
 #define LINK_WD_MAX_ATTEMPTS     6u   /* ~48 s of retries before giving up */
 #define LINK_WD_RX_STALE_S       60u  /* no RX for this many seconds => dark */
+/* Grace before a link that has NEVER carried a frame may escalate to a
+ * reboot. See the give-up block in emac_link_watchdog() for why it exists
+ * and why it has to outlast the guest bringing its own network up. */
+#define LINK_WD_FIRST_RX_GRACE_S 300u
 
 static uint64_t g_wd_last_check_ticks;
 static uint32_t g_wd_attempts;
 static uint32_t g_wd_gave_up;
 
-/* Grace before a link that has NEVER carried a frame may escalate to a
- * reboot. See the give-up block in emac_link_watchdog() for why this has to
- * exist and why it has to be this long. */
-#define LINK_WD_FIRST_RX_GRACE_S 300u
-static uint64_t g_emac_up_ticks;   /* CNTPCT at emac_init(), for that grace */
 
 /* Recency predicate: returns 1 if at least one RX frame was received within
  * the last LINK_WD_RX_STALE_S seconds, 0 if the link is dark (no traffic
