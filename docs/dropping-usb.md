@@ -58,6 +58,26 @@ Being straight about this matters more than the rest of the plan.
 - **Hypervisor wedges, EMAC dark:** the SoC watchdog still recovers it to
   U-Boot on its own. What is lost is forcing a reset *on demand*.
 
+  **That sentence was wrong, and 2026-09-23 showed how.** The SoC watchdog is
+  armed by exactly one thing on this board -- the hypervisor's `wdt_init()`.
+  U-Boot arms none of its own (`CONFIG_WATCHDOG_AUTOSTART` unset, and
+  `CONFIG_CMD_WDT` unset so there is nothing to arm it with), so the window
+  from the reset through BROM, SPL, U-Boot, bootcmd, TFTP and bootm is
+  covered by nothing. A hang in that window is permanent.
+
+  Worse, the autonomous EMAC-dark escalation was resetting *uncleanly* --
+  letting the watchdog fire with the MUSB pull-up still up, which wedges
+  U-Boot's gadget coming back. Since `preboot` makes that gadget U-Boot's
+  console, the board loses its console, never reaches bootcmd, and goes
+  silent on every channel at once. Fixed in 4084408 (clean disconnect first)
+  and fe2ecd6 (do not escalate on a link that has never carried a frame).
+  Full account in `sessions/2026-09-23-board-dark-root-cause.md`.
+
+  The remaining hole is the U-Boot window itself, and it closes with an
+  environment change rather than a flash: arm the watchdog at the front of
+  `preboot`, ahead of the console switch. `uboot_env.py` can do that from the
+  guest.
+
   Measured once, 2026-09-23, and it is not as clean as that sentence reads.
   The WDEP record (`0x50022000`) after the episode: 7 link-watchdog attempts,
   6 PHY re-kicks, `rekick_result = 0` on every one, and one give-up -- the
