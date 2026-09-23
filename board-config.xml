@@ -95,6 +95,50 @@
     <feature name="guest_mipi_dsi"    dtb-only="true" enabled="false"/>
     <feature name="guest_mipi_csi"    dtb-only="true" enabled="false"/>
     <feature name="guest_ir"          dtb-only="true" enabled="true"/>
+
+    <!-- The remaining two I2C controllers. Safe to hand over: no `dmas`
+         property, so they cannot arm the ungated DMA engine, and FreeBSD's
+         iichb driver already binds the two buses the guest has.
+
+         NOT added, and each for a checked reason rather than caution:
+           i2s@1c22000/400/800, spdif - aw_i2s.c exists but every one of these
+                                        nodes carries `dmas`, which reopens
+                                        exactly the hazard dai@1c22c00 is in
+                                        FORBIDDEN_DTB_NODES for.
+           pwm@1c21400, lradc@1c21800 - no `dmas`, but FreeBSD has no driver
+                                        for either, so enabling them only
+                                        grows the guest's attack surface.
+           R_* domain (R_I2C, R_PWM)  - reaches the AXP803 the HV drives. -->
+    <feature name="guest_i2c_extra"   dtb-only="true" enabled="true"/>
+
+    <!-- SPI0/SPI1. Both nodes carry a `dmas` property, but that reference is
+         inert here: dma-controller@1c02000 stays in FORBIDDEN_DTB_NODES, so
+         nothing can resolve it, and FreeBSD's driver would not use it anyway.
+         sys/dev/spibus/controller/allwinner/aw_spi.c is PIO only: the sole
+         mention of DMA in it is the unused AW_SPI_MDMA_CTL register name;
+         transfers go byte-at-a-time through aw_spi_fill_txfifo(). So this
+         does not reopen the hazard dai@1c22c00 is forbidden for. -->
+    <feature name="guest_spi"         dtb-only="true" enabled="true"/>
+
+    <!-- PWM0. No `dmas`, so no DMA-engine exposure. The node declares
+         compatible = "allwinner,sun50i-a64-pwm", "allwinner,sun5i-a13-pwm"
+         and sys/dev/pwm/controller/allwinner/aw_pwm.c matches the second one
+         through ofw_bus_search_compatible(), so the existing driver binds
+         with nothing to write. (It lives under sys/dev/pwm/, not
+         sys/arm/allwinner/. Looking only in the latter is how this was
+         first, wrongly, written off as a missing driver.) -->
+    <feature name="guest_pwm"         dtb-only="true" enabled="true"/>
+
+    <!-- DEVELOPMENT ONLY. Un-forbids dai@1c22c00, the codec-i2s DAI, which is
+         the one node the `sound` node's simple-audio-card cpu link points at.
+         Without it pcm0 binds and can never create a stream, so there is no
+         audio at all; with it the SoC's general-purpose DMA engine becomes
+         reachable, and no SMMU gates that engine. While this is on, the
+         stage-2 isolation result for this board does not hold and an
+         isolation test measures nothing. Never ship it enabled.
+         See DMA_ISOLATION_RELAXABLE in gen_config.py. -->
+    <feature name="dev_relax_dma_isolation" dtb-only="true" enabled="true"/>
+    <feature name="guest_audio_dai"         dtb-only="true" enabled="true"/>
   </features>
   <!-- Deliberately NOT a feature: a "guest_usb_host0" for usb@1c1a000/
        usb@1c1a400 (EHCI0/OHCI0). Both sit on PHY0 ("pmu0"), the SAME silicon
@@ -176,6 +220,13 @@
      <soc-node feature="guest_mipi_dsi"    path="/soc/d-phy@1ca1000" owner="guest"/>
      <soc-node feature="guest_mipi_csi"    path="/soc/csi@1cb0000"  owner="guest"/>   <!-- no FreeBSD driver yet -->
      <soc-node feature="guest_ir"          path="/soc/ir@1f02000"   owner="guest"/>
+
+     <soc-node feature="guest_i2c_extra"   path="/soc/i2c@1c2ac00"      owner="guest"/>
+     <soc-node feature="guest_i2c_extra"   path="/soc/i2c@1c2b400"      owner="guest"/>
+     <soc-node feature="guest_spi"         path="/soc/spi@1c68000"      owner="guest"/>
+     <soc-node feature="guest_spi"         path="/soc/spi@1c69000"      owner="guest"/>
+     <soc-node feature="guest_audio_dai"   path="/soc/dai@1c22c00"      owner="guest"/>
+     <soc-node feature="guest_pwm"         path="/soc/pwm@1c21400"      owner="guest"/>
    </soc-nodes>
 
    <!-- Silicon sharing groups (SPEC_chimp_hal §3.3, часть 1).

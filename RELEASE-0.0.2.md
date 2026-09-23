@@ -881,6 +881,15 @@ earlier ranking of it as lowest-value was wrong. WiFi ships with
 firmware absent from the FreeBSD tree though the exact board-matched blob exists
 in the host's Linux tree — so it needs a guest kernel rebuild, not a switch.
 Bluetooth, MIPI-DSI and MIPI-CSI have **no driver anywhere** in FreeBSD and are
+
+**Firmware license** (internal-note): the brcmfmac43430-sdio blob
+(cyfmac43430-sdio.bin, 419 798 bytes from linux-firmware) is embedded in the
+guest image at /boot/firmware/ together with its NVRAM
+(brcmfmac43430-sdio.sinovoip,bananapi-m64.txt) and CLM blob. Redistribution
+is governed by LICENCE.broadcom_bcm43xx (also at /boot/firmware/), which
+permits use and redistribution only with Broadcom-chip devices. BCM43430 on the
+BPI-M64 satisfies this condition. Source: linux-firmware package,
+/usr/share/licenses/linux-firmware/LICENCE.broadcom_bcm43xx.
 closed as absent, with the absence checks cited, rather than left as vague
 future work.
 
