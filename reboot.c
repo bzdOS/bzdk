@@ -110,10 +110,24 @@ void reboot_clean(void)
 			break;
 	}
 
+	/* Reconnect and then STOP TOUCHING THE WATCHDOG.
+	 *
+	 * The first version of this loop called arm_watchdog() repeatedly to
+	 * "keep asking". That was backwards: arm_watchdog() writes
+	 * WDOG_CTRL = 0x14AF, and that is the RESTART key -- it reloads the
+	 * countdown. Calling it in a tight loop is petting the watchdog, so a
+	 * watchdog that was merely slow would have been prevented from ever
+	 * firing, by the very code waiting for it. The timer is already armed
+	 * above; leaving it alone is what lets it land.
+	 *
+	 * What is left here is the honest fallback: the reset did not arrive in
+	 * time, so put the gadget back and sit still. If the watchdog was slow it
+	 * fires on its own. If it is genuinely not running, at least the board is
+	 * reachable again instead of silent. Reconnecting is best-effort -- the
+	 * host re-enumerates when D+ goes high, but MUSB may want more than the
+	 * pull-up bit to come back cleanly, and there is no way to check from
+	 * here. */
 	usb_gadget_reconnect();
-	for (;;) {
-		arm_watchdog();                /* keep asking; stay visible meanwhile */
-		for (guard = 0; guard < 20000000ul; guard++)
-			__asm__ volatile("" ::: "memory");
-	}
+	for (;;)
+		__asm__ volatile("wfe" ::: "memory");
 }
