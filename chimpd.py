@@ -56,7 +56,12 @@ sys.path.insert(0, HERE)
 import loady_over_acm as L
 
 # ── constants ───────────────────────────────────────────────────────────────
-HYP_ELF   = os.path.join(HERE, "microkernel-dbg.elf")
+# Default: whatever the tree currently builds. Overridable, because the tree
+# is not always what you want to put on a board you are trying to rescue --
+# after a session that ended with the board dark, the first load should be a
+# build with a known history, not the one under suspicion.
+HYP_ELF   = os.environ.get("BZDOS_HYP_ELF",
+                           os.path.join(HERE, "microkernel-dbg.elf"))
 KERNEL    = "/opt/bzdos/tftpboot/kernel"
 # Overridable so a one-off experiment (e.g. a device tree that advertises a
 # second guest core) does not require editing this file and does not change
