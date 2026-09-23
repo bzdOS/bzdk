@@ -77,6 +77,43 @@ FORBIDDEN_DTB_NODES = {
     "/soc/dma-controller@1c02000", "/soc/dai@1c22c00",
 }
 
+# Nodes that the `dev_relax_dma_isolation` feature un-forbids, and only those.
+#
+# Why this exists: the audio chain is unusable without dai@1c22c00. The `sound`
+# node's simple-audio-card cpu link points straight at it, so with the DAI
+# disabled the driver still binds (pcm0 appears in devinfo) and can never
+# create a stream -- /dev/sndstat stays empty. There is no way to get audio
+# without this node.
+#
+# What it costs: enabling it arms the SoC's general-purpose DMA engine, which
+# no SMMU gates. That is the whole reason it is forbidden, and it is a real
+# hole rather than a formality -- a guest able to program that engine can read
+# and write hypervisor memory regardless of stage-2.
+#
+# Therefore: this is a DEVELOPMENT switch. While it is on, the stage-2
+# isolation result recorded for this board does NOT hold, and an isolation
+# test run in this configuration measures nothing. Do not ship a build with it
+# enabled.
+#
+# The guard stays hardcoded on purpose. You cannot get past it by editing
+# FORBIDDEN_DTB_NODES; only by naming this feature in board-config.xml, which
+# leaves a visible and reviewable statement of intent.
+DMA_ISOLATION_RELAXABLE = {
+    "/soc/dai@1c22c00",
+}
+
+
+def effective_forbidden(features):
+    """FORBIDDEN_DTB_NODES, minus whatever an explicit dev feature un-forbids.
+
+    Returns (forbidden_set, relaxed_bool).
+    """
+    feat = features.get("dev_relax_dma_isolation")
+    relax = bool(feat and feat.get("enabled"))
+    if not relax:
+        return set(FORBIDDEN_DTB_NODES), False
+    return set(FORBIDDEN_DTB_NODES) - DMA_ISOLATION_RELAXABLE, True
+
 
 def load_silicon_sharing(root):
     """Parse the <silicon-sharing> section (SPEC_chimp_hal §3.3, часть 1).
@@ -287,7 +324,8 @@ def validate(features, devices, soc_nodes, silicon_sharing):
         if n["feature"] not in features:
             errors.append(f"soc-node path={n['path']}: feature "
                            f"{n['feature']!r} has no matching <feature> entry")
-        if n["path"] in FORBIDDEN_DTB_NODES:
+        forbidden, _relaxed = effective_forbidden(features)
+        if n["path"] in forbidden:
             errors.append(f"soc-node path={n['path']} (feature "
                            f"{n['feature']!r}): this node is in "
                            f"FORBIDDEN_DTB_NODES — see that constant's "
@@ -300,7 +338,7 @@ def validate(features, devices, soc_nodes, silicon_sharing):
         sys.exit(1)
 
 
-def cross_check_board_constants(devices, soc_nodes):
+def cross_check_board_constants(devices, soc_nodes, features=None):
     """Verify ownership classes are consistent with board_bpi_m64.h / soc_a64.h.
 
     Reads #define constants from both headers and checks:
@@ -418,10 +456,18 @@ def cross_check_board_constants(devices, soc_nodes):
         "/soc/watchdog@1c20ca0",
         "/soc/usb@1c19000",      # MUSB
     }
+    # dev_relax_dma_isolation waives this for exactly the nodes named in
+    # DMA_ISOLATION_RELAXABLE, and for nothing else. The waiver is deliberately
+    # spelled out in both guards rather than centralised: each one states a
+    # different invariant (this one is ownership, the other is the DMA hazard),
+    # and a single shared bypass would be far easier to widen by accident.
+    _relaxable = set()
+    if features is not None and effective_forbidden(features)[1]:
+        _relaxable = DMA_ISOLATION_RELAXABLE
     for n in soc_nodes:
         o = n.get("owner")
         p = n.get("path", "")
-        if o == "guest" and p in EL2_ESSENTIAL_PATHS:
+        if o == "guest" and p in EL2_ESSENTIAL_PATHS and p not in _relaxable:
             errors.append(
                 f"soc-node path={p}: owner=guest but this is an EL2-essential "
                 f"peripheral — ownership conflict per SPEC §2")
@@ -655,6 +701,234 @@ def ensure_node_status(dtb_path, node_path, want_enabled, dry_run):
     fdtput(dtb_path, node_path, "s", "status", want, dry_run=dry_run)
 
 
+def ensure_rpio_fix(dtb_path, dry_run):
+    """Board-free fix for gpio1 ENOMEM (internal-note/193).
+
+    Root cause: pinctrl@1f02c00's `interrupts` is 3 cells <0 0x2d 0x04> but its
+    parent r_intc declared #interrupt-cells =2. dtc warns
+    "size is (12), expected multiple of 8", and FreeBSD's OFW decode of `interrupts` via the parent's #interrupt-cells fails, so aw_gpio's
+    bus_alloc_resources(IRQ) returns ENXIO -> "cannot allocate device
+    resources".
+
+    FreeBSD's aw_r_intc.c hardcodes ncells==3 (see
+    aw_r_intc_gicp_convert_map_data: daf->ncells !=3 -> NULL), so the
+    correct spec-compliant fix is to widen r_intc to 3, not to shrink the
+    child to 2. The child already carries the correct 3-cell GIC_SPI
+    encoding (type, spi, flags) that the driver expects. Also ensures
+    pinctrl@1f02c00 has its interrupt-parent pointing at r_intc.
+    """
+    cur = fdtget_ints(dtb_path, "/soc/interrupt-controller@1f00c00", "#interrupt-cells")
+    if cur != [3]:
+        have = cur[0] if cur else "missing"
+        print(f"[gen_config] /soc/interrupt-controller@1f00c00: #interrupt-cells {have} -> 3 (r_intc driver expects 3 cells, DT had 2)")
+        fdtput(dtb_path, "/soc/interrupt-controller@1f00c00", "x", "#interrupt-cells", 0x3, dry_run=dry_run)
+    else:
+        print(f"[gen_config] /soc/interrupt-controller@1f00c00: #interrupt-cells already 3, leaving as-is")
+    cur_parent = fdtget_ints(dtb_path, "/soc/pinctrl@1f02c00", "interrupt-parent")
+    want_parent = fdtget_ints(dtb_path, "/soc/interrupt-controller@1f00c00", "phandle")
+    want_val = want_parent[0] if want_parent else 0x4e
+    if cur_parent != [want_val]:
+        have = f"{cur_parent}" if cur_parent else "missing"
+        print(f"[gen_config] /soc/pinctrl@1f02c00: interrupt-parent {have} -> <{want_val:#x}> (r_intc)")
+        fdtput(dtb_path, "/soc/pinctrl@1f02c00", "x", "interrupt-parent", want_val, dry_run=dry_run)
+    else:
+        print(f"[gen_config] /soc/pinctrl@1f02c00: interrupt-parent already <{want_val:#x}>, leaving as-is")
+    cur_irq = fdtget_ints(dtb_path, "/soc/pinctrl@1f02c00", "interrupts")
+    want_irq = [0x0, 0x2d, 0x4]
+    if cur_irq != want_irq:
+        print(f"[gen_config] /soc/pinctrl@1f02c00: interrupts {cur_irq} -> {want_irq} (SPI45 level-high, 3 cells for r_intc)")
+        fdtput(dtb_path, "/soc/pinctrl@1f02c00", "x", "interrupts", *want_irq, dry_run=dry_run)
+    else:
+        print(f"[gen_config] /soc/pinctrl@1f02c00: interrupts already {want_irq}, leaving as-is")
+    # Also fix pmic@3a3 which shares the same r_intc parent: its interrupts was
+    # 2 cells <0 0x08> but r_intc now expects 3 cells <0 0x08 0x04>. Without this
+    # axp8xx fails "cannot allocate resources" and vcc-wifi never comes up.
+    cur_pmic_irq = fdtget_ints(dtb_path, "/soc/rsb@1f03400/pmic@3a3", "interrupts")
+    want_pmic_irq = [0x0, 0x08, 0x4]
+    if cur_pmic_irq != want_pmic_irq:
+        print(f"[gen_config] /soc/rsb@1f03400/pmic@3a3: interrupts {cur_pmic_irq} -> {want_pmic_irq} (r_intc 3 cells)")
+        fdtput(dtb_path, "/soc/rsb@1f03400/pmic@3a3", "x", "interrupts", *want_pmic_irq, dry_run=dry_run)
+    else:
+        print(f"[gen_config] /soc/rsb@1f03400/pmic@3a3: interrupts already {want_pmic_irq}, leaving as-is")
+
+
+def ensure_wifi_mmc1_clock_fix(dtb_path, dry_run):
+    """/soc/mmc@1c10000 (mmc1, the AP6212/BCM43430's SDIO host) ships with
+    `max-frequency = 150000000` in our base DTB. Upstream's real
+    sun50i-a64-bananapi-m64.dts does not set max-frequency on this node at
+    all -- ours almost certainly inherited it from whichever "aggressive"
+    variant bananapi-min.dtb was forked from, not a deliberate choice for
+    this controller.
+
+    150MHz is a very fast clock to be asking a cheap embedded SDIO WiFi
+    module to run CMD52 (command-only, no data phase) at, right after
+    enumeration -- and this project already has a proven precedent for
+    exactly this class of problem: mmc0 (the boot SD card) was unreliable
+    at an aggressive clock and was fixed by reclocking down to 25MHz (see
+    memory: sd-write-fixed-by-25mhz-reclock). Clamp mmc1 the same way
+    rather than leaving it unconstrained like upstream -- 25MHz is SDIO's
+    universal default-speed ceiling, every card supports it, and it's a
+    known-good operating point on this exact SoC family.
+    """
+    want_freq = 25000000
+    cur_freq = fdtget_ints(dtb_path, "/soc/mmc@1c10000", "max-frequency")
+    if cur_freq != [want_freq]:
+        print(f"[gen_config] /soc/mmc@1c10000: max-frequency {cur_freq} -> [{want_freq}] "
+              f"(150MHz inherited from an aggressive base DTB, not deliberate for WiFi SDIO)")
+        fdtput(dtb_path, "/soc/mmc@1c10000", "x", "max-frequency", want_freq, dry_run=dry_run)
+    else:
+        print(f"[gen_config] /soc/mmc@1c10000: max-frequency already {want_freq}, leaving as-is")
+
+
+AUDIO_CPU_PHANDLE = 0xb0   # free: the DTB's highest in use is 0xae
+
+
+def ensure_audio_simple_card_fix(dtb_path, dry_run):
+    """Restate /sound in the single-link form FreeBSD's audio_soc.c can read.
+
+    The DTB inherits upstream Linux's MULTI-link simple-audio-card layout:
+
+        sound {
+            simple-audio-card,dai-link@0 {
+                format = "i2s"; frame-master; bitclock-master; mclk-fs;
+                cpu   { sound-dai = <&dai>;   };
+                codec { sound-dai = <&codec 0>; };
+            };
+        };
+
+    sys/dev/sound/fdt/audio_soc.c does not implement that binding -- it says
+    so in as many words (`/* TODO: handle multi-link nodes */`) and then looks
+    for children named literally "simple-audio-card,cpu" and
+    "simple-audio-card,codec" directly under /sound, with the format,
+    mclk-fs and the two master phandles as properties of /sound itself.
+    Finding neither, it gives up with "pcm0: cpu node is missing" -- which is
+    all you get: pcm0 still attaches, so devinfo looks healthy while
+    /dev/sndstat stays empty.
+
+    So write the single-link form alongside the existing one. Both bindings
+    are legitimate DT; the multi-link subnode is left untouched so that a
+    kernel which later grows multi-link support still sees what it expects.
+
+    Note the codec's sound-dai is TWO cells upstream (<&codec 0>) because that
+    codec node advertises #sound-dai-cells = 1. audio_soc.c reads a single
+    cell with OF_getencprop(..., sizeof(xref)), so the phandle alone is what
+    goes here.
+
+    The real fix belongs in audio_soc.c -- teaching it the multi-link binding
+    would serve every board whose DTS uses it, which is most of them. This is
+    the DTB-side workaround that gets sound out of the jack today.
+    """
+    dts_text = dtb_to_dts_text(dtb_path)
+    if 'simple-audio-card,cpu {' in dts_text:
+        print("[gen_config] /sound: single-link form already present, "
+              "leaving as-is")
+        return
+
+    cpu_dai = parse_node_cells(dts_text, "cpu", "sound-dai")
+    codec_dai = parse_node_cells(dts_text, "codec", "sound-dai")
+    if not cpu_dai or not codec_dai:
+        print("[gen_config] /sound: could not read the dai-link phandles, "
+              "skipping the audio fix", file=sys.stderr)
+        return
+
+    print(f"[gen_config] /sound: adding single-link simple-audio-card form "
+          f"(cpu dai={hex(cpu_dai[0])}, codec dai={hex(codec_dai[0])})")
+
+    fdtput(dtb_path, "/sound/simple-audio-card,cpu", "x", "sound-dai",
+           hex(cpu_dai[0]), dry_run=dry_run)
+    fdtput(dtb_path, "/sound/simple-audio-card,cpu", "x", "phandle",
+           hex(AUDIO_CPU_PHANDLE), dry_run=dry_run)
+    fdtput(dtb_path, "/sound/simple-audio-card,codec", "x", "sound-dai",
+           hex(codec_dai[0]), dry_run=dry_run)
+
+    fdtput(dtb_path, "/sound", "s", "simple-audio-card,format", "i2s",
+           dry_run=dry_run)
+    fdtput(dtb_path, "/sound", "x", "simple-audio-card,mclk-fs", "0x80",
+           dry_run=dry_run)
+    fdtput(dtb_path, "/sound", "x", "simple-audio-card,frame-master",
+           hex(AUDIO_CPU_PHANDLE), dry_run=dry_run)
+    fdtput(dtb_path, "/sound", "x", "simple-audio-card,bitclock-master",
+           hex(AUDIO_CPU_PHANDLE), dry_run=dry_run)
+
+
+def ensure_wifi_pwrseq_fix(dtb_path, dry_run):
+    """Board-free fix for the WiFi SDIO chip never answering CMD5.
+
+    /pwrseq (mmc-pwrseq-simple) drives WL_REG_ON on PL2, but the AP6212's
+    BCM43430 also needs its 32.768 kHz LPO, which on this board is the SoC's
+    X32KFOUT pad -- rtc@1f00000's CLK_OSC32K_FANOUT (clock index 1, the
+    "osc32k-out" name in its clock-output-names). Upstream's
+    sun50i-a64-bananapi-m64.dts wires it via
+    `clocks = <&rtc CLK_OSC32K_FANOUT>; clock-names = "ext_clock"`, and the
+    flattened DTB we ship dropped both. Without the clock the chip never
+    leaves its internal reset, so the probe gets CMD0 out and then stops.
+
+    `post-power-on-delay-ms` is not in upstream's DTS either, but FreeBSD's
+    mmc_pwrseq.c only delays between deasserting reset and the first command
+    if the property is present, and the BCM43430 needs ~150 ms there.
+
+    BLOCKED, MEASURED ON HARDWARE 2026-09-19/20: the `clocks`/`clock-names`
+    half is NOT applied yet, deliberately. Turning the fanout gate on (the
+    bit at 0x1f00000+0x60) can make the guest panic ~5 s into boot with
+    "Misaligned access from kernel space" in _thread_lock(), on a random
+    CPU -- and because that register is in the always-on RTC domain the bit
+    SURVIVES a watchdog reset, so every following boot panics too until it
+    is cleared from U-Boot with `mw.l 0x1f00060 0`. That is what makes it
+    dangerous to wire up speculatively: the failure is not "WiFi does not
+    come up", it is "the board stops booting and the reason is invisible in
+    the DTB".
+
+    Isolated 2026-09-20 by toggling the two r_pio consumers one at a time,
+    with the gate on across a reset each time:
+      gate on, wifi@1 off, bluetooth off  -> boots clean
+      gate on, wifi@1 ON,  bluetooth off  -> boots clean, reaches login
+      gate on, bluetooth ON               -> panics
+    So the gate alone is harmless; the panic belongs to the `bluetooth`
+    node under serial@1c28400 (its LPO clock is the same fanout, and it
+    holds PL4/PL5/PL6). Whoever enables the clocks half MUST disable
+    bluetooth in the same change.
+
+    Two more things have to line up before the clocks half can be enabled:
+    the aw_rtc fanout-clknode port must be in the guest kernel (upstream
+    FreeBSD registers only ids 0 and 2, never id 1, so "ext_clock" cannot
+    resolve), and mmc_pwrseq_attach() returns ENXIO when a `clocks`
+    property is present but unresolvable -- which takes the whole pwrseq
+    node down and leaves WiFi worse off than with no clock at all.
+
+    `post-power-on-delay-ms` is applied: it is harmless on its own and is
+    needed regardless once the chip can answer.
+    """
+    # The clocks half stays OFF until the fanout-gate panic is root-caused
+    # -- see this function's docstring. Both halves are asserted absent
+    # rather than merely "not added", so a hand-edited DTB carrying them
+    # gets healed back instead of quietly bricking the next boot.
+    for prop in ("clocks", "clock-names"):
+        if fdtget_str(dtb_path, "/pwrseq", prop) is not None or \
+           fdtget_ints(dtb_path, "/pwrseq", prop) is not None:
+            print(f"[gen_config] /pwrseq: REMOVING {prop} -- the rtc "
+                  f"CLK_OSC32K_FANOUT gate panics the guest ~5s into boot "
+                  f"and the bit survives reset (see ensure_wifi_pwrseq_fix)")
+            if not dry_run:
+                subprocess.run(["fdtput", "-d", str(dtb_path), "/pwrseq", prop],
+                               check=False)
+
+    # 200ms was the documented ~150ms-plus-margin figure, but live testing
+    # 2026-09-20 showed the CAM mmc_xpt probe (CMD0/ACMD41) intermittently
+    # gets zero response and silently gives up with no scbus/pass/sdiob
+    # device at all -- on some boots, not others. That is the classic sign
+    # of a marginal power/clock settle time, not a logic bug: 200ms is
+    # sometimes not enough. Bumped to 500ms for real margin; still trivial
+    # against boot time.
+    WIFI_POWER_ON_DELAY_MS = 500
+    cur_delay = fdtget_ints(dtb_path, "/pwrseq", "post-power-on-delay-ms")
+    if cur_delay != [WIFI_POWER_ON_DELAY_MS]:
+        print(f"[gen_config] /pwrseq: post-power-on-delay-ms {cur_delay} -> [{WIFI_POWER_ON_DELAY_MS}] "
+              f"(200ms proved marginal -- intermittent silent CAM probe failures)")
+        fdtput(dtb_path, "/pwrseq", "x", "post-power-on-delay-ms", WIFI_POWER_ON_DELAY_MS, dry_run=dry_run)
+    else:
+        print(f"[gen_config] /pwrseq: post-power-on-delay-ms already {WIFI_POWER_ON_DELAY_MS}, leaving as-is")
+
+
 def remove_cpu_node(dtb_path, cpu_id, dry_run):
     node = f"cpu@{cpu_id}"
     path = f"/cpus/{node}"
@@ -698,7 +972,7 @@ def main():
 
     features, devices, soc_nodes, silicon_sharing = load_config(args.xml)
     validate(features, devices, soc_nodes, silicon_sharing)
-    cross_check_board_constants(devices, soc_nodes)
+    cross_check_board_constants(devices, soc_nodes, features)
     derived_forbidden = derive_forbidden_from_sharing(silicon_sharing)
     print(f"[gen_config] silicon-sharing: {len(silicon_sharing)} groups, "
           f"{len(derived_forbidden)} derived-forbidden nodes cross-checked "
@@ -766,6 +1040,11 @@ def main():
     for n in soc_nodes:
         f = features.get(n["feature"], {})
         ensure_node_status(dtb_path, n["path"], f.get("enabled", False), args.dry_run)
+
+    ensure_rpio_fix(dtb_path, args.dry_run)
+    ensure_wifi_mmc1_clock_fix(dtb_path, args.dry_run)
+    ensure_wifi_pwrseq_fix(dtb_path, args.dry_run)
+    ensure_audio_simple_card_fix(dtb_path, args.dry_run)
 
     print("[gen_config] done")
 
