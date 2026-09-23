@@ -1192,6 +1192,7 @@ int emac_init(void)
     g_poll_calls = 0; g_link_down_streak = 0;
     g_link_up_events = 0; g_link_down_events = 0; g_tx_drops = 0;
     g_first_rx_latched = 0;
+    g_emac_up_ticks = timer_now();
     tx_line_len = 0; rx_head = rx_tail = 0;
 
     /* Zero the TX cross-core lock so a stale "1" left over from a prior warm
@@ -1367,6 +1368,12 @@ static uint64_t g_wd_last_check_ticks;
 static uint32_t g_wd_attempts;
 static uint32_t g_wd_gave_up;
 
+/* Grace before a link that has NEVER carried a frame may escalate to a
+ * reboot. See the give-up block in emac_link_watchdog() for why this has to
+ * exist and why it has to be this long. */
+#define LINK_WD_FIRST_RX_GRACE_S 300u
+static uint64_t g_emac_up_ticks;   /* CNTPCT at emac_init(), for that grace */
+
 /* Recency predicate: returns 1 if at least one RX frame was received within
  * the last LINK_WD_RX_STALE_S seconds, 0 if the link is dark (no traffic
  * despite g_rx_count > 0 from pre-dark boot traffic). Uses the live
@@ -1451,6 +1458,41 @@ int emac_link_watchdog(void)
     bc(18, g_wd_attempts);
     wdep_write(2, g_wd_attempts);
     if (g_wd_attempts > LINK_WD_MAX_ATTEMPTS) {
+        /* Do NOT escalate while no frame has EVER arrived and we are still
+         * close to boot.
+         *
+         * emac_rx_recent() reports 0 when g_rx_count == 0 -- "never had any
+         * traffic" is indistinguishable here from "the wire went dark". With
+         * a check every 8 s and a 6-attempt budget that means a board which
+         * has simply not been spoken to yet gives up ~48 s after emac_init(),
+         * the caller sets wdt_debug_hold, and the 16 s HW watchdog reboots
+         * it: dark at ~64 s, every time.
+         *
+         * The guest cannot prevent that. It needs two to three minutes to
+         * reach the point where vtnet0 passes a packet -- four times the
+         * budget -- so a board nobody is polling reboots before its guest can
+         * ever produce the traffic that would prove the link. It then does it
+         * again, forever, and never finishes booting.
+         *
+         * That is not theoretical: measured 2026-09-23. The board stayed up
+         * all day only because chimpd polls it every 10 s; within 65 s of the
+         * last poller exiting it rebooted itself, and again after the next
+         * boot. 48 + 16 is exactly the 65 s observed.
+         *
+         * A link that has never carried a frame is UNPROVEN, not proven-dead,
+         * and rebooting cannot make traffic appear. Keep re-kicking the PHY
+         * (harmless, and it is the useful half of this watchdog) but withhold
+         * the reboot until the guest has had time to come up. Once any frame
+         * has ever arrived, g_rx_count is non-zero and the recency test from
+         * 2026-08-27 takes over unchanged -- a link that drops AFTER traffic
+         * still escalates immediately, which is what that change was for. */
+        if (g_rx_count == 0) {
+            uint64_t grace = freq * (uint64_t)LINK_WD_FIRST_RX_GRACE_S;
+            if (now - g_emac_up_ticks < grace) {
+                g_wd_attempts = 0;       /* fresh budget, keep re-kicking */
+                return 0;
+            }
+        }
         g_wd_gave_up = 1;
         bc(1, BC_STAGE_WD_GAVEUP);
         wdep_write(3, ++g_wdep_giveups);
