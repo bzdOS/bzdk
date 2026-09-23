@@ -23,6 +23,7 @@
                      * EMAC/dbgmon is dark */
 #include "emac.h"   /* emac_link_watchdog() self-heal */
 #include "wdt.h"
+#include "reboot.h"   /* reboot_clean(): clean USB disconnect + WDOG, see below */
 #include "hv_addrmap.h"   /* HVMAP_DBGTOOLS_HEARTBEAT: CPU1 debug-loop heartbeat */
 #include "hwbp.h"          /* hwbp_set_wp_el2(): per-core EL2 self-watch arm */
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
@@ -673,8 +674,37 @@ void smp_secondary_main(uint64_t cpuid)
 				 * the same wdt_debug_hold gate; usbacm_force_breakglass
 				 * is the single chokepoint for break-glass semantics. */
 				if (emac_link_watchdog() && dbg_emac_watchdog_reboot) {
+					/* Stop both pet paths FIRST: wdt_pet() on CPU0 restarts
+					 * the WDOG counter whenever the guest is making progress,
+					 * which would keep re-arming the timer reboot_clean() is
+					 * about to rely on. */
 					wdt_debug_hold = 1;
 					usbacm_force_breakglass();
+
+					/* Then reset CLEANLY, rather than just going quiet and
+					 * letting the 16 s HW watchdog fire underneath a gadget
+					 * that is still on the bus.
+					 *
+					 * A WDOG reset with the MUSB pull-up still up wedges
+					 * U-Boot's gadget on the way back -- the host sees
+					 * `device descriptor read/64, error -71`. That is a known
+					 * landmine here; it is the entire reason reboot_clean()
+					 * disconnects before arming, and why the host-initiated
+					 * path (bmc.c `reset`) has always gone through it. This
+					 * path did not, so every autonomous EMAC-dark recovery
+					 * was an unclean reset.
+					 *
+					 * It matters more here than anywhere else, because
+					 * `preboot` makes U-Boot's console the usbacm gadget. A
+					 * wedged gadget therefore costs U-Boot its console, so it
+					 * never reaches bootcmd, never TFTPs, never brings EMAC
+					 * up -- the board is powered, executing, and silent on
+					 * every channel, recoverable only by pulling the plug.
+					 *
+					 * Observed 2026-09-23: two autonomous resets in a row.
+					 * The first came back only after two -71 errors; the
+					 * second never came back at all. */
+					reboot_clean();   /* noreturn */
 				}
 			}
 #ifdef HV_HDMI
