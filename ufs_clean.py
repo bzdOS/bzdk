@@ -24,7 +24,13 @@ SBLOCK_OFF_BYTES = 65536     # SBLOCK_UFS2 (fs.h) — byte offset within partiti
 # 0x50030000 is vnet_emac.c's breadcrumb window (VNET_BC_BASE), not free
 # scratch DRAM -- confirmed live 2026-07-28 (see ufs2fuse.py). Use the
 # confirmed-free gap instead (0x50021040..0x50030000, hv_addrmap.h).
-SCRATCH_PA = 0x50022000
+# 0x50022000 is NOT free any more: emac.c's "WDEP" watchdog-episode record
+# (HVMAP_WDEP_BASE) sits there, and the link-watchdog rewrites words 4 and 5
+# of it whenever it samples the PHY. A block staged over it picks up the raw
+# BMSR and the link flag at byte offset 0x10 -- on the way to the device and
+# again in the read-back. Seen live 2026-09-23. hv_addrmap.h names 0x50023000
+# as the next free page; nothing else in the tree references it.
+SCRATCH_PA = 0x50023000
 
 # struct fs byte offsets (gcc offsetof, verified against sizeof(struct fs)==1376)
 OFF_SBSIZE        = 104
