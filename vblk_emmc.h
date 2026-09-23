@@ -200,11 +200,31 @@
  * Derived from bsdOS's own image recipe (infra/scripts/bpi-image.sh), not from a
  * guess: SPL_OFFSET_KIB=8 is BROM-mandated and FIXED (the A64 boot ROM reads the
  * SPL from byte offset 8 KiB == LBA 16, ignoring the partition table entirely),
- * and UBOOT_RESERVE_MIB=8 reserves an 8 MiB front gap for SPL + U-Boot ahead of
- * partition 1. 9 MiB == 18432 sectors covers the GPT, that whole gap, and 1 MiB
- * of slack so a larger FIT/full U-Boot build does not silently outgrow the
- * guard. See serve_data()'s block comment for why this exists at all. */
-#define VBLK_BOOT_GUARD_LBA       18432u   /* 9 MiB / 512 */
+ * and UBOOT_RESERVE_MIB=8 becomes the freebsd-boot partition that holds SPL +
+ * U-Boot. mkimg starts it at LBA 34, so it ends -- and the ESP begins -- at
+ * 34 + 8 MiB/512 = 16418. Everything the BROM and the SPL read lives below
+ * that; nothing above it can stop the board from reaching a U-Boot prompt.
+ *
+ * This was 18432 ("9 MiB, 1 MiB of slack so a larger U-Boot does not silently
+ * outgrow the guard"). The slack was a mistake twice over: it cannot protect
+ * anything, because bpi-image.sh already refuses to build an image whose
+ * U-Boot blob exceeds the reserve (its MAX_UBOOT_B check), and the partition
+ * after the reserve is the ESP, so 2014 sectors of guard landed inside it --
+ * on top of the FAT header and the first FAT, i.e. exactly the blocks any
+ * write to the ESP touches first. The visible effect was that the guest could
+ * not mount the ESP read/write at all: mount_msdosfs failed with EIO on its
+ * first metadata write, and vblk breadcrumb slot [62] counted the refusal.
+ *
+ * That blocks a deliberate capability, not just a curiosity -- uboot.env
+ * lives on the ESP, and rewriting it from the guest is how bootcmd is meant
+ * to be changed without a U-Boot prompt (docs/dropping-usb.md step 2), which
+ * is in turn the recovery path if netconsole is ever broken.
+ *
+ * The anti-brick property is unchanged: SPL and U-Boot stay unwritable, so
+ * the board still always reaches a prompt. A damaged ESP costs a boot
+ * configuration, which U-Boot itself can repair; a damaged SPL costs the
+ * board. See serve_data()'s block comment for why this exists at all. */
+#define VBLK_BOOT_GUARD_LBA       16418u   /* LBA 34 + 8 MiB/512: ESP start */
 
 /* ------------------------------------------------------------------ *
  * eMMC-CONTROLLER MUTUAL EXCLUSION (design §8.1, the stated TOP RISK).

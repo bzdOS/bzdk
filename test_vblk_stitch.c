@@ -90,8 +90,10 @@ static int emmc_bio_write_stub(uint32_t lba, const uint8_t *src)
  * the rest of this file mirrors rather than includes: vblk_emmc.c is full of
  * AArch64 inline asm that host gcc cannot assemble. If either value changes
  * there, change it here -- the tests below are what makes the drift visible. */
-#define VBLK_BOOT_GUARD_LBA  18432u   /* 9 MiB / 512; bpi-image.sh's 8 MiB
-                                       * U-Boot reserve + GPT + 1 MiB slack   */
+#define GPT_FIRST_USABLE_LBA 34u      /* where mkimg starts partition 1       */
+#define UBOOT_RESERVE_SECTORS (8u * 1024u * 1024u / 512u)   /* bpi-image.sh    */
+#define VBLK_BOOT_GUARD_LBA  16418u   /* GPT_FIRST_USABLE + the U-Boot reserve
+                                       * == the first LBA of the ESP          */
 #define VBLK_RC_BOOTGUARD    (-400)
 
 /* In vblk_emmc.c the floor is a compile-time constant. Here it is a variable,
@@ -293,9 +295,16 @@ static void t_guard_matches_production(void)
 	 * stitching tests with the guard inert, so asserting on it here would just
 	 * be reading test scaffolding. First version of this check did exactly that
 	 * and failed for a reason that had nothing to do with the guard. */
-	check(VBLK_BOOT_GUARD_LBA == 18432u, "mirrored floor is 9 MiB / 512 = 18432");
+	check(VBLK_BOOT_GUARD_LBA == 16418u, "mirrored floor is 16418");
 	check(VBLK_BOOT_GUARD_LBA > 16u,
 	      "floor is above the BROM-mandated SPL sector 16");
+	/* State the DERIVATION, not just the number. A bare equality check only
+	 * catches a typo; this catches the actual mistake that was made, which was
+	 * adding slack past the U-Boot reserve and silently walling off the start
+	 * of the ESP -- the guest could then not mount it read/write at all. */
+	check(VBLK_BOOT_GUARD_LBA
+	          == GPT_FIRST_USABLE_LBA + UBOOT_RESERVE_SECTORS,
+	      "floor is exactly the end of bpi-image.sh's U-Boot reserve");
 }
 
 static void t_guard_blocks_spl_write(void)
