@@ -121,3 +121,55 @@ the log; none of them is asserted as "the" proven final step.
    visibly, which is strictly better than hanging silently.
 3. The TFTP image is deliberately the proven `d80c9e2` build, not HEAD. Put
    the three fixes on the board one at a time, with a poller running.
+
+
+## 2026-09-24 — the second disappearance, and what it ruled out
+
+A deliberate test reproduced it. With chimpd stopped, the board was reset onto
+the fixed image, came up (HV gadget at host-uptime 1043061), sat with a dark
+EMAC for 370 s, escalated, reset — and never enumerated again.
+
+**That reset went through the new clean-disconnect path.** So the
+"unclean reset wedges U-Boot's gadget" mechanism from 4084408 is *not* what
+makes the board vanish. 4084408 is still correct on its own terms, and the
+-71 errors in the earlier log are still real, but it does not explain this.
+
+Ruled out along the way:
+
+- **internal-note's break-glass wiring.** `usbacm_force_breakglass()` sets
+  `wdt_debug_hold = 1`; the line above it already did. A no-op.
+- **A cross-core `wdt_disarm()` race.** No caller in the dbg build.
+- **The 32 kHz fanout gate.** Nothing in this tree touches it, and a causal
+  claim about that bit has already been retracted once.
+- **MUSB not being reset by the watchdog.** The host-initiated path drops the
+  same pull-up and the board comes back from it routinely.
+
+**One real bug found, and it was mine.** ea9cf38's retry loop called
+`arm_watchdog()` repeatedly; `WDOG_CTRL = 0x14AF` is the RESTART key, so that
+loop pets the watchdog it is waiting for. A merely-slow watchdog would have
+been held off forever by the code waiting for it. Fixed in 3682eaf: arm once,
+wait, then reconnect and sit still.
+
+It is not the cause of either disappearance — the watchdog is armed for 2 s
+and the wait is 5 s, so on both occasions it should have fired long before
+that loop ran — but it is the same failure shape, and it would have bitten
+eventually.
+
+**What is still unknown, precisely.** After the reset, the host logged *zero*
+USB events: not a successful enumeration, not a failed one. U-Boot brings its
+gadget up early, before `bootcmd`, so "nothing at all" means the SoC is not
+reaching that code. Whether it reset and then hung, or never reset, cannot be
+told apart from outside — and DRAM, where all our breadcrumbs live, is wiped
+by the power-cycle that is the only way back.
+
+**So the next step is not another theory, it is evidence that outlives the
+board.** A boot record written to a raw SD sector (LBA 64 is inside the
+1004 K gap before p1, below the partition table and above the GPT array)
+would answer the one question that matters: after an escalation, does the
+board reboot repeatedly and silently, or does it stop once? Nothing else
+distinguishes those, and they point at completely different faults.
+
+**Meanwhile the path is disarmed.** `dbg_emac_watchdog_reboot` is 0 as of
+1c3d6db, so the board no longer resets itself on a dark EMAC. The failure
+cannot recur unattended; it can only be provoked deliberately, which is the
+right way round for something this expensive to observe.
