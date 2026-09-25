@@ -46,6 +46,7 @@ extern void reboot_clean(void);
  * wdt.h (rather than a local `extern volatile uint32_t wdt_debug_hold;`)
  * is what makes that macro visible here. */
 #include "wdt.h"
+#include "sdbox.h"
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 extern void wdt_arm(void);
 extern void wdt_disarm(void);
@@ -686,7 +687,7 @@ static void bmc_reset(void)
 		return;
 	cputs("resetting (reboot_clean)...\r\n");
 	console_flush();
-	reboot_clean();     /* noreturn */
+	reboot_reason = RB_REASON_BMC; reboot_clean();     /* noreturn */
 }
 
 /* `bmc wdt <hold|release|arm|disarm>`:

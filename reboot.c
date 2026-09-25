@@ -13,6 +13,7 @@
 #define ISCR_CHANGE_DETECT  ((1u << 4) | (1u << 5) | (1u << 6)) /* w1c */
 #define POWER_SOFTCONN      0x40u
 
+#include "sdbox.h"   /* black box on the SD card, written on the way out */
 #include "wdt.h"     /* wdt_debug_hold: the guest-progress pet on CPU0 must stop */
 #define WDOG_CTRL   SOC_A64_WDOG_CTRL
 #define WDOG_CFG    SOC_A64_WDOG_CFG
@@ -68,6 +69,11 @@ static void arm_watchdog(void)
 	*(volatile uint32_t *)WDOG_CTRL = 0x14AFu;
 }
 
+volatile uint32_t reboot_reason = RB_REASON_UNKNOWN;
+
+/* Builds without the SD stack (HDMI_OBJS etc.) link this no-op instead. */
+void __attribute__((weak)) sdbox_record(uint32_t reason) { (void)reason; }
+
 void reboot_clean(void)
 {
 	uint64_t hz, t0;
@@ -96,6 +102,11 @@ void reboot_clean(void)
 	 * generation, so it cannot outlive the reset it asks for. */
 	wdt_debug_hold = 1;
 	__asm__ volatile("dsb sy" ::: "memory");
+
+	/* The black box, before anything irreversible: who asked for this
+	 * reset, and the flight recorder's tail. On the SD card, so it is
+	 * still there after the power-cycle that a lost board ends in. */
+	sdbox_record(reboot_reason);
 
 	usb_gadget_disconnect();
 	arm_watchdog();

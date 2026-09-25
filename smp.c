@@ -23,7 +23,8 @@
                      * EMAC/dbgmon is dark */
 #include "emac.h"   /* emac_link_watchdog() self-heal */
 #include "wdt.h"
-#include "reboot.h"   /* reboot_clean(): clean USB disconnect + WDOG, see below */
+#include "reboot.h"
+#include "sdbox.h"   /* reboot_clean(): clean USB disconnect + WDOG, see below */
 #include "hv_addrmap.h"   /* HVMAP_DBGTOOLS_HEARTBEAT: CPU1 debug-loop heartbeat */
 #include "hwbp.h"          /* hwbp_set_wp_el2(): per-core EL2 self-watch arm */
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
@@ -737,7 +738,7 @@ void smp_secondary_main(uint64_t cpuid)
 					 * Observed 2026-09-23: two autonomous resets in a row.
 					 * The first came back only after two -71 errors; the
 					 * second never came back at all. */
-					reboot_clean();   /* noreturn */
+					reboot_reason = RB_REASON_EMACDARK; reboot_clean();   /* noreturn */
 				}
 			}
 #ifdef HV_HDMI

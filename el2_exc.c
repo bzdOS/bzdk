@@ -58,6 +58,7 @@
                            * no framebuffer there is nothing to flip. */
 #endif
 #include "reboot.h"
+#include "sdbox.h"
 #include "backtrace.h"
 #include "flightrec.h"
 #include "coredump.h"
@@ -1194,7 +1195,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 				r[1u + ((idx - 1u) & 0xFu)] = 0x0FF0FF0Fu; /* bc: clean-off */
 				__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
 				wdt_debug_hold = 1;   /* release both pet paths so WDOG fires */
-				reboot_clean();       /* USB drop + ~2s WDOG warm reset; no return */
+				reboot_reason = RB_REASON_PSCI_OFF; reboot_clean();       /* USB drop + ~2s WDOG warm reset; no return */
 			}
 			/* SYSTEM_RESET (0x84000009): honor it the same controlled
 			 * way. See dbg_clean_reset's comment for why lying to
@@ -1206,7 +1207,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 				r[1u + ((idx - 1u) & 0xFu)] = 0x0FF0FF09u; /* bc: clean-reset */
 				__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(r) : "memory");
 				wdt_debug_hold = 1;   /* let the WDOG actually fire */
-				reboot_clean();       /* USB drop + WDOG warm reset; no return */
+				reboot_reason = RB_REASON_PSCI_RST; reboot_clean();       /* USB drop + WDOG warm reset; no return */
 			}
 			if ((fnid == 0x84000009ull || fnid == 0x84000008ull) &&
 			    dbg_block_reset) {
