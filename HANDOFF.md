@@ -41,6 +41,12 @@ including the wrong turns.
   with **`failok`** (2026-09-25): a missing card no longer drops rc into
   single-user; `varmfs=AUTO` gives a memory /var and sshd still comes up.
   Backup of the previous fstab: `/etc/fstab.bak-2026-09-25` on the guest.
+- **U-Boot with its own watchdog exists and is chain-load-proven**
+  (`build/u-boot-WDT-2026-09-25-*.bin`): WDOG armed at its prompt, `wdt
+  expire` resets in 4 s, boots through to the guest. NOT on the eMMC. Test
+  any candidate with `uboot_chainload_test.py` (`--net-test` first); the
+  stub arms the SoC watchdog and cleans the whole cache by set/way, so a
+  hung candidate costs 16 s, not a power-cycle. See the session doc.
 - U-Boot environment: byte-exact known-good values are in `rescue_env.py`;
   `uboot_env.py` edits it from the guest. U-Boot arms no watchdog of its own;
   the reset→`wdt_init()` window is still unprotected (see

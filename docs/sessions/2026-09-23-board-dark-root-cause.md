@@ -248,3 +248,39 @@ hypervisor drives the EMAC. The boots that survived did so because hdmi.c's
 relock fallback happens to write 0x88 (DC1SW+DLDO1) when its RSB read
 fails under contention. Fixed in 228623b: `phy_rail_ensure()` re-enables
 DC1SW whenever the PHY reads as absent, before re-kicking.
+
+## 2026-09-25, afternoon — U-Boot with its own watchdog, proven without touching media
+
+Asked to close the reset→`wdt_init()` window. Candidate: v2026.07-rc5 with
+`CONFIG_WATCHDOG_AUTOSTART=y`, `CONFIG_CMD_WDT=y`,
+`CONFIG_WATCHDOG_TIMEOUT_MSECS=16000`, netconsole off (config saved as
+`build/uboot-config-2026-09-25-wdt.saved`). Run only by chain-loading:
+TFTP to 0x4a000000, enter through `tools/chainload/chainload_stub.S`.
+
+What it cost to get there, in order:
+
+1. `go` straight in with the MMU on: silent hang, no watchdog. Power-cycle.
+2. Stub that turned the MMU off after cleaning two ranges by VA: hang before
+   USB init. Power-cycle. **Two power-cycles for want of arming the SoC
+   watchdog before the jump — three `mw.l` I had known about since the
+   morning.** The stub arms it now, and `--net-test` proves the net from the
+   stock prompt (board resets itself in 19 s) before a candidate is run.
+3. With the net in place, every further hang cost nothing. DRAM progress
+   marks (survive the warm reset) put the death in `initr_binman`:
+   `fdt_path_offset("/binman")` = FDT_ERR_BADSTRUCTURE on a DTB copy whose
+   header was intact. The stock loader's data was still valid in L1/L2 at
+   the top of DRAM where the candidate relocates and copies its DTB with
+   the cache off; turning the cache on served the stale lines. Fix: the
+   stub cleans+invalidates the whole data cache by set/way.
+4. Then: candidate prompt in 10 s, `WDOG_MODE` reads 0xb1 (armed, 16 s),
+   `wdt list` shows `sunxi_wdt`, `wdt expire` resets the board in 4 s,
+   `bootcmd → TFTP → bootm` boots the hypervisor, which takes the watchdog
+   over (alive 60 s+), and the guest comes up behind it. Twice.
+
+**Not flashed.** The proven images are `build/u-boot-WDT-2026-09-25-*.bin`
+(md5 15cf30… proper, 0e496f… with-spl). If it is ever written, write only
+U-Boot proper (the FIT at 32 KiB after the SPL) and keep the July SPL that
+has booted for months; a rebuilt SPL cannot be chain-load-tested. Do it
+from the stock U-Boot prompt (`tftpboot` + `mmc write`), not from the guest
+(the boot guard exists precisely to stop that), and with someone at the
+switch.
