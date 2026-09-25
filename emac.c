@@ -1448,6 +1448,27 @@ static int phy_rail_ensure(void)
     return 1;
 }
 
+/* Autonomous EMAC-dark reboot budget. smp.c may reboot the board when the
+ * link watchdog gives up -- but a board whose cable is out, or whose switch
+ * died, would then reboot every couple of minutes forever, dirty-stopping
+ * the guest each time, until someone noticed. WDEP[16] counts consecutive
+ * autonomous reboots; it lives in DRAM and so survives the warm reset it
+ * counts. Ten healthy minutes clear it (emac_link_watchdog() above). After
+ * a power-cycle the slot reads 0xffffffff, which counts as zero. Returns 1
+ * and takes one unit if a reboot is still allowed, 0 if the budget is spent:
+ * the board then stays up, dark, reachable over USB. */
+#define EMAC_AUTOREBOOT_MAX 3u
+int emac_autoreboot_budget(void)
+{
+    uint32_t n = wdep_read(16);
+    if (n == 0xffffffffu)
+        n = 0;
+    if (n >= EMAC_AUTOREBOOT_MAX)
+        return 0;
+    wdep_write(16, n + 1u);
+    return 1;
+}
+
 int emac_link_watchdog(void)
 {
     uint64_t freq = timer_freq();
@@ -1490,7 +1511,15 @@ int emac_link_watchdog(void)
     }
 
     if (emac_rx_recent(freq, now) && g_link_up && !g_wd_test_mode
-        && !phy_physr_no_link())
+        && !phy_physr_no_link()) {
+        /* Ten healthy minutes forgive the autonomous-reboot streak in
+         * WDEP[16] (see emac_autoreboot_budget()): a board that came back
+         * and stayed reachable is not looping. */
+        static uint64_t healthy_since;
+        if (healthy_since == 0)
+            healthy_since = now;
+        else if (now - healthy_since > freq * 600ull)
+            wdep_wc(16, 0);
         return 0;   /* healthy: recent RX traffic + link up. The old test was
                      * "at least one frame has EVER arrived" (g_rx_count != 0),
                      * which went permanently blind to a link that DROPPED
@@ -1500,6 +1529,7 @@ int emac_link_watchdog(void)
                      * original zero-RX case: no RX can be in flight over a
                      * down link, and tx_frame_raw() drops TX on link-down
                      * before it ever touches the rings. */
+    }
 
     g_wd_attempts++;
     bc(18, g_wd_attempts);
