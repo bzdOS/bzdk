@@ -95,6 +95,7 @@ int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
  * exactly once so the caller may escalate (e.g. opt-in self-reboot);
  * returns 0 on every other call. */
 int emac_link_watchdog(void);
+int emac_autoreboot_budget(void);   /* see emac.c: WDEP[16] streak, max 3 */
 
 /* Watchdog-ladder test mode ("PHY refuses to train" in software): while on,
  * (a) emac_link_watchdog()'s healthy short-circuit is bypassed and (b)
