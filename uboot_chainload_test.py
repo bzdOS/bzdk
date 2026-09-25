@@ -113,11 +113,38 @@ def main():
     except OSError:
         pass
 
-    # the candidate brings its own gadget up -> new node
-    fd = open_when_present(30)
+    # The candidate brings its own gadget up -> a NEW node. A node that is
+    # merely still there is the stock gadget, abandoned (attempt 2 was fooled
+    # by exactly that). So wait for the host to log a fresh enumeration.
+    def usb_new_since(t):
+        since = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t))
+        out = subprocess.run(['journalctl', '-k', '--since', since, '-o', 'short-unix',
+                              '--no-pager'], capture_output=True, text=True).stdout
+        return [l for l in out.splitlines() if 'usb 1-4' in l and 'idProduct=efe8' in l]
+    t_wait = time.time()
+    while time.time() - t_wait < 40 and not usb_new_since(t_go + 1):
+        time.sleep(0.5)
+    if not usb_new_since(t_go + 1):
+        log("!!! no fresh gadget within 40 s of go: candidate hung before USB init, "
+            "and the stub's 16 s watchdog did not bring the stock loader back either")
+        return 5
+    fd = open_when_present(10)
     if fd is None:
-        log("!!! candidate's gadget never appeared (hang before preboot?)"); return 5
-    log(f"candidate tty open at +{time.time() - t_go:.1f}s after go")
+        log("!!! gadget enumerated but no tty"); return 5
+    log(f"fresh gadget + tty at +{time.time() - t_go:.1f}s after go")
+    # Which loader is this? If the stub's watchdog fired, it is the STOCK
+    # loader again -- catch its prompt and read the candidate's last progress
+    # mark out of DRAM (0x4bf00000 survives a warm reset).
+    ok, _ = L.catch_uboot(fd, 6)
+    if ok:
+        marks = cmd("md.l 0x4bf00000 1", 2)
+        log(f"prompt caught at +{time.time() - t_go:.1f}s; DRAM progress mark: "
+            + ' '.join(marks.split()[-3:]))
+        log("(stub=0xb0 1=entry 2=after lowlevel_init 3=before _main "
+            "4=board_init_f 5=board_init_r)")
+        if not CATCH:
+            log("this is the loader that came back after the candidate; leaving it at the prompt")
+            os.close(fd); return 6
     if CATCH:
         ok, _ = L.catch_uboot(fd, 12)
         log("candidate prompt caught" if ok else "!!! candidate prompt NOT caught")
