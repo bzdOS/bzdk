@@ -1,3 +1,73 @@
+# Handoff — 2026-09-25, the board is not fragile any more (read this first)
+
+Two days of "the board went dark and needed the plug pulled" ended today with
+two root causes, both fixed and both hardware-proven. Everything below the
+next heading is the older handoff and still valid where it does not
+contradict this.
+
+## What was actually wrong
+
+1. **`bmc reset` never reset the board when the guest was busy** (6c01475).
+   `reboot_clean()` dropped the USB pull-up and armed a 2 s watchdog on CPU1
+   -- while CPU0 kept petting that watchdog on every EL2 exception because
+   the guest's eMMC traffic counted as "progress" for 180 s. Any ssh command
+   in the previous three minutes made the reset impossible: gadget gone,
+   CPU1 parked, guest alive, board dark on every channel. Not a failed reset;
+   no reset. Fixed by setting `wdt_debug_hold` inside `reboot_clean()`.
+   Proven: `warm_reset_soak.py 3 3` = 6/6, U-Boot in 5 s, guest in ~47 s,
+   including three resets under eMMC reads + SD writes.
+2. **The EMAC died after guest boot because the PHY's rail (AXP803 DC1SW)
+   was switched off** (228623b). Read live: REG 0x12 = 0x58, bit 7 clear;
+   BMSR 0xffff. Who clears it -- FreeBSD's disable-unused pass despite
+   `always_on`, or our own hdmi relock's read-modify-write racing the guest
+   on the RSB bus -- is NOT settled; the guard (`phy_rail_ensure()`) is right
+   either way and fires only when the PHY reads as absent. WDEP[15] counts
+   how often it had to.
+
+Retracted today: the `bootcmd` watchdog edit as the cause of the 24th's loss
+(it never ran), and "eMMC state survives the warm reset" (there was no reset).
+`docs/sessions/2026-09-23-board-dark-root-cause.md` has the full trail,
+including the wrong turns.
+
+## The board, right now
+
+- Image: 228623b (`microkernel-dbg.uimg` in /opt/bzdos/tftpboot, `.elf` for
+  chimpd's loady). Autoboot (`bootcmd` → TFTP → `bootm`) is the boot path and
+  is proven with chimpd stopped; chimpd (`systemctl status chimpd`) is the
+  backstop that catches U-Boot if autoboot does not.
+- `dbg_emac_watchdog_reboot = 0`: the hypervisor does not reset itself on a
+  dark EMAC. With the rail guard in, EMAC-dark should self-heal instead.
+- Guest: FreeBSD 15.1-RC3, 4 vCPU, root ro on eMMC, /var and /opt on the SD
+  with **`failok`** (2026-09-25): a missing card no longer drops rc into
+  single-user; `varmfs=AUTO` gives a memory /var and sshd still comes up.
+  Backup of the previous fstab: `/etc/fstab.bak-2026-09-25` on the guest.
+- U-Boot environment: byte-exact known-good values are in `rescue_env.py`;
+  `uboot_env.py` edits it from the guest. U-Boot arms no watchdog of its own;
+  the reset→`wdt_init()` window is still unprotected (see
+  memory `uboot-arms-no-watchdog`). Do not close it from `bootcmd`.
+
+## Levers, in the order to pull them
+
+1. `ssh -i ~/.ssh/chimp_ed25519 root@192.168.88.82` -- guest work.
+2. `bzdctl.py status` / `bzdctl.py power reset` -- EMAC; the reset now works.
+3. USB console (`/dev/ttyCHIMP`): guest `login:` is there; the hypervisor
+   monitor answers `~BZDBG <cmd>` (separator byte after the prefix; replies
+   lag one command; `r <pa> <hexcount>`, `call <pa> [x0..x3]`). **Stop chimpd
+   first**, it holds the port lock.
+4. Break-glass: write `\x00~BZRST\x00` to the tty -> WDOG reset in 16 s.
+   Proven today twice.
+5. Only then the power switch.
+
+## Not done, deliberately
+
+- The EMAC-dark autonomous reset stays off. If EMAC dies again with the
+  guard in place, read WDEP (`r 0x50022000 0x10` over USB): slot 4 = last
+  BMSR, slot 15 = rail fixes. That tells whether the guard fired.
+- Attribution of the rail cut (guest vs our relock). Test: boot with
+  `dbg_hdmi_relock=0` a few times.
+- The non-volatile SD boot record. Not needed now that the losses are
+  explained.
+
 # Handoff — 2026-08-29, guest kernel rebuilt + IR lands (the v0.0.2-prealpha close-out session)
 
 Written at the end of a long session. Read this, then `SESSION-RULES.md`, then

@@ -116,6 +116,19 @@ attached.
    read/write at all. The guard exists to stop the guest destroying SPL; it was
    also stopping it from editing boot configuration. Floor is now the ESP's
    first LBA (16418) and SPL remains unwritable.
+   **2026-09-25, the other half of this step is now proven too.** The
+   autoboot path itself -- `bootcmd` → `boothv` → TFTP of DTB, kernel and
+   `microkernel-dbg.uimg` → `bootm` -- brought the board from a reset to a
+   running guest with chimpd *stopped*, repeatedly, in ~45 s per cycle
+   (`warm_reset_soak.py`). chimpd is a backstop for that path now, not the
+   path.
+
+   And the reset that feeds it is fixed: `bmc reset` used to arm a 2 s WDOG
+   on CPU1 while CPU0 kept petting it on the guest's behalf, so the reset
+   never happened and the board went dark until someone cut the power
+   (6c01475, see docs/sessions/2026-09-23-board-dark-root-cause.md).
+   That, not anything in U-Boot, was the "warm reset sometimes never
+   returns" of the last two days.
 3. Switch `board_ctl.wait_for_power_cycle()` off "does /dev/ttyACM0 exist" and
    onto EMAC liveness.
 4. Triage the 21 python files under `microkernel/` that reference the ACM tty
