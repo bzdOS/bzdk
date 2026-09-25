@@ -127,9 +127,10 @@ volatile uint32_t dbg_emac_watchdog_reboot = 1;   /* back ON 2026-09-25: see bel
  * boot chain also self-recovers. The known cause of a dark EMAC (the PHY
  * rail cut, 228623b) is repaired in place before this ever fires. What is
  * left is a true unknown, and for that the owner wants a reboot rather than
- * a board that sits dark until someone walks over. emac_autoreboot_budget()
- * caps it at three consecutive reboots without ten healthy minutes, so a
- * pulled cable cannot turn into an endless dirty-reboot loop. */
+ * a board that sits dark until someone walks over -- but after HOURS of
+ * continuous dark (LINK_WD_DARK_REBOOT_S in emac.c, 3 h), not after a
+ * minute: the PHY keeps being re-kicked the whole time, and a pulled cable
+ * costs one reboot every few hours, not a loop. */
 
 /* HDMI PHY re-lock defense (HV_HDMI builds), DEFAULT ON. hdmi_init() brings the
  * pipeline up with the PHY locked, but ~1 s into guest boot FreeBSD's axp8xx
@@ -705,8 +706,7 @@ void smp_secondary_main(uint64_t cpuid)
 				 * EMAC-dark recovery needs no host typing. Both paths set
 				 * the same wdt_debug_hold gate; usbacm_force_breakglass
 				 * is the single chokepoint for break-glass semantics. */
-				if (emac_link_watchdog() && dbg_emac_watchdog_reboot
-				    && emac_autoreboot_budget()) {
+				if (emac_link_watchdog() && dbg_emac_watchdog_reboot) {
 					/* Stop both pet paths FIRST: wdt_pet() on CPU0 restarts
 					 * the WDOG counter whenever the guest is making progress,
 					 * which would keep re-arming the timer reboot_clean() is
