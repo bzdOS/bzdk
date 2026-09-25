@@ -309,3 +309,23 @@ build: `build/uboot-config-2026-09-25-wdt.saved`.
 
 One guard tripped on my own arithmetic on the first run (0xd55ed vs the
 real 0xd556d) and aborted before writing anything — which is what it is for.
+
+## 2026-09-25, 16:41 — lost again, cause unknown; the black box ships
+
+Reloading the first build with the EMAC-dark auto-reboot back on (78ff1ed):
+U-Boot 16:41:03, HV gadget 16:41:42, EMAC answered 16:41:46, **gadget gone
+16:41:50**, nothing since. Eight seconds in. Not the ladder (needs 48 s),
+not chimpd (it only read), not the host tools (the only reset was the one
+at 16:40:58 that started this boot). A gadget drop is a `reboot_clean()`
+or something that resets the MUSB, and no reset followed. The hold-flag
+coherency idea was checked against the code and does not hold: hv-scratch
+is one shared table for all cores, Normal-WB inner-shareable.
+
+Unknown, and unknowable after the power-cycle -- which is why `sdbox.c`
+exists as of d6c59b1: `reboot_clean()` now writes the caller's reason, the
+core, CNTPCT and the flight recorder's tail to SD LBA 64 before it touches
+anything. Next time this happens, `sdbox_read.py` says who asked.
+
+Also in this image: the EMAC-dark reboot after **3 h** of continuous dark
+(a30f9fa; the owner's number), not 50 s; the PHY keeps being re-kicked
+throughout. Power-cycles today: six.

@@ -35,8 +35,16 @@ including the wrong turns.
   chimpd's loady). Autoboot (`bootcmd` → TFTP → `bootm`) is the boot path and
   is proven with chimpd stopped; chimpd (`systemctl status chimpd`) is the
   backstop that catches U-Boot if autoboot does not.
-- `dbg_emac_watchdog_reboot = 0`: the hypervisor does not reset itself on a
-  dark EMAC. With the rail guard in, EMAC-dark should self-heal instead.
+- `dbg_emac_watchdog_reboot = 1` again (a30f9fa): a dark EMAC is re-kicked
+  every 8 s and the board reboots itself only after **3 h** of continuous
+  dark. WDEP[16] shows the running dark seconds.
+- **Black box (d6c59b1):** every `reboot_clean()` writes SD LBA 64 first --
+  reason (bmc / PSCI off / PSCI reset / EMAC-dark / repl), core, CNTPCT,
+  flight-recorder tail. `python3 sdbox_read.py` decodes it via the guest.
+  Read it FIRST after any unexplained reset or dark board.
+- **Open:** 16:41 on the 25th the board went dark 8 s into the first boot of
+  a build with auto-reboot on -- a gadget drop, no reset after. Unexplained.
+  The black box exists so the next one is not.
 - Guest: FreeBSD 15.1-RC3, 4 vCPU, root ro on eMMC, /var and /opt on the SD
   with **`failok`** (2026-09-25): a missing card no longer drops rc into
   single-user; `varmfs=AUTO` gives a memory /var and sshd still comes up.
