@@ -35,6 +35,24 @@ _start:
 	tlbi	alle2
 	dsb	sy
 	isb
+	/* Arm the SoC watchdog (16 s, whole-system reset) so a candidate that
+	 * hangs before its own initr_watchdog() costs a warm reset into the
+	 * stock loader, not a power-cycle -- and DRAM, with the candidate's
+	 * progress marks at 0x4bf00000, survives that reset. Attempts 1 and 2
+	 * (2026-09-25) each cost a trip to the switch for want of this. */
+	ldr	x5, =0x01c20cb4
+	mov	w6, #1
+	str	w6, [x5]		/* WDOG_CFG: system reset */
+	mov	w6, #0xb1
+	str	w6, [x5, #4]		/* WDOG_MODE: 16 s + enable */
+	ldr	w6, =0x14af
+	str	w6, [x5, #-4]		/* WDOG_CTRL: restart key */
+	dsb	sy
+	/* progress mark 0: stub reached the jump */
+	ldr	x5, =0x4bf00000
+	mov	w6, #0xb0
+	str	w6, [x5]
+	dsb	sy
 	ldr	x4, =0x4a000000
 	br	x4
 
