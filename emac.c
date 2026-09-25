@@ -76,6 +76,7 @@
                     * naked seconds-long wait here would trip the watchdog. */
 #include "timer.h" /* timer_now()/timer_freq() — emac_link_watchdog()'s own
                     * rate limit; same timebase the CPU1 loop already uses. */
+#include "rsb.h"   /* phy_rail_ensure(): the PHY's PMIC rail, see there */
 #include "hv_addrmap.h" /* HVMAP_WDEP_BASE — the watchdog EPISODE record
                     * window (see the map in hv_addrmap.h; written ONLY by
                     * the watchdog/poll paths below, never by emac_init(),
@@ -1404,6 +1405,49 @@ static int phy_physr_no_link(void)
     return !(physr & PHYSR_LINK);
 }
 
+/* The PHY's power rail is AXP803 DC1SW ("vcc-phy"), REG 0x12 bit 7 -- and
+ * the guest switches it OFF. FreeBSD's regulator framework disables every
+ * regulator nobody references (hw.regulator.disable_unused) at the end of
+ * boot; the emac node in the guest DTB is status="disabled" because this
+ * hypervisor drives the EMAC, so from the guest's side vcc-phy has no user.
+ * The PHY then vanishes from MDIO: BMSR reads 0xffff, every re-kick fails,
+ * the link watchdog gives up, and the board is EMAC-dark with a healthy
+ * guest behind it -- ssh, vnet and dbgmon all gone.
+ *
+ * Measured 2026-09-25 (two boots in a row, WDEP bmsr ring all 0xffff,
+ * REG 0x12 read live = 0x58, bit 7 clear). The boots that survived did so by
+ * accident: hdmi.c's relock, when its own RSB read fails under contention,
+ * falls back to writing 0x88 -- DC1SW + DLDO1 -- and switched the PHY back
+ * on as a side effect. When that read succeeds it preserves the guest's
+ * bit 7 = 0, and the PHY stays dead.
+ *
+ * Same shape as the dldo1/HDMI case, same answer: the hypervisor owns the
+ * silicon, so it owns the rail. Called ONLY when the PHY reads as absent, so
+ * the RSB bus (shared with the guest's axp8xx driver) is touched only when
+ * the alternative is a dark board. Returns 1 if the rail was switched on,
+ * 0 if it was already on, -1 if the PMIC could not be read. */
+#define AXP803_HW_ADDR      0x3a3u
+#define AXP803_RT_ADDR      0x2du
+#define AXP803_REG_OUT2     0x12u    /* DC1SW | DLDO4..1 | ELDO3..1 enables */
+#define AXP803_OUT2_DC1SW   0x80u
+static uint32_t g_wdep_railfix;      /* WDEP[15]: times the rail was found off */
+
+static int phy_rail_ensure(void)
+{
+    uint8_t v = 0;
+
+    if (rsb_init() != 0)
+        return -1;
+    rsb_set_device_address(AXP803_HW_ADDR, AXP803_RT_ADDR);
+    if (rsb_read(AXP803_RT_ADDR, AXP803_REG_OUT2, &v) != 0)
+        return -1;
+    if (v & AXP803_OUT2_DC1SW)
+        return 0;
+    rsb_write(AXP803_RT_ADDR, AXP803_REG_OUT2, (uint8_t)(v | AXP803_OUT2_DC1SW));
+    wdep_write(15, ++g_wdep_railfix);
+    return 1;
+}
+
 int emac_link_watchdog(void)
 {
     uint64_t freq = timer_freq();
@@ -1501,6 +1545,14 @@ int emac_link_watchdog(void)
         wdep_write(3, ++g_wdep_giveups);
         return 1;           /* one-shot: tell the caller to consider escalating */
     }
+
+    /* PHY reads as absent (last BMSR sample 0xffff): its rail is off, see
+     * phy_rail_ensure(). Restore it BEFORE retraining; an unpowered PHY
+     * cannot answer phy_startup_ctx() and the re-kick budget would just
+     * burn down to give-up. The RTL8211E needs its power-on delay before
+     * MDIO answers; the QUICK bring-up's own polling covers that. */
+    if ((wdep_read(4) & 0xffffu) == 0xffffu)
+        phy_rail_ensure();
 
     /* Bounded re-kick: re-run PHY bring-up; re-arm the rings and RX/TX/MAC
      * enables ONLY in the never-had-traffic case (g_rx_count==0).
