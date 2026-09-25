@@ -35,6 +35,7 @@
 #include "stage2.h"
 #include "kload.h"
 #include "reboot.h"
+#include "sdbox.h"
 #include "hud.h"
 
 /* ------------------------------------------------------------------ *
@@ -722,7 +723,7 @@ void repl_run(void)
 			/* Clean reboot: drop the USB pull-up so the host sees a proper
 			 * disconnect, then a ~2s watchdog — avoids the zombie-gadget the
 			 * old 0.5s reset caused (host couldn't re-enumerate in time). */
-			reboot_clean();     /* noreturn */
+			reboot_reason = RB_REASON_REPL; reboot_clean();     /* noreturn */
 		}
 		if (console_link_up())
 			link_grace = LINK_GRACE;      /* healthy: refill the grace */
