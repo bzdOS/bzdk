@@ -22,7 +22,48 @@ _start:
 	ldr	x2, =0x4a000000
 	ldr	x3, =0x4a100000		/* 1 MiB: u-boot.bin is ~840 KiB */
 	bl	clean_range
-	dsb	sy
+	/* Then clean+invalidate EVERY data cache line by set/way, all levels.
+	 * Clean-by-VA of two ranges is not enough: the stock loader's own
+	 * data -- its relocated image, page tables, DTB copy -- sits valid in
+	 * L1/L2 at the top of DRAM, exactly where the candidate relocates
+	 * itself and copies its DTB with the cache off. When the candidate
+	 * turns its cache on it reads those stale lines: measured 2026-09-25
+	 * 14:47, fdt_path_offset() = FDT_ERR_BADSTRUCTURE on a copy whose
+	 * header was intact. Classic ARMv8 set/way walk from CLIDR. */
+	mrs	x0, clidr_el1
+	and	w3, w0, #0x07000000
+	lsr	w3, w3, #23		/* LoC * 2 */
+	cbz	w3, 9f
+	mov	w10, #0			/* cache level << 1 */
+1:	add	w2, w10, w10, lsr #1	/* 3 * level */
+	lsr	w1, w0, w2
+	and	w1, w1, #7		/* cache type at this level */
+	cmp	w1, #2
+	b.lt	5f			/* no data/unified cache here */
+	msr	csselr_el1, x10
+	isb
+	mrs	x1, ccsidr_el1
+	and	w2, w1, #7
+	add	w2, w2, #4		/* log2(line bytes) */
+	mov	w4, #0x3ff
+	and	w4, w4, w1, lsr #3	/* max way */
+	clz	w5, w4			/* way field shift */
+	mov	w7, #0x7fff
+	and	w7, w7, w1, lsr #13	/* max set */
+2:	mov	w9, w4			/* way */
+3:	lsl	w6, w9, w5
+	orr	w11, w10, w6
+	lsl	w6, w7, w2
+	orr	w11, w11, w6
+	dc	cisw, x11
+	subs	w9, w9, #1
+	b.ge	3b
+	subs	w7, w7, #1
+	b.ge	2b
+5:	add	w10, w10, #2
+	cmp	w3, w10
+	b.gt	1b
+9:	dsb	sy
 	ic	iallu
 	dsb	sy
 	isb
