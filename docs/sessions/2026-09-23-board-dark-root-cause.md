@@ -284,3 +284,28 @@ has booted for months; a rebuilt SPL cannot be chain-load-tested. Do it
 from the stock U-Boot prompt (`tftpboot` + `mmc write`), not from the guest
 (the boot guard exists precisely to stop that), and with someone at the
 switch.
+
+## 2026-09-25, 16:21 — the watchdog U-Boot is on the eMMC
+
+Owner's call ("доделывай всё на постоянку"). Written from the stock
+prompt: `tftpboot u-boot-wdt.itb` (879741 B) → `mmc dev 1` (verified
+`mmc@1c11000`, 7.3 GiB, the eMMC) → LBA 80 verified to hold the July FIT
+(`d00dfeed`, totalsize 0xd556d) → `mmc write 0x4a000000 0x50 0x6b7` →
+read back → `cmp.b … 0xd6c7d`: same. The July SPL at LBA 16 is untouched;
+ATF inside the FIT is byte-identical to July's; SCP empty in both.
+
+First boot from eMMC through the July SPL: `U-Boot 2026.07-rc5 (Sep 25
+2026 - 14:55:03)`, `WDOG_MODE` = 0xb1 at the prompt, `wdt list` shows
+`sunxi_wdt`, `bootcmd` → `bootm`, hypervisor and guest up.
+
+The reset→`wdt_init()` window is now covered from the moment U-Boot proper
+starts (`initr_watchdog`, ~1 s after SPL) until the hypervisor re-arms it.
+SPL and BROM (< 1 s) remain uncovered; that is the residue.
+
+Backup and rollback: `build/emmc-bootarea-backup-2026-09-25.bin` (LBA
+16..16417 before the write), `build/u-boot-July-emmc.itb` (873837 B, 0x6ab
+sectors) — same procedure, from any U-Boot prompt. Config of the flashed
+build: `build/uboot-config-2026-09-25-wdt.saved`.
+
+One guard tripped on my own arithmetic on the first run (0xd55ed vs the
+real 0xd556d) and aborted before writing anything — which is what it is for.

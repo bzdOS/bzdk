@@ -41,9 +41,14 @@ including the wrong turns.
   with **`failok`** (2026-09-25): a missing card no longer drops rc into
   single-user; `varmfs=AUTO` gives a memory /var and sshd still comes up.
   Backup of the previous fstab: `/etc/fstab.bak-2026-09-25` on the guest.
-- **U-Boot with its own watchdog exists and is chain-load-proven**
-  (`build/u-boot-WDT-2026-09-25-*.bin`): WDOG armed at its prompt, `wdt
-  expire` resets in 4 s, boots through to the guest. NOT on the eMMC. Test
+- **U-Boot on the eMMC now arms its own watchdog** (since 2026-09-25 16:21:
+  `U-Boot 2026.07-rc5 (Sep 25 2026 - 14:55:03)`, `CONFIG_WATCHDOG_AUTOSTART`,
+  16 s, `wdt` command). Only U-Boot proper (the FIT at LBA 80) was written;
+  the July SPL at LBA 16 is untouched. A hang anywhere from U-Boot proper
+  to the hypervisor's `wdt_init()` now costs 16 s, not a power-cycle.
+  Rollback: `build/u-boot-July-emmc.itb` via the same `mmc write`
+  procedure (session doc, 16:21). Chain-load-proven first with
+  `build/u-boot-WDT-2026-09-25-*.bin`. Test
   any candidate with `uboot_chainload_test.py` (`--net-test` first); the
   stub arms the SoC watchdog and cleans the whole cache by set/way, so a
   hung candidate costs 16 s, not a power-cycle. See the session doc.
