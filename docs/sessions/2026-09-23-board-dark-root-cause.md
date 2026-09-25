@@ -173,3 +173,41 @@ distinguishes those, and they point at completely different faults.
 1c3d6db, so the board no longer resets itself on a dark EMAC. The failure
 cannot recur unattended; it can only be provoked deliberately, which is the
 right way round for something this expensive to observe.
+
+## 2026-09-25 — Correction: the bootcmd edit was not the killer
+
+On the morning of the 25th, with the board dark since 01:46 on the 24th, I
+said the cause was my 01:46 environment edit (arming the watchdog at the
+front of `bootcmd`), and "fixed" it by restoring the previous `bootcmd`
+byte-for-byte via `rescue_env.py`. The board came back. Re-reading the
+host kernel log and chimpd's log against the transcript shows the claim
+does not hold:
+
+- **01:46:04** environment written. **01:46:15** `bzdctl.py power reset`
+  (`reboot_clean()` via BMC). **01:46:18** the HV gadget disconnected —
+  and *no U-Boot gadget ever appeared*. U-Boot's gadget comes up in
+  `preboot`, before `bootdelay`, before `bootcmd`. So `bootcmd` never ran.
+  This is the same shape as 21:22:55 on the 23rd: a warm reset after which
+  nothing enumerates, until the power is cut.
+- **10:55:09 (25th)** power-cycle; U-Boot gadget up; **10:55:11** chimpd
+  caught the prompt, inside the 3 s `bootdelay` — `bootcmd` did not run;
+  **10:55:13.8** USB disconnect, then a ghost reconnect that never
+  answered a SETUP. **11:00:09** second power-cycle, prompt caught at
+  11:00:10, dead at 11:00:42 with `Cannot enable. Maybe the USB cable is
+  bad?` on the host, while the cable was being re-plugged. **11:05:54**
+  third power-cycle: prompt caught, env restored, `boot` typed, TFTP at
+  10.8 MiB/s, guest up. Same U-Boot, same eMMC.
+
+So: the edit was reverted (correctly — an unverifiable boot-chain edit
+should not stay), but reverting it fixed nothing. What is actually
+established is narrower and worse: **a warm (WDOG) reset issued by the
+hypervisor sometimes never returns to U-Boot, and a cold start always
+does.** Both losses had the guest busy on the eMMC (root mount on the
+23rd; `uboot.env` written 11 s earlier on the 24th). The WDOG resets the
+SoC but not the PMIC, the eMMC, the SD card or the RTC domain — whatever
+state they were in survives into the BROM. `warm_reset_soak.py` measures
+this: N resets idle, N under eMMC reads + SD writes.
+
+The morning's two dead prompts are a separate, unexplained thing; the host
+errors were physical-layer, and they coincided with the cable being
+handled. Not pursued.

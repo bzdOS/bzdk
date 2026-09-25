@@ -13,6 +13,7 @@
 #define ISCR_CHANGE_DETECT  ((1u << 4) | (1u << 5) | (1u << 6)) /* w1c */
 #define POWER_SOFTCONN      0x40u
 
+#include "wdt.h"     /* wdt_debug_hold: the guest-progress pet on CPU0 must stop */
 #define WDOG_CTRL   SOC_A64_WDOG_CTRL
 #define WDOG_CFG    SOC_A64_WDOG_CFG
 #define WDOG_MODE   SOC_A64_WDOG_MODE
@@ -71,6 +72,30 @@ void reboot_clean(void)
 {
 	uint64_t hz, t0;
 	unsigned long guard;
+
+	/* STOP EVERY PET PATH FIRST, HERE, NOT IN THE CALLER.
+	 *
+	 * This runs on whichever core asked for the reset (CPU1 for `bmc reset`
+	 * and the EMAC-dark escalation, CPU0 for the PSCI paths). CPU0 keeps
+	 * running the guest meanwhile, and el2_exc.c's wdt_pet() restarts the
+	 * WDOG counter on EVERY EL2 exception while the guest's last "progress"
+	 * is under 180 s old -- and vblk_emmc.c counts eMMC traffic as progress.
+	 * So a 2 s watchdog armed below, underneath a live guest that touched
+	 * the eMMC in the last three minutes, NEVER FIRES: CPU0 reloads it
+	 * hundreds of times a second. The gadget is already dropped, this core
+	 * is about to park, and the board goes dark on every channel with the
+	 * guest still running behind it -- recoverable only by cutting power.
+	 *
+	 * That is what `bmc reset` did on 2026-09-24 01:46 (11 s after an ssh
+	 * session wrote uboot.env) and 2026-09-25 11:33 (right after ssh
+	 * commands read the root disk); it worked at 01:39 only because the
+	 * guest had been idle for nine minutes. Two of the three reboot_clean()
+	 * callers set wdt_debug_hold themselves; bmc_reset() and repl.c did
+	 * not. The hold belongs here, so no caller can forget it again. It is
+	 * a fixed-address word (hv_addrmap.h) that wdt_arm() clears on the next
+	 * generation, so it cannot outlive the reset it asks for. */
+	wdt_debug_hold = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
 
 	usb_gadget_disconnect();
 	arm_watchdog();
