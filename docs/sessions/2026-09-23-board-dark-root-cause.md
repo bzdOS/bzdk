@@ -211,3 +211,40 @@ this: N resets idle, N under eMMC reads + SD writes.
 The morning's two dead prompts are a separate, unexplained thing; the host
 errors were physical-layer, and they coincided with the cable being
 handled. Not pursued.
+
+## 2026-09-25 — Resolved: why the warm reset "never returned"
+
+`warm_reset_soak.py` lost the board on its very first cycle, idle, 25 min
+after a cold start. Reading `reboot_clean()` against its callers gave the
+mechanism, and the USB monitor confirmed the state:
+
+- `bmc_reset()` → `reboot_clean()` runs on CPU1: drop the USB pull-up, arm
+  a **2 s** WDOG, park. CPU0 keeps running the guest, and `el2_exc.c`
+  calls `wdt_pet()` on **every** EL2 exception while the guest's last
+  "progress" is under 180 s old — and `vblk_emmc.c` counts eMMC traffic as
+  progress. Any ssh command in the previous three minutes therefore kept
+  the WDOG reloaded hundreds of times a second. **No reset ever happened.**
+  Gadget gone, CPU1 parked, guest alive at `login:`, board dark on every
+  channel.
+- Confirmed live: with the board "lost", `~BZDBG` on ttyACM still answered
+  and the guest console showed `login:`. Break-glass (`\x00~BZRST\x00`, which
+  sets `wdt_debug_hold`) brought it back in 16 s.
+- Fixed in 6c01475: `wdt_debug_hold = 1` inside `reboot_clean()` itself.
+  The PSCI and EMAC-dark callers had set it; `bmc_reset()` and `repl.c`
+  had not.
+
+The 01:39 reset that worked did so because the guest had been idle for
+nine minutes. The "eMMC state survives the warm reset" hypothesis from
+earlier today is withdrawn: there was no warm reset to survive.
+
+## 2026-09-25 — Second, independent: the guest switches the PHY's rail off
+
+Two consecutive boots after that came up with the EMAC dead once the guest
+finished booting. WDEP (read over USB) showed the BMSR ring all `0xffff`;
+`rsb_read(0x2d, 0x12)` via `~BZDBG call` returned **0x58: DC1SW (vcc-phy)
+off.** FreeBSD disables every regulator nobody references at the end of
+boot, and the guest DTB's emac node is `status="disabled"` because this
+hypervisor drives the EMAC. The boots that survived did so because hdmi.c's
+relock fallback happens to write 0x88 (DC1SW+DLDO1) when its RSB read
+fails under contention. Fixed in 228623b: `phy_rail_ensure()` re-enables
+DC1SW whenever the PHY reads as absent, before re-kicking.
