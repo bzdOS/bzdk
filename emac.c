@@ -1371,7 +1371,12 @@ int emac_init(void)
 /* Grace before a link that has NEVER carried a frame may escalate to a
  * reboot. See the give-up block in emac_link_watchdog() for why it exists
  * and why it has to outlast the guest bringing its own network up. */
-#define LINK_WD_FIRST_RX_GRACE_S 300u
+#define LINK_WD_FIRST_RX_GRACE_S 300u   /* superseded by LINK_WD_DARK_REBOOT_S */
+/* Continuous dark time before the ladder gives up and smp.c may reboot.
+ * Owner's number: "раз в несколько часов". WDEP[16] shows the running dark
+ * seconds; g_dark_since resets the moment the link is healthy again. */
+#define LINK_WD_DARK_REBOOT_S    (3u * 3600u)
+static uint64_t g_dark_since;
 
 static uint64_t g_wd_last_check_ticks;
 static uint32_t g_wd_attempts;
@@ -1448,26 +1453,6 @@ static int phy_rail_ensure(void)
     return 1;
 }
 
-/* Autonomous EMAC-dark reboot budget. smp.c may reboot the board when the
- * link watchdog gives up -- but a board whose cable is out, or whose switch
- * died, would then reboot every couple of minutes forever, dirty-stopping
- * the guest each time, until someone noticed. WDEP[16] counts consecutive
- * autonomous reboots; it lives in DRAM and so survives the warm reset it
- * counts. Ten healthy minutes clear it (emac_link_watchdog() above). After
- * a power-cycle the slot reads 0xffffffff, which counts as zero. Returns 1
- * and takes one unit if a reboot is still allowed, 0 if the budget is spent:
- * the board then stays up, dark, reachable over USB. */
-#define EMAC_AUTOREBOOT_MAX 3u
-int emac_autoreboot_budget(void)
-{
-    uint32_t n = wdep_read(16);
-    if (n == 0xffffffffu)
-        n = 0;
-    if (n >= EMAC_AUTOREBOOT_MAX)
-        return 0;
-    wdep_write(16, n + 1u);
-    return 1;
-}
 
 int emac_link_watchdog(void)
 {
@@ -1512,14 +1497,7 @@ int emac_link_watchdog(void)
 
     if (emac_rx_recent(freq, now) && g_link_up && !g_wd_test_mode
         && !phy_physr_no_link()) {
-        /* Ten healthy minutes forgive the autonomous-reboot streak in
-         * WDEP[16] (see emac_autoreboot_budget()): a board that came back
-         * and stayed reachable is not looping. */
-        static uint64_t healthy_since;
-        if (healthy_since == 0)
-            healthy_since = now;
-        else if (now - healthy_since > freq * 600ull)
-            wdep_wc(16, 0);
+        g_dark_since = 0;               /* healthy: no dark episode running */
         return 0;   /* healthy: recent RX traffic + link up. The old test was
                      * "at least one frame has EVER arrived" (g_rx_count != 0),
                      * which went permanently blind to a link that DROPPED
@@ -1563,12 +1541,20 @@ int emac_link_watchdog(void)
          * has ever arrived, g_rx_count is non-zero and the recency test from
          * 2026-08-27 takes over unchanged -- a link that drops AFTER traffic
          * still escalates immediately, which is what that change was for. */
-        if (g_rx_count == 0) {
-            uint64_t grace = freq * (uint64_t)LINK_WD_FIRST_RX_GRACE_S;
-            if (now - g_emac_up_ticks < grace) {
-                g_wd_attempts = 0;       /* fresh budget, keep re-kicking */
-                return 0;
-            }
+        /* THE OWNER'S RULE (2026-09-25): a dark EMAC is rebooted after
+         * HOURS, not after a minute. Keep re-kicking the PHY every check
+         * period for as long as it takes -- a re-kick is cheap and it is
+         * what fixes the known cause (the PHY rail, phy_rail_ensure()) --
+         * and only when the link has been continuously dark for
+         * LINK_WD_DARK_REBOOT_S does the ladder give up and let smp.c
+         * reboot the board. A never-had-a-frame boot is the same case:
+         * it gets the same hours, not a 300 s grace. */
+        if (g_dark_since == 0)
+            g_dark_since = now;
+        if (now - g_dark_since < freq * (uint64_t)LINK_WD_DARK_REBOOT_S) {
+            g_wd_attempts = 0;           /* fresh budget, keep re-kicking */
+            wdep_write(16, (uint32_t)((now - g_dark_since) / freq));  /* dark seconds so far */
+            return 0;
         }
         g_wd_gave_up = 1;
         bc(1, BC_STAGE_WD_GAVEUP);
