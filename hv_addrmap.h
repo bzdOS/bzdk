@@ -867,4 +867,17 @@ _Static_assert(HVMAP_RSBTRAP_LOG >= HVMAP_RSBTRAP_BC + HVMAP_RSBTRAP_BC_SIZE,
 _Static_assert(HVMAP_RSBTRAP_END <= 0x50100000UL,
                "rsbtrap window runs into emac.c's DMA scratch (0x50100000)");
 
+/* el2_exc.c: per-core state sample, one 0x40 window per physical CPU, taken
+ * every 256th EL2 entry on that core: [0] "CORE" [1] sample count [2..3]
+ * HCR_EL2 [4] GICC_RPR [5] GICC_HPPIR [6] GICC_CTLR [7] GICC_PMR [8] DAIF
+ * [9] exception kind [10] ESR_EL2 [11] CNTPCT lo [12] CNTP_CTL [13..14]
+ * CNTP_CVAL. GICC and CNTP are banked: each window is that core's own view,
+ * which nothing else can read. For "a core stops taking interrupts". */
+#define HVMAP_CORESAMP          0x5009E800UL
+#define HVMAP_CORESAMP_SIZE     0x00000100UL
+_Static_assert(HVMAP_CORESAMP >= HVMAP_RSBTRAP_END,
+               "core samples overlap the rsbtrap window");
+_Static_assert(HVMAP_CORESAMP + HVMAP_CORESAMP_SIZE <= 0x50100000UL,
+               "core samples run into emac.c's DMA scratch");
+
 #endif /* HV_ADDRMAP_H */
