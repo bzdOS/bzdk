@@ -1,6 +1,6 @@
 # Peripheral status
 
-State of the A64 peripherals as seen by the FreeBSD guest. Updated 2026-09-23.
+State of the A64 peripherals as seen by the FreeBSD guest. Updated 2026-09-26.
 Each "not done" entry says why, so the next person does not re-derive it.
 
 ## Working
@@ -67,7 +67,7 @@ specific, not merely be untidy:
 | `watchdog@1c20ca0` | the board's only unattended recovery path |
 | `hdmi@*`, `lcd-controller@*` | hypervisor drives the display |
 | `mmc@1c0f000`, `mmc@1c11000` | passed to the guest as virtio-blk instead |
-| `rsb@1f03400` | hypervisor drives the AXP803 PMIC through it |
+| `rsb@1f03400` | shared, not given: the guest runs aw_rsb + axp8xx_pmu, but its controller is emulated by `rsbtrap.c` (one bus lock for guest and EL2; writes that would cut the CPU/DRAM/PHY/HDMI rails or power the PMIC off are refused). Since 2026-09-26 |
 
 ## Enabled but with a cost worth knowing
 
