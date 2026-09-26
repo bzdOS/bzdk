@@ -1,66 +1,47 @@
-# Handoff — 2026-09-26, a U-Boot that cannot be parked for ever (read this first)
+# Handoff — 2026-09-26, nothing can park the board for ever any more (read this first)
 
-**The board has been dark since 2026-09-25 18:09 and the owner will not
-power it again until the cause is fixed.** The cause of *that* loss is
-established from the host's USB log alone; its fix is built but can only be
-put on the board after one more power-up.
+## State (verified 14:36, full reset through the whole chain)
 
-## What keeps the board lost
+- **U-Boot on the eMMC:** `2026.07-rc5 (Sep 26 2026 - 13:46:18)` = the
+  watchdog build + `BOOT_RETRY=120`/`RESET_TO_RETRY`. An idle `=>` resets the
+  board after 120 s (chain-load-proven: 122 s). `reset` works in it
+  (SYSRESET_WATCHDOG); the old "reset hangs" note is about the July loader.
+  Flashed with `uboot_flash_fit.py` (card byte-checked against
+  `u-boot-wdt.itb` first, read back + cmp). SPL untouched.
+  Rollback: `uboot_flash_fit.py --fit u-boot-wdt.itb --current u-boot-retry.itb
+  --expect-version "Sep 25 2026 - 14:55"` (needs a prompt: see bootdelay).
+- **`bootdelay=-2`** in uboot.env: autoboot cannot be interrupted. For a
+  prompt: `uboot_env.py set bootdelay=3`, reset, catch, and put `-2` back.
+  chimpd cannot catch U-Boot and stays disabled. Env backup:
+  `build/uboot.env.backup-2026-09-26`.
+- **Hypervisor:** `228623b` + the reachability gate = branch
+  `board-2026-09-26` (d4cebeb) in `/opt/bzdos/microkernel-wt-unreach`, built
+  clean WITH config.mk. No pet without a reach within 900 s (EMAC RX frame, or
+  USB SOFs advancing MUSB FRAME @0x01c19054). Proven: 30 s window with live
+  channels = no reset in 90 s; `wdt_unreach_test=1` = reset in 47 s, back on
+  its own. master has the same change (2247d7f). No black box in this image
+  (sdbox came later, in the a30f9fa-era builds that are not trusted yet).
 
-Four times (09-23 18:40, 09-25 10:55, 11:00, 18:09), identical signature:
-U-Boot's gadget enumerates, chimpd's `catch_uboot()` Ctrl-C flood stops
-autoboot, 1-4 s later the gadget disconnects, re-attaches high-speed and
-never answers again (`error -71` → `unable to enumerate USB device`). Both
-the July and the watchdog U-Boot. ~0.4 % of ~1000 chimpd catches since August.
-What wedges the sunxi MUSB gadget is NOT known.
+## What was wrong (both found from evidence, not guessed)
 
-Why that is permanent: autoboot was stopped, so U-Boot sits at `=>`; there
-is no network at a prompt; USB is dead; and the prompt loop itself services
-U-Boot's watchdog (`schedule()`), so the 16 s WDOG never fires. No software
-lever reaches it. 19 h and counting.
+1. **U-Boot parked for ever** (the 19 h loss): chimpd's Ctrl-C catch wedges
+   the U-Boot MUSB gadget (~0.4 % of catches, 4 times since 09-23), autoboot
+   is already stopped, and the prompt loop services U-Boot's own watchdog.
+   What wedges the gadget is still NOT known; the two fixes above make it
+   cost ≤ 120 s instead of a power cut, and remove the catch altogether.
+2. **Today's first boot hung the guest in memset** (IPA 0xb7ff1000, stage-2
+   L1[2] = 0): the "known-good 228623b" staged 09-25 18:08 was MY build in a
+   git worktree, where the gitignored config.mk does not exist ->
+   GUEST_DRAM_2G=0 (1 GiB stage-2) under a 2 GiB DTB. The Makefile now refuses
+   `dbg` without config.mk; after creating one, `make clean` (objects do not
+   depend on it).
 
-## The fix (both parts owner-approved 2026-09-26, "делай оба")
+## Still open
 
-1. **U-Boot resets itself from an idle prompt**: `CONFIG_BOOT_RETRY=y`,
-   `BOOT_RETRY_TIME=120`, `RESET_TO_RETRY=y` -- no input for 120 s at `=>`
-   → `do_reset()` (sysreset via the watchdog; if even that hung, nobody
-   services the WDOG and it fires 16 s later). Otherwise the exact config on
-   the eMMC today (`build/uboot-config-2026-09-26-retry.saved`, diff = those
-   options). Built: `build/u-boot-RETRY-2026-09-26-{proper,with-spl}.bin`,
-   FIT `tftpboot/u-boot-retry.itb` (0xd6c85 B, 0x6b7 sectors, same as now),
-   stamp `Sep 26 2026 - 13:46`. **Not yet chain-load-tested -- the board is off.**
-2. **Autoboot that nobody can stop**: `bootdelay=-2` in `uboot.env`
-   (`common/autoboot.c:497`: no countdown, no abort check). `bootcmd`
-   already retries 10 times and then arms the WDOG, so U-Boot never waits at
-   a prompt at all. To get a prompt for maintenance: `uboot_env.py set
-   bootdelay=3` from the guest, reset, catch, and put `-2` back afterwards.
-   chimpd cannot catch U-Boot with `-2`; it stays disabled.
-
-## On the next power-up, in this order
-
-Board comes up on autoboot (chimpd disabled → no catch → the trigger above
-is absent). Image staged for both paths: **228623b** (auto-reboot OFF; the
-16:41/17:13 deaths were on the a30f9fa-era builds, still unexplained).
-1. One-shot: `bzdctl.py status`, guest ssh, `python3 sdbox_read.py`.
-2. `uboot_env.py backup /opt/bzdos/build/uboot.env.backup-2026-09-26`.
-3. `uboot_chainload_test.py --net-test`, then
-   `uboot_chainload_test.py u-boot-retry.bin --idle-reset` -- catches the
-   candidate's prompt, goes silent, must see a fresh loader ≥115 s later
-   (rc 0 = PASS, 8 = never reset, 9 = reset too early).
-   Each catch still carries the ~0.4 % gadget-wedge risk until step 4 lands.
-4. `uboot_flash_fit.py --fit u-boot-retry.itb --current u-boot-wdt.itb
-   --expect-version "Sep 26 2026 - 13:46"` (refuses unless the card holds
-   exactly u-boot-wdt.itb; write, read back, cmp, reset, version check).
-5. `uboot_env.py set bootdelay=-2`; `uboot_env.py get bootdelay`.
-6. `bzdctl.py power reset` once: autoboot to the hypervisor, no catch.
-
-Rollback for step 4: `uboot_flash_fit.py --fit u-boot-wdt.itb --current
-u-boot-retry.itb --expect-version "Sep 25 2026 - 14:55"` (or
-`u-boot-July-emmc.itb`, also in the TFTP root).
-
-Still open, separately: CPU1 services the HV's watchdog unconditionally
-while its tick runs, so a hypervisor with EMAC dark AND USB dead is invisible
-until the EMAC-dark rule gives up (off in 228623b, 3 h in a30f9fa).
+- The 16:41 / 17:13 deaths on 09-25 (a30f9fa-era builds). Whether those were
+  also worktree/config.mk builds is not known -- the binaries are gone.
+- One `sshd-session` SIGSEGV in the guest on the 14:11 boot, not repeated.
+- What wedges U-Boot's MUSB gadget.
 
 # Handoff — 2026-09-25, the board is not fragile any more
 

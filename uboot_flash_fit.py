@@ -130,7 +130,7 @@ def main():
         log("!!! mmc dev 1 is not the eMMC (1c11000): abort -- nothing written"); return 5
     cmd(f"mmc read 0x{READ:x} 0x{FIT_LBA:x} 0x{cur_sec:x}", 8)
     o = cmd(f"cmp.b 0x{READ:x} 0x{REF:x} 0x{cur_n:x}", 20, b"same")
-    log("card vs --current: " + o.strip().splitlines()[-1][:120])
+    log("card vs --current: " + ' | '.join(l.strip() for l in o.splitlines() if 'same' in l or 'differ' in l or '!=' in l)[:160])
     if 'were the same' not in o:
         log(f"!!! LBA 0x{FIT_LBA:x} does not hold {a.current}: abort -- nothing written"); return 6
 
@@ -140,16 +140,23 @@ def main():
     o = cmd(f"mmc read 0x{READ:x} 0x{FIT_LBA:x} 0x{new_sec:x}", 8)
     log("read back: " + o.strip().splitlines()[-1][:120])
     o = cmd(f"cmp.b 0x{LOAD:x} 0x{READ:x} 0x{new_n:x}", 20, b"same")
-    log("verify: " + o.strip().splitlines()[-1][:120])
+    log("verify: " + ' | '.join(l.strip() for l in o.splitlines() if 'same' in l or 'differ' in l or '!=' in l)[:160])
     if 'were the same' not in o:
         log(f"!!! VERIFY FAILED -- NOT resetting; the prompt is still alive. Put the old "
             f"loader back by hand from it: tftpboot 0x{LOAD:x} {a.current} ; "
             f"mmc write 0x{LOAD:x} 0x{FIT_LBA:x} 0x{cur_sec:x}")
         return 7
 
-    log("flashed and verified. warm reset via WDOG -> SPL loads the new FIT")
+    log("flashed and verified. `reset` -> SPL loads the new FIT")
     t_rst = time.time()
-    cmd("mw.l 0x1c20cb4 1 ; mw.l 0x1c20cb8 0xb1 ; mw.l 0x1c20cb0 0x14af", 1)
+    # NOT the WDOG mw.l sequence: a U-Boot with WATCHDOG_AUTOSTART services
+    # the watchdog from its own prompt loop and simply re-kicks it (that is
+    # how the first run of this tool, 2026-09-26 14:31, sat there for 60 s).
+    # With SYSRESET_WATCHDOG `reset` expires it on purpose; on a loader that
+    # has no watchdog of its own the mw.l sequence is the one that works.
+    cmd("reset", 1)
+    if 'resetting' not in rd(2):
+        cmd("mw.l 0x1c20cb4 1 ; mw.l 0x1c20cb8 0xb1 ; mw.l 0x1c20cb0 0x14af", 1)
     try:
         os.close(fd)
     except OSError:
