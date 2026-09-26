@@ -37,6 +37,11 @@ void wdt_disarm(void);
  * EMAC to release the pet and let the HW WDOG reset the board. See wdt.c. */
 void wdt_debug_kick(void);
 
+/* Someone reached the board (emac.c: an RX frame). Every pet path above also
+ * requires a reach within WDT_UNREACH_S -- see wdt.c's reachability gate. */
+void wdt_note_reachable(void);
+extern volatile uint32_t wdt_unreach_test;   /* !=0: ignore all reach sources */
+
 /* Fixed-address flag, NOT a linked symbol: a host tool sets this with a
  * single `w <addr> <val>` MMIO poke (HVMAP_WDT_DEBUG_HOLD, hv_addrmap.h) --
  * no `nm`-resolved symbol address, and therefore no build-vs-running-image

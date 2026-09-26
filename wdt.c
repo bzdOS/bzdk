@@ -55,6 +55,35 @@
 #define WDT_TIMEOUT_S      180u
 
 static uint64_t wdt_last_progress;   /* CNTPCT at the last observed progress   */
+
+/* ── Reachability gate ────────────────────────────────────────────────────
+ * Every pet path used to keep the board resident on a proof of LIFE: CPU1's
+ * tick kicked unconditionally, CPU0 kicked while the guest made progress.
+ * Neither says anything about whether anyone can still REACH the board. With
+ * the EMAC dark and the USB gadget dead, a perfectly alive hypervisor fed its
+ * watchdog for ever and was invisible on every channel -- the same shape as
+ * U-Boot's parked prompt (HANDOFF 2026-09-26), one level up. Nothing but the
+ * power switch could end it.
+ *
+ * So every pet now also requires that the board was reachable within
+ * WDT_UNREACH_S: an EMAC frame received (emac.c calls wdt_note_reachable()),
+ * or the USB host still clocking the bus -- the MUSB frame number advances
+ * with every SOF only while a host holds the port enabled; a wedged gadget
+ * that the host gave up on stops it. Past that, nobody pets, the 16 s WDOG
+ * fires, and the board comes back through U-Boot.
+ *
+ * This does not replace the EMAC-dark rule: with the USB console alive the
+ * board is reachable and a dark EMAC is left to that rule. Only "no channel
+ * at all" trips this.
+ *
+ * wdt_unreach_test != 0 ignores both sources (hardware test of this gate:
+ * poke it over EMAC, the board must reset ~WDT_UNREACH_S + 16 s later). */
+#define WDT_UNREACH_S      900u
+#define MUSB_FRAME_REG (*(volatile uint16_t *)(SOC_A64_MUSB_BASE + 0x54u)) /* sunxi layout */
+static uint64_t wdt_unreach_ticks;
+static volatile uint64_t wdt_last_reach;
+static uint16_t wdt_last_frame;
+volatile uint32_t wdt_unreach_test;
 static uint64_t wdt_window_ticks;    /* WDT_TIMEOUT_S expressed in counter ticks */
 
 static inline uint64_t rd_cntpct(void)
@@ -79,6 +108,10 @@ wdt_arm(void)
         f = 24000000ull;              /* A64 arch timer default 24 MHz */
     wdt_window_ticks  = f * (uint64_t)WDT_TIMEOUT_S;
     wdt_last_progress = rd_cntpct();   /* treat arm time as fresh progress */
+    wdt_unreach_ticks = f * (uint64_t)WDT_UNREACH_S;
+    wdt_last_reach    = wdt_last_progress;  /* boot grace: one full window */
+    wdt_last_frame    = MUSB_FRAME_REG;
+    wdt_unreach_test  = 0u;
 
     /* CLEAR THE HOLD FLAG. It lives at a FIXED ADDRESS in hv-scratch DRAM
      * (HVMAP_WDT_DEBUG_HOLD), and DRAM survives the warm reset the WDOG
@@ -111,6 +144,43 @@ wdt_note_progress(void)
     wdt_last_progress = rd_cntpct();
 }
 
+void
+wdt_note_reachable(void)
+{
+    if (!wdt_unreach_test)
+        wdt_last_reach = rd_cntpct();
+}
+
+/* Samples the USB frame number (cheap: one MMIO read) and answers whether
+ * any channel reached the board within WDT_UNREACH_S. Several cores call
+ * this; the shared stamp is a single aligned 64-bit store, and a stamp
+ * another core wrote a moment "later" than our own `now` counts as fresh
+ * rather than as a huge unsigned age. */
+static int
+wdt_reach_fresh(uint64_t now)
+{
+    uint64_t last = wdt_last_reach;
+
+    if (last >= now)
+        return 1;
+    return (now - last) < wdt_unreach_ticks;
+}
+
+static int
+wdt_reachable(void)
+{
+    uint64_t now = rd_cntpct();
+
+    if (!wdt_unreach_test) {
+        uint16_t fr = MUSB_FRAME_REG;
+        if (fr != wdt_last_frame) {
+            wdt_last_frame = fr;
+            wdt_last_reach = now;
+        }
+    }
+    return wdt_reach_fresh(now);
+}
+
 /* Called on every EL2 exception. Re-arm the HW timer only while progress is
  * fresh; once stale > WDT_TIMEOUT_S, stop feeding it so it fires. */
 void
@@ -123,7 +193,16 @@ wdt_pet(void)
      * remote reset. See emac-flakiness-analysis (hypothesis #5). */
     if (wdt_debug_hold)
         return;
-    if (rd_cntpct() - wdt_last_progress < wdt_window_ticks)
+    /* CPU0, every EL2 exception: compare the stamp only -- the MMIO sample
+     * happens on CPU1's tick (wdt_debug_kick), not hundreds of times a
+     * second here. If CPU1 is dead nobody samples, the stamp ages, and the
+     * board resets after WDT_UNREACH_S: with CPU1 gone the debug channel is
+     * gone too, so that is the right answer. */
+    uint64_t now = rd_cntpct();
+
+    if (!wdt_reach_fresh(now))
+        return;
+    if (now - wdt_last_progress < wdt_window_ticks)
         WDOG_CTRL = WDOG_CTRL_RESTART;
     /* else: stale — do NOT re-arm; the HW watchdog will fire and reset. */
 }
@@ -158,6 +237,6 @@ wdt_disarm(void)
 void
 wdt_debug_kick(void)
 {
-    if (!wdt_debug_hold)
+    if (!wdt_debug_hold && wdt_reachable())
         WDOG_CTRL = WDOG_CTRL_RESTART;
 }
