@@ -85,11 +85,33 @@ int emmc_bio_set_highspeed(void);
  * 128*nblk little-endian 32-bit words. Returns 0 on success, a nonzero
  * packed code on any failure -- the caller then falls back to one
  * emmc_bio_read()/emmc_bio_write() call per sector, exactly as it already
- * does for a single-block failure. NOT hardware-verified yet: validate with
- * dbgmon `call` before wiring into any guest-facing path (see HANDOFF.md). */
+ * does for a single-block failure. HARDWARE-VALIDATED 2026-09-27
+ * (test_emmc_multi.py) and wired into vblk_emmc.c's guest I/O path. */
 #define EMMC_MULTI_MAX_BLOCKS 128u
 int emmc_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 int emmc_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+
+/* Same contract as emmc_bio_read_multi()/write_multi() (nblk in
+ * [2, EMMC_MULTI_MAX_BLOCKS], same packed-failure-code convention), but the
+ * data phase is moved by the controller's own IDMAC (descriptor-chain DMA)
+ * instead of a CPU FIFO-drain loop: the vCPU/debug core programs one
+ * descriptor chain and polls IDST for completion, instead of reading/writing
+ * REG_FIFO one word at a time. This is the actual fix for "a vCPU burns
+ * cycles doing I/O" (see HANDOFF.md item 2) -- CMD18/CMD25 batching alone
+ * only cut the number of controller *transactions*, not the per-transaction
+ * PIO cost, which is what these functions remove.
+ *
+ * Descriptor format, register map and the exact enable/reset/wait sequence
+ * are transcribed VERBATIM from the guest's own aw_mmc.c driver (FreeBSD
+ * sys/arm/allwinner/aw_mmc.c, the real driver for this exact controller,
+ * already the project's standing reference for anything not in the
+ * hardware-verified Python sequence -- see this header's own top-of-file
+ * note and emmc_bio.c's "REWRITTEN 2026-07-30 to match the reference
+ * driver" precedent for GCTL_DMA_RST). NOT YET hardware-verified: validate
+ * with dbgmon `call` (same standalone cross-check methodology as
+ * test_emmc_multi.py) before wiring into any guest-facing path. */
+int emmc_bio_read_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+int emmc_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 
 /* Arm/disarm WRITE fault injection. OFF by default; nothing in a normal boot
  * touches this.
