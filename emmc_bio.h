@@ -74,6 +74,23 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa);
  * failed when word[6]==2 (0 otherwise). Always returns 0. */
 int emmc_bio_set_highspeed(void);
 
+/* Read/write NBLK contiguous 512-byte blocks (CMD18/CMD25, the controller's
+ * own AUTO_STOP raising CMD12 for us) in ONE controller transaction instead
+ * of one emmc_bio_read()/emmc_bio_write() call per sector. Same command
+ * encoding as sd_bio.c's read_multi/write_multi (identical controller IP),
+ * but built on emmc_bio.c's own hardened timing/abort idioms -- see that
+ * file's header comment above the functions themselves.
+ *
+ * nblk must be in [2, EMMC_MULTI_MAX_BLOCKS]; buf_pa holds nblk*512 bytes as
+ * 128*nblk little-endian 32-bit words. Returns 0 on success, a nonzero
+ * packed code on any failure -- the caller then falls back to one
+ * emmc_bio_read()/emmc_bio_write() call per sector, exactly as it already
+ * does for a single-block failure. NOT hardware-verified yet: validate with
+ * dbgmon `call` before wiring into any guest-facing path (see HANDOFF.md). */
+#define EMMC_MULTI_MAX_BLOCKS 128u
+int emmc_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+int emmc_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+
 /* Arm/disarm WRITE fault injection. OFF by default; nothing in a normal boot
  * touches this.
  *
