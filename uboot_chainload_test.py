@@ -38,7 +38,18 @@ IDLE_RESET = '--idle-reset' in sys.argv
 if IDLE_RESET:
     CATCH = True
 IDLE_RESET_EXPECT_S = 120      # CONFIG_BOOT_RETRY_TIME of the candidate
-NET_TEST = '--net-test' in sys.argv   # prove the safety net first, run no candidate
+# --net-test: prove the safety net before trusting it with a candidate. The
+# net is the stub's watchdog arm, so the test is the stub jumping into code
+# that hangs for ever (`b .`): the board must come back to the stock loader
+# on its own. (Arming the WDOG from the stock prompt proved nothing once the
+# eMMC U-Boot got a watchdog of its own: its prompt loop re-kicks it.)
+NET_TEST = '--net-test' in sys.argv
+if NET_TEST:
+    CAND = 'hang-forever.bin'
+    _hf = '/opt/bzdos/tftpboot/hang-forever.bin'
+    if not os.path.exists(_hf):
+        open(_hf, 'wb').write(bytes.fromhex('00000014'))   # b .
+NO_MAINT = '--no-maint' in sys.argv   # bootdelay already 3 (uboot_maint.py open)
 WATCH_S = 150
 
 
@@ -95,30 +106,6 @@ def main():
         os.write(fd, (line + '\n').encode())
         return rd(fd, secs, stop).decode('latin1', 'replace')
 
-    if NET_TEST:
-        # The safety net, alone, with no new code on the board: arm the SoC
-        # watchdog from the STOCK prompt (the same three writes the stub and
-        # the hypervisor use) and do nothing else. The stock loader has no
-        # watchdog driver, so nothing pets it: the board must reset itself
-        # and re-enumerate the stock gadget ~16 s later. Only when this has
-        # been seen to work is a jump into a candidate allowed at all.
-        t_arm = time.time()
-        cmd("mw.l 0x1c20cb4 1 ; mw.l 0x1c20cb8 0xb1 ; mw.l 0x1c20cb0 0x14af", 1)
-        log("watchdog armed from the stock prompt; waiting for the board to reset itself")
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        while time.time() - t_arm < 40:
-            since = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_arm + 1))
-            usb = subprocess.run(['journalctl', '-k', '--since', since, '-o', 'short-unix',
-                                  '--no-pager'], capture_output=True, text=True).stdout
-            if any('idProduct=efe8' in l for l in usb.splitlines()):
-                log(f"NET OK: stock loader re-enumerated {time.time() - t_arm:.1f} s after arming")
-                return 0
-            time.sleep(0.5)
-        log("!!! NET FAILED: no reset within 40 s of arming -- do NOT jump into anything")
-        return 7
     out = cmd(f"setenv autostart no ; setenv netretry no ; setenv ipaddr {B.BOARD_IP} ; "
               f"setenv serverip {B.SRV_IP}", 2)
     out = cmd(f"tftpboot 0x4a000000 {CAND}", 40, b"Bytes transferred")
@@ -173,48 +160,14 @@ def main():
         marks = cmd("md.l 0x4bf00000 0x18", 3)
         words = [w for w in marks.replace('\r', ' ').split() if len(w) == 8 and
                  all(c in '0123456789abcdef' for c in w)]
-        log(f"prompt caught at +{time.time() - t_go:.1f}s; DRAM words @0x4bf00000: {words[:6]}")
-        try:
-            fn = int(words[3] + words[2], 16)       # 0x4bf00008: last initcall (relocated)
-            bir = int(words[5] + words[4], 16)      # 0x4bf00010: board_init_r (relocated)
-            nm = subprocess.run(['aarch64-linux-gnu-nm', '/opt/bzdos/build/u-boot/u-boot'],
-                                capture_output=True, text=True).stdout
-            syms = {}
-            for l in nm.splitlines():
-                p_ = l.split()
-                if len(p_) == 3 and p_[1] in 'Tt':
-                    syms[int(p_[0], 16)] = p_[2]
-            link_bir = [a for a, n in syms.items() if n == 'board_init_r'][0]
-            off = bir - link_bir
-            name = syms.get(fn - off, '?')
-            log(f"last initcall: 0x{fn:x} (reloc off 0x{off:x}) = {name}")
-            sub = int(words[6], 16)
-            tlb = int(words[9] + words[8], 16); tlbsz = int(words[11] + words[10], 16)
-            log(f"sub-mark 0x{sub:x} (10 before tlbi, 20 before ttbr, 21 after ttbr, 11 before M, "
-                f"12 after M, 13 after dcache inval, 14 after C); tlb_addr 0x{tlb:x} size 0x{tlbsz:x}")
-            fb = int(words[15] + words[14], 16); magic = int(words[16], 16)
-            off = int(words[19] + words[18], 16); src = int(words[20], 16); sub = int(words[23] + words[22], 16)
-            log(f"binman diag: fdt_blob=0x{fb:x} magic=0x{magic:x} path_offset(/binman)=0x{off:x} "
-                f"fdt_src={src} first_subnode=0x{sub:x}")
-            rc = int(words[13] + words[12], 16)
-            log(f"initcall failure code at 0x4bf00030: 0x{rc:x}" + (f" ({rc - (1 << 64)})" if rc >> 63 else ""))
-        except Exception as e:
-            log(f"(initcall decode failed: {e!r})")
-        # the candidate's pre-console buffer (CONFIG_PRE_CON_BUF_ADDR=0x4bf10000,
-        # 16 KiB ring, civac'd per byte): everything it printed before its
-        # console came up, including the initcall failure line or an abort.
-        dump = cmd("md.l 0x4bf10000 0x400", 12)
-        raw = bytearray()
-        for l in dump.replace('\r', '').splitlines():
-            p_ = l.split()
-            if len(p_) >= 5 and p_[0].endswith(':') and len(p_[0]) == 9:
-                for w in p_[1:5]:
-                    if len(w) == 8:
-                        raw += int(w, 16).to_bytes(4, 'little')
-        txt = raw.rstrip(b'\x00').decode('latin1', 'replace')
-        log("candidate pre-console buffer (%d bytes):\n%s" % (len(raw), txt[-3000:]))
+        log(f"prompt caught at +{time.time() - t_go:.1f}s; progress mark @0x4bf00000: "
+            f"{words[0] if words else '?'}")
         log("(stub=0xb0 1=entry 2=after lowlevel_init 3=before _main "
             "4=board_init_f 5=board_init_r)")
+        if NET_TEST:
+            log(f"NET OK: the stub's watchdog brought the stock loader back "
+                f"{time.time() - t_go:.1f} s after jumping into a hang")
+            os.close(fd); return 0
         if not CATCH:
             log("this is the loader that came back after the candidate; leaving it at the prompt")
             os.close(fd); return 6
@@ -272,4 +225,9 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    if NO_MAINT:
+        sys.exit(main())
+    import uboot_maint
+    with uboot_maint.maintenance(log):
+        rc = main()
+    sys.exit(rc)
