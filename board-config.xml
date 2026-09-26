@@ -144,7 +144,7 @@
     <feature name="guest_pmu"         dtb-only="true" enabled="true"/>
     <!-- guest_header_uarts: uart2/3/4 on PB0-1, PD0-1, PD2-3. uart2/uart3 share
          the trapped UART page with the emulated UART0; they reach hardware
-         since vconsole passes UART1-3 through (microkernel a9ff769). -->
+         since vconsole passes UART1-3 through (microkernel 91e6b61). -->
     <feature name="guest_header_uarts" dtb-only="true" enabled="true"/>
     <feature name="guest_r_pwm" dtb-only="true" enabled="true"/>
     <feature name="guest_r_i2c" dtb-only="true" enabled="true"/>

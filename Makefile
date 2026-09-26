@@ -23,7 +23,7 @@
 # (stage-2 maps 1 GiB) while bananapi-min.dtb still hands the guest 2 GiB, so
 # the guest's first touch of high RAM takes a stage-2 fault for ever. That is
 # exactly what a git worktree produces (config.mk is gitignored): the
-# "known-good 228623b" staged on 2026-09-25 18:08 was such a build, and the
+# "known-good 2ca4fdb" staged on 2026-09-25 18:08 was such a build, and the
 # guest hung in memset at IPA 0xb7ff1000 on its first boot. And config.mk
 # changes do not rebuild existing objects -- after creating it, `make clean`.
 ifeq ($(wildcard config.mk),)

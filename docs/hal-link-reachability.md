@@ -7,7 +7,7 @@ through ad-hoc code.
 
 ## Why
 
-Since 2247d7f the hypervisor's watchdog is petted only while the board is
+Since 6f20348 the hypervisor's watchdog is petted only while the board is
 *reachable*: an EMAC frame, or USB SOFs from a host (the MUSB frame
 counter), within `WDT_UNREACH_S` (900 s). Both sources are
 hypervisor-native. A guest that is reachable over WiFi is a real lever too:
