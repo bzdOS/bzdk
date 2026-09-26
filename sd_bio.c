@@ -245,6 +245,8 @@ static int sd_acmd(uint32_t rca, uint32_t acmd, uint32_t arg, uint32_t fl,
 	return sd_cmd_done(acmd, arg, fl, resp0_out);
 }
 
+static int sd_set_hs50(void);
+
 /* ------------------------------------------------------------------ */
 /* sd_set_bus4() — 4-bit data bus, FAIL-SAFE (same contract as          */
 /* sd_bio_set_highspeed(): it can only leave the card on a WORKING bus). */
@@ -423,8 +425,9 @@ int sd_bio_init(void)
 
 	g_sd_inited = 1;
 	sdbc(0, 0);
-	if (sd_bio_set_highspeed() == 0)   /* best-effort; see its own header comment */
-		(void)sd_set_bus4(rca);    /* only on a clock that already works */
+	if (sd_bio_set_highspeed() == 0 &&  /* best-effort; see its own header comment */
+	    sd_set_bus4(rca) == 0)          /* only on a clock that already works */
+		(void)sd_set_hs50();            /* only on a 4-bit bus that works */
 	return 0;
 }
 
@@ -813,4 +816,94 @@ fail:
 	 * the caller keeps the record (sd_bio's own window is full) */
 	sd_multi_abort();
 	return (int)(0x40000000u | ((nwords & 0x3fffu) << 16) | (ri & 0xffffu));
+}
+
+/* ------------------------------------------------------------------ */
+/* sd_set_hs50() — SD High Speed (50 MHz), FAIL-SAFE.                   */
+/*                                                                      */
+/* WHY: at 25 MHz x 4 bits the bus tops out at 12.5 MB/s and reads      */
+/* already measured 11.25 MB/s (2026-09-26). High Speed doubles the     */
+/* bus; it needs a CMD6 SWITCH_FUNC (mode 1, group 1 -> 1) the card     */
+/* must accept (status bits 379:376 == 1), then the host clock raised.  */
+/* UHS modes need 1.8 V signalling this slot does not have.             */
+/*                                                                      */
+/* Proof before keeping it, BOTH directions: LBA 0 must read back       */
+/* identical to its 25 MHz copy, and the black-box sector (SDBOX_LBA,   */
+/* 64) is rewritten with its own contents at 50 MHz and read back.      */
+/* Any failure: back to 25 MHz (an HS-switched card still runs Default  */
+/* Speed clocks) and LBA 64 rewritten there, so the box is never left   */
+/* with a bad 50 MHz write. SD window [1]: 50 = active, 0x20|step =     */
+/* stayed at 25 MHz.                                                    */
+/* ------------------------------------------------------------------ */
+#define CCU_MMC0_CLK_HS50   0x8100000Bu   /* PLL6(600MHz) | N=0 | M=11 -> 50 MHz */
+#define CMD6_SWITCH_CMDR    0x80002346u   /* LOAD|WAIT_PRE|DATA|CRC|RESP|6 */
+#define SD_BC_HS50          1
+#define SD_HS50_LBA_BOX     64u
+
+static int sd_hs50_fallback(uint32_t step, const uint32_t *box)
+{
+	(void)sd_reclock(CCU_MMC0_CLK_HS25);
+	if (box != NULL)
+		(void)sd_bio_write(SD_HS50_LBA_BOX, (uint64_t)(uintptr_t)box);
+	sdbc(SD_BC_HS50, 0x20u | step);
+	return -1;
+}
+
+static int sd_set_hs50(void)
+{
+	static uint32_t ref0[128], box[128], chk[128];
+	uint32_t st[16], nwords = 0, grp1;
+	int i;
+
+	if (sd_bio_read(0, (uint64_t)(uintptr_t)ref0) != 0 ||
+	    sd_bio_read(SD_HS50_LBA_BOX, (uint64_t)(uintptr_t)box) != 0)
+		return sd_hs50_fallback(1, NULL);
+
+	/* CMD6 mode 1 (set), group 1 = 1 (High Speed), others unchanged */
+	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
+	small_delay();
+	wreg(REG_BKSR, 64);
+	wreg(REG_BYCR, 64);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, 0x80FFFFF1u);
+	wreg(REG_CMDR, CMD6_SWITCH_CMDR);
+	for (i = 0; i < SD_POLL_CAP && nwords < 16; i++) {
+		if (rreg(REG_STAR) & STAR_FIFO_EMPTY) {
+			if (rreg(REG_RINT) & RINT_ERR_MASK)
+				break;
+			continue;
+		}
+		st[nwords++] = rreg(REG_FIFO);
+	}
+	if (nwords < 16 || poll_rint(RINT_DATA_OVER, RINT_DATA_OVER) != 0)
+		return sd_hs50_fallback(2, NULL);
+	/* 512-bit status, MSB first on the wire; the FIFO hands it over as
+	 * little-endian words, so byte 16 of the block (bits 379:376 in its
+	 * low nibble) is the low byte of st[4]. */
+	grp1 = st[4] & 0x0Fu;
+	if (grp1 != 1u)
+		return sd_hs50_fallback(0x10u | grp1, NULL);
+
+	/* the card switches within 8 clocks of the status block's end */
+	small_delay();
+	if (sd_reclock(CCU_MMC0_CLK_HS50) != 0)
+		return sd_hs50_fallback(3, NULL);
+
+	if (sd_bio_read(0, (uint64_t)(uintptr_t)chk) != 0)
+		return sd_hs50_fallback(4, NULL);
+	for (i = 0; i < 128; i++)
+		if (chk[i] != ref0[i])
+			return sd_hs50_fallback(5, NULL);
+	if (sd_bio_write(SD_HS50_LBA_BOX, (uint64_t)(uintptr_t)box) != 0)
+		return sd_hs50_fallback(6, box);
+	for (i = 0; i < 128; i++)
+		chk[i] = 0;
+	if (sd_bio_read(SD_HS50_LBA_BOX, (uint64_t)(uintptr_t)chk) != 0)
+		return sd_hs50_fallback(7, box);
+	for (i = 0; i < 128; i++)
+		if (chk[i] != box[i])
+			return sd_hs50_fallback(8, box);
+
+	sdbc(SD_BC_HS50, 50);
+	return 0;
 }
