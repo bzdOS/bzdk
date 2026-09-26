@@ -246,6 +246,54 @@ static int sd_acmd(uint32_t rca, uint32_t acmd, uint32_t arg, uint32_t fl,
 }
 
 /* ------------------------------------------------------------------ */
+/* sd_set_bus4() — 4-bit data bus, FAIL-SAFE (same contract as          */
+/* sd_bio_set_highspeed(): it can only leave the card on a WORKING bus). */
+/*                                                                      */
+/* WHY: at 25 MHz the 1-bit bus caps the card at ~3 MB/s; measured      */
+/* 2.07 MB/s reads, 1.50 MB/s writes (CMD25) on 2026-09-26. Every SD     */
+/* card supports 4-bit (SCR bit only matters for SD v1.0 MMC-ish cards,  */
+/* and PF0..PF5 already carry D0..D3). The switch is ACMD6 (arg 2) to    */
+/* the card, BWDR=1 on the host. The check is stronger than an rc: LBA 0 */
+/* is read on the 1-bit bus first and must come back identical on the    */
+/* 4-bit one -- a wrong-width bus fails CRC, but a wired-but-dead line  */
+/* is exactly what should never be trusted on rc alone.                  */
+/* SD window [7]: 4 = 4-bit active, 0x10|step = stayed on 1-bit.         */
+/* ------------------------------------------------------------------ */
+#define SD_BC_BUS  7
+
+static int sd_bus1_fallback(uint32_t rca, uint32_t step)
+{
+	wreg(REG_BWDR, 0);
+	(void)sd_acmd(rca, 6, 0, CMDR_RESP_EXP, NULL);   /* card back to 1-bit */
+	sdbc(SD_BC_BUS, 0x10u | step);
+	return -1;
+}
+
+static int sd_set_bus4(uint32_t rca)
+{
+	static uint32_t ref[128];
+	volatile uint32_t *t = (volatile uint32_t *)(unsigned long)HVMAP_SD_TESTBUF;
+	uint32_t r1 = 0;
+	int i;
+
+	if (sd_bio_read(0, (uint64_t)(uintptr_t)ref) != 0)
+		return sd_bus1_fallback(rca, 1);
+	if (sd_acmd(rca, 6, 2, CMDR_RESP_EXP | CMDR_CHK_CRC, &r1) != 0 ||
+	    (r1 & 0xFDF80008u) != 0)   /* R1 error bits 31-26, 24-19, 3 */
+		return sd_bus1_fallback(rca, 2);
+	wreg(REG_BWDR, 1);
+	for (i = 0; i < 128; i++)
+		t[i] = 0;
+	if (sd_bio_read(0, (uint64_t)HVMAP_SD_TESTBUF) != 0)
+		return sd_bus1_fallback(rca, 3);
+	for (i = 0; i < 128; i++)
+		if (t[i] != ref[i])
+			return sd_bus1_fallback(rca, 4);
+	sdbc(SD_BC_BUS, 4);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* sd_bio_init() — controller bring-up + SD card identification.       */
 /* Negative return codes are step-specific for diagnosis (see below);  */
 /* also mirrored into the SD breadcrumb window word[0].                */
@@ -375,7 +423,8 @@ int sd_bio_init(void)
 
 	g_sd_inited = 1;
 	sdbc(0, 0);
-	(void)sd_bio_set_highspeed();   /* best-effort; see its own header comment */
+	if (sd_bio_set_highspeed() == 0)   /* best-effort; see its own header comment */
+		(void)sd_set_bus4(rca);    /* only on a clock that already works */
 	return 0;
 }
 
