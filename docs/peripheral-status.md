@@ -22,6 +22,7 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | PMU | `pmu0` on SPIs 116-119, all four vCPUs; hwpmc counting and overflow sampling work. Feature `guest_pmu` (2026-09-26) |
 | Header UARTs | uart2 (PB0/PB1), uart3 (PD0/PD1), uart4 (PD2/PD3) as `/dev/cuau2..4`; pinctrl + pull-ups from gen_config (`guest_header_uarts`); internal-loopback 8/8 each (2026-09-26) |
 | R_PWM, R_I2C | `pwmc1.0` (PL10): 1 ms / 25 % programmed and read back from EL2; `iic3` (PL8/PL9) scans clean, nothing attached on this board (2026-09-26) |
+| LEDs | gpio-leds: `/dev/led/bananapi-m64:{red:pwr,green:user,blue:user}` (PD24, PE14, PE15); state verified in the PIO data register from EL2 (2026-09-26) |
 | UART, GPIO, IR, thermal, RTC | stock drivers, nothing special |
 
 ## Not done: no FreeBSD driver exists
@@ -76,6 +77,15 @@ an explicit `dev_relax_dma_isolation` feature in `board-config.xml`.
 **While that feature is on, this board's stage-2 isolation result does not
 hold, and an isolation test run in this configuration measures nothing.** Do
 not ship a build with it enabled.
+
+## Checked 2026-09-26 and left off, with the reason
+
+| Device | Why |
+| --- | --- |
+| `crypto@1c15000` (CE) | no FreeBSD driver; the A64 CE has a PRNG but no TRNG, and `armv8crypto` (CPU AES/SHA instructions) already outruns it for bulk crypto |
+| `i2s@1c22000/400/800` | no pin groups in the DT and nothing on this board to talk to (the analog codec has its own DAI, which is on) |
+| `spdif@1c21000` | no A64 SPDIF driver in FreeBSD; PH8 goes nowhere useful on this board |
+| `lradc@1c21800` | no FreeBSD driver, and the Banana Pi M64 wires no buttons to it (power key is the PMIC's) |
 
 ## Could be enabled, simply not needed yet
 
