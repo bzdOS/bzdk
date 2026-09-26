@@ -545,6 +545,61 @@ def fdtput(dtb_path, node, prop_type, prop, *values, dry_run=False):
     subprocess.run(cmd, check=True)
 
 
+def _phandle_of(dts_text, header_re, inner_re=None):
+    """Phandle of the first node whose header matches header_re (and, if
+    given, whose body matches inner_re), or None."""
+    for m in re.finditer(header_re + r"\s*\{", dts_text):
+        depth, i = 1, m.end()
+        while depth and i < len(dts_text):
+            depth += {"{": 1, "}": -1}.get(dts_text[i], 0)
+            i += 1
+        body = dts_text[m.end():i]
+        own = re.sub(r"\{[^{}]*\}", "", body)        # drop nested nodes
+        if inner_re and not re.search(inner_re, body):
+            continue
+        ph = re.search(r"phandle = <(0x[0-9a-f]+)>;", own)
+        if ph:
+            return int(ph.group(1), 16)
+    return None
+
+
+# CPU DVFS: what every /cpus/cpu@N needs for cpufreq_dt to attach. The OPP
+# table, vdd-cpux (dcdc2) and the CCU's CPUX clock (CLK_CPUX = 21) are all in
+# the DTB already; only the references were missing from cpu@1..3 (added by
+# ensure_cpu_node) and had been stripped from cpu@0 in 2026-07, when guest
+# DVFS wedged the SoC. That was with the PMIC's RSB bus shared unarbitrated
+# with EL2; since rsbtrap.c (2026-09-26) all frequency steps 648-1152 MHz
+# were verified on hardware with the voltages logged.
+CPU_DVFS_PROPS = ("clocks", "operating-points-v2", "cpu-supply", "#cooling-cells")
+
+
+def ensure_cpu_dvfs(dtb_path, dts_text, enabled, dry_run):
+    cpus = sorted(set(re.findall(r"\bcpu@(\d+) \{", dts_text)))
+    if not enabled:
+        # Only what 2026-07 stripped: cpu@0 keeps its clocks/#cooling-cells
+        # (thermal cooling-maps reference it).
+        for c in cpus:
+            for prop in ("operating-points-v2", "cpu-supply"):
+                if not dry_run:
+                    subprocess.run(["fdtput", "-d", str(dtb_path), f"/cpus/cpu@{c}", prop],
+                                   stderr=subprocess.DEVNULL)
+        print("[gen_config] cpu DVFS: off (references removed)")
+        return
+    opp = _phandle_of(dts_text, r"opp-table-cpu")
+    vdd = _phandle_of(dts_text, r"dcdc2", r'regulator-name = "vdd-cpux"')
+    ccu = _phandle_of(dts_text, r"(?:clock|clock-controller)@1c20000")
+    if None in (opp, vdd, ccu):
+        sys.exit(f"[gen_config] cpu DVFS: cannot resolve opp={opp} vdd-cpux={vdd} ccu={ccu}")
+    for c in cpus:
+        path = f"/cpus/cpu@{c}"
+        fdtput(dtb_path, path, "x", "clocks", ccu, 0x15, dry_run=dry_run)
+        fdtput(dtb_path, path, "x", "operating-points-v2", opp, dry_run=dry_run)
+        fdtput(dtb_path, path, "x", "cpu-supply", vdd, dry_run=dry_run)
+        fdtput(dtb_path, path, "x", "#cooling-cells", 2, dry_run=dry_run)
+    print(f"[gen_config] cpu DVFS: cpu@{',cpu@'.join(cpus)} -> opp 0x{opp:x}, "
+          f"vdd-cpux 0x{vdd:x}, ccu 0x{ccu:x}")
+
+
 def ensure_cpu_node(dtb_path, dts_text, cpu_id, dry_run):
     node = f"cpu@{cpu_id}"
     path = f"/cpus/{node}"
@@ -1000,6 +1055,12 @@ def main():
     for name, f in features.items():
         if f["enabled"] and f["needs_dtb_cpu"]:
             ensure_cpu_node(dtb_path, dts_text, f["needs_dtb_cpu"], args.dry_run)
+
+    if not args.dry_run:
+        dts_text = dtb_to_dts_text(dtb_path)   # sees cpu nodes just added
+    ensure_cpu_dvfs(dtb_path, dts_text,
+                    features.get("guest_dvfs", {}).get("enabled", False),
+                    args.dry_run)
 
     # /memory tracks whichever feature declares a dtb-memory-size -- and, just as
     # importantly, gets put BACK when none is enabled. Leaving it wide after the
