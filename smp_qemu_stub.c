@@ -40,6 +40,8 @@
 #include "emac.h"
 #include "dbgmon.h"
 #include "usbacm.h"
+#include "reboot.h"
+#include "sdbox.h"
 #include "wdt.h"
 
 /* --- el2_exc.c's shared guest-frame snapshot + debug-core flag -------------
@@ -147,4 +149,20 @@ int emac_link_watchdog(void)
  * called here. */
 void usbacm_poll(void)
 {
+}
+
+/* --- the EMAC-dark escalation (smp.c) --------------------------------------
+ * Reached only after emac_link_watchdog() returns non-zero, which the stub
+ * above never does; these exist so smp.o links. reboot_clean() is noreturn,
+ * so the stand-in parks instead of returning. */
+volatile uint32_t reboot_reason;
+
+void usbacm_force_breakglass(void)
+{
+}
+
+void reboot_clean(void)
+{
+	for (;;)
+		__asm__ volatile("wfe");
 }
