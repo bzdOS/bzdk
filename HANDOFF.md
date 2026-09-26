@@ -2,7 +2,7 @@
 
 ## State (verified 16:07)
 
-- **Hypervisor: master** (`53b5b5b`+), built clean WITH config.mk, staged in
+- **Hypervisor: master** (`4a6d41d`+), built clean WITH config.mk, staged in
   both boot paths. Contains, all hardware-verified today:
   - **RSB trap** (`rsbtrap.c`, `HV_RSBTRAP` in `dbg`): the guest's RSB
     controller is emulated; every PMIC transaction (guest and EL2) runs under
@@ -13,7 +13,7 @@
     USB SOFs within 900 s.
   - **Black box** on SD LBA 64 (`sdbox_read.py`): every `reboot_clean()`, plus
     the tick's two silent paths (EMAC ladder give-up = 6, gate lapse = 7).
-  - **EMAC-dark auto-reboot on, 3 h** of continuous dark (a30f9fa).
+  - **EMAC-dark auto-reboot on, 3 h** of continuous dark (e80f80a).
   - `warm_reset_soak.py 3 0`: 3/3.
 - **U-Boot on the eMMC:** `Sep 26 2026 - 13:46:18`: own watchdog, idle `=>`
   resets after 120 s, `reset` works. **`bootdelay=-2`**: autoboot cannot be
@@ -38,7 +38,7 @@
    guest's own PMIC setup, and a blind `0x88` to REG 0x12 on a failed read),
    phy_rail_ensure and health reads raced it. A misdirected write to REG 0x10
    turns off CPU/DRAM: no watchdog, no USB, only the power switch. Likeliest
-   cause of the 09-25 16:41/17:13 losses (16:41 was the old 228623b image,
+   cause of the 09-25 16:41/17:13 losses (16:41 was the old 2ca4fdb image,
    dying at the first 8 s link check). The trap's write log shows the guest
    never clears DC1SW: the 0x58 of 09-25 came from EL2.
 2. **U-Boot parked for ever** (the 19 h loss): chimpd's catch wedges the
@@ -63,7 +63,7 @@ contradict this.
 
 ## What was actually wrong
 
-1. **`bmc reset` never reset the board when the guest was busy** (6c01475).
+1. **`bmc reset` never reset the board when the guest was busy** (cfbe93b).
    `reboot_clean()` dropped the USB pull-up and armed a 2 s watchdog on CPU1
    -- while CPU0 kept petting that watchdog on every EL2 exception because
    the guest's eMMC traffic counted as "progress" for 180 s. Any ssh command
@@ -73,7 +73,7 @@ contradict this.
    Proven: `warm_reset_soak.py 3 3` = 6/6, U-Boot in 5 s, guest in ~47 s,
    including three resets under eMMC reads + SD writes.
 2. **The EMAC died after guest boot because the PHY's rail (AXP803 DC1SW)
-   was switched off** (228623b). Read live: REG 0x12 = 0x58, bit 7 clear;
+   was switched off** (2ca4fdb). Read live: REG 0x12 = 0x58, bit 7 clear;
    BMSR 0xffff. Who clears it -- FreeBSD's disable-unused pass despite
    `always_on`, or our own hdmi relock's read-modify-write racing the guest
    on the RSB bus -- is NOT settled; the guard (`phy_rail_ensure()`) is right
@@ -87,16 +87,16 @@ including the wrong turns.
 
 ## The board, right now
 
-- Image: 228623b (`microkernel-dbg.uimg` in /opt/bzdos/tftpboot, `.elf` for
+- Image: 2ca4fdb (`microkernel-dbg.uimg` in /opt/bzdos/tftpboot, `.elf` for
   chimpd's loady). Autoboot (`bootcmd` → TFTP → `bootm`) is the boot path and
   is proven with chimpd stopped; chimpd (`systemctl status chimpd`) is the
   backstop that catches U-Boot if autoboot does not.
-- (Superseded 09-25 18:08: 228623b restored for both boot paths after the
-  16:41/17:13 deaths; the following describes a30f9fa, which is NOT staged.)
-  `dbg_emac_watchdog_reboot = 1` again (a30f9fa): a dark EMAC is re-kicked
+- (Superseded 09-25 18:08: 2ca4fdb restored for both boot paths after the
+  16:41/17:13 deaths; the following describes e80f80a, which is NOT staged.)
+  `dbg_emac_watchdog_reboot = 1` again (e80f80a): a dark EMAC is re-kicked
   every 8 s and the board reboots itself only after **3 h** of continuous
   dark. WDEP[16] shows the running dark seconds.
-- **Black box (d6c59b1):** every `reboot_clean()` writes SD LBA 64 first --
+- **Black box (7b03f1f):** every `reboot_clean()` writes SD LBA 64 first --
   reason (bmc / PSCI off / PSCI reset / EMAC-dark / repl), core, CNTPCT,
   flight-recorder tail. `python3 sdbox_read.py` decodes it via the guest.
   Read it FIRST after any unexplained reset or dark board.

@@ -126,7 +126,7 @@ attached.
    And the reset that feeds it is fixed: `bmc reset` used to arm a 2 s WDOG
    on CPU1 while CPU0 kept petting it on the guest's behalf, so the reset
    never happened and the board went dark until someone cut the power
-   (6c01475, see docs/sessions/2026-09-23-board-dark-root-cause.md).
+   (cfbe93b, see docs/sessions/2026-09-23-board-dark-root-cause.md).
    That, not anything in U-Boot, was the "warm reset sometimes never
    returns" of the last two days.
 3. Switch `board_ctl.wait_for_power_cycle()` off "does /dev/ttyACM0 exist" and

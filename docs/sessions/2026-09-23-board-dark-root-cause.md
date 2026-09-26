@@ -229,7 +229,7 @@ mechanism, and the USB monitor confirmed the state:
 - Confirmed live: with the board "lost", `~BZDBG` on ttyACM still answered
   and the guest console showed `login:`. Break-glass (`\x00~BZRST\x00`, which
   sets `wdt_debug_hold`) brought it back in 16 s.
-- Fixed in 6c01475: `wdt_debug_hold = 1` inside `reboot_clean()` itself.
+- Fixed in cfbe93b: `wdt_debug_hold = 1` inside `reboot_clean()` itself.
   The PSCI and EMAC-dark callers had set it; `bmc_reset()` and `repl.c`
   had not.
 
@@ -246,7 +246,7 @@ off.** FreeBSD disables every regulator nobody references at the end of
 boot, and the guest DTB's emac node is `status="disabled"` because this
 hypervisor drives the EMAC. The boots that survived did so because hdmi.c's
 relock fallback happens to write 0x88 (DC1SW+DLDO1) when its RSB read
-fails under contention. Fixed in 228623b: `phy_rail_ensure()` re-enables
+fails under contention. Fixed in 2ca4fdb: `phy_rail_ensure()` re-enables
 DC1SW whenever the PHY reads as absent, before re-kicking.
 
 ## 2026-09-25, afternoon — U-Boot with its own watchdog, proven without touching media
@@ -312,7 +312,7 @@ real 0xd556d) and aborted before writing anything — which is what it is for.
 
 ## 2026-09-25, 16:41 — lost again, cause unknown; the black box ships
 
-Reloading the first build with the EMAC-dark auto-reboot back on (78ff1ed):
+Reloading the first build with the EMAC-dark auto-reboot back on (289463d):
 U-Boot 16:41:03, HV gadget 16:41:42, EMAC answered 16:41:46, **gadget gone
 16:41:50**, nothing since. Eight seconds in. Not the ladder (needs 48 s),
 not chimpd (it only read), not the host tools (the only reset was the one
@@ -322,10 +322,10 @@ coherency idea was checked against the code and does not hold: hv-scratch
 is one shared table for all cores, Normal-WB inner-shareable.
 
 Unknown, and unknowable after the power-cycle -- which is why `sdbox.c`
-exists as of d6c59b1: `reboot_clean()` now writes the caller's reason, the
+exists as of 7b03f1f: `reboot_clean()` now writes the caller's reason, the
 core, CNTPCT and the flight recorder's tail to SD LBA 64 before it touches
 anything. Next time this happens, `sdbox_read.py` says who asked.
 
 Also in this image: the EMAC-dark reboot after **3 h** of continuous dark
-(a30f9fa; the owner's number), not 50 s; the PHY keeps being re-kicked
+(e80f80a; the owner's number), not 50 s; the PHY keeps being re-kicked
 throughout. Power-cycles today: six.

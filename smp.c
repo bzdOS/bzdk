@@ -123,10 +123,10 @@ volatile uint32_t dbg_usbacm = 1;
 volatile uint32_t dbg_emac_watchdog_reboot = 1;   /* back ON 2026-09-25: see below */
 /* Re-enabled after the two things that made it dangerous were fixed and
  * hardware-proven the same day: reboot_clean() now stops CPU0's pet before
- * arming (6c01475 -- the "reset never returns" was never a reset), and the
+ * arming (cfbe93b -- the "reset never returns" was never a reset), and the
  * U-Boot on the eMMC arms its own 16 s watchdog, so a hang anywhere in the
  * boot chain also self-recovers. The known cause of a dark EMAC (the PHY
- * rail cut, 228623b) is repaired in place before this ever fires. What is
+ * rail cut, 2ca4fdb) is repaired in place before this ever fires. What is
  * left is a true unknown, and for that the owner wants a reboot rather than
  * a board that sits dark until someone walks over -- but after HOURS of
  * continuous dark (LINK_WD_DARK_REBOOT_S in emac.c, 3 h), not after a
