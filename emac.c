@@ -627,6 +627,7 @@ static inline void note_rx_frame(void)
 {
     bc(7, ++g_rx_count);
     g_last_rx_ticks = timer_now();
+    wdt_note_reachable();
     if (!g_first_rx_latched) {
         g_first_rx_latched = 1;
         bc(19, 1);

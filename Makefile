@@ -18,6 +18,20 @@
 # gen_config.py once to start using it. Never hand-edit config.mk itself.
 -include config.mk
 
+# ...except for the images that actually boot the board. `dbg` built without
+# config.mk is NOT the board's configuration: GUEST_DRAM_2G falls back to 0
+# (stage-2 maps 1 GiB) while bananapi-min.dtb still hands the guest 2 GiB, so
+# the guest's first touch of high RAM takes a stage-2 fault for ever. That is
+# exactly what a git worktree produces (config.mk is gitignored): the
+# "known-good 228623b" staged on 2026-09-25 18:08 was such a build, and the
+# guest hung in memset at IPA 0xb7ff1000 on its first boot. And config.mk
+# changes do not rebuild existing objects -- after creating it, `make clean`.
+ifeq ($(wildcard config.mk),)
+ifneq ($(filter dbg hv-uimage dual gdb,$(MAKECMDGOALS)),)
+$(error config.mk is missing: run `python3 gen_config.py` (or copy the main tree's config.mk into this worktree), then `make clean`)
+endif
+endif
+
 CROSS   ?= aarch64-linux-gnu-
 CC      := $(CROSS)gcc
 OBJCOPY := $(CROSS)objcopy
