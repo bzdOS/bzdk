@@ -52,15 +52,32 @@ unless resumed with the same state file).
 
 ## Agreed next work, in order
 
-1. **eMMC: the same SD recipe.** `emmc_bio.c`/`vblk_emmc.c` are today where
-   `sd_bio.c`/`vblk_sd.c` were yesterday morning — 4-bit only (8-bit
-   commented out "until checked"), 25 MHz, one CMD17/CMD24 per sector, PIO.
-   This is the single biggest lever on system responsiveness: root, all
-   binaries/libraries and swap are on it. Port: CMD25/CMD18 multi-block +
-   whole-request gather (mirror `sd_serve_gathered()`), then try the already
-   commented-out 8-bit bus, then push the clock past 25 MHz the same
-   fail-safe-both-directions way `sd_set_hs50()` does. Verify with fsck -n +
-   parallel md5, same as the SD series.
+1. **eMMC: the same SD recipe. DONE 2026-09-27**, all three sub-parts:
+   - `emmc_bio_read_multi()`/`emmc_bio_write_multi()` (CMD18/CMD25 + HW
+     AUTO_STOP) landed and hardware-validated standalone (`91ba856`), then
+     wired into `vblk_emmc.c` via two fast paths (`c2029c5`):
+     `emmc_serve_gathered()` (whole-request, mirrors `sd_serve_gathered()`)
+     AND a per-descriptor inner fast path in `serve_data()` (mirrors
+     `sd_serve_data()`'s own inner path) — the second one turned out to be
+     the one that actually matters: FreeBSD's busdma usually coalesces a
+     request into ONE physically-contiguous descriptor, which the
+     whole-request gather alone can't accelerate (needs >= 2 descriptors).
+     Measured live: a 26 MB sequential dd read went from 4.4 MB/s to
+     10.8 MB/s (2.5x); a write to the (swapoff'd) eMMC swap partition
+     verified byte-identical via read-back; `g_ioerrs` stayed 0 throughout;
+     `fsck_ufs -n` on the live root clean.
+   - 8-bit bus (`EMMC_BUS_WIDTH=8`) and 50 MHz clock (`EMMC_HS_CLK_REG=
+     CCU_MMC2_CLK_HS50`) BOTH tried, individually and combined, all via
+     the existing fail-safe post-switch test read — all three combos
+     passed (`EBIO_BC_HS_STATE`==1, no fallback), confirmed with the same
+     dd+md5 check as above. **NOT kept as the shipped default**: measured
+     throughput was IDENTICAL to 4-bit/25 MHz (~10.8-10.9 MB/s) in every
+     combination — the multi-block work above already saturates the PIO
+     drain loop, so neither a wider bus nor a faster clock does anything
+     more until that CPU-bound loop itself is replaced. Revisit combining
+     these with DMA below, where they should finally show a difference.
+   - Verified with fsck -n + parallel md5, same as the SD series, at every
+     step above.
 2. **DMA (IDMAC) for both controllers.** Today's SD/eMMC I/O is a vCPU
    spinning in PIO inside its own trap handler — CMD25/CMD18 batching cut
    the number of traps, not the PIO cost of each one. IDMAC descriptor-chain
