@@ -30,6 +30,14 @@ import bmc_client
 LOG = open('/var/tmp/uboot_chainload.log', 'a')
 CAND = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('--') else 'u-boot-wdt.bin'
 CATCH = '--catch' in sys.argv
+# --idle-reset: catch the candidate's prompt, then send NOTHING and prove the
+# prompt resets the board by itself (CONFIG_BOOT_RETRY + RESET_TO_RETRY). This
+# is the property that keeps a U-Boot whose USB gadget has wedged from sitting
+# at `=>` for ever, feeding its own watchdog (2026-09-25 18:09 -> 09-26).
+IDLE_RESET = '--idle-reset' in sys.argv
+if IDLE_RESET:
+    CATCH = True
+IDLE_RESET_EXPECT_S = 120      # CONFIG_BOOT_RETRY_TIME of the candidate
 NET_TEST = '--net-test' in sys.argv   # prove the safety net first, run no candidate
 WATCH_S = 150
 
@@ -217,6 +225,24 @@ def main():
             for line in ("version", "wdt list", "wdt dev", "wdt dev watchdog@1c20ca0",
                          "wdt list"):
                 log(f"=> {line}\n" + cmd(line, 2.5)[-700:])
+            if IDLE_RESET:
+                log("=> printenv bootretry\n" + cmd("printenv bootretry", 2)[-200:])
+                # The last byte we send starts the candidate's idle timer.
+                t_idle = time.time()
+                os.close(fd)
+                log(f"idle from now; expecting a self-reset ~{IDLE_RESET_EXPECT_S} s later")
+                while time.time() - t_idle < IDLE_RESET_EXPECT_S + 60:
+                    if usb_new_since(t_idle + 1):
+                        dt = time.time() - t_idle
+                        early = dt < IDLE_RESET_EXPECT_S - 5
+                        log(f"{'!!! ' if early else ''}fresh loader enumerated {dt:.0f} s after "
+                            f"the last byte" + (" -- EARLIER than the retry timeout: "
+                            "something else reset it" if early else " -- idle prompt reset itself: PASS"))
+                        return 9 if early else 0
+                    time.sleep(1)
+                log(f"!!! no reset within {IDLE_RESET_EXPECT_S + 60} s of idle: FAIL "
+                    "(the stub's watchdog is serviced by the candidate's prompt loop)")
+                return 8
             log("leaving the candidate at its prompt (its watchdog is being serviced by its own loop)")
             os.close(fd)
             return 0
