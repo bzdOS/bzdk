@@ -263,6 +263,20 @@ static uint64_t stage2_l2_mmio[STAGE2_L2_ENTRIES]
 static uint64_t stage2_l3_uart[STAGE2_L3_ENTRIES]
 	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
 
+#ifdef HV_RSBTRAP
+/* The 2 MiB block 0x01E00000 (R_ peripherals: R_PRCM, R_PIO, R_RSB, R_PWM),
+ * split to 4 KiB so the one page holding rsb@1f03400 can be invalid: every
+ * guest access to the RSB controller faults to rsbtrap.c. */
+#include "rsbtrap.h"
+#define RSBTRAP_L2_IDX ((unsigned)(RSBTRAP_PAGE_BASE >> STAGE2_L2_BLOCK_SHIFT))
+#define RSBTRAP_L3_IDX ((unsigned)((RSBTRAP_PAGE_BASE & (STAGE2_L2_BLOCK_SIZE - 1u)) >> STAGE2_L3_PAGE_SHIFT))
+_Static_assert(RSBTRAP_L2_IDX == 15u, "RSB page left the 0x01E00000 block");
+_Static_assert(RSBTRAP_L3_IDX == 259u, "RSB page index drifted");
+_Static_assert(RSBTRAP_L2_IDX != UART_L2_IDX, "RSB block is the UART block: use stage2_l3_uart");
+static uint64_t stage2_l3_rpriv[STAGE2_L3_ENTRIES]
+	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
+#endif
+
 #if defined(HV_HDMI) && defined(HV_FB_GUEST)
 /* L3 table for the one DRAM block that holds the BUF0/BUF1 boundary. Separate
  * from stage2_l3_uart[] because that one lives under the MMIO L2 table and its
@@ -419,12 +433,28 @@ stage2_build_mmio_tables(void)
 	 * page, but at 2 MiB granularity — nothing real lives in 0x0A000000..
 	 * 0x0A200000, so no L3 split is needed). See docs/virtio-blk-design.md §5
 	 * and docs/virtio-blk-integration.md §3. */
+#ifdef HV_RSBTRAP
+	{
+		uint64_t base = (uint64_t)RSBTRAP_L2_IDX << STAGE2_L2_BLOCK_SHIFT;
+		for (unsigned j = 0; j < STAGE2_L3_ENTRIES; j++)
+			stage2_l3_rpriv[j] = (j == RSBTRAP_L3_IDX) ? 0 :   /* INVALID: trapped */
+			    stage2_page_desc(base + (uint64_t)j * STAGE2_L3_PAGE_SIZE,
+				S2_MEMATTR_DEVICE_nGnRE, S2_SH_OUTER, /*xn=*/1);
+	}
+#endif
 	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
 		if (i == UART_L2_IDX) {
 			uint64_t l3_pa = (uint64_t)(uintptr_t)&stage2_l3_uart[0];
 			stage2_l2_mmio[i] = stage2_table_desc(l3_pa);
 			continue;
 		}
+#ifdef HV_RSBTRAP
+		if (i == RSBTRAP_L2_IDX) {
+			stage2_l2_mmio[i] = stage2_table_desc(
+			    (uint64_t)(uintptr_t)&stage2_l3_rpriv[0]);
+			continue;
+		}
+#endif
 		if (i == (unsigned)(VBLK_MMIO_BASE >> STAGE2_L2_BLOCK_SHIFT)) { /* ==80 */
 			stage2_l2_mmio[i] = 0;   /* INVALID: trapped virtio-mmio window */
 			continue;

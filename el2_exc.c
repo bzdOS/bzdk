@@ -23,7 +23,10 @@
 #include <stdint.h>
 #include "hv_addrmap.h"
 #include "vgicd.h"   /* vgicd_handle_fault() -- trapped GIC distributor */
-#include "wdogtrap.h"   /* wdogtrap_handle_fault() -- CCU/PIO/WDOG page, see
+#include "wdogtrap.h"
+#ifdef HV_RSBTRAP
+#include "rsbtrap.h"
+#endif   /* wdogtrap_handle_fault() -- CCU/PIO/WDOG page, see
                           * that file; inert while STAGE2_TRAP_WDOG_PAGE
                           * (stage2.c) is off, safe to call unconditionally */
 #include "exceptions.h"
@@ -1375,6 +1378,13 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			if (wdogtrap_handle_fault(frame)) {
 				return;
 			}
+#ifdef HV_RSBTRAP
+			/* The emulated RSB controller (rsbtrap.c): the guest's PMIC
+			 * traffic, serialised with EL2's own under one bus lock. */
+			if (rsbtrap_handle_fault(frame)) {
+				return;
+			}
+#endif
 			/* Next, the eMMC-backed virtio-blk device at 0x0A000000. Same
 			 * "handled -> return without recording" contract as vconsole.
 			 * vblk_mmio_fault() returns 0 for any abort outside its 0x200-byte

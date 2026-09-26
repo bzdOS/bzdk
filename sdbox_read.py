@@ -11,7 +11,8 @@ import struct, subprocess, sys, time
 SSH = ['ssh', '-o', 'ConnectTimeout=8', '-o', 'BatchMode=yes',
        '-i', '/root/.ssh/chimp_ed25519', 'root@192.168.88.82']
 REASON = {0: 'unknown', 1: 'bmc reset', 2: 'guest PSCI SYSTEM_OFF',
-          3: 'guest PSCI SYSTEM_RESET', 4: 'EMAC-dark escalation', 5: 'repl reset'}
+          3: 'guest PSCI SYSTEM_RESET', 4: 'EMAC-dark escalation', 5: 'repl reset',
+          6: 'EMAC ladder gave up (auto-reboot off)', 7: 'unreachable: no EMAC/USB reach in window'}
 KIND = {1: 'FAULT', 2: 'TRAP/PSCI', 3: 'IRQ', 4: 'VIRTIO', 5: 'CONSOLE', 6: 'TIMER'}
 
 
@@ -20,7 +21,8 @@ def main():
         raw = open(sys.argv[1], 'rb').read()
     else:
         raw = subprocess.run(SSH + ['dd if=/dev/vtbd1 bs=512 skip=64 count=1 2>/dev/null'],
-                             capture_output=True, timeout=60).stdout
+                             capture_output=True, timeout=60,
+                             stdin=subprocess.DEVNULL).stdout
     if len(raw) < 512:
         sys.exit(f"short read: {len(raw)} bytes")
     w = struct.unpack('<128I', raw[:512])

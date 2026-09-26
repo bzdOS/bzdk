@@ -41,6 +41,8 @@ void wdt_debug_kick(void);
  * requires a reach within WDT_UNREACH_S -- see wdt.c's reachability gate. */
 void wdt_note_reachable(void);
 extern volatile uint32_t wdt_unreach_test;   /* !=0: ignore all reach sources */
+/* 0 once the reachability window has lapsed: nobody pets any more. */
+int wdt_reach_ok(void);
 
 /* Fixed-address flag, NOT a linked symbol: a host tool sets this with a
  * single `w <addr> <val>` MMIO poke (HVMAP_WDT_DEBUG_HOLD, hv_addrmap.h) --

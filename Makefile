@@ -325,6 +325,8 @@ $(HDMI_BIN): $(HDMI_ELF)
 HV_HDMI ?= 1
 ifeq ($(HV_HDMI),1)
 dbg: CFLAGS += -DHV_HDMI
+# The guest's RSB controller is emulated (rsbtrap.c): one bus owner.
+dbg: CFLAGS += -DHV_RSBTRAP
 endif
 
 # 1080p is the DEFAULT display mode as of 2026-08-20, and this is a correctness
@@ -418,7 +420,7 @@ ifeq ($(GUEST_DRAM_2G),1)
 SNAP_OBJS :=
 endif
 
-DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
+DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o rsbtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \

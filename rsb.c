@@ -14,6 +14,7 @@
  */
 #include <stdint.h>
 #include "rsb.h"
+#include "smp.h"     /* spinlock_t: one owner of the bus at a time */
 
 /* ------------------------------------------------------------------ */
 /* Physical bases (A64 == cpu_sun4i.h branch of U-Boot's cpu.h: not sun9i,  */
@@ -84,6 +85,14 @@ static inline void wreg(uint32_t off, uint32_t v) { wr32(RSB_BASE + off, v); }
 
 static int g_rsb_ready;
 
+/* EVERY transaction on the bus holds this, the guest's included (rsbtrap.c
+ * executes each guest transaction through rsb_guest_transfer() below). Before
+ * it existed EL2 and FreeBSD's aw_rsb drove the same controller unarbitrated:
+ * one side's DADDR/DATA/CMD setup could be overwritten by the other's between
+ * its register writes and its START, i.e. a write landed in a register nobody
+ * asked for -- on a PMIC whose REG 0x10 switches the CPU and DRAM rails. */
+static spinlock_t g_rsb_lock = SPINLOCK_INIT;
+
 /* ------------------------------------------------------------------ */
 /* GPIO pinmux — GPL0/GPL1 -> RSB function, pull-up, drive strength 2. */
 /* Direct register poke (no shared gpio helper exists in this tree yet;    */
@@ -112,7 +121,7 @@ static void rsb_pinmux(void)
 /* Bounded wait for a transaction to finish; mirrors sun8i_rsb_await_trans().
  * Returns 0 on TOVER (success), -1 on TERR/LBSY, -2 on iteration timeout.
  * Clears the status bits on the way out either way (write-1-to-clear). */
-static int rsb_await(void)
+static int rsb_await_stat(uint32_t *stat_out)
 {
 	int i;
 	uint32_t stat = 0;
@@ -125,7 +134,14 @@ static int rsb_await(void)
 		if (stat & RSB_STAT_TOVER_INT) { ret = 0; break; }
 	}
 	wreg(RSB_STAT, stat);   /* write-1-to-clear whatever we saw */
+	if (stat_out)
+		*stat_out = stat;
 	return ret;
+}
+
+static int rsb_await(void)
+{
+	return rsb_await_stat(0);
 }
 
 static int rsb_do_trans(void)
@@ -137,7 +153,7 @@ static int rsb_do_trans(void)
 /* ------------------------------------------------------------------ */
 /* rsb_init() — controller + pin + clock bring-up + device-mode switch.*/
 /* ------------------------------------------------------------------ */
-int rsb_init(void)
+static int rsb_init_locked(void)
 {
 	uint32_t div, cd_odly;
 	int i;
@@ -178,7 +194,28 @@ int rsb_init(void)
 	return 0;
 }
 
-int rsb_set_device_address(uint16_t hw_addr, uint8_t runtime_addr)
+int rsb_init(void)
+{
+	int rc;
+
+	spin_lock(&g_rsb_lock);
+#ifdef HV_RSBTRAP
+	/* With the guest's accesses trapped (rsbtrap.c) nothing but this file
+	 * ever touches the controller, so there is nothing to "reclaim": a
+	 * repeat init would only soft-reset the bus under nobody's feet. The
+	 * old callers (hdmi relock, phy_rail_ensure) re-inited precisely
+	 * because the guest reconfigured it behind EL2's back. */
+	if (g_rsb_ready) {
+		spin_unlock(&g_rsb_lock);
+		return 0;
+	}
+#endif
+	rc = rsb_init_locked();
+	spin_unlock(&g_rsb_lock);
+	return rc;
+}
+
+static int rsb_set_device_address_locked(uint16_t hw_addr, uint8_t runtime_addr)
 {
 	if (!g_rsb_ready)
 		return -100;
@@ -188,7 +225,7 @@ int rsb_set_device_address(uint16_t hw_addr, uint8_t runtime_addr)
 	return rsb_do_trans();
 }
 
-int rsb_read(uint8_t runtime_addr, uint8_t reg, uint8_t *out)
+static int rsb_read_locked(uint8_t runtime_addr, uint8_t reg, uint8_t *out)
 {
 	int ret;
 
@@ -206,7 +243,7 @@ int rsb_read(uint8_t runtime_addr, uint8_t reg, uint8_t *out)
 	return 0;
 }
 
-int rsb_write(uint8_t runtime_addr, uint8_t reg, uint8_t val)
+static int rsb_write_locked(uint8_t runtime_addr, uint8_t reg, uint8_t val)
 {
 	if (!g_rsb_ready)
 		return -100;
@@ -216,4 +253,83 @@ int rsb_write(uint8_t runtime_addr, uint8_t reg, uint8_t val)
 	wreg(RSB_DATA, val);
 	wreg(RSB_CMD, RSB_CMD_BYTE_WRITE);
 	return rsb_do_trans();
+}
+
+int rsb_set_device_address(uint16_t hw_addr, uint8_t runtime_addr)
+{
+	int rc;
+
+	spin_lock(&g_rsb_lock);
+	rc = rsb_set_device_address_locked(hw_addr, runtime_addr);
+	spin_unlock(&g_rsb_lock);
+	return rc;
+}
+
+int rsb_read(uint8_t runtime_addr, uint8_t reg, uint8_t *out)
+{
+	int rc;
+
+	spin_lock(&g_rsb_lock);
+	rc = rsb_read_locked(runtime_addr, reg, out);
+	spin_unlock(&g_rsb_lock);
+	return rc;
+}
+
+int rsb_write(uint8_t runtime_addr, uint8_t reg, uint8_t val)
+{
+	int rc;
+
+	spin_lock(&g_rsb_lock);
+	rc = rsb_write_locked(runtime_addr, reg, val);
+	spin_unlock(&g_rsb_lock);
+	return rc;
+}
+
+int rsb_update_bits(uint8_t runtime_addr, uint8_t reg, uint8_t set,
+    uint8_t *before)
+{
+	uint8_t v = 0;
+	int rc;
+
+	spin_lock(&g_rsb_lock);
+	rc = rsb_read_locked(runtime_addr, reg, &v);
+	if (rc == 0) {
+		if (before)
+			*before = v;
+		if ((v & set) != set)
+			rc = rsb_write_locked(runtime_addr, reg, (uint8_t)(v | set));
+	}
+	spin_unlock(&g_rsb_lock);
+	return rc;
+}
+
+int rsb_guest_transfer(const struct rsb_guest_xfer *x, uint32_t *stat,
+    uint32_t *data0, uint32_t *data1)
+{
+	int rc;
+	uint32_t st = 0;
+
+	spin_lock(&g_rsb_lock);
+	if (!g_rsb_ready && rsb_init_locked() != 0) {
+		spin_unlock(&g_rsb_lock);
+		*stat = RSB_STAT_TERR_INT;
+		return -100;
+	}
+	wreg(RSB_STAT, rreg(RSB_STAT));          /* start from a clean status */
+	wreg(RSB_DEVADDR, x->dar);
+	wreg(RSB_ADDR, x->daddr0);
+	wreg(RSB_ADDR + 4u, x->daddr1);
+	wreg(RSB_ADDR + 8u, x->dlen);
+	wreg(RSB_DATA, x->data0);
+	wreg(RSB_DATA + 4u, x->data1);
+	wreg(RSB_CMD, x->cmd);
+	/* START without GLOBAL_INT_ENB: nobody takes the RSB interrupt, the
+	 * guest's driver polls INTS (which rsbtrap.c serves from *stat). */
+	wreg(RSB_CTRL, RSB_CTRL_START_TRANS);
+	rc = rsb_await_stat(&st);
+	*data0 = rreg(RSB_DATA);
+	*data1 = rreg(RSB_DATA + 4u);
+	spin_unlock(&g_rsb_lock);
+	*stat = st;
+	return rc;
 }

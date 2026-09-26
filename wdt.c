@@ -166,6 +166,12 @@ wdt_reach_fresh(uint64_t now)
     return (now - last) < wdt_unreach_ticks;
 }
 
+int
+wdt_reach_ok(void)
+{
+    return wdt_reach_fresh(rd_cntpct());
+}
+
 static int
 wdt_reachable(void)
 {
