@@ -21,6 +21,7 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | CPU DVFS | cpufreq_dt 648-1152 MHz + powerd; **needs the DC supply** (micro-USB browns out at 1152x4). aw_thermal throttles at 85 C. Feature `guest_dvfs` (2026-09-26) |
 | PMU | `pmu0` on SPIs 116-119, all four vCPUs; hwpmc counting and overflow sampling work. Feature `guest_pmu` (2026-09-26) |
 | Header UARTs | uart2 (PB0/PB1), uart3 (PD0/PD1), uart4 (PD2/PD3) as `/dev/cuau2..4`; pinctrl + pull-ups from gen_config (`guest_header_uarts`); internal-loopback 8/8 each (2026-09-26) |
+| R_PWM, R_I2C | `pwmc1.0` (PL10): 1 ms / 25 % programmed and read back from EL2; `iic3` (PL8/PL9) scans clean, nothing attached on this board (2026-09-26) |
 | UART, GPIO, IR, thermal, RTC | stock drivers, nothing special |
 
 ## Not done: no FreeBSD driver exists
@@ -79,6 +80,4 @@ not ship a build with it enabled.
 ## Could be enabled, simply not needed yet
 
 `i2s@1c22400/1c22800`
-and `spdif@1c21000` (the analog path already carries audio), `pwm@1f03800`
-(R_PWM), `i2c@1f02400` (R_I2C, in the PMIC's domain — check against the
-hypervisor's RSB use first).
+and `spdif@1c21000` (the analog path already carries audio).
