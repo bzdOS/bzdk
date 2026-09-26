@@ -778,11 +778,17 @@ def ensure_node_pins(dtb_path, dts_text, node_path, pins, dry_run):
     """Point a node's pinctrl-0 at the pinctrl group `pins` (a child of the
     main pinctrl@1c20800), for nodes the upstream DTS never enabled and so
     never gave a pinctrl-0 (the header UARTs)."""
+    # The group lives under whichever pinctrl owns its pins (PA-PH: @1c20800,
+    # PL: the R_PIO @1f02c00).
+    ctl = "pinctrl@1f02c00" if re.search(
+        r"pinctrl@1f02c00 \{(?:(?!\n\t\t\};).)*?\b" + re.escape(pins) + r" \{",
+        dts_text, re.S) else "pinctrl@1c20800"
+    pins_path = f"/soc/{ctl}/{pins}"
     ph = _phandle_of(dts_text, re.escape(pins))
     if ph is None:
         used = {int(x, 16) for x in re.findall(r"phandle = <(0x[0-9a-f]+)>;", dts_text)}
         ph = max(used) + 1
-        fdtput(dtb_path, f"/soc/pinctrl@1c20800/{pins}", "x", "phandle", ph, dry_run=dry_run)
+        fdtput(dtb_path, pins_path, "x", "phandle", ph, dry_run=dry_run)
     fdtput(dtb_path, node_path, "s", "pinctrl-names", "default", dry_run=dry_run)
     fdtput(dtb_path, node_path, "x", "pinctrl-0", ph, dry_run=dry_run)
     # Header pins are usually left unconnected: a floating RX line makes the
@@ -790,7 +796,7 @@ def ensure_node_pins(dtb_path, dts_text, node_path, pins, dry_run):
     # (uart2 on PB1, 2026-09-26). Pull the group up -- a UART line idles high.
     if not dry_run:
         subprocess.run(["fdtput", "-t", "s", str(dtb_path),
-                        f"/soc/pinctrl@1c20800/{pins}", "bias-pull-up", ""], check=True)
+                        pins_path, "bias-pull-up", ""], check=True)
 
 
 def ensure_node_status(dtb_path, node_path, want_enabled, dry_run):
