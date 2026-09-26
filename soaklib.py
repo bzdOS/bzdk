@@ -267,6 +267,108 @@ while :; do
 done
 """
 
+# The 4-vCPU mixed load (--profile mixed). Same file contract as LOAD_SCRIPT
+# (pid / progress / errors), so sampling, classification and the verdict are
+# unchanged; the SD verify loop is still the one that advances `gen`. Around it
+# run workers that each stress one path the single-disk load never touched:
+#   cpu   bursts of 5-40 s then 0-20 s idle, so powerd keeps changing the
+#         operating point (the RSB-trapped DVFS path, see guest-dvfs-works-on-dc)
+#   emmc  re-reads random 64 MB windows of the READ-ONLY root and compares each
+#         with the md5 it got the first time (root is ro, so any change is a
+#         read-path corruption)
+#   net   pulls a blob with a known md5 from the host's TFTP (vnet RX, EMAC)
+#   gpu   limabench: pixel-checked lima renders; non-zero exit is a failure
+# A worker that dies is an error, and so is any verify mismatch. The master
+# traps TERM and takes the workers with it, so the idempotent restart in
+# guest_start_load() never leaves orphans behind.
+LOAD_SCRIPT_MIXED = r"""#!/bin/sh
+D=%(dir)s
+SZ=%(size_mb)s
+IDLE=%(idle_s)s
+NET_URL='%(net_url)s'
+NET_MD5='%(net_md5)s'
+GPU_CMD='%(gpu_cmd)s'
+EMMC_DEV=%(emmc_dev)s
+mkdir -p $D/tree $D/emmc
+echo $$ > $D/pid
+: > $D/errors
+err() { echo "`date '+%%Y-%%m-%%dT%%H:%%M:%%S'` $*" >> $D/errors; }
+rnd() { echo $((`od -An -N2 -tu2 /dev/urandom` %% $1)); }
+w_cpu() {
+  while :; do
+    n=$((5 + `rnd 36`))
+    timeout $n sh -c 'while :; do dd if=/dev/zero bs=1m count=256 2>/dev/null | md5 >/dev/null; done'
+    sleep `rnd 21`
+  done
+}
+w_emmc() {
+  nmb=$((`diskinfo $EMMC_DEV | awk '{print $3}'` / 1048576 / 64))
+  while :; do
+    w=`rnd $nmb`
+    h=`dd if=$EMMC_DEV bs=1m skip=$((w*64)) count=64 2>/dev/null | md5`
+    if [ -f $D/emmc/$w ]; then
+      [ "`cat $D/emmc/$w`" = "$h" ] || err "EMMC-MISMATCH win=$w got=$h want=`cat $D/emmc/$w`"
+    else
+      echo $h > $D/emmc/$w
+    fi
+    echo "win=$w ts=`date +%%s`" > $D/emmc.progress
+    sleep 2
+  done
+}
+w_net() {
+  # NET_URL is "host:file" on the host's TFTP (69/udp is the one port the
+  # host firewall opens to the LAN -- the board already boots from it)
+  while :; do
+    printf "binary\nblocksize 1428\nget %%s $D/net.blob\nquit\n" "${NET_URL#*:}" |
+      timeout 300 tftp "${NET_URL%%%%:*}" >/dev/null 2>&1
+    h=`md5 -q $D/net.blob 2>/dev/null`
+    rm -f $D/net.blob
+    [ "$h" = "$NET_MD5" ] || err "NET-MISMATCH got=$h want=$NET_MD5"
+    echo "ts=`date +%%s`" > $D/net.progress
+    sleep 10
+  done
+}
+w_gpu() {
+  while :; do
+    $GPU_CMD > $D/gpu.last 2>&1 || err "GPU-FAIL rc=$? `tail -1 $D/gpu.last`"
+    echo "ts=`date +%%s`" > $D/gpu.progress
+    sleep 5
+  done
+}
+W=""
+w_cpu & W="$W $!:cpu"
+w_cpu & W="$W $!:cpu"
+[ -c $EMMC_DEV ] && { w_emmc & W="$W $!:emmc"; }
+[ -n "$NET_URL" ] && { w_net & W="$W $!:net"; }
+[ -n "$GPU_CMD" ] && { w_gpu & W="$W $!:gpu"; }
+echo "$W" > $D/workers
+# started by daemon(8) in a session of its own: one signal to that process
+# group takes every worker AND their dd/md5/tftp children (and the daemon
+# supervisor, which has nothing left to supervise)
+PG=`ps -o pgid= -p $$ | tr -d ' '`
+trap 'trap - TERM INT; kill -TERM -$PG 2>/dev/null; exit 0' TERM INT
+gen=0
+while :; do
+  gen=$((gen+1))
+  dd if=/dev/urandom of=$D/blob bs=1m count=$SZ 2>/dev/null
+  a=`md5 -q $D/blob 2>/dev/null`
+  sync
+  b=`md5 -q $D/blob 2>/dev/null`
+  if [ -z "$a" ] || [ "$a" != "$b" ]; then
+    err "VERIFY-MISMATCH gen=$gen a=$a b=$b"
+  fi
+  i=0
+  while [ $i -lt 200 ]; do echo x > $D/tree/f$i; i=$((i+1)); done
+  rm -f $D/tree/f*
+  rm -f $D/blob
+  for p in $W; do
+    kill -0 ${p%%:*} 2>/dev/null || { err "WORKER-DIED ${p#*:} pid=${p%%:*}"; W=`echo $W | sed "s|$p||"`; }
+  done
+  echo "gen=$gen ts=`date +%%s`" > $D/progress
+  sleep $IDLE
+done
+"""
+
 # Sampled every poll. One command, one line per field, so the lossy console
 # only has to frame one reply. `|` separators are parsed positionally.
 GUEST_LOAD_PROBE = (
@@ -396,8 +498,27 @@ class Board:
         return ok
 
     def guest_fs_state(self):
-        """a2_cycle.fs_state(): mount line, df, fsck-repair count, readonly."""
-        return self._a2.fs_state() if self._a2 else None
+        """a2_cycle.fs_state(): mount line, df, fsck-repair count, readonly.
+
+        Since 2026-08-25 root is read-only BY DESIGN (fstab `ro`), so a
+        read-only `/` is not the dirty-filesystem signal any more; when fstab
+        says so, `readonly` reports /var -- where the load and every other
+        write lands -- instead."""
+        if not self._a2:
+            return None
+        fs = self._a2.fs_state()
+        if not fs or not fs.get("readonly"):
+            return fs
+        rc, out, _ = self._a2.guest(
+            "awk '$2==\"/\"{print $4}' /etc/fstab; echo '|'; "
+            "mount -p | awk '$2==\"/var\"{print $4}'", 60)
+        if rc != 0:
+            return fs
+        parts = [p.strip() for p in out.split("|")]
+        if len(parts) == 2 and "ro" in parts[0].split(","):
+            fs = dict(fs, root_ro_by_design=True,
+                      readonly="rw" not in parts[1].split(","))
+        return fs
 
     def console(self, cmd, timeout=60.0):
         """One command over the guest console. Refuses a busy tty."""
@@ -425,11 +546,17 @@ class Board:
                 return out
         return self.console(cmd, timeout=timeout)
 
-    def guest_start_load(self, size_mb=48, idle_s=5):
+    def guest_start_load(self, size_mb=48, idle_s=5, mixed=None):
         """(Re)start the sustained load inside the guest. Idempotent: kills a
-        previous instance first, so calling it after every recovery is safe."""
-        body = LOAD_SCRIPT % {"dir": LOAD_DIR, "size_mb": size_mb,
-                              "idle_s": idle_s}
+        previous instance first, so calling it after every recovery is safe.
+        `mixed` (a dict of LOAD_SCRIPT_MIXED's net_url/net_md5/gpu_cmd/
+        emmc_dev) selects the 4-vCPU mixed load instead of the disk-only one."""
+        if mixed is not None:
+            body = LOAD_SCRIPT_MIXED % dict(mixed, dir=LOAD_DIR,
+                                            size_mb=size_mb, idle_s=idle_s)
+        else:
+            body = LOAD_SCRIPT % {"dir": LOAD_DIR, "size_mb": size_mb,
+                                  "idle_s": idle_s}
         # Written with a here-document so it survives both channels (no scp,
         # and the console cannot be trusted with long single lines).
         cmd = (f"mkdir -p {LOAD_DIR}; "
@@ -437,7 +564,7 @@ class Board:
                f"2>/dev/null; fi; "
                f"cat > {LOAD_DIR}/load.sh <<'BZDEOF'\n{body}BZDEOF\n"
                f"chmod +x {LOAD_DIR}/load.sh; "
-               f"nohup {LOAD_DIR}/load.sh >{LOAD_DIR}/load.out 2>&1 & "
+               f"daemon -o {LOAD_DIR}/load.out {LOAD_DIR}/load.sh; "
                f"sleep 2; echo STARTED-`cat {LOAD_DIR}/pid 2>/dev/null`")
         out = self.guest_exec(cmd, timeout=120)
         return bool(out and "STARTED-" in out and
@@ -1166,7 +1293,7 @@ class FakeBoard:
             return "STARTED-4242"
         return ""
 
-    def guest_start_load(self, size_mb=48, idle_s=5):
+    def guest_start_load(self, size_mb=48, idle_s=5, mixed=None):
         self._count("guest_start_load")
         out = self._answer("cat > load.sh")
         return bool(out and "STARTED-" in out)

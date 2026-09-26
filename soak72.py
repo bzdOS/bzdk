@@ -84,6 +84,31 @@ def _sig(signum, _frame):
           f"re-run the same command to resume)", flush=True)
 
 
+def start_load(board, cfg):
+    return board.guest_start_load(cfg["size_mb"], cfg["idle_s"],
+                                  mixed=cfg.get("mixed"))
+
+
+# ── the mixed profile's net peer ─────────────────────────────────────────
+def start_net_server(args):
+    """Put a fixed random blob in the host's TFTP root for the guest's net
+    worker (69/udp is the one port the host firewall opens to the LAN; an
+    ad-hoc HTTP port is refused). Kept across resumes so the md5 is stable.
+    Returns (None, "host:file", md5) -- nothing to stop afterwards."""
+    import hashlib
+    blob = os.path.join(args.tftp_root, "soak72-netblob.bin")
+    if not os.path.exists(blob):
+        with open(blob + ".tmp", "wb") as f:
+            f.write(os.urandom(args.net_mb << 20))
+        os.chmod(blob + ".tmp", 0o644)
+        os.replace(blob + ".tmp", blob)
+    h = hashlib.md5()
+    with open(blob, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return None, f"{args.net_host}:{os.path.basename(blob)}", h.hexdigest()
+
+
 # ── one health sample ────────────────────────────────────────────────────
 def sample(board, prev, state, cfg):
     """Build one sample dict. Every field is best-effort: an unreadable field
@@ -213,7 +238,7 @@ def do_guest_recovery(board, ev, state, cfg, why):
             f"(still_dirty={rec.get('still_dirty')}, "
             f"mount={(rec.get('mount') or '')[:120]!r}). Stopping rather than "
             f"soaking a broken guest.")
-    if not board.guest_start_load(cfg["size_mb"], cfg["idle_s"]):
+    if not start_load(board, cfg):
         raise HarnessStop("could not restart the guest-side load after recovery")
     ev.emit("load-restarted", "info")
     state.d["last_load_gen"] = None
@@ -258,9 +283,13 @@ def run(board, clock, ev, state, cfg):
     prev = None
     # Idempotent start: if the load is already running (resumed run), leave it.
     lp = board.guest_load_progress()
+    # --restart is a fresh run: a load left behind by an earlier run (possibly
+    # another profile, with its own error history) must not be adopted.
+    if cfg.get("restart"):
+        lp = None
     if not (lp and lp.get("running")):
         if board.usb() == "hv" and board.status().get("reachable"):
-            if board.guest_start_load(cfg["size_mb"], cfg["idle_s"]):
+            if start_load(board, cfg):
                 ev.emit("load-started", "info", size_mb=cfg["size_mb"],
                         idle_s=cfg["idle_s"])
             else:
@@ -301,7 +330,7 @@ def run(board, clock, ev, state, cfg):
         if recovers:
             k, d = recovers[0]
             if k == "load-not-running":
-                if not board.guest_start_load(cfg["size_mb"], cfg["idle_s"]):
+                if not start_load(board, cfg):
                     raise HarnessStop("the guest-side load will not start")
                 ev.emit("load-restarted", "info", detail=d)
                 state.d["last_load_gen_ts"] = clock.now()
@@ -972,6 +1001,20 @@ def main(argv=None):
                     help="write size per load generation inside the guest")
     ap.add_argument("--idle-s", type=int, default=5,
                     help="pause between load generations (0 = flat out)")
+    ap.add_argument("--profile", choices=("disk", "mixed"), default="disk",
+                    help="disk: the single-disk v1-gate load; mixed: SD verify "
+                         "plus CPU bursts (DVFS), eMMC read-verify, net pull "
+                         "and lima renders on the 4-vCPU guest")
+    ap.add_argument("--net-host", default="192.168.88.2",
+                    help="(mixed) host address the guest pulls the blob from")
+    ap.add_argument("--tftp-root", default="/opt/bzdos/tftpboot")
+    ap.add_argument("--net-mb", type=int, default=4,
+                    help="(mixed) blob size; TFTP runs ~100 KB/s")
+    ap.add_argument("--no-net", action="store_true")
+    ap.add_argument("--gpu-cmd", default="/root/limabench",
+                    help="(mixed) guest GPU workload, '' to disable")
+    ap.add_argument("--emmc-dev", default="/dev/vtbd0p3",
+                    help="(mixed) READ-ONLY eMMC partition to read-verify")
     ap.add_argument("--max-resets", type=int, default=20,
                     help="stop if the run needs more resets than this; each is "
                          "individually by design (R2), but a soak that needs "
@@ -986,8 +1029,9 @@ def main(argv=None):
                     help="require the VBK1 breadcrumb at verify")
     ap.add_argument("--progress-every", type=int, default=10,
                     help="emit a progress event every N samples")
-    ap.add_argument("--state", default=DEFAULT_STATE)
-    ap.add_argument("--events", default=DEFAULT_EVENTS)
+    ap.add_argument("--state", default=None,
+                    help="default soak72[-mixed]-state.json by profile")
+    ap.add_argument("--events", default=None)
     ap.add_argument("--logdir", default=DEFAULT_LOGDIR)
     ap.add_argument("--iface", default="br0")
     ap.add_argument("--restart", action="store_true",
@@ -1002,6 +1046,11 @@ def main(argv=None):
     ap.add_argument("--scenario", help="one dry-run scenario instead of the "
                                        "whole matrix")
     args = ap.parse_args(argv)
+    sfx = "" if args.profile == "disk" else "-" + args.profile
+    if args.state is None:
+        args.state = os.path.join(HERE, f"soak72{sfx}-state.json")
+    if args.events is None:
+        args.events = os.path.join(HERE, f"soak72{sfx}-events.jsonl")
 
     if args.status:
         return cmd_status(args)
@@ -1018,11 +1067,22 @@ def main(argv=None):
                   run_id=time.strftime("%Y%m%d-%H%M%S"))
     stopped = None
     ok = False
+    net = None
+    cfg = make_cfg(args)
+    cfg["restart"] = args.restart
     try:
+        if args.profile == "mixed":
+            url = md5 = ""
+            if not args.no_net:
+                net, url, md5 = start_net_server(args)
+            cfg["mixed"] = {"net_url": url, "net_md5": md5,
+                            "gpu_cmd": args.gpu_cmd,
+                            "emmc_dev": args.emmc_dev}
+            ev.emit("profile", "info", profile="mixed", **cfg["mixed"])
         state = RunState(args.state, clock, "soak72", new_state_defaults(),
                          restart=args.restart)
         board = L.make_board(False, None, clock, ev, iface=args.iface)
-        ok = run(board, clock, ev, state, make_cfg(args))
+        ok = run(board, clock, ev, state, cfg)
     except HarnessStop as e:
         stopped = str(e)
         ev.emit("harness-stop", FAIL, detail=stopped)
@@ -1035,6 +1095,9 @@ def main(argv=None):
         stopped = f"{type(e).__name__}: {e}"
         ev.emit("harness-crash", FAIL, detail=stopped)
         raise
+    finally:
+        if net is not None:
+            net.terminate()
     closed = verdict(state, make_cfg(args), ev, ok, stopped)
     if _stop["flag"] and not closed:
         print("(interrupted: re-run the same command to resume)")
