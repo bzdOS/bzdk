@@ -1,6 +1,173 @@
-# Handoff — 2026-09-26 (evening): one owner per bus, nothing parks the board (read this first)
+# Handoff — 2026-09-27: the board is the reference "weak mobile" benchmark; agreed roadmap below (read this first)
 
-## State (verified 16:07)
+## Framing agreed with the owner
+
+The Banana Pi M64 (2 GiB, 4x Cortex-A53, Mali-400) is being treated
+deliberately as **the reference weak-mobile target** — "делать максимально
+как тормозная мобильная платформа" — not a desktop stand-in. A port to a
+second SoC is real (H616/H618/H6 first, Rockchip after), but happens under
+that actual port, not as speculative core/soc/board refactoring done ahead
+of it.
+
+**No formal benchmark suite, no native-FreeBSD-without-hypervisor baseline**
+— explicitly declined ("не нужен особенно ценой фряхи без гипервизора, мне
+лень"). Instead: a plain before/after measurement per change (`dd`, boot
+time, fps) plus an integrity check (fsck -n, parallel md5 after
+umount/mount), the same way today's SD work was verified. See
+`vblk-sd-shared-bounce-under-lock` memory for the method and its one real
+miss (scatter-after-unlock on a shared EL2 buffer — any new shared buffer in
+a device path needs the same lock-discipline review before it touches
+hardware).
+
+**eMMC wear vs SD wear:** swap must NOT move to the SD card if it ever needs
+to move at all — the SD is already the weaker link (holds /var, /opt) and
+the eMMC has real wear-leveling. Swap is currently idle insurance
+(`v_swappgsout` was 0 all session, even under the mixed soak) — not urgent,
+but its policy is decided: eMMC if anywhere, and swap usage becomes a
+regression signal (target: 0), not something to optimize for capacity.
+Soak's own SD write cycle was cut 32→8 MiB to reduce wear once this was
+raised (`93d00e1`).
+
+## Today's SD result (context for the eMMC work below — same recipe applies)
+
+0.34 MB/s write / 2.07 MB/s read (1-bit, 25 MHz, one CMD24/CMD17 per sector)
+→ **13.5 MB/s write / 21.0 MB/s read** (4-bit + SD High Speed 50 MHz +
+CMD25/CMD18 multi-block + whole-virtio-request gather through one bounce).
+Commits `fb7f18f c8e76d1 9741412 a2560eb` (+ `3e38fe3` zeroing stale
+counters). UHS needs 1.8 V this slot doesn't have — 50 MHz / 4-bit is the
+ceiling for the SD path. QEMU CI fixed 10/10 (`c524d95` — 4 stages had been
+broken at HEAD since the EMAC-dark commits, unnoticed for a day; this is
+itself an argument for a pre-push CI gate, still not built).
+
+**Currently running:** `soak72.py --profile mixed --hours 24 --size-mb 8
+--restart`, started 2026-09-26 23:50, clean SD-write cycle. Mixed profile
+(new: `93d00e1`, fixed for ro-root and the group-kill/restart races:
+`3e38fe3`) drives CPU bursts (DVFS), eMMC read-verify, a TFTP pull from the
+host, and `limabench` in a loop, alongside the SD write/verify loop that
+still advances `gen`. **Check its status first** (`soak72.py --status` or
+tail `soak72-mixed-events.jsonl`) before doing anything else — if it's
+still healthy, let it run to the 24 h target before reloading the board for
+the eMMC work below (reloading loses the accumulated healthy-hours count
+unless resumed with the same state file).
+
+## Agreed next work, in order
+
+1. **eMMC: the same SD recipe.** `emmc_bio.c`/`vblk_emmc.c` are today where
+   `sd_bio.c`/`vblk_sd.c` were yesterday morning — 4-bit only (8-bit
+   commented out "until checked"), 25 MHz, one CMD17/CMD24 per sector, PIO.
+   This is the single biggest lever on system responsiveness: root, all
+   binaries/libraries and swap are on it. Port: CMD25/CMD18 multi-block +
+   whole-request gather (mirror `sd_serve_gathered()`), then try the already
+   commented-out 8-bit bus, then push the clock past 25 MHz the same
+   fail-safe-both-directions way `sd_set_hs50()` does. Verify with fsck -n +
+   parallel md5, same as the SD series.
+2. **DMA (IDMAC) for both controllers.** Today's SD/eMMC I/O is a vCPU
+   spinning in PIO inside its own trap handler — CMD25/CMD18 batching cut
+   the number of traps, not the PIO cost of each one. IDMAC descriptor-chain
+   DMA hands the transfer to the controller and frees the vCPU; this is the
+   real fix for "vCPU burns cycles doing I/O" and matters more as guest load
+   goes up (soak's mixed profile is the regression test for this once built).
+3. **Compressed swap (vzram) — mechanism agreed, one number still open.**
+   - `lz4.c`/`lz4.h` are written and validated (NOT YET committed — new
+     untracked files in this tree): 20000-case round-trip fuzz across
+     random/zero/repeating/text/Markov-ish inputs including corrupted-input
+     decode attempts (no OOB write, bounded failure), plus a two-direction
+     cross-check against Python's reference `lz4.block` (their decoder
+     accepts our compressed output byte-for-byte on a real page; our
+     decoder correctly decodes 2000 of their high-compression-mode outputs
+     across edge sizes 1..4096). Solid, reusable regardless of how vzram is
+     sized. Still needs a proper hosted unit test under `make test` (see
+     `test_kload_modinfo.c` for the pattern) before it's "done" by this
+     project's own convention — the scratchpad fuzzer that validated it is
+     ephemeral, not in the tree.
+   - **Carve mechanism:** reduce the guest's advertised `/memory` size
+     further via the *existing* `dtb-memory-size` machinery
+     (`board-config.xml` + `gen_config.py`, the same path `guest_dram_2g`
+     already uses) — a new slice taken from BELOW the ~113 MiB U-Boot
+     reservation at the top of the 2 GiB (do not touch that strip; it's a
+     repeat offender in this project's history). Stage-2 already maps the
+     whole 2 GiB 1:1 regardless (`STAGE2_DRAM_L1_BLOCKS`), so EL2 can use
+     the un-advertised slice as backing store with zero coordination with
+     the guest — FreeBSD's own allocator simply never touches PA it was
+     never told about, exactly like the existing top-of-DRAM carve-out.
+   - **Sizing — proposed, not confirmed:** 128 MiB physical carve, 256 MiB
+     exposed to the guest as the vzram device's capacity (2x overcommit,
+     conservative). Needs the owner's go-ahead on the actual numbers before
+     wiring board-config.xml.
+   - **Runtime resize — checked in `freebsd-src-bpi`, not assumed:**
+     `virtio_blk.c`'s `vtblk_config_change()` → `vtblk_resize_disk()` DOES
+     support a live GEOM-disk capacity change via the config-change
+     interrupt. But the swap subsystem on top does not adopt a grown
+     device automatically — needs `swapoff`/`swapon` of that device after a
+     grow. Shrinking an active swap device live is NOT safe (data loss risk
+     for already-swapped pages) — never do it while `swapon` is active on
+     it. So: the internal physical-pool accounting can be adjusted anytime
+     (guest never sees that RAM at all), but the exposed capacity is
+     effectively fixed at boot in practice.
+   - New virtio-blk device, same shape as `vblk_sd.c` (own MMIO slot — next
+     free SPI per `board-config.xml`'s documented gap 0x68..0x73 is 109/
+     0x6D, base `0x0A005000`), backed by a page table of LZ4-compressed 4
+     KiB slots inside the carved pool, raw fallback for incompressible
+     pages, one lock across the whole compress/decompress/copy path (this
+     project's one proven bug class here — see the SD gather postmortem).
+4. **Wear counters in `bzdctl status`.** eMMC exposes wear via
+   `EXT_CSD[268]`/`[269]` (`DEVICE_LIFE_TIME_EST_A/B`) and `EXT_CSD[267]`
+   (`PRE_EOL_INFO`); not read anywhere today. SD wear is vendor-specific and
+   may not be exposed by this card at all — check, don't assume. Publish
+   next to temperature once read.
+5. **Guest cleanup + kernel rebuild.** `zfs.ko` is loaded on the guest for
+   no reason (ARC eats RAM on a 2 GiB board) — drop it from the module set.
+   Rebuild the kernel from the clean `bpi-m64-15.1` branch
+   (`/opt/bzdos/freebsd-src-bpi`, 12 commits on 15.1-RELEASE, byte-identical
+   tree to what's running today, replaces the dirty `earlyboot-wt` lineage)
+   with `-mcpu=cortex-a53`.
+6. **DE2 hardware-layer compositor (HWC-style) — the biggest perceived-speed
+   lever, do after eMMC/DMA/swap.** `bzkms` today does one zero-copy window;
+   DE2 has ~4 real hardware mixer layers. Both Android (SurfaceFlinger +
+   Hardware Composer: per-frame, hand as many surfaces as possible straight
+   to hardware planes, GPU-composite only the overflow into one client
+   layer) and iOS (render server + the SoC's display co-processor, same
+   idea, plus always-on-display composition with the GPU never woken) are
+   proof this is the standard mobile pattern, not a novel bet. Missing
+   piece is exactly the negotiation logic HWC provides — which surfaces get
+   a plane vs fall back to GPU — layered on top of the already-working
+   zero-copy `bzkms` path.
+7. **VE (video engine) hardware decode** — deferred; large (register-level
+   reverse-engineering from linux-sunxi, one path per codec, an ffmpeg
+   hwaccel module) and depends on #6's DE2 layer plumbing to land the
+   decoded frame on its own hardware plane with zero GPU/CPU touch.
+8. **Second SoC port** (H616/H618/H6 first; Rockchip — RK3566/RK3588 —
+   after) and the resulting core/soc/board split of this tree: do it when
+   actually starting that port, not speculatively now.
+
+## Fantasy tier (recorded, not scheduled)
+
+Discussed as "what could this architecture do that no phone OS does",
+explicitly speculative, kept here so the reasoning isn't lost:
+
+- **Per-jail hypervisor-level snapshot/resume**, granular to one
+  `jail-per-stream` instance rather than the whole guest — a truer instant
+  suspend/resume than Android's cgroup freezer, since it doesn't need the
+  frozen process to re-warm anything on resume.
+- **Input-triggered DVFS pre-ramp**: EL2 sees a `vinput` event before the
+  guest scheduler wakes the app; could start raising frequency in parallel
+  with guest wake-up instead of after a cpufreq governor reacts.
+- **Whole-system incremental snapshot ("undo history" for the live OS)**,
+  reusing the W^X pool's stage-2 permission-bit-flip machinery for dirty
+  tracking instead of a full eager copy.
+- **Stage-2-fault-driven predictive prefetch** — EL2 sees every guest page
+  fault at the boundary already; a per-app access pattern model could
+  preload pages before the guest kernel asks, below the filesystem layer.
+- **Live migration of a frozen guest across boards** in the fleet (the
+  snapshot mechanism generalized from "resume on this board" to "resume on
+  a different one").
+- **Thermal-aware live core migration** transparent to the guest scheduler.
+- **Generalized on-demand deterministic micro-guest cores**, extending the
+  already-proven `dual`-build (FreeBSD + real Zephyr concurrently on
+  separate cores) into a general "give me a dedicated low-jitter core for
+  this loop" primitive instead of a fixed build-time pairing.
+
+## State (verified 16:07, 2026-09-26)
 
 - **Hypervisor: master** (`4a6d41d`+), built clean WITH config.mk, staged in
   both boot paths. Contains, all hardware-verified today:
