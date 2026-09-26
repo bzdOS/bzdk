@@ -116,7 +116,8 @@ const char *const bzdos_vblk_emmc_owner = "vblk_emmc";
  *        stopped -- worth investigating on its own, not just a stat.
  *
  * INDEX MAP WARNING. Slots 0..61 are ALL taken, and this window is 64 words
- * (HVMAP_VBLK_BC_SIZE 0x100). 62 is this counter; 63 is the last one free.
+ * (HVMAP_VBLK_BC_SIZE 0x100). 62 is this counter; 63 was the last one free,
+ * now spent on [63] below (emmc_serve_gathered()) -- the window is FULL.
  * The boot-guard counter was first put at [59] and that slot already belonged to
  * g_lock_retries (line ~854) -- eMMC lock-acquire retries, a normal and frequent
  * event -- so the aliased reading looked like "the guest tried to write the boot
@@ -135,6 +136,11 @@ const char *const bzdos_vblk_emmc_owner = "vblk_emmc";
  *   [58] writes those retries rescued — [57] non-zero with [58] tracking it is
  *        the card stalling and recovering; [57] climbing with [58] flat means
  *        the retries are not helping and the failure is not transient
+ *   [63] emmc_serve_gathered() successful whole-request CMD18/CMD25 runs
+ *        (2026-09-27) — the LAST free slot in this window, spent here because
+ *        a failed gather always falls back to the per-descriptor path, whose
+ *        own bc[42..56] already capture the failure; see g_gather_fails (a
+ *        plain, non-breadcrumb counter) for gather attempts that failed.
  * ------------------------------------------------------------------ */
 /* Address owned by hv_addrmap.h (via vblk_emmc.h). Was 0x50005000, INSIDE the
  * 64 KiB vconsole ring, where console output clobbered these words. */
@@ -147,7 +153,7 @@ const char *const bzdos_vblk_emmc_owner = "vblk_emmc";
  * only this can prove it is big enough for its own writer. emmc_bio.c's window
  * had drifted exactly that way (13 slots written, 8 reserved). Raising this
  * past 63 means the window has to grow first -- see the INDEX MAP WARNING. */
-#define VBLK_BC_MAX_IDX  62u
+#define VBLK_BC_MAX_IDX  63u
 _Static_assert((VBLK_BC_MAX_IDX + 1u) * 4u <= HVMAP_VBLK_BC_SIZE,
                "vblk_emmc.c writes more breadcrumb slots than "
                "HVMAP_VBLK_BC_SIZE reserves");
@@ -199,6 +205,16 @@ volatile uint32_t g_vblk_async_ready;
 static uint64_t g_bounce_q[VBLK_SECTOR_BYTES / 8];   /* 512 bytes */
 #define BOUNCE_PA  ((uint64_t)(uintptr_t)&g_bounce_q[0])
 static inline uint8_t *bounce(void) { return (uint8_t *)(uintptr_t)&g_bounce_q[0]; }
+
+/* Bounce-run buffer for emmc_bio_read_multi()/emmc_bio_write_multi(): a
+ * whole, sector-aligned request is gathered/scattered through ONE bounce and
+ * moved with a single CMD18/CMD25 instead of one CMD17/CMD24 per sector.
+ * Mirrors vblk_sd.c's g_bounce_run exactly (see project memory
+ * vblk-sd-shared-bounce-under-lock) -- same size cap (EMMC_MULTI_MAX_BLOCKS
+ * == SD_MULTI_MAX_BLOCKS == 128, one whole SEG_MAX=16 x 4 KiB request), same
+ * EL2-private, lock-bracketed contract. See emmc_serve_gathered() below. */
+static uint64_t g_bounce_run[EMMC_MULTI_MAX_BLOCKS * VBLK_SECTOR_BYTES / 8];
+#define BOUNCE_RUN_PA  ((uint64_t)(uintptr_t)&g_bounce_run[0])
 
 /* ------------------------------------------------------------------ *
  * D2 fix: guest-PA range check.
@@ -748,6 +764,16 @@ static uint32_t g_write_retry_ok;   /* [58] writes a retry rescued   */
 static uint32_t g_lock_retries;     /* [59] extra acquires needed    */
 static uint32_t g_lock_giveups;     /* [60] gave up -> S_IOERR       */
 
+/* emmc_serve_gathered() stats. [63] is the LAST free breadcrumb slot in this
+ * window (see the INDEX MAP WARNING above) -- spent on the success counter,
+ * since a failed gather always falls back to the per-descriptor path, whose
+ * own STICKY IOERR forensics (bc[42..56]) already capture the failure. Kept
+ * as a plain (non-breadcrumb) counter, readable via nm+dbgmon `r` like
+ * emmc_bio.c's own multi-block stats -- consistent with that file's
+ * decision not to add breadcrumb slots for these. */
+static uint32_t g_gathered;         /* [63] whole-request CMD18/CMD25 runs */
+static uint32_t g_gather_fails;     /* attempted (lock held) but emmc_bio_*_multi() failed */
+
 /* The exact eMMC LBA serve_data() was on when it last failed. A request's
  * chain can die several sectors into a descriptor, so neither the request's
  * start sector nor the bytes-served count pins down the actual sector — and
@@ -795,6 +821,12 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 	 * the guest filesystem silently, so keep the two in step -- change the
 	 * test first, then this. */
 	uint32_t done = 0;
+	/* Per-CALL (i.e. per descriptor), like sd_serve_data()'s own `no_multi`:
+	 * once a multi-block attempt fails partway through this descriptor, the
+	 * remaining tail falls back to one emmc_bio_read/write per sector rather
+	 * than paying for another CMD18/CMD25 timeout on data already known to
+	 * be trouble. Reset on the NEXT descriptor (next serve_data() call). */
+	int no_multi = 0;
 	while (done < len) {
 		uint32_t off = *sector_fill;
 		uint32_t chunk = VBLK_SECTOR_BYTES - off;
@@ -814,6 +846,113 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		 * sector behind for vblk_note_ioerr(), without repeating the store at
 		 * each one. Meaningless unless this call actually fails. */
 		g_serve_fail_lba = lba;
+
+		/* Per-descriptor multi-block fast path (2026-09-27), mirroring
+		 * sd_serve_data()'s own inner fast path: emmc_serve_gathered() above
+		 * only fires when a REQUEST has >= 2 whole-sector data descriptors,
+		 * but in practice FreeBSD's virtio_blk very often hands a single
+		 * physically-contiguous descriptor spanning the WHOLE transfer (a
+		 * freshly allocated buffer is usually physically contiguous, so
+		 * busdma coalesces it to one segment) -- exactly the case
+		 * emmc_serve_gathered() cannot help, since it needs >= 2 descriptors
+		 * to be worth gathering. Measured live: a 26 MB sequential dd read
+		 * moved g_gathered by only +7 while g_reads moved by +807 -- almost
+		 * every request was ONE big descriptor. This is the path that
+		 * actually captures that traffic. Same eligibility shape as
+		 * emmc_serve_gathered(): only at a sector boundary (off==0), only for
+		 * >= 2 whole sectors, only up to EMMC_MULTI_MAX_BLOCKS -- anything
+		 * else (or a failure) falls through to the existing single-sector
+		 * path below untouched. */
+		if (is_read && !no_multi && off == 0u &&
+		    len - done >= 2u * VBLK_SECTOR_BYTES) {
+			uint32_t n = (len - done) / VBLK_SECTOR_BYTES;
+			uint32_t bytes;
+
+			if (n > EMMC_MULTI_MAX_BLOCKS)
+				n = EMMC_MULTI_MAX_BLOCKS;
+			bytes = n * VBLK_SECTOR_BYTES;
+			if (!gpa_in_range(buf_gpa, bytes)) {
+				g_gmem_oob++;
+				vblk_bc(27, g_gmem_oob);
+				return VBLK_RC_BADPA;
+			}
+			{
+				uint32_t tries = 0;
+				while (!emmc_lock_acquire_bounded()) {
+					vblk_bc(59, ++g_lock_retries);
+					if (++tries >= VBLK_LOCK_RETRIES) {
+						vblk_bc(60, ++g_lock_giveups);
+						return VBLK_RC_BUSY;
+					}
+					vblk_pet_wdt();
+				}
+			}
+			rc = emmc_bio_read_multi(lba, BOUNCE_RUN_PA, n);
+			/* The scatter MUST stay under the lock (same rule as
+			 * emmc_serve_gathered() below): g_bounce_run is shared by
+			 * every vCPU/CPU2, and once unlocked another request's CMD18
+			 * can overwrite it mid-copy, handing this vCPU someone else's
+			 * sectors. */
+			if (rc == 0)
+				gmem_write(buf_gpa, (uint8_t *)g_bounce_run, bytes);
+			vblk_emmc_unlock();
+			vblk_pet_wdt();
+			if (rc == 0) {
+				vblk_bc(63, ++g_gathered);
+				done += bytes;
+				*sector += n;
+				continue;
+			}
+			no_multi = 1;
+			g_gather_fails++;
+		}
+
+		if (!is_read && !no_multi && off == 0u &&
+		    len - done >= 2u * VBLK_SECTOR_BYTES) {
+			uint32_t n = (len - done) / VBLK_SECTOR_BYTES;
+			uint32_t bytes;
+
+			if (n > EMMC_MULTI_MAX_BLOCKS)
+				n = EMMC_MULTI_MAX_BLOCKS;
+			bytes = n * VBLK_SECTOR_BYTES;
+			if (!gpa_in_range(buf_gpa, bytes)) {
+				g_gmem_oob++;
+				vblk_bc(27, g_gmem_oob);
+				return VBLK_RC_BADPA;
+			}
+			/* Same boot-guard floor as the single-sector path below --
+			 * `lba` is the same value that check will use (off==0 here,
+			 * so lba == *sector exactly, not yet advanced). */
+			if (lba < VBLK_BOOT_GUARD_LBA)
+				return VBLK_RC_BOOTGUARD;
+			{
+				uint32_t tries = 0;
+				while (!emmc_lock_acquire_bounded()) {
+					vblk_bc(59, ++g_lock_retries);
+					if (++tries >= VBLK_LOCK_RETRIES) {
+						vblk_bc(60, ++g_lock_giveups);
+						return VBLK_RC_BUSY;
+					}
+					vblk_pet_wdt();
+				}
+			}
+			gmem_read(buf_gpa, (uint8_t *)g_bounce_run, bytes);
+			__asm__ volatile("dsb sy" ::: "memory");
+			rc = emmc_bio_write_multi(lba, BOUNCE_RUN_PA, n);
+			vblk_emmc_unlock();
+			vblk_pet_wdt();
+			if (rc == 0) {
+				vblk_bc(63, ++g_gathered);
+				done += bytes;
+				*sector += n;
+				continue;
+			}
+			/* Nothing lost: the tail of this descriptor retries one
+			 * emmc_bio_write() (with its own bounded retry) per sector
+			 * below, without paying for another CMD25 timeout first. */
+			no_multi = 1;
+			g_gather_fails++;
+		}
 
 		/* D2 fix: emmc_bio_read()/emmc_bio_write() take buf_gpa as a raw PA
 		 * and dereference it directly (a real DMA-like buffer handoff, NOT
@@ -1041,6 +1180,95 @@ done_sector:
 	return 0;
 }
 
+/* Whole-request fast path, mirroring vblk_sd.c's sd_serve_gathered(): when
+ * every data descriptor is a whole number of sectors and the request fits
+ * g_bounce_run, gather it (write) / scatter it (read) through the bounce and
+ * move it with ONE emmc_bio_read_multi()/write_multi() (CMD18/CMD25) instead
+ * of one emmc_bio_read()/write() per sector. `addr`/`len` are the DATA
+ * descriptors only (no header/status), `n` of them -- this shape is what
+ * BOTH call sites already have on hand: vblk_async_poll()'s mailbox arrays
+ * directly, and vblk_request()'s sync fallback via a small on-stack copy.
+ *
+ * Anything this isn't sure about -- an odd length, a bad GPA, too few/many
+ * sectors, a busy lock, a failed command -- returns non-zero BEFORE calling
+ * emmc_bio_*_multi() on anything, and the caller serves the request the old
+ * per-descriptor way. This path can only add speed, never correctness risk.
+ *
+ * NOT wired through the D2 gpa_in_range() bypass emmc_bio_read/write use for
+ * a whole-sector single-block read (no direct-to-guest-buffer fast path
+ * here) -- always bounces, exactly like sd_serve_gathered(), so there is
+ * exactly one buffer shape to reason about. */
+static int emmc_serve_gathered(uint32_t is_read, const uint64_t *addr,
+                                 const uint32_t *len, uint32_t n,
+                                 uint64_t sector, uint32_t *used_len)
+{
+	uint32_t i, total = 0, off, nblk;
+	int rc;
+
+	if (n < 2)
+		return VBLK_RC_BADPA;             /* not worth a CMD18/CMD25 */
+	for (i = 0; i < n; i++) {
+		if (len[i] == 0 || (len[i] % VBLK_SECTOR_BYTES) != 0 ||
+		    !gpa_in_range(addr[i], len[i]))
+			return VBLK_RC_BADPA;
+		total += len[i];
+		if (total > sizeof(g_bounce_run))
+			return VBLK_RC_BADPA;         /* falls back, never truncates */
+	}
+	nblk = total / VBLK_SECTOR_BYTES;
+	if (nblk < 2 || nblk > EMMC_MULTI_MAX_BLOCKS)
+		return VBLK_RC_BADPA;
+
+	if (!is_read && sector < VBLK_BOOT_GUARD_LBA)
+		return VBLK_RC_BOOTGUARD;         /* same floor as serve_data() */
+
+	/* Same patient acquire as serve_data() -- see its own comment for why
+	 * giving up after one bounded try is worse than waiting: a lost lock
+	 * race here would fail the WHOLE gathered request, exactly like a lost
+	 * race would fail one sector in the per-descriptor path. */
+	{
+		uint32_t tries = 0;
+		while (!emmc_lock_acquire_bounded()) {
+			vblk_bc(59, ++g_lock_retries);
+			if (++tries >= VBLK_LOCK_RETRIES) {
+				vblk_bc(60, ++g_lock_giveups);
+				return VBLK_RC_BUSY;
+			}
+			vblk_pet_wdt();
+		}
+	}
+
+	g_serve_fail_lba = (uint32_t)sector;
+
+	if (is_read) {
+		rc = emmc_bio_read_multi((uint32_t)sector, BOUNCE_RUN_PA, nblk);
+	} else {
+		for (i = 0, off = 0; i < n; off += len[i], i++)
+			gmem_read(addr[i], (uint8_t *)g_bounce_run + off, len[i]);
+		__asm__ volatile("dsb sy" ::: "memory");
+		rc = emmc_bio_write_multi((uint32_t)sector, BOUNCE_RUN_PA, nblk);
+	}
+	/* The scatter MUST stay under the lock: g_bounce_run is shared by every
+	 * vCPU/CPU2, each serving its own request in its own trap/poll --
+	 * scattering after unlock handed the guest another request's sectors on
+	 * the SD path (2026-09-26: reads returned foreign data, userland hung).
+	 * gmem_write() publishes each scattered slice to PoC itself (see its own
+	 * comment), so no separate gmem_cmo() is needed here. */
+	if (rc == 0 && is_read)
+		for (i = 0, off = 0; i < n; off += len[i], i++)
+			gmem_write(addr[i], (uint8_t *)g_bounce_run + off, len[i]);
+	vblk_emmc_unlock();
+	vblk_pet_wdt();
+	if (rc != 0) {
+		g_gather_fails++;
+		return rc;
+	}
+
+	*used_len = is_read ? total : 0;
+	vblk_bc(63, ++g_gathered);
+	return 0;
+}
+
 /* Extra completion diagnostics (breadcrumb words 14..19) for the LAST request
  * vblk_request() finished. Cheap plain stores via vblk_bc() -- purely so a
  * live session can correlate a guest-reported "hard error" against exactly
@@ -1251,6 +1479,26 @@ void vblk_async_poll(void)
 	status_gpa = g_async.status_gpa;
 	ndesc      = g_async.ndesc;
 
+	/* Whole-request fast path first (see emmc_serve_gathered()'s own
+	 * comment). The capacity check here is the SAME check the per-
+	 * descriptor loop below does per-descriptor, just applied to the
+	 * whole gathered range up front so a request that would exceed
+	 * capacity never gets offered to emmc_serve_gathered() at all --
+	 * it falls through untouched to the existing per-descriptor loop,
+	 * which reproduces today's exact capacity-exceeded behaviour. */
+	if (ndesc >= 2) {
+		uint64_t total_bytes = 0;
+		for (i = 0; i < ndesc; i++)
+			total_bytes += g_async.data_len[i];
+		if (sector + (total_bytes / VBLK_SECTOR_BYTES) <= g_blk.capacity) {
+			int grc = emmc_serve_gathered(is_read, g_async.data_addr,
+			                               g_async.data_len, ndesc,
+			                               sector, &used_len);
+			if (grc == 0)
+				goto async_gathered_done;
+		}
+	}
+
 	for (i = 0; i < ndesc; i++) {
 		uint64_t addr = g_async.data_addr[i];
 		uint32_t len  = g_async.data_len[i];
@@ -1273,6 +1521,7 @@ void vblk_async_poll(void)
 		if (is_read)
 			used_len += len;
 	}
+async_gathered_done:
 	if (is_read) g_reads++; else g_writes++;
 	vblk_bc(6, g_reads);
 	vblk_bc(7, g_writes);
@@ -1532,6 +1781,33 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		 * of failing; common case the lock is free the moment we ask. */
 		vblk_async_drain_bounded();
 		vblk_bc(26, g_async_fallbacks);
+
+		/* Whole-request fast path first (see emmc_serve_gathered()'s own
+		 * comment) -- same capacity pre-check as vblk_async_poll()'s
+		 * mirror of this, applied to the whole gathered range so a
+		 * request that would exceed capacity is never offered to it and
+		 * falls through untouched to the per-descriptor loop below. */
+		if (n >= 3 && (n - 2u) <= VBLK_MAX_CHAIN) {
+			uint64_t g_addr[VBLK_MAX_CHAIN];
+			uint32_t g_len[VBLK_MAX_CHAIN];
+			uint32_t ndata = n - 2u;
+			uint64_t total_bytes = 0;
+			uint32_t gi;
+
+			for (gi = 0; gi < ndata; gi++) {
+				g_addr[gi] = chain[1 + gi].addr;
+				g_len[gi]  = chain[1 + gi].len;
+				total_bytes += g_len[gi];
+			}
+			if (ndata >= 2 &&
+			    sector + (total_bytes / VBLK_SECTOR_BYTES) <= d->capacity) {
+				int grc = emmc_serve_gathered(is_read, g_addr, g_len,
+				                               ndata, sector, &used_len);
+				if (grc == 0)
+					goto sync_gathered_done;
+			}
+		}
+
 		for (uint32_t i = 1; i < n - 1; i++) {
 			struct vblk_desc *dd = &chain[i];
 			/* D5(d) diagnostic (see the comment above chain[0]/stdesc's own
@@ -1559,6 +1835,7 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 			if (is_read)
 				used_len += dd->len;     /* device wrote these bytes          */
 		}
+sync_gathered_done:
 		if (is_read) g_reads++; else g_writes++;
 		vblk_bc(6, g_reads);
 		vblk_bc(7, g_writes);
