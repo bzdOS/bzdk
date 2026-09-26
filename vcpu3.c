@@ -25,6 +25,9 @@
 #include "gic_timer.h"
 #include "vgic.h"
 
+/* CPU3's own CNTP tick period, same as vcpu1.c / vcpu2.c. */
+#define VCPU3_TICK_PERIOD_US 10000u
+
 /* MUTUAL EXCLUSION WITH zguest_cpu3.c, ENFORCED AT LINK TIME.
  *
  * See vcpu3.h's header comment for the runtime hazard this prevents (CPU3
@@ -155,12 +158,10 @@ void vcpu3_run(void)
 	/* ---- one-way entry into the guest, at EL1 ------------------------ */
 
 	/* NOT PORTED FROM vcpu1.c, DELIBERATELY -- same reasoning as vcpu2.c's
-	 * identical note: `dbg_core_active`, the musb/hdmi IRQ targeting, and
-	 * the periodic tick are CPU1-only duties (EMAC/dbgmon single-owner
-	 * mutex, USB-ACM console bridge, HDMI HUD/vblank, and the watchdog
-	 * cadence that carries them) with no bearing on, or equivalent for,
-	 * this core. CPU1 keeps all of it regardless of whether CPU3 is a
-	 * guest vCPU. */
+	 * identical note: `dbg_core_active` and the musb/hdmi IRQ targeting are
+	 * CPU1-only duties (EMAC/dbgmon single-owner mutex, USB-ACM console
+	 * bridge, HDMI HUD/vblank). The periodic tick is NOT one of them: this
+	 * core arms its own below, for vtimer_mask_watchdog(). */
 
 	/* Same tables CPU0/CPU2 use. VTTBR_EL2/VTCR_EL2 are banked per-PE, so
 	 * stage2_arm_secondary() programs THIS core's registers against the
@@ -195,6 +196,19 @@ void vcpu3_run(void)
 	 * injection) ready for it. Also zeroes CNTVOFF_EL2, deliberately: every
 	 * vCPU of one SMP guest must share one virtual timebase. */
 	vgic_init();
+
+	/* This core's own periodic CNTP tick -- the fix vcpu2.c got on
+	 * 2026-08-27 and this file never did (the "NOT PORTED" note above
+	 * wrongly lumps the tick in with CPU1's duties). The tick is the only
+	 * caller of vtimer_mask_watchdog(): without it, the first time the
+	 * software-vtimer path leaves CNTV masked and the guest does not
+	 * rewrite CNTV_CTL, this vCPU loses its timer for the rest of the
+	 * boot. Observed 2026-09-26: after ~15 min of bursty load, FreeBSD's
+	 * CPU on this core took no timer interrupts (sleep never woke, top
+	 * showed it idle at 0 ticks) while still running code, CNTP_CTL on
+	 * this core read 0x2 (no tick), and ssh sessions stalled whenever
+	 * sshd landed here. Same period and CNTVOFF handling as vcpu2.c. */
+	gic_timer_arm_preserving_cntvoff(VCPU3_TICK_PERIOD_US);
 
 	/* Publish what THIS core's banked registers actually hold, read on
 	 * this core -- see vcpu2.c's comment on why a debug-channel read of
