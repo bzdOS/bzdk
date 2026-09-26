@@ -73,6 +73,7 @@
 
 #define GCTL_RESET_ALL     0x00000007u
 #define GCTL_FIFO_RST      0x00000002u
+#define GCTL_DMA_RST       0x00000004u   /* bit2, needed by sd_bio_read_dma/write_dma */
 #define GCTL_AHB_INIT      0x80000010u
 
 #define CKCR_CARD_CLK_EN   0x00010000u
@@ -816,6 +817,254 @@ fail:
 	 * the caller keeps the record (sd_bio's own window is full) */
 	sd_multi_abort();
 	return (int)(0x40000000u | ((nwords & 0x3fffu) << 16) | (ri & 0xffffu));
+}
+
+/* ------------------------------------------------------------------ */
+/* sd_bio_read_dma() / sd_bio_write_dma() -- IDMAC descriptor-chain DMA */
+/* ------------------------------------------------------------------ */
+/* Same controller IP as emmc_bio.c's SMHC2/eMMC (confirmed: byte-identical
+ * CMD17/CMD24 CMDR encoding across both files), just a different MMIO base
+ * (SD_BASE, SMHC0) -- so the IDMAC register map, descriptor format and the
+ * enable/reset/wait sequence are the SAME ones emmc_bio_read_dma()/
+ * write_dma() already hardware-validated, transcribed here against SD_BASE
+ * instead. See that file's own header comment for the full derivation
+ * (verbatim from FreeBSD's aw_mmc.c, this project's standing reference for
+ * anything not already covered by a hardware-verified Python sequence). */
+#define REG_FWLR   0x40u
+#define REG_DMAC   0x80u
+#define REG_DLBA   0x84u
+#define REG_IDST   0x88u
+#define REG_IDIE   0x8Cu
+
+#define GCTL_FIFO_AC_MOD   0x80000000u
+#define GCTL_DMA_ENB       0x00000020u
+
+#define DMAC_IDMAC_SOFT_RST   0x00000001u
+#define DMAC_IDMAC_FIX_BURST  0x00000002u
+#define DMAC_IDMAC_IDMA_ON    0x00000080u
+
+#define IDST_TX_INT        0x00000001u
+#define IDST_RX_INT        0x00000002u
+#define IDST_FATAL_BERR    0x00000004u
+#define IDST_DES_UNAVL     0x00000010u
+#define IDST_ERR_FLAG_SUM  0x00000020u
+#define IDST_ABN_INT_SUM   0x00000200u
+#define IDST_ERROR   (IDST_FATAL_BERR | IDST_ERR_FLAG_SUM | \
+                      IDST_DES_UNAVL | IDST_ABN_INT_SUM)
+
+#define DESC_DIC   0x00000002u
+#define DESC_LD    0x00000004u
+#define DESC_FD    0x00000008u
+#define DESC_CH    0x00000010u
+#define DESC_ER    0x00000020u
+#define DESC_OWN   0x80000000u
+
+#define SD_DMA_FTRGLEVEL  0x20070008u
+
+#define SD_DMA_SEG_BYTES    0x2000u
+#define SD_DMA_DESC_COUNT   ((SD_MULTI_MAX_BLOCKS * 512u + \
+                              SD_DMA_SEG_BYTES - 1u) / SD_DMA_SEG_BYTES)
+
+struct sd_dma_desc {
+	uint32_t config;
+	uint32_t buf_size;
+	uint32_t buf_addr;
+	uint32_t next;
+};
+static struct sd_dma_desc g_sd_dma_desc[SD_DMA_DESC_COUNT]
+	__attribute__((aligned(64)));
+#define SD_DMA_DESC_PA  ((uint64_t)(uintptr_t)&g_sd_dma_desc[0])
+
+/* Clean+invalidate [pa, pa+len) to PoC -- see emmc_bio.c's emmc_dma_cmo()
+ * for the full rationale (same one applies here verbatim: the IDMAC is a
+ * real bus-master, not this CPU, so its reads/writes need explicit cache
+ * maintenance that a same-core PIO load/store never did). */
+static void sd_dma_cmo(uint64_t pa, uint32_t len)
+{
+	uint64_t p = pa & ~63ULL;
+	uint64_t end = pa + len;
+	for (; p < end; p += 64)
+		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static uint32_t sd_dma_build_desc(uint64_t buf_pa, uint32_t total_bytes)
+{
+	uint32_t ndesc = 0, done = 0;
+
+	while (done < total_bytes) {
+		uint32_t seg = total_bytes - done;
+		if (seg > SD_DMA_SEG_BYTES)
+			seg = SD_DMA_SEG_BYTES;
+		g_sd_dma_desc[ndesc].buf_size = seg;
+		g_sd_dma_desc[ndesc].buf_addr = (uint32_t)(buf_pa + done);
+		g_sd_dma_desc[ndesc].config = DESC_CH | DESC_OWN | DESC_DIC;
+		g_sd_dma_desc[ndesc].next = (uint32_t)(SD_DMA_DESC_PA +
+			(uint64_t)(ndesc + 1) * sizeof(struct sd_dma_desc));
+		done += seg;
+		ndesc++;
+	}
+	g_sd_dma_desc[0].config |= DESC_FD;
+	g_sd_dma_desc[ndesc - 1].config |= DESC_LD | DESC_ER;
+	g_sd_dma_desc[ndesc - 1].config &= ~(uint32_t)DESC_DIC;
+	g_sd_dma_desc[ndesc - 1].next = 0;
+
+	sd_dma_cmo(SD_DMA_DESC_PA, ndesc * (uint32_t)sizeof(struct sd_dma_desc));
+	return ndesc;
+}
+
+static void sd_dma_arm(void)
+{
+	uint32_t gctl = rreg(REG_GCTL);
+
+	wreg(REG_GCTL, gctl | GCTL_FIFO_RST | GCTL_DMA_RST);
+	small_delay();
+
+	gctl = rreg(REG_GCTL);
+	gctl &= ~GCTL_FIFO_AC_MOD;
+	gctl |= GCTL_DMA_ENB;
+	wreg(REG_GCTL, gctl);
+
+	wreg(REG_DMAC, DMAC_IDMAC_SOFT_RST);
+	small_delay();
+	wreg(REG_DMAC, DMAC_IDMAC_IDMA_ON | DMAC_IDMAC_FIX_BURST);
+	wreg(REG_IDIE, rreg(REG_IDIE) | IDST_RX_INT | IDST_TX_INT);
+	wreg(REG_DLBA, (uint32_t)SD_DMA_DESC_PA);
+	wreg(REG_FWLR, SD_DMA_FTRGLEVEL);
+	wreg(REG_IDST, 0xFFFFFFFFu);
+}
+
+/* Restore plain AHB/PIO FIFO-access mode so every other function in this
+ * file (sd_bio_read/write, *_multi, sd_set_hs50's own test read) keeps
+ * working unmodified -- none of them expect GCTL_DMA_ENB set. */
+static void sd_dma_disarm(void)
+{
+	uint32_t gctl = rreg(REG_GCTL);
+	gctl |= GCTL_FIFO_AC_MOD;
+	gctl &= ~GCTL_DMA_ENB;
+	wreg(REG_GCTL, gctl);
+	wreg(REG_DMAC, 0);
+}
+
+static int sd_dma_wait_complete(uint32_t is_read, uint32_t *ri_out)
+{
+	uint64_t start = rd_cntpct();
+	uint64_t cap = ms_to_ticks(SD_WRITE_DATA_TIMEOUT_MS);
+	uint32_t want = is_read ? IDST_RX_INT : IDST_TX_INT;
+
+	for (;;) {
+		uint32_t idst = rreg(REG_IDST);
+		uint32_t ri = rreg(REG_RINT);
+
+		if ((idst & IDST_ERROR) || (ri & RINT_ERR_MASK)) {
+			*ri_out = ri;
+			return -1;
+		}
+		if ((idst & want) && (ri & RINT_DATA_OVER)) {
+			wreg(REG_IDST, idst);
+			*ri_out = ri;
+			return 0;
+		}
+		if (rd_cntpct() - start > cap) {
+			*ri_out = ri;
+			return -1;
+		}
+	}
+}
+
+int sd_bio_read_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
+{
+	uint32_t total, ndesc, ri = 0;
+	uint64_t start, cap;
+
+	if (!g_sd_inited)
+		return -100;
+	if (nblk < 2 || nblk > SD_MULTI_MAX_BLOCKS)
+		return -101;
+	total = nblk * 512u;
+	/* Whole cache lines only -- see emmc_bio_read_dma(): a partial edge
+	 * line shared with data another core dirties mid-transfer gets written
+	 * back over the DMA'd bytes. The caller falls back to PIO. */
+	if ((buf_pa | total) & 63u)
+		return -102;
+
+	ndesc = sd_dma_build_desc(buf_pa, total);
+	sd_dma_cmo(buf_pa, total);   /* IDMAC is about to WRITE buf_pa */
+	sd_dma_arm();
+	(void)ndesc;
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, total);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, sd_addr(lba));
+	wreg(REG_CMDR, CMD18_READ_CMDR);
+
+	if (sd_dma_wait_complete(1, &ri) != 0)
+		goto fail;
+
+	start = rd_cntpct();
+	cap = ms_to_ticks(SD_WRITE_BUSY_TIMEOUT_MS);
+	while (rreg(REG_STAR) & STAR_CARD_BUSY) {
+		if (rd_cntpct() - start > cap) {
+			ri = STAR_CARD_BUSY;
+			goto fail;
+		}
+	}
+
+	sd_dma_disarm();
+	sd_dma_cmo(buf_pa, total);   /* publish the IDMAC's write */
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+
+fail:
+	sd_dma_disarm();
+	sd_multi_abort();
+	return (int)(0x40000000u | (ri & 0xffffu));
+}
+
+int sd_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
+{
+	uint32_t total, ndesc, ri = 0;
+	uint64_t start, cap;
+
+	if (!g_sd_inited)
+		return -100;
+	if (nblk < 2 || nblk > SD_MULTI_MAX_BLOCKS)
+		return -101;
+	total = nblk * 512u;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	ndesc = sd_dma_build_desc(buf_pa, total);
+	sd_dma_cmo(buf_pa, total);   /* IDMAC is about to READ buf_pa */
+	sd_dma_arm();
+	(void)ndesc;
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, total);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, sd_addr(lba));
+	wreg(REG_CMDR, CMD25_WRITE_CMDR);
+
+	if (sd_dma_wait_complete(0, &ri) != 0)
+		goto fail;
+
+	start = rd_cntpct();
+	cap = ms_to_ticks(SD_WRITE_BUSY_TIMEOUT_MS);
+	while (rreg(REG_STAR) & STAR_CARD_BUSY) {
+		if (rd_cntpct() - start > cap) {
+			ri = STAR_CARD_BUSY;
+			goto fail;
+		}
+	}
+
+	sd_dma_disarm();
+	return 0;
+
+fail:
+	sd_dma_disarm();
+	sd_multi_abort();
+	return (int)(0x40000000u | (ri & 0xffffu));
 }
 
 /* ------------------------------------------------------------------ */

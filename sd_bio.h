@@ -66,6 +66,18 @@ int sd_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 /* CMD18 counterpart, same contract. */
 int sd_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 
+/* Same contract as sd_bio_read_multi()/write_multi() (nblk in
+ * [2, SD_MULTI_MAX_BLOCKS], same packed-failure-code convention), but the
+ * data phase moves through the controller's own IDMAC (descriptor-chain
+ * DMA) instead of a CPU FIFO-drain loop -- see emmc_bio.c's
+ * emmc_bio_read_dma()/write_dma() for the design (same controller IP,
+ * confirmed byte-identical CMD17/CMD24 CMDR encoding, same IDMAC register
+ * map at a different base). NOT YET hardware-validated: validate with
+ * dbgmon `call` (same standalone cross-check methodology as
+ * test_emmc_dma.py) before wiring into any guest-facing path. */
+int sd_bio_read_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+int sd_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+
 /* Best-effort reclock from the 400 kHz identification clock to SD Default
  * Speed (25 MHz), FAIL-SAFE by construction: unlike eMMC's HS_TIMING switch,
  * SD cards support the whole 0-25 MHz default-speed range with NO CMD6
