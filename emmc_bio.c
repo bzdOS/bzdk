@@ -1536,6 +1536,260 @@ int emmc_bio_write(uint32_t lba, uint64_t buf_pa)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* emmc_bio_read_multi() / emmc_bio_write_multi() — CMD18/CMD25, the       */
+/* controller's own AUTO_STOP raising CMD12 for us. One transaction for a  */
+/* whole run of sectors instead of one emmc_bio_read()/write() call each.  */
+/*                                                                          */
+/* SAME sunxi SMHC IP as sd_bio.c's own read_multi/write_multi (identical   */
+/* CMD17/CMD24 CMDR encodings in both files -- CMD17_READ_CMDR/             */
+/* CMD24_WRITE_CMDR match byte for byte -- confirms the command layout      */
+/* transfers directly), but built on THIS file's OWN hardened idioms, not   */
+/* sd_bio.c's simpler ones: a stall-based, two-read-CNTPCT-confirmed        */
+/* timeout that resets on every word of progress (see emmc_bio_read()'s own */
+/* "ROOT-CAUSE FIX" comment -- an iteration cap or a fixed total-transfer    */
+/* deadline both under- and over-fire on a card that pauses mid-block for    */
+/* internal housekeeping), and ebio_fail_settle_full() for every abort       */
+/* path -- targeted CMD12 only while the data phase is genuinely still open, */
+/* never after AUTO_STOP has already retired it (see that function's own     */
+/* header: an untargeted STOP_TRANSMISSION measured 19-53% failure rates     */
+/* and corrupted sectors on the single-block path this is built next to).    */
+/*                                                                          */
+/* NOT hardware-verified yet. Validate exactly like sd_bio.c's series was:  */
+/* dbgmon `call` first (see emmc_bio.h's header on why these are call-able), */
+/* then fsck -n + parallel md5 reads across a remount, before this is wired */
+/* into any guest-facing path. See HANDOFF.md. */
+/* ------------------------------------------------------------------ */
+#define CMDR_AUTO_STOP        0x00001000u   /* bit12, CMDR register */
+#define RINT_AUTO_STOP_DONE   0x00004000u   /* bit14, RINT register */
+#define CMD18_READ_CMDR       (0x80002352u | CMDR_AUTO_STOP)   /* CMD18 */
+#define CMD25_WRITE_CMDR      (0x80002759u | CMDR_AUTO_STOP)   /* CMD25 */
+
+/* Per-word stall budget for the multi push/drain loops -- same values and
+ * same rationale as the single-block read path's EMMC_READ_STALL_TIMEOUT_MS/
+ * EMMC_READ_DRAIN_TAIL_MS (resets on progress, so total wall time scales
+ * naturally with nblk without needing a separate "whole transfer" cap). */
+#define EMMC_MULTI_STALL_TIMEOUT_MS  EMMC_READ_STALL_TIMEOUT_MS
+#define EMMC_MULTI_TAIL_TIMEOUT_MS   EMMC_READ_DRAIN_TAIL_MS
+
+int emmc_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
+{
+	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
+	uint32_t nwords = 0, total, ri = 0;
+
+	if (nblk < 2 || nblk > EMMC_MULTI_MAX_BLOCKS)
+		return -101;
+	total = nblk * 128u;
+
+	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
+	gctl_reset_and_wait(GCTL_FIFO_RST);
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, nblk * 512u);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, lba);
+	wreg(REG_CMDR, CMD18_READ_CMDR);
+
+	/* Drain, stall-based -- direct generalisation of emmc_bio_read()'s own
+	 * loop (see its comment for why DATA_OVER needs a short tail wait rather
+	 * than ending the drain the instant it latches: the final word can still
+	 * be in flight when DATA_OVER is observed). */
+	{
+		uint64_t patience = ms_to_ticks(EMMC_MULTI_STALL_TIMEOUT_MS);
+		uint64_t last = rd_cntpct();
+		unsigned over = 0, over_done = 0;
+		uint64_t guard = (uint64_t)EMMC_POLL_CAP * 64ull * (uint64_t)nblk;
+		uint64_t i;
+
+		for (i = 0; i < guard && nwords < total; i++) {
+			uint32_t st = rreg(REG_STAR);
+
+			if (!(st & STAR_FIFO_EMPTY)) {
+				buf[nwords++] = rreg(REG_FIFO);
+				last = rd_cntpct();
+				over = 0;
+				continue;
+			}
+			ri = rreg(REG_RINT);
+			if (ri & RINT_READ_ERR_MASK)
+				goto fail_open;
+			if (ri & RINT_DATA_OVER) {
+				if (nwords >= total)
+					break;
+				if (!over_done) {
+					over_done = 1;
+					last = rd_cntpct();
+					patience = ms_to_ticks(EMMC_MULTI_TAIL_TIMEOUT_MS);
+				}
+			}
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el = (now >= last) ? (now - last) : 0ull;
+				if (el > patience) {
+					if (++over < 2)
+						continue;
+					goto fail_open;
+				}
+				over = 0;
+			}
+		}
+		if (nwords < total)
+			goto fail_open;
+	}
+
+	/* DATA_OVER + the controller's own AUTO_STOP (CMD12) done. */
+	{
+		uint64_t start = rd_cntpct();
+		uint64_t cap = ms_to_ticks(EMMC_WRITE_DATA_TIMEOUT_MS);
+		unsigned over = 0;
+		for (;;) {
+			ri = rreg(REG_RINT);
+			if (ri & RINT_READ_ERR_MASK)
+				goto fail_open;
+			if ((ri & (RINT_DATA_OVER | RINT_AUTO_STOP_DONE)) ==
+			    (RINT_DATA_OVER | RINT_AUTO_STOP_DONE))
+				break;
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el = (now >= start) ? (now - start) : 0ull;
+				if (el > cap) {
+					if (++over < 2)
+						continue;
+					goto fail_open;
+				}
+				over = 0;
+			}
+		}
+	}
+
+	/* AUTO_STOP's own CMD12 is R1b: card holds DAT0 low while it retires. */
+	if (wait_card_idle_timed(EMMC_WRITE_BUSY_TIMEOUT_MS) != 0)
+		goto fail_closed;
+
+	ri = rreg(REG_RINT);
+	if (ri & RINT_READ_ERR_MASK)
+		goto fail_closed;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+
+fail_open:
+	/* Data phase may still be live on the card: targeted CMD12 needed. */
+	ebio_fail_settle_full(1);
+	return (int)(0x60000000u | ((nwords & 0x3fffu) << 14) | (ri & 0x3fffu));
+fail_closed:
+	/* AUTO_STOP already retired the transfer on the card's side; a second
+	 * CMD12 here is the illegal-command case ebio_fail_settle_full()'s own
+	 * header warns about. */
+	ebio_fail_settle_full(0);
+	return (int)(0x70000000u | (ri & 0x3fffu));
+}
+
+int emmc_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
+{
+	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
+	uint32_t nwords = 0, total, ri = 0;
+
+	if (nblk < 2 || nblk > EMMC_MULTI_MAX_BLOCKS)
+		return -101;
+	total = nblk * 128u;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
+	gctl_reset_and_wait(GCTL_FIFO_RST);
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, nblk * 512u);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, lba);
+	wreg(REG_CMDR, CMD25_WRITE_CMDR);
+
+	/* Push, stall-based -- direct generalisation of emmc_bio_write()'s own
+	 * FIFO-full spin, with the same 0x0180 (DATA_CRC/DATA_TIMEOUT) fatal
+	 * check that single-block write already relies on. */
+	{
+		uint64_t patience = ms_to_ticks(EMMC_MULTI_STALL_TIMEOUT_MS);
+		uint64_t last = rd_cntpct();
+		unsigned over = 0;
+		uint64_t guard = (uint64_t)EMMC_POLL_CAP * 64ull * (uint64_t)nblk;
+		uint64_t i;
+
+		for (i = 0; i < guard && nwords < total; i++) {
+			uint32_t st = rreg(REG_STAR);
+
+			if (!(st & STAR_FIFO_FULL)) {
+				wreg(REG_FIFO, buf[nwords++]);
+				last = rd_cntpct();
+				over = 0;
+				continue;
+			}
+			ri = rreg(REG_RINT);
+			if (ri & 0x0180u)   /* DATA_CRC(bit7)/DATA_TIMEOUT(bit8) */
+				goto fail_open;
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el = (now >= last) ? (now - last) : 0ull;
+				if (el > patience) {
+					if (++over < 2)
+						continue;
+					goto fail_open;
+				}
+				over = 0;
+			}
+		}
+		if (nwords < total)
+			goto fail_open;
+	}
+
+	/* DATA_OVER + AUTO_STOP_DONE -- same asymmetric-fatality rule as
+	 * emmc_bio_write()'s own DATA_OVER wait: RINT_READ_ERR_MASK|RESP_TIMEOUT
+	 * bits seen at THIS point are fatal, matching the read-error mask
+	 * (excludes bit8, per that file's own measured-false-positive note). */
+	{
+		uint64_t start = rd_cntpct();
+		uint64_t cap = ms_to_ticks(EMMC_WRITE_DATA_TIMEOUT_MS);
+		unsigned over = 0;
+		for (;;) {
+			ri = rreg(REG_RINT);
+			if (ri & (RINT_READ_ERR_MASK | RINT_RESP_TIMEOUT))
+				goto fail_open;
+			if ((ri & (RINT_DATA_OVER | RINT_AUTO_STOP_DONE)) ==
+			    (RINT_DATA_OVER | RINT_AUTO_STOP_DONE))
+				break;
+			{
+				uint64_t now = rd_cntpct();
+				uint64_t el = (now >= start) ? (now - start) : 0ull;
+				if (el > cap) {
+					if (++over < 2)
+						continue;
+					goto fail_open;
+				}
+				over = 0;
+			}
+		}
+	}
+
+	/* AUTO_STOP's own CMD12 is R1b: card holds DAT0 low while it programs. */
+	if (wait_card_idle_timed(EMMC_WRITE_BUSY_TIMEOUT_MS) != 0)
+		goto fail_closed;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+
+fail_open:
+	/* Data phase may still be live: targeted CMD12 needed (see the header
+	 * comment on why an untargeted one corrupted sectors before). */
+	ebio_fail_settle_full(1);
+	return (int)(0x60000000u | ((nwords & 0x3fffu) << 14) | (ri & 0x3fffu));
+fail_closed:
+	/* AUTO_STOP's CMD12 already ran; sending a second one is the illegal-
+	 * command case. Do not claim success: the card never signalled program-
+	 * done, exactly the -2 contract emmc_bio_write() already uses. */
+	ebio_fail_settle_full(0);
+	return -2;
+}
+
 /* Arm or disarm write fault injection. See the g_fi_* block for the rationale.
  * every == 0 disarms. Echoes the armed configuration into [28] so the host can
  * confirm what is actually live rather than what it believes it asked for.
