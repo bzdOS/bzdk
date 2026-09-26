@@ -828,6 +828,41 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 	 * no human, no manual reset. See SESSION-RULES.md R2/R3. */
 	wdt_pet();
 
+	/* Per-core state sample (HVMAP_CORESAMP): what a core's own GIC CPU
+	 * interface and timer look like, for the case where one core stops
+	 * taking interrupts while the others carry on. Every 256th entry. */
+	{
+		static uint32_t samples[4];
+		unsigned c = smp_cpu_id() & 3u;
+
+		if ((++samples[c] & 255u) == 0) {
+			volatile uint32_t *w = (volatile uint32_t *)
+			    (HVMAP_CORESAMP + c * 0x40u);
+			uint64_t hcr, daif, ctl, cval, cnt;
+
+			__asm__ volatile("mrs %0, hcr_el2" : "=r"(hcr));
+			__asm__ volatile("mrs %0, daif" : "=r"(daif));
+			__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
+			__asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(cval));
+			__asm__ volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+			w[0] = 0x45524F43u;             /* "CORE" */
+			w[1] = samples[c];
+			w[2] = (uint32_t)hcr;
+			w[3] = (uint32_t)(hcr >> 32);
+			w[4] = *(volatile uint32_t *)(SOC_A64_GICC_BASE + 0x14u);
+			w[5] = *(volatile uint32_t *)(SOC_A64_GICC_BASE + 0x18u);
+			w[6] = *(volatile uint32_t *)(SOC_A64_GICC_BASE + 0x00u);
+			w[7] = *(volatile uint32_t *)(SOC_A64_GICC_BASE + 0x04u);
+			w[8] = (uint32_t)daif;
+			w[9] = (uint32_t)kind;
+			w[10] = (uint32_t)frame->esr;
+			w[11] = (uint32_t)cnt;
+			w[12] = (uint32_t)ctl;
+			w[13] = (uint32_t)cval;
+			w[14] = (uint32_t)(cval >> 32);
+		}
+	}
+
 	/* GUEST-BREAKPOINT KEEP-ALIVE (opt-in: -DGUEST_BP_ADDR=0x...).
 	 *
 	 * MDSCR_EL1.MDE (bit 15) is the master enable for breakpoints and
