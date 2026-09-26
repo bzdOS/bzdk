@@ -686,6 +686,70 @@ static void sd_multi_abort(void)
 	wreg(REG_RINT, RINT_ALL);
 }
 
+/* sd_bio_read_multi() — CMD18 multi-block read, auto CMD12. Same error
+ * contract as sd_bio_write_multi(): stop the card, reset the FIFO, return
+ * non-zero; the caller re-reads the run one CMD17 at a time (the buffer's
+ * partial contents are simply overwritten). */
+#define CMD18_READ_CMDR       (0x80002352u | CMDR_AUTO_STOP)
+
+int sd_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
+{
+	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
+	uint32_t nwords = 0, total = nblk * 128u, ri = 0;
+	uint64_t start, cap;
+
+	if (!g_sd_inited)
+		return -100;
+	if (nblk < 2 || nblk > SD_MULTI_MAX_BLOCKS)
+		return -101;
+
+	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
+	small_delay();
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, nblk * 512u);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, sd_addr(lba));
+	wreg(REG_CMDR, CMD18_READ_CMDR);
+
+	start = rd_cntpct();
+	cap = ms_to_ticks(SD_WRITE_DATA_TIMEOUT_MS);
+	while (nwords < total) {
+		if ((rreg(REG_STAR) & STAR_FIFO_EMPTY) == 0) {
+			buf[nwords++] = rreg(REG_FIFO);
+			continue;
+		}
+		ri = rreg(REG_RINT);
+		if ((ri & RINT_ERR_MASK) || rd_cntpct() - start > cap)
+			goto fail;
+	}
+
+	start = rd_cntpct();
+	for (;;) {
+		ri = rreg(REG_RINT);
+		if (ri & RINT_ERR_MASK)
+			goto fail;
+		if ((ri & (RINT_DATA_OVER | RINT_AUTO_STOP_DONE)) ==
+		    (RINT_DATA_OVER | RINT_AUTO_STOP_DONE))
+			break;
+		if (rd_cntpct() - start > cap)
+			goto fail;
+	}
+	start = rd_cntpct();
+	while (rreg(REG_STAR) & STAR_CARD_BUSY) {
+		if (rd_cntpct() - start > cap) {
+			ri = STAR_CARD_BUSY;
+			goto fail;
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+
+fail:
+	sd_multi_abort();
+	return (int)(0x40000000u | ((nwords & 0x3fffu) << 16) | (ri & 0xffffu));
+}
+
 int sd_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
 {
 	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;

@@ -61,8 +61,10 @@ int sd_bio_write(uint32_t lba, uint64_t buf_pa);
 /* CMD25 multi-block write of nblk (2..SD_MULTI_MAX_BLOCKS) sectors from
  * buf_pa, controller auto-CMD12. Non-zero on any error, after stopping the
  * card; the caller rewrites the run with sd_bio_write(). */
-#define SD_MULTI_MAX_BLOCKS 64u
+#define SD_MULTI_MAX_BLOCKS 128u   /* one whole SEG_MAX=16 x 4 KiB request */
 int sd_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
+/* CMD18 counterpart, same contract. */
+int sd_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 
 /* Best-effort reclock from the 400 kHz identification clock to SD Default
  * Speed (25 MHz), FAIL-SAFE by construction: unlike eMMC's HS_TIMING switch,
