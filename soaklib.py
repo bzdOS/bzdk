@@ -277,7 +277,8 @@ done
 #         with the md5 it got the first time (root is ro, so any change is a
 #         read-path corruption)
 #   net   pulls a blob with a known md5 from the host's TFTP (vnet RX, EMAC)
-#   gpu   limabench: pixel-checked lima renders; non-zero exit is a failure
+#   gpu   limabench: pixel-checked lima renders; no PASS line is a failure,
+#         a crash after PASS is counted apart (gpu.crashes + core)
 # A worker that dies is an error, and so is any verify mismatch. The master
 # traps TERM and takes the workers with it, so the idempotent restart in
 # guest_start_load() never leaves orphans behind.
@@ -302,6 +303,12 @@ w_cpu() {
   done
 }
 w_emmc() {
+  # References are valid for one boot only: each boot may legitimately
+  # rewrite root metadata (mount/fsck after an unclean stop update the
+  # superblock and cylinder groups even though / is mounted ro), and a
+  # reference kept across one read as corruption (2026-09-26, window 13).
+  # The load is restarted after every reboot, so clearing here is enough.
+  rm -f $D/emmc/*
   nmb=$((`diskinfo $EMMC_DEV | awk '{print $3}'` / 1048576 / 64))
   while :; do
     w=`rnd $nmb`
@@ -329,8 +336,20 @@ w_net() {
   done
 }
 w_gpu() {
+  # A render that verified (limabench prints WORKLOAD PASSED only after every
+  # pixel check) and THEN died is a teardown bug, not a wrong frame: counted
+  # in gpu.crashes with its core (cwd, since daemon(8) left us in the
+  # read-only /), at most 3 kept. No PASS line is the real failure.
+  mkdir -p $D/cores
   while :; do
-    $GPU_CMD > $D/gpu.last 2>&1 || err "GPU-FAIL rc=$? `tail -1 $D/gpu.last`"
+    (cd $D/cores && $GPU_CMD) > $D/gpu.last 2>&1
+    rc=$?
+    if grep -q "WORKLOAD PASSED" $D/gpu.last; then
+      [ $rc -ne 0 ] && echo "`date '+%%Y-%%m-%%dT%%H:%%M:%%S'` rc=$rc after PASS" >> $D/gpu.crashes
+      ls -t $D/cores/*.core 2>/dev/null | tail -n +4 | xargs rm -f
+    else
+      err "GPU-FAIL rc=$rc `tail -1 $D/gpu.last`"
+    fi
     echo "ts=`date +%%s`" > $D/gpu.progress
     sleep 5
   done
