@@ -560,8 +560,13 @@ class Board:
         # Written with a here-document so it survives both channels (no scp,
         # and the console cannot be trusted with long single lines).
         cmd = (f"mkdir -p {LOAD_DIR}; "
-               f"if [ -f {LOAD_DIR}/pid ]; then kill `cat {LOAD_DIR}/pid` "
-               f"2>/dev/null; fi; "
+               f"if [ -f {LOAD_DIR}/pid ]; then P=`cat {LOAD_DIR}/pid`; G=; "
+               # the group only when that pid IS our load.sh: a stale pid
+               # file may name a reused pid (sshd's group, say)
+               f"ps -o command= -p $P 2>/dev/null | grep -q {LOAD_DIR}/load.sh "
+               f"&& G=`ps -o pgid= -p $P | tr -d ' '`; "
+               f"kill $P 2>/dev/null; [ -n \"$G\" ] && [ \"$G\" != 0 ] && "
+               f"kill -TERM -$G 2>/dev/null; sleep 1; fi; "
                f"cat > {LOAD_DIR}/load.sh <<'BZDEOF'\n{body}BZDEOF\n"
                f"chmod +x {LOAD_DIR}/load.sh; "
                f"daemon -o {LOAD_DIR}/load.out {LOAD_DIR}/load.sh; "
