@@ -128,6 +128,16 @@
          sys/arm/allwinner/. Looking only in the latter is how this was
          first, wrongly, written off as a missing driver.) -->
     <feature name="guest_pwm"         dtb-only="true" enabled="true"/>
+    <!-- guest_dvfs: cpufreq_dt on all four CPUs (clocks, operating-points-v2,
+         cpu-supply = vdd-cpux). Off since 2026-07 because guest DVFS wedged
+         the SoC; back on 2026-09-26 after rsbtrap.c serialised the PMIC bus
+         (the voltage writes raced EL2). Verified 648..1152 MHz, PLL and DCDC2
+         writes observed from EL2. -->
+    <!-- OFF again 2026-09-26 18:28: a 4-core load at 1152 MHz / 1.3 V took
+         the board dark ~15 s in (70 C at 10 s). The board is powered from
+         VBUS (micro-USB), not ACIN; likeliest a supply brownout, PMIC off.
+         Re-enable only with a DC supply, or with the top OPPs capped. -->
+    <feature name="guest_dvfs"        dtb-only="true" enabled="false"/>
 
     <!-- DEVELOPMENT ONLY. Un-forbids dai@1c22c00, the codec-i2s DAI, which is
          the one node the `sound` node's simple-audio-card cpu link points at.
