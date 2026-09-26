@@ -17,7 +17,8 @@ then: write, read back, `cmp.b` the whole image, and only then a warm reset
 into the new loader, whose `version` must carry --expect-version.
 
 Run ONLY after the candidate passed uboot_chainload_test.py, with chimpd
-stopped (it holds the tty lock and would catch the prompt itself).
+stopped. Opens its own bootdelay window (uboot_maint.py); --no-maint if one
+is already open.
 
     uboot_flash_fit.py --fit u-boot-retry.itb --current u-boot-wdt.itb \\
                        --expect-version "Sep 26 2026 - 13:46"
@@ -202,4 +203,10 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    if '--no-maint' in sys.argv:
+        sys.argv.remove('--no-maint')
+        sys.exit(main())
+    import uboot_maint
+    with uboot_maint.maintenance(log):
+        rc = main()
+    sys.exit(rc)
