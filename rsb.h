@@ -85,4 +85,21 @@ int rsb_read(uint8_t runtime_addr, uint8_t reg, uint8_t *out);
  * Returns 0 on success, negative on a bounded poll timeout / bus error. */
 int rsb_write(uint8_t runtime_addr, uint8_t reg, uint8_t val);
 
+/* Read `reg`, OR in `set`, write it back only if that changed anything --
+ * as ONE transaction pair under the bus lock, so nobody (the guest included)
+ * can write the register between the read and the write. `before` (may be
+ * NULL) gets the value read. Returns 0 or a negative rsb error. */
+int rsb_update_bits(uint8_t runtime_addr, uint8_t reg, uint8_t set,
+    uint8_t *before);
+
+/* One guest transaction, executed by rsbtrap.c on the guest's behalf with the
+ * guest's (shadowed) register values, under the same lock as every EL2
+ * transaction. *stat gets the raw status bits, *data0/*data1 the data
+ * registers afterwards (the read result, for a read command). */
+struct rsb_guest_xfer {
+	uint32_t dar, daddr0, daddr1, dlen, data0, data1, cmd;
+};
+int rsb_guest_transfer(const struct rsb_guest_xfer *x, uint32_t *stat,
+    uint32_t *data0, uint32_t *data1);
+
 #endif /* BZDOS_RSB_H */

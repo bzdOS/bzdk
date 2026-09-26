@@ -1012,13 +1012,11 @@ void hdmi_relock(void)
 	 * this + the PHY re-init below brings PHY_STATUS bit7 back to 1, stable. */
 	rsb_init();
 	rsb_set_device_address(0x3a3u, 0x2du);   /* AXP803 hw=0x3a3, runtime=0x2d */
-	{
-		uint8_t v = 0;
-		if (rsb_read(0x2du, 0x12u, &v) == 0)
-			rsb_write(0x2du, 0x12u, (uint8_t)(v | 0x08u)); /* set DLDO1 en */
-		else
-			rsb_write(0x2du, 0x12u, 0x88u);   /* best-effort: DC1SW+DLDO1 */
-	}
+	/* One locked read-modify-write. Never a blind write: this used to fall
+	 * back to writing 0x88 when the read failed -- and the read failed
+	 * exactly when the guest was on the bus, i.e. when the register the
+	 * write landed in was least certain (2026-09-26, see rsb.c). */
+	(void)rsb_update_bits(0x2du, 0x12u, 0x08u, 0);   /* DLDO1 en */
 
 	/* Re-lock PLL_VIDEO0 next. FreeBSD's CCU init
 	 * gates/disables PLL_VIDEO0 (the pixel-clock source) as "unused" once the

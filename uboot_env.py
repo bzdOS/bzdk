@@ -46,7 +46,11 @@ ENV_SIZE = 65536
 def ssh(cmd, binary=False, check=True):
     argv = ['ssh', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes',
             '-i', KEY, GUEST, cmd]
-    r = subprocess.run(argv, capture_output=True, timeout=180)
+    # stdin=DEVNULL: under `timeout` (or any non-foreground process group) an
+    # ssh left reading the caller's stdin is stopped by SIGTTIN and the read
+    # comes back empty -- which is what made sdbox_read.py fail 2026-09-26.
+    r = subprocess.run(argv, capture_output=True, timeout=180,
+                       stdin=subprocess.DEVNULL)
     if check and r.returncode:
         sys.exit(f"guest command failed: {cmd}\n{r.stderr.decode(errors='replace')}")
     return r.stdout if binary else r.stdout.decode(errors='replace')

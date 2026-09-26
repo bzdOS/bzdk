@@ -33,7 +33,7 @@ not in the board-config.xml `<devices>` or `<soc-nodes>` sections.
 | Block | SPEC owner | Why not in board-config.xml |
 |---|---|---|
 | Timers/GIC/PLL_CPUX | EL2 | SoC-level, gic_timer.c/sched.c — no DTB flip |
-| PMIC AXP803 (RSB) | EL2 | axp803.c/rsb.c — EL2-owned, no guest driver |
+| PMIC AXP803 (RSB) | EL2, guest through a trap | Was wrong until 2026-09-26: the guest DOES run aw_rsb + axp8xx_pmu, and both sides drove the controller unarbitrated. Now rsbtrap.c emulates the guest's controller; every transaction (guest and EL2) runs under rsb.c's bus lock; guest writes to REG 0x10/0x12/0x32 are policed and logged (HVMAP_RSBTRAP_LOG). |
 | Thermal THS | EL2 | Not yet implemented (SPEC §9 phase 2) |
 | Watchdog WDOG | EL2 | wdt.c — EL2 pets, guest cannot disarm |
 | GPIO | EL2 + guest allow-list | Stage2 trap-based, not DTB-gated |

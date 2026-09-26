@@ -851,4 +851,20 @@ _Static_assert(HVMAP_WDOGTRAP_BC >= HVMAP_VGIC_BC_HI_END,
 _Static_assert(HVMAP_WDOGTRAP_BC_END <= 0x50100000UL,
                "wdogtrap breadcrumbs run into emac.c's DMA scratch (0x50100000)");
 
+/* rsbtrap.c: the guest's RSB controller, emulated. Counters (see rsbtrap.h
+ * for the word map) and a ring of the guest's PMIC writes (16 x 2 words).
+ * Placed past HVMAP_WDOGTRAP_BC, the current top of this block. */
+#define HVMAP_RSBTRAP_BC        0x5009E700UL
+#define HVMAP_RSBTRAP_BC_SIZE   0x00000040UL
+#define HVMAP_RSBTRAP_LOG       0x5009E740UL
+#define HVMAP_RSBTRAP_LOG_SIZE  0x00000080UL
+#define HVMAP_RSBTRAP_END       (HVMAP_RSBTRAP_LOG + HVMAP_RSBTRAP_LOG_SIZE)
+
+_Static_assert(HVMAP_RSBTRAP_BC >= HVMAP_WDOGTRAP_BC_END,
+               "rsbtrap breadcrumbs overlap the wdogtrap window");
+_Static_assert(HVMAP_RSBTRAP_LOG >= HVMAP_RSBTRAP_BC + HVMAP_RSBTRAP_BC_SIZE,
+               "rsbtrap log overlaps its own counters");
+_Static_assert(HVMAP_RSBTRAP_END <= 0x50100000UL,
+               "rsbtrap window runs into emac.c's DMA scratch (0x50100000)");
+
 #endif /* HV_ADDRMAP_H */

@@ -199,6 +199,7 @@
 #include "dbgmon.h"  /* dbgmon_service() — ditto */
 #include "musb.h"    /* MUSB_IRQ_SPI/MUSB_IRQ_INTID — cited constants, see musb.h */
 #include "usbacm.h"  /* usbacm_poll() — CPU1 MUSB-IRQ path, see musb_irq_arm_cpu1() */
+#include "sdbox.h"   /* sdbox_record() on the tick's two silent reset paths */
 #include "emac.h"    /* emac_link_watchdog() — link self-heal, see the CPU1 tick block */
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 
@@ -1680,8 +1681,30 @@ gic_timer_irq(struct el2_frame *frame)
 		 * re-inits while zero RX frames have arrived, so the healthy path
 		 * costs ~one branch. Escalation on give-up stays OPT-IN, exactly
 		 * like the tight loop it replaces. */
-		if (emac_link_watchdog() && dbg_emac_watchdog_reboot)
-			wdt_debug_hold = 1;
+		if (emac_link_watchdog()) {
+			/* The reset this leads to is a plain WDOG fire, not
+			 * reboot_clean(): write the black box here or nothing
+			 * says why the board went away. Once per generation. */
+			static uint32_t giveup_recorded;
+			if (!giveup_recorded) {
+				giveup_recorded = 1;
+				reboot_reason = dbg_emac_watchdog_reboot
+				    ? RB_REASON_EMACDARK : RB_REASON_EMACGIVEUP;
+				sdbox_record(reboot_reason);
+			}
+			if (dbg_emac_watchdog_reboot)
+				wdt_debug_hold = 1;
+		}
+		/* Same for wdt.c's reachability gate: once it lapses the WDOG
+		 * fires within 16 s and leaves no other trace. */
+		{
+			static uint32_t unreach_recorded;
+			if (!unreach_recorded && !wdt_reach_ok()) {
+				unreach_recorded = 1;
+				reboot_reason = RB_REASON_UNREACH;
+				sdbox_record(RB_REASON_UNREACH);
+			}
+		}
 		/* KNOWN GAP (board-free code-reading finding, 2026-08-27, STILL NOT
 		 * fixed here, now for a DIFFERENT and more fundamental reason than
 		 * when this comment was first written -- see the update below).

@@ -1445,11 +1445,11 @@ static int phy_rail_ensure(void)
     if (rsb_init() != 0)
         return -1;
     rsb_set_device_address(AXP803_HW_ADDR, AXP803_RT_ADDR);
-    if (rsb_read(AXP803_RT_ADDR, AXP803_REG_OUT2, &v) != 0)
+    /* Read and set under one bus lock (rsb.c): no guest write in between. */
+    if (rsb_update_bits(AXP803_RT_ADDR, AXP803_REG_OUT2, AXP803_OUT2_DC1SW, &v) != 0)
         return -1;
     if (v & AXP803_OUT2_DC1SW)
         return 0;
-    rsb_write(AXP803_RT_ADDR, AXP803_REG_OUT2, (uint8_t)(v | AXP803_OUT2_DC1SW));
     wdep_write(15, ++g_wdep_railfix);
     return 1;
 }
