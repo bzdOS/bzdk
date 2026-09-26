@@ -595,3 +595,109 @@ int sd_bio_write(uint32_t lba, uint64_t buf_pa)
 	}
 	return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* sd_bio_write_multi() — CMD25 multi-block write, auto CMD12.          */
+/*                                                                      */
+/* WHY: one CMD24 per sector pays the card's whole program latency per  */
+/* 512 bytes; measured 343 KB/s sustained on the guest's /opt and /var  */
+/* (2026-09-26), with each vtbd1 write stalling its vCPU's trap for     */
+/* ~1.5 ms a sector. One CMD25 for a run of sectors pays it once.       */
+/*                                                                      */
+/* The controller sends the CMD12 itself (CMDR bit 12, the same         */
+/* AUTO_STOP aw_mmc(4) uses on this IP for mmc_da's multi-block I/O)    */
+/* and raises RINT AUTO_STOP_DONE. Any error: stop the card by hand,    */
+/* reset the FIFO, wait out busy, and return non-zero -- the caller     */
+/* then rewrites the same run one CMD24 at a time, so a failed CMD25    */
+/* can cost speed but never data.                                       */
+/* ------------------------------------------------------------------ */
+#define CMDR_AUTO_STOP        0x00001000u
+#define CMDR_STOP_ABORT       0x00004000u
+#define RINT_AUTO_STOP_DONE   0x00004000u
+/* RESP_ERR|RESP_CRC|DATA_CRC|RESP_TO|DATA_TO|FIFO_RUN|HW_LOCK|START|END,
+ * aw_mmc's AW_MMC_INT_ERR_BIT plus DATA_TIMEOUT */
+#define RINT_ERR_MASK         0x0000BBC2u
+#define CMD25_WRITE_CMDR      (0x80002759u | CMDR_AUTO_STOP)
+#define CMD12_STOP_CMDR       (CMDR_LOAD | CMDR_STOP_ABORT | CMDR_CHK_CRC | \
+                               CMDR_RESP_EXP | 12u)
+
+static void sd_multi_abort(void)
+{
+	uint64_t start, cap = ms_to_ticks(SD_WRITE_BUSY_TIMEOUT_MS);
+
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, 0);
+	wreg(REG_CMDR, CMD12_STOP_CMDR);
+	(void)poll_rint(RINT_CMD_DONE, RINT_CMD_DONE);
+	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
+	small_delay();
+	start = rd_cntpct();
+	while ((rreg(REG_STAR) & STAR_CARD_BUSY) && rd_cntpct() - start < cap)
+		;
+	wreg(REG_RINT, RINT_ALL);
+}
+
+int sd_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk)
+{
+	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
+	uint32_t nwords = 0, total = nblk * 128u, ri = 0;
+	uint64_t start, cap;
+
+	if (!g_sd_inited)
+		return -100;
+	if (nblk < 2 || nblk > SD_MULTI_MAX_BLOCKS)
+		return -101;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	wreg(REG_GCTL, rreg(REG_GCTL) | GCTL_FIFO_RST);
+	small_delay();
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, nblk * 512u);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, sd_addr(lba));
+	wreg(REG_CMDR, CMD25_WRITE_CMDR);
+
+	start = rd_cntpct();
+	cap = ms_to_ticks(SD_WRITE_DATA_TIMEOUT_MS);
+	while (nwords < total) {
+		if ((rreg(REG_STAR) & STAR_FIFO_FULL) == 0) {
+			wreg(REG_FIFO, buf[nwords++]);
+			continue;
+		}
+		ri = rreg(REG_RINT);
+		if ((ri & RINT_ERR_MASK) || rd_cntpct() - start > cap)
+			goto fail;
+	}
+
+	/* DATA_OVER and the controller's own CMD12 */
+	start = rd_cntpct();
+	for (;;) {
+		ri = rreg(REG_RINT);
+		if (ri & RINT_ERR_MASK)
+			goto fail;
+		if ((ri & (RINT_DATA_OVER | RINT_AUTO_STOP_DONE)) ==
+		    (RINT_DATA_OVER | RINT_AUTO_STOP_DONE))
+			break;
+		if (rd_cntpct() - start > cap)
+			goto fail;
+	}
+
+	/* CMD12 is R1b: the card holds DAT0 low while it programs */
+	start = rd_cntpct();
+	cap = ms_to_ticks(SD_WRITE_BUSY_TIMEOUT_MS);
+	while (rreg(REG_STAR) & STAR_CARD_BUSY) {
+		if (rd_cntpct() - start > cap) {
+			ri = STAR_CARD_BUSY;   /* busy never cleared */
+			goto fail;
+		}
+	}
+	return 0;
+
+fail:
+	/* RINT in the low bits, the words that made it into the FIFO above;
+	 * the caller keeps the record (sd_bio's own window is full) */
+	sd_multi_abort();
+	return (int)(0x40000000u | ((nwords & 0x3fffu) << 16) | (ri & 0xffffu));
+}

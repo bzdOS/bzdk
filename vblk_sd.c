@@ -268,6 +268,16 @@ static void vblk_sd_inject_irq(void)
 static uint64_t g_bounce_q[VBLK_SD_SECTOR_BYTES / 8];
 #define SD_BOUNCE_PA ((uint64_t)(uintptr_t)&g_bounce_q[0])
 
+/* Run bounce for sd_bio_write_multi(): whole, sector-aligned stretches of a
+ * write descriptor go to the card as one CMD25 instead of one CMD24 per
+ * sector (343 KB/s -> see sd_bio_write_multi()). Same EL2-private, trap-
+ * synchronous contract as g_bounce_q. Breadcrumbs: [14] runs written,
+ * [15] runs that failed and were rewritten sector by sector, [16] the last
+ * failure's rc, [17] its lba. */
+static uint64_t g_bounce_run[SD_MULTI_MAX_BLOCKS * VBLK_SD_SECTOR_BYTES / 8];
+#define SD_BOUNCE_RUN_PA ((uint64_t)(uintptr_t)&g_bounce_run[0])
+static uint32_t g_multi_runs, g_multi_fails;
+
 /* Return codes serve_data() itself can produce, kept disjoint from
  * VIRTIO_BLK_S_* since the caller maps them, same pattern as vblk_emmc.c. */
 #define SD_RC_OK        0
@@ -284,6 +294,7 @@ static int sd_serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
                           uint64_t *sector, uint32_t *sector_fill)
 {
 	uint32_t done = 0;
+	int no_multi = 0;
 
 	while (done < len) {
 		uint32_t off = *sector_fill;
@@ -296,6 +307,43 @@ static int sd_serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		if (chunk > len - done)
 			chunk = len - done;
 		whole = (off == 0u && chunk == VBLK_SD_SECTOR_BYTES);
+
+		if (!is_read && !no_multi && off == 0u &&
+		    len - done >= 2u * VBLK_SD_SECTOR_BYTES) {
+			uint32_t n = (len - done) / VBLK_SD_SECTOR_BYTES;
+			uint32_t bytes;
+
+			if (n > SD_MULTI_MAX_BLOCKS)
+				n = SD_MULTI_MAX_BLOCKS;
+			bytes = n * VBLK_SD_SECTOR_BYTES;
+			if (!gpa_in_range(buf_gpa, bytes)) {
+				g_gmem_oob++;
+				vblk_sd_bc(8, g_gmem_oob);
+				return SD_RC_BADPA;
+			}
+			if (!sd_lock_acquire_bounded()) {
+				vblk_sd_bc(10, ++g_lock_giveups);
+				return SD_RC_BUSY;
+			}
+			vblk_sd_bc(12, lba);
+			gmem_read(buf_gpa, g_bounce_run, bytes);
+			__asm__ volatile("dsb sy" ::: "memory");
+			rc = sd_bio_write_multi(lba, SD_BOUNCE_RUN_PA, n);
+			vblk_sd_unlock();
+			if (rc == 0) {
+				vblk_sd_bc(14, ++g_multi_runs);
+				done += bytes;
+				*sector += n;
+				continue;
+			}
+			/* Nothing is lost: fall through and rewrite the rest of
+			 * this descriptor one CMD24 (with its own retries) per
+			 * sector, without paying another CMD25 timeout. */
+			no_multi = 1;
+			vblk_sd_bc(15, ++g_multi_fails);
+			vblk_sd_bc(16, (uint32_t)rc);
+			vblk_sd_bc(17, lba);
+		}
 		if (!whole)
 			vblk_sd_bc(9, ++g_stitch_events);
 
@@ -702,6 +750,7 @@ void vblk_sd_init(void)
 	g_sd_blk.base = VBLK_SD_MMIO_BASE;
 	g_reads = g_writes = g_irqs = g_faults = g_gmem_oob = 0;
 	g_stitch_events = g_lock_giveups = g_write_retries = g_read_retries = 0;
+	g_multi_runs = g_multi_fails = 0;
 
 	rc = sd_bio_init();
 	g_sd_blk.sd_ready = (rc == 0);
