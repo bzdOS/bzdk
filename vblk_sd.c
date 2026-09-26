@@ -862,6 +862,11 @@ void vblk_sd_init(void)
 	rc = sd_bio_init();
 	g_sd_blk.sd_ready = (rc == 0);
 
+	/* Every counter slot starts at 0: the event-only ones ([10]-[20])
+	 * are otherwise whatever DRAM held (warm resets keep it), and a stale
+	 * word there reads like a real failure count. */
+	for (uint32_t i = 4; i <= 20; i++)
+		vblk_sd_bc(i, 0);
 	vblk_sd_bc(0, VBLK_SD_BC_MAGIC);
 	vblk_sd_bc(2, 0);
 	vblk_sd_bc(3, g_sd_blk.sd_ready);
