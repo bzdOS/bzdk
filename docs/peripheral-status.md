@@ -11,6 +11,7 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | USB host | EHCI + OHCI on PHY1, hub enumerates |
 | Networking | virtio-net |
 | WiFi | BCM43430 SDIO, WPA2-PSK, real traffic. See the brcmfmac work |
+| Bluetooth | AP6212 (BCM43438A1) on uart1: new `bcmbt(4)` + `ng_h4(4)` + `bcmbtattach`, up at boot, inquiry/name/l2ping to a laptop. See `bsdOS/hal/bluetooth/README.md` (2026-09-26) |
 | GPU / DRM / KMS | Mali-400 via the lima port |
 | HDMI | driven by the hypervisor, guest gets a framebuffer |
 | Audio | analog codec, `pcm0` play/rec. Needed the DAI un-forbidden — see below |
@@ -20,15 +21,6 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | UART, GPIO, IR, thermal, RTC, crypto | stock drivers, nothing special |
 
 ## Not done: no FreeBSD driver exists
-
-**Bluetooth.** The AP6212's BT side is on uart1 and the DT binding
-(`brcm,bcm43438-bt`) is already present upstream — but FreeBSD has no UART HCI
-transport at all. `ng_h4` was removed in 79a100e28e3c (2021-11-10), having been
-broken since the MPSAFE TTY rewrite; only `ubt`/`ubtbcmfw` remain, both USB.
-Writing one is roughly 1500-2500 lines plus a Broadcom patchram firmware
-loader. This is the only remaining item with value beyond this board: it would
-serve every SBC with UART-attached Bluetooth, the Raspberry Pi family included.
-See `bluetooth-uart-assessment.md`.
 
 **LRADC.** No driver anywhere in FreeBSD (only DT bindings docs). Drives
 resistor-ladder buttons. Not worth writing.
