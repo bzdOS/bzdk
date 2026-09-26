@@ -1,47 +1,58 @@
-# Handoff — 2026-09-26, nothing can park the board for ever any more (read this first)
+# Handoff — 2026-09-26 (evening): one owner per bus, nothing parks the board (read this first)
 
-## State (verified 14:36, full reset through the whole chain)
+## State (verified 16:07)
 
-- **U-Boot on the eMMC:** `2026.07-rc5 (Sep 26 2026 - 13:46:18)` = the
-  watchdog build + `BOOT_RETRY=120`/`RESET_TO_RETRY`. An idle `=>` resets the
-  board after 120 s (chain-load-proven: 122 s). `reset` works in it
-  (SYSRESET_WATCHDOG); the old "reset hangs" note is about the July loader.
-  Flashed with `uboot_flash_fit.py` (card byte-checked against
-  `u-boot-wdt.itb` first, read back + cmp). SPL untouched.
-  Rollback: `uboot_flash_fit.py --fit u-boot-wdt.itb --current u-boot-retry.itb
-  --expect-version "Sep 25 2026 - 14:55"` (needs a prompt: see bootdelay).
-- **`bootdelay=-2`** in uboot.env: autoboot cannot be interrupted. For a
-  prompt: `uboot_env.py set bootdelay=3`, reset, catch, and put `-2` back.
-  chimpd cannot catch U-Boot and stays disabled. Env backup:
-  `build/uboot.env.backup-2026-09-26`.
-- **Hypervisor:** `228623b` + the reachability gate = branch
-  `board-2026-09-26` (d4cebeb) in `/opt/bzdos/microkernel-wt-unreach`, built
-  clean WITH config.mk. No pet without a reach within 900 s (EMAC RX frame, or
-  USB SOFs advancing MUSB FRAME @0x01c19054). Proven: 30 s window with live
-  channels = no reset in 90 s; `wdt_unreach_test=1` = reset in 47 s, back on
-  its own. master has the same change (2247d7f). No black box in this image
-  (sdbox came later, in the a30f9fa-era builds that are not trusted yet).
+- **Hypervisor: master** (`53b5b5b`+), built clean WITH config.mk, staged in
+  both boot paths. Contains, all hardware-verified today:
+  - **RSB trap** (`rsbtrap.c`, `HV_RSBTRAP` in `dbg`): the guest's RSB
+    controller is emulated; every PMIC transaction (guest and EL2) runs under
+    `rsb.c`'s bus lock; guest writes to AXP803 REG 0x10/0x12/0x32 are policed
+    (CPU/DRAM/3V3/SYS rails, DC1SW, DLDO1 stay on; PMIC power-off refused) and
+    logged: ring at `HVMAP_RSBTRAP_LOG`, counters at `HVMAP_RSBTRAP_BC`.
+  - **Reachability gate** (`wdt.c`): no watchdog pet without an EMAC frame or
+    USB SOFs within 900 s.
+  - **Black box** on SD LBA 64 (`sdbox_read.py`): every `reboot_clean()`, plus
+    the tick's two silent paths (EMAC ladder give-up = 6, gate lapse = 7).
+  - **EMAC-dark auto-reboot on, 3 h** of continuous dark (a30f9fa).
+  - `warm_reset_soak.py 3 0`: 3/3.
+- **U-Boot on the eMMC:** `Sep 26 2026 - 13:46:18`: own watchdog, idle `=>`
+  resets after 120 s, `reset` works. **`bootdelay=-2`**: autoboot cannot be
+  stopped. Tools that need a prompt open a window themselves
+  (`uboot_maint.py`); by hand: `python3 uboot_maint.py open|close`.
+  Safety-net test: `uboot_chainload_test.py --net-test` (jumps into a hang,
+  stock loader must come back; 35 s).
+- **chimpd: retired** (unit disabled). It works by catching U-Boot, which
+  `bootdelay=-2` makes impossible and which was the trigger of the gadget
+  wedge. Its fallback role -- loading the HV over USB when TFTP fails -- is
+  covered by `bootcmd` (10 tries, then a WDOG reset and try again).
+- **Guest drm-kmod** = exactly the upstream PRs (#512-#515) + one backport,
+  `bsdOS/hal/lima/patches/drm-kmod/000[1-5]`; `/opt/bzdos/drm-kmod` is a
+  pristine archive of the tag. Modules in `/boot/modules` since today
+  (old ones: `*.ko.bak-2026-09-26`).
 
-## What was wrong (both found from evidence, not guessed)
+## What was wrong (from evidence)
 
-1. **U-Boot parked for ever** (the 19 h loss): chimpd's Ctrl-C catch wedges
-   the U-Boot MUSB gadget (~0.4 % of catches, 4 times since 09-23), autoboot
-   is already stopped, and the prompt loop services U-Boot's own watchdog.
-   What wedges the gadget is still NOT known; the two fixes above make it
-   cost ≤ 120 s instead of a power cut, and remove the catch altogether.
-2. **Today's first boot hung the guest in memset** (IPA 0xb7ff1000, stage-2
-   L1[2] = 0): the "known-good 228623b" staged 09-25 18:08 was MY build in a
-   git worktree, where the gitignored config.mk does not exist ->
-   GUEST_DRAM_2G=0 (1 GiB stage-2) under a 2 GiB DTB. The Makefile now refuses
-   `dbg` without config.mk; after creating one, `make clean` (objects do not
-   depend on it).
+1. **The PMIC bus had two unarbitrated masters.** The ownership audit said
+   "no guest driver"; the guest runs aw_rsb + axp8xx_pmu. EL2's hdmi relock
+   (soft-reset + RMW once a second while the PHY is unlocked, i.e. during the
+   guest's own PMIC setup, and a blind `0x88` to REG 0x12 on a failed read),
+   phy_rail_ensure and health reads raced it. A misdirected write to REG 0x10
+   turns off CPU/DRAM: no watchdog, no USB, only the power switch. Likeliest
+   cause of the 09-25 16:41/17:13 losses (16:41 was the old 228623b image,
+   dying at the first 8 s link check). The trap's write log shows the guest
+   never clears DC1SW: the 0x58 of 09-25 came from EL2.
+2. **U-Boot parked for ever** (the 19 h loss): chimpd's catch wedges the
+   U-Boot MUSB gadget (~0.4 %), the prompt then feeds its own watchdog.
+   Mitigated (retry + `-2`); what wedges the gadget is not known.
+3. **Worktree builds lack config.mk** → 1 GiB stage-2 under a 2 GiB DTB.
+   Makefile refuses now.
 
 ## Still open
 
-- The 16:41 / 17:13 deaths on 09-25 (a30f9fa-era builds). Whether those were
-  also worktree/config.mk builds is not known -- the binaries are gone.
-- One `sshd-session` SIGSEGV in the guest on the 14:11 boot, not repeated.
-- What wedges U-Boot's MUSB gadget.
+- Root cause inside U-Boot's MUSB gadget: needs a ~250-cycle catch soak
+  (~5 h of board time).
+- The 16:41/17:13 attribution to the RSB race is inference; the trap now
+  makes a repeat impossible and the log/black box would show it.
 
 # Handoff — 2026-09-25, the board is not fragile any more
 
