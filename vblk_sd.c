@@ -273,10 +273,10 @@ static uint64_t g_bounce_q[VBLK_SD_SECTOR_BYTES / 8];
  * sector (343 KB/s -> see sd_bio_write_multi()). Same EL2-private, trap-
  * synchronous contract as g_bounce_q. Breadcrumbs: [14] runs written,
  * [15] runs that failed and were rewritten sector by sector, [16] the last
- * failure's rc, [17] its lba. */
+ * failure's rc, [17] its lba; [18]/[19] the same for CMD18 read runs. */
 static uint64_t g_bounce_run[SD_MULTI_MAX_BLOCKS * VBLK_SD_SECTOR_BYTES / 8];
 #define SD_BOUNCE_RUN_PA ((uint64_t)(uintptr_t)&g_bounce_run[0])
-static uint32_t g_multi_runs, g_multi_fails;
+static uint32_t g_multi_runs, g_multi_fails, g_multi_rruns, g_multi_rfails;
 
 /* Return codes serve_data() itself can produce, kept disjoint from
  * VIRTIO_BLK_S_* since the caller maps them, same pattern as vblk_emmc.c. */
@@ -307,6 +307,41 @@ static int sd_serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 		if (chunk > len - done)
 			chunk = len - done;
 		whole = (off == 0u && chunk == VBLK_SD_SECTOR_BYTES);
+
+		if (is_read && !no_multi && off == 0u &&
+		    len - done >= 2u * VBLK_SD_SECTOR_BYTES) {
+			uint32_t n = (len - done) / VBLK_SD_SECTOR_BYTES;
+			uint32_t bytes;
+
+			if (n > SD_MULTI_MAX_BLOCKS)
+				n = SD_MULTI_MAX_BLOCKS;
+			bytes = n * VBLK_SD_SECTOR_BYTES;
+			if (!gpa_in_range(buf_gpa, bytes)) {
+				g_gmem_oob++;
+				vblk_sd_bc(8, g_gmem_oob);
+				return SD_RC_BADPA;
+			}
+			if (!sd_lock_acquire_bounded()) {
+				vblk_sd_bc(10, ++g_lock_giveups);
+				return SD_RC_BUSY;
+			}
+			vblk_sd_bc(12, lba);
+			/* straight into the guest buffer, as the whole-sector
+			 * CMD17 path below does, then the same CMO */
+			rc = sd_bio_read_multi(lba, buf_gpa, n);
+			vblk_sd_unlock();
+			if (rc == 0) {
+				gmem_cmo(buf_gpa, bytes);
+				vblk_sd_bc(18, ++g_multi_rruns);
+				done += bytes;
+				*sector += n;
+				continue;
+			}
+			no_multi = 1;
+			vblk_sd_bc(19, ++g_multi_rfails);
+			vblk_sd_bc(16, (uint32_t)rc);
+			vblk_sd_bc(17, lba);
+		}
 
 		if (!is_read && !no_multi && off == 0u &&
 		    len - done >= 2u * VBLK_SD_SECTOR_BYTES) {
@@ -443,6 +478,71 @@ static int sd_serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 	return SD_RC_OK;
 }
 
+/* Whole-request fast path: a request's data descriptors are usually 4 KiB
+ * guest pages (SEG_MAX 16), so per-descriptor runs were only 8 sectors long.
+ * When every data descriptor is a whole number of sectors and the request
+ * fits g_bounce_run, gather it (write) / scatter it (read) through the bounce
+ * and move it with ONE CMD25/CMD18. Anything else -- odd lengths, a bad GPA,
+ * a busy lock, a failed command -- returns non-OK before touching the ring,
+ * and the caller serves the request the old per-descriptor way, so this path
+ * can only add speed. [20] requests served here. */
+static uint32_t g_gathered;
+
+static int sd_serve_gathered(uint32_t is_read, const struct vblk_sd_desc *chain,
+                             uint32_t n, uint64_t sector, uint32_t *used_len)
+{
+	uint32_t i, total = 0, off, nblk;
+	int rc;
+
+	if (n < 3)
+		return SD_RC_BADPA;
+	for (i = 1; i < n - 1; i++) {
+		if (chain[i].len == 0 || (chain[i].len % VBLK_SD_SECTOR_BYTES) != 0 ||
+		    !gpa_in_range(chain[i].addr, chain[i].len))
+			return SD_RC_BADPA;
+		total += chain[i].len;
+		if (total > sizeof(g_bounce_run))
+			return SD_RC_BADPA;
+	}
+	nblk = total / VBLK_SD_SECTOR_BYTES;
+	if (nblk < 2)
+		return SD_RC_BADPA;
+
+	if (!sd_lock_acquire_bounded()) {
+		vblk_sd_bc(10, ++g_lock_giveups);
+		return SD_RC_BUSY;
+	}
+	vblk_sd_bc(12, (uint32_t)sector);
+	if (is_read) {
+		rc = sd_bio_read_multi((uint32_t)sector, SD_BOUNCE_RUN_PA, nblk);
+	} else {
+		for (i = 1, off = 0; i < n - 1; off += chain[i].len, i++)
+			gmem_read(chain[i].addr, (uint8_t *)g_bounce_run + off,
+			          chain[i].len);
+		__asm__ volatile("dsb sy" ::: "memory");
+		rc = sd_bio_write_multi((uint32_t)sector, SD_BOUNCE_RUN_PA, nblk);
+	}
+	/* The scatter MUST stay under the lock: g_bounce_run is shared by
+	 * every vCPU, each serving its own requests in its own trap, and
+	 * scattering after the unlock handed the guest another request's
+	 * sectors (2026-09-26: reads returned foreign data, userland hung). */
+	if (rc == 0 && is_read)
+		for (i = 1, off = 0; i < n - 1; off += chain[i].len, i++)
+			gmem_write(chain[i].addr, (uint8_t *)g_bounce_run + off,
+			           chain[i].len);
+	vblk_sd_unlock();
+	if (rc != 0) {
+		vblk_sd_bc(is_read ? 19 : 15,
+		           is_read ? ++g_multi_rfails : ++g_multi_fails);
+		vblk_sd_bc(16, (uint32_t)rc);
+		vblk_sd_bc(17, (uint32_t)sector);
+		return SD_RC_IOERR;
+	}
+	*used_len = is_read ? total : 0;
+	vblk_sd_bc(20, ++g_gathered);
+	return SD_RC_OK;
+}
+
 static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 {
 	struct vblk_sd_vq *vq = &d->vq[VBLK_SD_QUEUE];
@@ -496,10 +596,16 @@ static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 
 	if (!d->sd_ready) {
 		status = VIRTIO_BLK_S_IOERR;
+	} else if ((hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) &&
+	           sd_serve_gathered(hdr.type == VIRTIO_BLK_T_IN, chain, n,
+	                             hdr.sector, &used_len) == SD_RC_OK) {
+		vblk_sd_bc(hdr.type == VIRTIO_BLK_T_IN ? 4 : 5,
+		           hdr.type == VIRTIO_BLK_T_IN ? ++g_reads : ++g_writes);
 	} else if (hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) {
 		uint32_t is_read = (hdr.type == VIRTIO_BLK_T_IN);
 		uint32_t i;
 
+		used_len = 0;
 		for (i = 1; i < n - 1; i++) {
 			int rc = sd_serve_data(is_read, chain[i].addr, chain[i].len,
 			                       &sector, &sfill);
@@ -750,7 +856,8 @@ void vblk_sd_init(void)
 	g_sd_blk.base = VBLK_SD_MMIO_BASE;
 	g_reads = g_writes = g_irqs = g_faults = g_gmem_oob = 0;
 	g_stitch_events = g_lock_giveups = g_write_retries = g_read_retries = 0;
-	g_multi_runs = g_multi_fails = 0;
+	g_multi_runs = g_multi_fails = g_multi_rruns = g_multi_rfails = 0;
+	g_gathered = 0;
 
 	rc = sd_bio_init();
 	g_sd_blk.sd_ready = (rc == 0);
