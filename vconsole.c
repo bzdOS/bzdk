@@ -577,13 +577,39 @@ vconsole_handle_fault_impl(struct el2_frame *frame, struct vc_chan *cs)
 	 * -- see the original comment: every register here is byte/word-sized
 	 * and we never vary behavior on transfer width. */
 	uint32_t sas = (esr >> ESR_SAS_SHIFT) & ESR_SAS_MASK;
-	(void)sas;
 
 	uint32_t off = (uint32_t)(addr - UART0_BASE);
 
-	/* UART0/1/2 share this one 4 KiB page at page offsets 0x000/0x400/0x800
-	 * -- fold onto a single register window (see original comment for the
-	 * secondary-UART IIR-spin bug this fixed). */
+	/* UART1/2/3 share this 4 KiB page with UART0 (offsets 0x400/0x800/
+	 * 0xC00) but are real, guest-owned hardware: uart1 carries the AP6212's
+	 * Bluetooth. For the FreeBSD guest (the interactive channel) they pass
+	 * straight through. Until 2026-09-26 they were folded onto the fake
+	 * UART0 below -- every byte FreeBSD wrote to uart1 went into its own
+	 * console log and nothing ever reached the Bluetooth chip. */
+	if (cs->interactive && off >= 0x400u) {
+		volatile void *hw = (volatile void *)(uintptr_t)addr;
+		if (wnr) {
+			uint64_t v = (srt == SRT_XZR) ? 0 : frame->x[srt];
+			switch (sas) {
+			case 0: *(volatile uint8_t *)hw = (uint8_t)v; break;
+			case 1: *(volatile uint16_t *)hw = (uint16_t)v; break;
+			default: *(volatile uint32_t *)hw = (uint32_t)v; break;
+			}
+			__asm__ volatile("dsb sy" ::: "memory");
+		} else if (srt != SRT_XZR) {
+			switch (sas) {
+			case 0: frame->x[srt] = *(volatile uint8_t *)hw; break;
+			case 1: frame->x[srt] = *(volatile uint16_t *)hw; break;
+			default: frame->x[srt] = *(volatile uint32_t *)hw; break;
+			}
+		}
+		frame->elr += 4;
+		return 1;
+	}
+
+	/* Channel 1 (Zephyr) and UART0 itself: fold onto a single emulated
+	 * register window (see original comment for the secondary-UART
+	 * IIR-spin bug this fixed). */
 	uint32_t reg = off & 0x3FFu;
 
 	if (wnr) {
