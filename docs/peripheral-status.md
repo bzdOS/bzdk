@@ -18,7 +18,9 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | SPI | `aw_spi`, PIO only |
 | I2C | four buses |
 | PWM | `pwm0`/`pwmbus0`/`pwmc0`. Driver is a module, `kldload aw_pwm` |
-| UART, GPIO, IR, thermal, RTC, crypto | stock drivers, nothing special |
+| CPU DVFS | cpufreq_dt 648-1152 MHz + powerd; **needs the DC supply** (micro-USB browns out at 1152x4). aw_thermal throttles at 85 C. Feature `guest_dvfs` (2026-09-26) |
+| PMU | `pmu0` on SPIs 116-119, all four vCPUs; hwpmc counting and overflow sampling work. Feature `guest_pmu` (2026-09-26) |
+| UART, GPIO, IR, thermal, RTC | stock drivers, nothing special |
 
 ## Not done: no FreeBSD driver exists
 

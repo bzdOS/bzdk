@@ -139,6 +139,9 @@
          1152 reach 85 C in ~26 s, where aw_thermal's alarm throttles to 648
          MHz by itself (shutdown trip 106 C). Needs the DC supply. -->
     <feature name="guest_dvfs"        dtb-only="true" enabled="true"/>
+    <!-- guest_pmu: the Cortex-A53 PMU (hwpmc / perf counters). EL2 does not
+         trap it (MDCR_EL2 TPM/TPMCR clear, HPMN = all 6 counters). -->
+    <feature name="guest_pmu"         dtb-only="true" enabled="true"/>
 
     <!-- DEVELOPMENT ONLY. Un-forbids dai@1c22c00, the codec-i2s DAI, which is
          the one node the `sound` node's simple-audio-card cpu link points at.
