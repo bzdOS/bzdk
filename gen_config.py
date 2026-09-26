@@ -600,6 +600,42 @@ def ensure_cpu_dvfs(dtb_path, dts_text, enabled, dry_run):
           f"vdd-cpux 0x{vdd:x}, ccu 0x{ccu:x}")
 
 
+def _cpu_phandles(dtb_path, dts_text, dry_run):
+    """{cpu_id: phandle} for every /cpus/cpu@N, giving the ones
+    ensure_cpu_node() created (which have none) a fresh phandle."""
+    used = {int(x, 16) for x in re.findall(r"phandle = <(0x[0-9a-f]+)>;", dts_text)}
+    nxt = max(used or {0}) + 1
+    out = {}
+    for c in sorted(set(int(x) for x in re.findall(r"\bcpu@(\d+) \{", dts_text))):
+        ph = _phandle_of(dts_text, rf"cpu@{c}")
+        if ph is None:
+            ph, nxt = nxt, nxt + 1
+            fdtput(dtb_path, f"/cpus/cpu@{c}", "x", "phandle", ph, dry_run=dry_run)
+        out[c] = ph
+    return out
+
+
+# The Cortex-A53 PMU: SPIs 116-119, one per core, which the DT pairs with the
+# cores through interrupt-affinity. Disabled 2026-08-10 because the DTB then
+# exposed one CPU but kept four interrupts: pmu_attach failed with ENXIO after
+# activating IRQ 0, and the next kldload's retry panicked ("double activation
+# of resource"). With every CPU in the DT, affinity lists all of them.
+def ensure_pmu(dtb_path, dts_text, enabled, dry_run):
+    if not enabled:
+        ensure_node_status(dtb_path, "/pmu", False, dry_run)
+        return
+    phs = _cpu_phandles(dtb_path, dts_text, dry_run)
+    m = re.search(r"pmu \{[^}]*interrupts = <([^>]*)>;", dts_text)
+    nirq = len(m.group(1).split()) // 3 if m else 0
+    cpus = sorted(phs)[:nirq]
+    if len(cpus) != nirq:
+        sys.exit(f"[gen_config] pmu: {nirq} interrupts but cpus {sorted(phs)}")
+    fdtput(dtb_path, "/pmu", "x", "interrupt-affinity", *[phs[c] for c in cpus],
+           dry_run=dry_run)
+    ensure_node_status(dtb_path, "/pmu", True, dry_run)
+    print(f"[gen_config] pmu: {nirq} interrupts -> cpu@{',cpu@'.join(map(str, cpus))}")
+
+
 def ensure_cpu_node(dtb_path, dts_text, cpu_id, dry_run):
     node = f"cpu@{cpu_id}"
     path = f"/cpus/{node}"
@@ -1061,6 +1097,11 @@ def main():
     ensure_cpu_dvfs(dtb_path, dts_text,
                     features.get("guest_dvfs", {}).get("enabled", False),
                     args.dry_run)
+
+    if not args.dry_run:
+        dts_text = dtb_to_dts_text(dtb_path)
+    ensure_pmu(dtb_path, dts_text,
+               features.get("guest_pmu", {}).get("enabled", False), args.dry_run)
 
     # /memory tracks whichever feature declares a dtb-memory-size -- and, just as
     # importantly, gets put BACK when none is enabled. Leaving it wide after the
