@@ -166,6 +166,12 @@
  * sequence: LOAD | WAIT_PRE_OVER | DATA_EXP | CHK_CRC | RESP_EXP | 17 */
 #define CMD17_READ_CMDR    0x80002351u
 
+/* CMD8 (SEND_EXT_CSD, eMMC meaning) full CMDR word: identical flag set to
+ * CMD17 (single-block PIO read, no address argument needed -- EXT_CSD is a
+ * fixed per-card register, not sector-addressed), command index 8 instead
+ * of 17: LOAD | WAIT_PRE_OVER | DATA_EXP | CHK_CRC | RESP_EXP | 8. */
+#define CMD8_SEND_EXT_CSD_CMDR  0x80002348u
+
 /* CMD24 (WRITE_BLOCK) full CMDR word, mirrored from CMD17 per the source
  * sequence's note: LOAD | WAIT_PRE_OVER | DATA_EXP | WRITE | CHK_CRC |
  * RESP_EXP | 24 == 0x80000000|0x2000|0x200|0x400|0x100|0x40|24 */
@@ -991,7 +997,18 @@ static void ebio_fail_settle_full(int stop_card)
  * must be spelled out rather than the safe one. */
 static void ebio_fail_settle(void) { ebio_fail_settle_full(0); }
 
-int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
+/* Shared by emmc_bio_read() (CMD17, cagr=lba) and emmc_bio_read_ext_csd()
+ * (CMD8, cagr=0) -- structurally the exact same single-block PIO drain
+ * (same FIFO/stall/DATA_OVER handling that took real hardware debugging to
+ * get right, see the comments below), differing only in which command is
+ * loaded and whether the argument is a sector address. Factored rather
+ * than copied (unlike emmc_bio_write()'s deliberate mirror-copy of this
+ * function, per its own header comment) because this is not a structural
+ * mirror with real differences to keep readable side by side -- it is the
+ * identical operation, and a hand-copy would silently drift from any
+ * future fix made here. `lba` in breadcrumbs/comments below is really
+ * "the CAGR argument used", which is 0 (meaningless) for EXT_CSD. */
+static int emmc_bio_read_block(uint32_t cmdr, uint32_t lba, uint64_t buf_pa)
 {
 	volatile uint32_t *buf = (volatile uint32_t *)(unsigned long)buf_pa;
 	unsigned nwords = 0;
@@ -1013,7 +1030,7 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 	wreg(REG_BYCR, 512);
 	wreg(REG_RINT, RINT_ALL);
 	wreg(REG_CAGR, lba);
-	wreg(REG_CMDR, CMD17_READ_CMDR);
+	wreg(REG_CMDR, cmdr);
 
 	/* ROOT-CAUSE FIX (found live 2026-08-20, from the diagnostics this very
 	 * loop records). The bound used to be a single iteration count shared
@@ -1194,6 +1211,38 @@ int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
 
 	__asm__ volatile("dsb sy" ::: "memory");
 	return 0;
+}
+
+int emmc_bio_read(uint32_t lba, uint64_t buf_pa)
+{
+	return emmc_bio_read_block(CMD17_READ_CMDR, lba, buf_pa);
+}
+
+int emmc_bio_read_ext_csd(uint64_t buf_pa)
+{
+	return emmc_bio_read_block(CMD8_SEND_EXT_CSD_CMDR, 0, buf_pa);
+}
+
+/* EXT_CSD[267]/[268]/[269] -- PRE_EOL_INFO / DEVICE_LIFE_TIME_EST_TYP_A/B.
+ * Bounded and self-zeroing on any failure, matching axp803_read_health()'s
+ * contract (bmc.c's bmc_health_snapshot() relies on exactly this shape). */
+void emmc_bio_read_wear(struct emmc_wear *out)
+{
+	const volatile uint8_t *ecsd =
+	    (const volatile uint8_t *)(unsigned long)HVMAP_EMMC_EXTCSD_BUF;
+
+	out->pre_eol_info = 0;
+	out->life_est_a = 0;
+	out->life_est_b = 0;
+	out->ok = 0;
+
+	if (emmc_bio_read_ext_csd(HVMAP_EMMC_EXTCSD_BUF) != 0)
+		return;
+
+	out->pre_eol_info = ecsd[267];
+	out->life_est_a   = ecsd[268];
+	out->life_est_b   = ecsd[269];
+	out->ok = 1;
 }
 
 /* ------------------------------------------------------------------ */
