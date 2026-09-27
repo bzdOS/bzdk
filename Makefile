@@ -152,7 +152,7 @@ toolchain-check:
 config-check:
 	python3 gen_config.py --dry-run
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vzram_pool test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -161,6 +161,7 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_zload2_parsing
 	./test_zstage
 	./test_lz4
+	./test_vzram_pool
 	./test_vconsole_uart
 	./test_vconsole_pm
 	./test_gdbstub_resolve
@@ -209,6 +210,10 @@ test_zstage: test_zstage.c zstage.c zstage.h
 
 # Compiles the REAL lz4.c (no board-specific asm, so no mirroring needed).
 test_lz4: test_lz4.c lz4.c lz4.h
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+# Compiles the REAL vzram_pool.c + lz4.c (neither has board-specific asm).
+test_vzram_pool: test_vzram_pool.c vzram_pool.c vzram_pool.h lz4.c lz4.h
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vconsole_uart: test_vconsole_uart.c
