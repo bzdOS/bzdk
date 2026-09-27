@@ -152,7 +152,7 @@ toolchain-check:
 config-check:
 	python3 gen_config.py --dry-run
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -160,6 +160,7 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_kload_modinfo
 	./test_zload2_parsing
 	./test_zstage
+	./test_lz4
 	./test_vconsole_uart
 	./test_vconsole_pm
 	./test_gdbstub_resolve
@@ -204,6 +205,10 @@ test_zload2_parsing: test_zload2_parsing.c
 # Compiles the REAL zstage.c (behind ZSTAGE_HOSTED_TEST) rather than a
 # hand-transcribed mirror -- see test_zstage.c's header for why.
 test_zstage: test_zstage.c zstage.c zstage.h
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+# Compiles the REAL lz4.c (no board-specific asm, so no mirroring needed).
+test_lz4: test_lz4.c lz4.c lz4.h
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_vconsole_uart: test_vconsole_uart.c
