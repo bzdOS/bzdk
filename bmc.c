@@ -82,6 +82,16 @@ extern void axp803_read_health(struct axp803_health *out);
 #define BMC_BATT_DIE_HOT   (1u << 3)
 #define BMC_BATT_CHIP_OK   (1u << 4)
 
+/* emmc_bio.c / vblk_emmc.c — eMMC wear telemetry (HANDOFF item 4). Same
+ * self-contained-extern-decl discipline as the axp803 block above (no
+ * emmc_bio.h/vblk_emmc.h pull-in beyond the names actually used). */
+struct emmc_wear {
+	uint32_t pre_eol_info, life_est_a, life_est_b, ok;
+};
+extern void emmc_bio_read_wear(struct emmc_wear *out);
+extern int  vblk_emmc_trylock(void);
+extern void vblk_emmc_unlock(void);
+
 /* ------------------------------------------------------------------ *
  * Breadcrumb windows we READ (documented owners in parentheses). Fixed
  * addresses per the tree convention; we do not include their headers, we just
@@ -376,6 +386,25 @@ struct bmc_health *bmc_health_snapshot(struct bmc_health *out)
 		out->axp_ok      = bh.chip_ok;
 	}
 
+	/* eMMC wear telemetry (v1.2) — UNLIKE axp803_read_health(), this one
+	 * touches a controller CPU0's virtio-blk guest I/O also drives (design
+	 * §8.1, the stated TOP RISK — see vblk_emmc.h's VBLK_EMMC_LOCK_PA
+	 * comment). bmc_health_snapshot() must never block waiting for it: a
+	 * failed trylock just means "not read this round" (emmc_wear_ok=0,
+	 * fields left at 0 — never stale, per emmc_bio_read_wear()'s own
+	 * contract), exactly like a real EXT_CSD timeout would report. */
+	{
+		struct emmc_wear ew = { 0, 0, 0, 0 };
+		if (vblk_emmc_trylock()) {
+			emmc_bio_read_wear(&ew);
+			vblk_emmc_unlock();
+		}
+		out->emmc_pre_eol_info = ew.pre_eol_info;
+		out->emmc_life_est_a   = ew.life_est_a;
+		out->emmc_life_est_b   = ew.life_est_b;
+		out->emmc_wear_ok      = ew.ok;
+	}
+
 	/* Latch to the BMC1 breadcrumb, word-for-word (struct order == word order). */
 	{
 		const uint32_t *w = (const uint32_t *)out;
@@ -430,6 +459,13 @@ static void bmc_print_health(void)
 	cputs("  temp_mC=");   pdec(h.temp_mc);
 	cputs(" flags=0x");    ph32(h.flags);
 	cputs(" wdt_hold=");   pdec(h.wdt_hold); nl();
+	if (h.emmc_wear_ok) {
+		cputs("  eMMC wear: pre_eol=");    pdec(h.emmc_pre_eol_info);
+		cputs(" life_est_a=");             pdec(h.emmc_life_est_a);
+		cputs(" life_est_b=");              pdec(h.emmc_life_est_b); nl();
+	} else {
+		cputs("  eMMC wear: not read (controller busy, or EXT_CSD unsupported)\r\n");
+	}
 	if (h.axp_ok) {
 		/* chip_ok with every reading at zero means the PMIC answered but no
 		 * battery telemetry came back (typically: no pack on the

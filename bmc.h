@@ -56,8 +56,8 @@
  * MAJOR it does not understand.
  * ------------------------------------------------------------------------- */
 #define BMC_PROTO_MAJOR   1u
-#define BMC_PROTO_MINOR   1u   /* +AXP803 battery telemetry (back-compat: */
-                               /* fills what was reserved[23..28], see below) */
+#define BMC_PROTO_MINOR   2u   /* +eMMC wear telemetry (back-compat: fills */
+                               /* what was reserved[29..31], see below)    */
 
 /* -------------------------------------------------------------------------
  * Structured health / status record ("BMC1"). Written by bmc_health_snapshot()
@@ -119,7 +119,23 @@ struct bmc_health {
 	uint32_t batt_ts_mv;     /* [26] TS-pin raw mV (NOT calibrated to °C)   */
 	uint32_t batt_status;    /* [27] BMC_BATT_* bitmap (axp803.h)           */
 	uint32_t axp_ok;         /* [28] 1 = AXP803 detected + REG03H verified  */
-	uint32_t reserved[3];    /* [29..31] padding to a clean 32-word record  */
+	/* --- v1.2: eMMC wear telemetry (HANDOFF item 4, see emmc_bio.h's
+	 * struct emmc_wear). Fills what was reserved[29..31] in v1.1 --
+	 * additive, back-compatible; a pre-v1.2 client just never reads these
+	 * words. All 0 if EXT_CSD was never successfully read this snapshot
+	 * (emmc_wear_ok clear) -- controller lock contention or a bounded
+	 * timeout, not necessarily a bad card; see bmc_health_snapshot(). */
+	uint32_t emmc_pre_eol_info; /* [29] EXT_CSD[267]: 0=n/a, 1=normal,     */
+	                            /*      2=warning (80%), 3=urgent (drive   */
+	                            /*      is near end-of-life)               */
+	uint32_t emmc_life_est_a;  /* [30] EXT_CSD[268]: 0=n/a, else a BAND    */
+	                           /*      index 1..10 (1=0-10% of rated life  */
+	                           /*      used .. 10=90-100%), NOT a percent  */
+	uint32_t emmc_life_est_b;  /* [31] EXT_CSD[269]: same convention as    */
+	                           /*      emmc_life_est_a                     */
+	uint32_t emmc_wear_ok;     /* [32] 1 = EXT_CSD read succeeded this    */
+	                           /*      snapshot                           */
+	uint32_t reserved[3];      /* [33..35] padding for future growth       */
 };
 
 /* Bit assignments for the `flags` word above and for `bmc flags`. Each maps to
