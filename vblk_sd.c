@@ -283,6 +283,42 @@ static uint64_t g_bounce_run[SD_MULTI_MAX_BLOCKS * VBLK_SD_SECTOR_BYTES / 8]
 #define SD_BOUNCE_RUN_PA ((uint64_t)(uintptr_t)&g_bounce_run[0])
 static uint32_t g_multi_runs, g_multi_fails, g_multi_rruns, g_multi_rfails;
 
+/* IDMAC first, PIO multi as fallback -- same shape as vblk_emmc.c's
+ * emmc_multi_read/write. sd_bio_read_dma() refuses (-102) a buffer that is
+ * not whole cache lines (the direct-to-guest read below often is not), so
+ * those take PIO; see g_bounce_run for why partial lines are unsafe. Plain
+ * counters: g_sd_dma_skip counts the -102 refusals, g_sd_dma_fallback real
+ * IDMAC failures PIO rescued. Caller holds the SD lock. */
+static uint32_t g_sd_dma_ok, g_sd_dma_skip, g_sd_dma_fallback;
+
+static int sd_multi_read(uint32_t lba, uint64_t pa, uint32_t n)
+{
+	int rc = sd_bio_read_dma(lba, pa, n);
+	if (rc == 0) {
+		g_sd_dma_ok++;
+		return 0;
+	}
+	rc = sd_bio_read_multi(lba, pa, n);
+	if (rc == 0 && ((pa | ((uint64_t)n * 512u)) & 63u))
+		g_sd_dma_skip++;
+	else if (rc == 0)
+		g_sd_dma_fallback++;
+	return rc;
+}
+
+static int sd_multi_write(uint32_t lba, uint64_t pa, uint32_t n)
+{
+	int rc = sd_bio_write_dma(lba, pa, n);
+	if (rc == 0) {
+		g_sd_dma_ok++;
+		return 0;
+	}
+	rc = sd_bio_write_multi(lba, pa, n);
+	if (rc == 0)
+		g_sd_dma_fallback++;
+	return rc;
+}
+
 /* Return codes serve_data() itself can produce, kept disjoint from
  * VIRTIO_BLK_S_* since the caller maps them, same pattern as vblk_emmc.c. */
 #define SD_RC_OK        0
@@ -333,7 +369,7 @@ static int sd_serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			vblk_sd_bc(12, lba);
 			/* straight into the guest buffer, as the whole-sector
 			 * CMD17 path below does, then the same CMO */
-			rc = sd_bio_read_multi(lba, buf_gpa, n);
+			rc = sd_multi_read(lba, buf_gpa, n);
 			vblk_sd_unlock();
 			if (rc == 0) {
 				gmem_cmo(buf_gpa, bytes);
@@ -368,7 +404,7 @@ static int sd_serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			vblk_sd_bc(12, lba);
 			gmem_read(buf_gpa, g_bounce_run, bytes);
 			__asm__ volatile("dsb sy" ::: "memory");
-			rc = sd_bio_write_multi(lba, SD_BOUNCE_RUN_PA, n);
+			rc = sd_multi_write(lba, SD_BOUNCE_RUN_PA, n);
 			vblk_sd_unlock();
 			if (rc == 0) {
 				vblk_sd_bc(14, ++g_multi_runs);
@@ -519,13 +555,13 @@ static int sd_serve_gathered(uint32_t is_read, const struct vblk_sd_desc *chain,
 	}
 	vblk_sd_bc(12, (uint32_t)sector);
 	if (is_read) {
-		rc = sd_bio_read_multi((uint32_t)sector, SD_BOUNCE_RUN_PA, nblk);
+		rc = sd_multi_read((uint32_t)sector, SD_BOUNCE_RUN_PA, nblk);
 	} else {
 		for (i = 1, off = 0; i < n - 1; off += chain[i].len, i++)
 			gmem_read(chain[i].addr, (uint8_t *)g_bounce_run + off,
 			          chain[i].len);
 		__asm__ volatile("dsb sy" ::: "memory");
-		rc = sd_bio_write_multi((uint32_t)sector, SD_BOUNCE_RUN_PA, nblk);
+		rc = sd_multi_write((uint32_t)sector, SD_BOUNCE_RUN_PA, nblk);
 	}
 	/* The scatter MUST stay under the lock: g_bounce_run is shared by
 	 * every vCPU, each serving its own requests in its own trap, and
