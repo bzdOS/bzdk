@@ -274,7 +274,12 @@ static uint64_t g_bounce_q[VBLK_SD_SECTOR_BYTES / 8];
  * synchronous contract as g_bounce_q. Breadcrumbs: [14] runs written,
  * [15] runs that failed and were rewritten sector by sector, [16] the last
  * failure's rc, [17] its lba; [18]/[19] the same for CMD18 read runs. */
-static uint64_t g_bounce_run[SD_MULTI_MAX_BLOCKS * VBLK_SD_SECTOR_BYTES / 8];
+/* Cache-line aligned: a DMA read into a buffer whose first/last line is
+ * shared with a neighbouring variable loses those bytes when another core
+ * dirties the neighbour mid-transfer and the line is written back (found
+ * 2026-09-27: garbage UFS indirect blocks with eMMC IDMAC wired in). */
+static uint64_t g_bounce_run[SD_MULTI_MAX_BLOCKS * VBLK_SD_SECTOR_BYTES / 8]
+	__attribute__((aligned(64)));
 #define SD_BOUNCE_RUN_PA ((uint64_t)(uintptr_t)&g_bounce_run[0])
 static uint32_t g_multi_runs, g_multi_fails, g_multi_rruns, g_multi_rfails;
 
