@@ -588,6 +588,29 @@ def render(s):
             cards.append(("battery (AXP803)",
                           '<span class="pill warn">present, no readings</span>'))
 
+    # eMMC wear: a failed read (controller busy) must not show as a false
+    # "healthy" reading -- same "absent must not read as good" discipline
+    # as the battery card above. Plain text rows for the normal case (no
+    # pill markup here -- this card has nothing to do with core liveness,
+    # and reusing "pill ok"/"pill bad" would make render_stale_latch's own
+    # "no core pills leaked" check ambiguous about which card it saw).
+    if h.get("emmc_wear_ok"):
+        eol = {0: "n/a", 1: "normal", 2: "WARNING (80%)", 3: "URGENT"}.get(
+            h["emmc_pre_eol_info"], f"unknown({h['emmc_pre_eol_info']})")
+
+        def life_band(v):
+            return "n/a" if v == 0 else (f"{(v-1)*10}-{v*10}% used"
+                                          if 1 <= v <= 10 else f"reserved({v})")
+
+        cards.append(("eMMC wear", _rows([
+            ("pre-EOL", eol),
+            ("life used (type A)", life_band(h["emmc_life_est_a"])),
+            ("life used (type B)", life_band(h["emmc_life_est_b"])),
+        ])))
+    else:
+        cards.append(("eMMC wear",
+                      '<span class="pill warn">not read (controller busy)</span>'))
+
     try:
         st = boot_ledger.stats()
         if isinstance(st, dict):
@@ -893,6 +916,19 @@ def case_render_battery_real_readings_shown():
     assert "3950" in out
 
 
+def case_render_emmc_wear_shown():
+    out = render(_mkstatus(health=_mkhealth(
+        emmc_wear_ok=1, emmc_pre_eol_info=2, emmc_life_est_a=3, emmc_life_est_b=0)))
+    assert "WARNING" in out
+    assert "20-30%" in out            # life_est_a=3 is a BAND, not "3%"
+
+
+def case_render_emmc_wear_not_read():
+    out = render(_mkstatus(health=_mkhealth(
+        emmc_wear_ok=0, emmc_pre_eol_info=0, emmc_life_est_a=0, emmc_life_est_b=0)))
+    assert "not read" in out
+
+
 def case_render_console_state_labels():
     for val, want in ((None, "unknown"), (True, "advancing"), (False, "quiet")):
         out = render(_mkstatus(console_advancing=val))
@@ -1102,6 +1138,8 @@ _ST_CASES = [
      case_render_battery_present_no_readings_not_shown_as_zero_mv),
     ("render_battery_real_readings_shown",
      case_render_battery_real_readings_shown),
+    ("render_emmc_wear_shown", case_render_emmc_wear_shown),
+    ("render_emmc_wear_not_read", case_render_emmc_wear_not_read),
     ("render_console_state_labels", case_render_console_state_labels),
     ("pm_parse_window_from_header_not_body",
      case_pm_parse_window_from_header_not_body),
