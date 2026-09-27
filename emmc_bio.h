@@ -147,4 +147,44 @@ int emmc_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 void emmc_bio_fault_inject(uint32_t every, uint32_t min_lba, uint32_t point,
                            uint32_t legacy_wait);
 
+/* ------------------------------------------------------------------ *
+ * EXT_CSD / wear telemetry (HANDOFF item 4).
+ * ------------------------------------------------------------------ */
+
+/* Read the card's 512-byte EXT_CSD register (CMD8, SEND_EXT_CSD -- eMMC
+ * meaning; not SD's CMD8/SEND_IF_COND) into DRAM at physical address
+ * `buf_pa`, as 128 little-endian 32-bit words, byte order preserved (so
+ * EXT_CSD byte N is at `((uint8_t *)buf_pa)[N]`). Structurally the exact
+ * same single-block PIO drain as emmc_bio_read() (same FIFO/stall/DATA_OVER
+ * handling, which is why it is a thin wrapper over a shared internal
+ * helper, not a hand-copy) with a different command index and no block
+ * address argument. Returns 0 on success, negative on a bounded timeout —
+ * same convention as emmc_bio_read(). Caller must hold the eMMC controller
+ * lock (VBLK_EMMC_LOCK_PA / vblk_emmc_trylock()), exactly like every other
+ * function in this file. */
+int emmc_bio_read_ext_csd(uint64_t buf_pa);
+
+struct emmc_wear {
+	uint32_t pre_eol_info;   /* EXT_CSD[267] PRE_EOL_INFO: 0=n/a/unread,
+	                          * 1=normal, 2=warning (80% reserved used),
+	                          * 3=urgent */
+	uint32_t life_est_a;     /* EXT_CSD[268] DEVICE_LIFE_TIME_EST_TYP_A
+	                          * (SLC or single type): 0=n/a, 1..10 = a BAND index,
+	                          * 1=0-10% of rated lifetime used .. 10=90-100% */
+	uint32_t life_est_b;     /* EXT_CSD[269] DEVICE_LIFE_TIME_EST_TYP_B
+	                          * (MLC, 0 if the card has no separate MLC
+	                          * region): 0=n/a, 1..10 = a BAND index,
+	                          * same convention as life_est_a above */
+	uint32_t ok;             /* 1 = EXT_CSD read succeeded this call; 0 =
+	                          * timeout/error -- the three fields above are
+	                          * left as 0, not stale, when this is 0 */
+};
+
+/* Fill *out from a fresh EXT_CSD read: pre_eol_info/life_est_a/life_est_b
+ * plus the ok gate. Uses the fixed HVMAP_EMMC_EXTCSD_BUF landing buffer
+ * internally (see hv_addrmap.h). Bounded, like every other call in this
+ * file; on failure *out is all-zero (ok=0), never stale or partial. Caller
+ * must hold the eMMC controller lock, same as emmc_bio_read_ext_csd(). */
+void emmc_bio_read_wear(struct emmc_wear *out);
+
 #endif /* BZDOS_EMMC_BIO_H */

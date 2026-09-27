@@ -105,6 +105,17 @@
 #define HVMAP_SD_TESTBUF     0x50020800UL
 #define HVMAP_SD_TESTBUF_SIZE 0x200UL    /* one 512-byte sector */
 
+/* eMMC EXT_CSD landing buffer (emmc_bio.c: emmc_bio_read_ext_csd(), one
+ * 512-byte block), for HANDOFF item 4's wear telemetry (bmc.c's
+ * bmc_health_snapshot() reads PRE_EOL_INFO/DEVICE_LIFE_TIME_EST_A/B out of
+ * it). A NEW window rather than reusing HVMAP_EMMC_HS_TESTBUF: that buffer
+ * belongs to emmc_bio.c's one-shot high-speed probe at init, this one is
+ * read repeatedly (every `bmc health`) — exactly the "two purposes sharing
+ * one window" pattern this file exists to stop repeating. 0x50020a00 is
+ * free (HVMAP_SD_TESTBUF ends at 0x50020a00) and clear of HVMAP_IO_BLOCK_END. */
+#define HVMAP_EMMC_EXTCSD_BUF      0x50020A00UL
+#define HVMAP_EMMC_EXTCSD_BUF_SIZE 0x200UL    /* one 512-byte block */
+
 /* End of the reserved I/O-storage block (one 4 KiB page). */
 #define HVMAP_IO_BLOCK_END   0x50021000UL
 
@@ -220,8 +231,10 @@ _Static_assert(HVMAP_ASYNC_BC + HVMAP_ASYNC_BC_SIZE <= HVMAP_USED_LOCK,
                "async breadcrumbs overlap the used-ring lock word");
 _Static_assert(HVMAP_USED_LOCK + HVMAP_USED_LOCK_SIZE <= HVMAP_SD_TESTBUF,
                "used-ring lock overlaps the SD scratch buffer");
-_Static_assert(HVMAP_SD_TESTBUF + HVMAP_SD_TESTBUF_SIZE <= HVMAP_IO_BLOCK_END,
-               "SD scratch buffer overruns the I/O-storage block");
+_Static_assert(HVMAP_SD_TESTBUF + HVMAP_SD_TESTBUF_SIZE <= HVMAP_EMMC_EXTCSD_BUF,
+               "SD scratch buffer overlaps the eMMC EXT_CSD buffer");
+_Static_assert(HVMAP_EMMC_EXTCSD_BUF + HVMAP_EMMC_EXTCSD_BUF_SIZE <= HVMAP_IO_BLOCK_END,
+               "eMMC EXT_CSD buffer overruns the I/O-storage block");
 _Static_assert(HVMAP_SD_BC + HVMAP_SD_BC_SIZE <= HVMAP_SD_TESTBUF,
                "SD breadcrumbs overlap the SD scratch buffer");
 _Static_assert(HVMAP_IO_BLOCK_END <= HVMAP_DBGTOOLS_BASE,
