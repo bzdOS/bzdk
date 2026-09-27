@@ -118,49 +118,68 @@ unless resumed with the same state file).
      brownouts at that point), or a Mesa bug. First step: rerun the soak
      with the frequency capped (`sysctl dev.cpu.0.freq=816`, powerd off);
      if it passes, it is the power/thermal envelope, not the storage.
-3. **Compressed swap (vzram) — mechanism agreed, one number still open.**
-   - `lz4.c`/`lz4.h` are written and validated (NOT YET committed — new
-     untracked files in this tree): 20000-case round-trip fuzz across
-     random/zero/repeating/text/Markov-ish inputs including corrupted-input
-     decode attempts (no OOB write, bounded failure), plus a two-direction
-     cross-check against Python's reference `lz4.block` (their decoder
-     accepts our compressed output byte-for-byte on a real page; our
-     decoder correctly decodes 2000 of their high-compression-mode outputs
-     across edge sizes 1..4096). Solid, reusable regardless of how vzram is
-     sized. Still needs a proper hosted unit test under `make test` (see
-     `test_kload_modinfo.c` for the pattern) before it's "done" by this
-     project's own convention — the scratchpad fuzzer that validated it is
-     ephemeral, not in the tree.
-   - **Carve mechanism:** reduce the guest's advertised `/memory` size
-     further via the *existing* `dtb-memory-size` machinery
-     (`board-config.xml` + `gen_config.py`, the same path `guest_dram_2g`
-     already uses) — a new slice taken from BELOW the ~113 MiB U-Boot
-     reservation at the top of the 2 GiB (do not touch that strip; it's a
-     repeat offender in this project's history). Stage-2 already maps the
-     whole 2 GiB 1:1 regardless (`STAGE2_DRAM_L1_BLOCKS`), so EL2 can use
-     the un-advertised slice as backing store with zero coordination with
-     the guest — FreeBSD's own allocator simply never touches PA it was
-     never told about, exactly like the existing top-of-DRAM carve-out.
-   - **Sizing — proposed, not confirmed:** 128 MiB physical carve, 256 MiB
-     exposed to the guest as the vzram device's capacity (2x overcommit,
-     conservative). Needs the owner's go-ahead on the actual numbers before
-     wiring board-config.xml.
-   - **Runtime resize — checked in `freebsd-src-bpi`, not assumed:**
-     `virtio_blk.c`'s `vtblk_config_change()` → `vtblk_resize_disk()` DOES
-     support a live GEOM-disk capacity change via the config-change
-     interrupt. But the swap subsystem on top does not adopt a grown
-     device automatically — needs `swapoff`/`swapon` of that device after a
-     grow. Shrinking an active swap device live is NOT safe (data loss risk
-     for already-swapped pages) — never do it while `swapon` is active on
-     it. So: the internal physical-pool accounting can be adjusted anytime
-     (guest never sees that RAM at all), but the exposed capacity is
-     effectively fixed at boot in practice.
-   - New virtio-blk device, same shape as `vblk_sd.c` (own MMIO slot — next
-     free SPI per `board-config.xml`'s documented gap 0x68..0x73 is 109/
-     0x6D, base `0x0A005000`), backed by a page table of LZ4-compressed 4
-     KiB slots inside the carved pool, raw fallback for incompressible
-     pages, one lock across the whole compress/decompress/copy path (this
-     project's one proven bug class here — see the SD gather postmortem).
+3. **Compressed swap (vzram) — PAUSED 2026-09-27, on purpose. Logic layer
+   done, hardware wiring is deliberate tech debt (not started).**
+   - **Decided:** don't fix the exposed capacity to a permanent number —
+     grow it live under swap pressure instead, using the config-change
+     -interrupt resize path `freebsd-src-bpi`'s `virtio_blk.c` already
+     supports (see below). Start with whatever numbers get the mechanism
+     working; retune later from real usage, not from a guess made now.
+   - **DONE, committed, hosted-tested (`fdaafa9`, `f709ec1`):**
+     - `lz4.c`/`lz4.h` — LZ4 block codec, no board asm. `test_lz4.c`
+       compiles the real source directly (like `test_zstage.c` does for
+       `zstage.c`): round-trip across every fill pattern and edge size
+       0..4096, undersized-dst refusal, decompress() bounds safety under
+       truncation/byte-flip corruption (no OOB write ever — a flip inside
+       literal payload legitimately decodes to wrong bytes, this format
+       has no checksum, that's expected not a bug), and a hand-built
+       stream pinning down the match-offset guard.
+     - `vzram_pool.c`/`vzram_pool.h` — the compressed-page store: a slab
+       allocator (fixed classes 256/512/1024/2048/4096, per-class free
+       lists over a shared bump pointer — no cross-class coalescing, a
+       named limitation, not a bug) plus a slot table per logical 4 KiB
+       page whose `nslots` `vzram_pool_grow()` can raise without touching
+       pages that predate the grow. `test_vzram_pool.c` compiles the real
+       source (same reasoning as above): unwritten-page zero-read,
+       round-trip across mixed compressibility, 5000 overwrites of one
+       page (free-list reclaim), pool exhaustion leaves the page's PRIOR
+       content untouched, grow() leaves old pages alone and refuses to
+       shrink. Both are plain hosted C, no board dependency at all.
+   - **NOT STARTED — tech debt, explicitly deferred, not forgotten:**
+     1. `vblk_zram.c`, a new virtio-blk device wired to `vzram_pool.c`
+        (same shape as `vblk_sd.c`) — next free MMIO slot per
+        `board-config.xml`'s documented SPI gap 0x68..0x73 is 109/0x6D,
+        base `0x0A005000`. One lock across the whole compress/decompress
+        /copy path (this project's one proven bug class here — see the SD
+        gather postmortem) — do not skip that the way `vblk_sd.c`'s own
+        header warns against.
+     2. **Physical DRAM carve** via the existing `dtb-memory-size`
+        machinery (`board-config.xml` + `gen_config.py`, the same path
+        `guest_dram_2g` already uses) — a slice taken from BELOW the
+        ~113 MiB U-Boot reservation at the top of the 2 GiB (do NOT touch
+        that strip; repeat offender in this project's history). Stage-2
+        already maps the whole 2 GiB 1:1 regardless
+        (`STAGE2_DRAM_L1_BLOCKS`), so EL2 can use the un-advertised slice
+        as backing store with zero guest coordination. Size is an open
+        question again (the owner said "start with any numbers", meaning
+        get the mechanism working first — not that this step is free to
+        skip the conversation about the real number before it touches
+        `board-config.xml`).
+     3. **Config-change-interrupt-driven growth.** `virtio_blk.c`'s
+        `vtblk_config_change()` → `vtblk_resize_disk()` DOES support a live
+        GEOM-disk capacity change (confirmed in `freebsd-src-bpi`, not
+        assumed) — `vblk_zram.c` needs to raise `config.capacity` and
+        raise the interrupt when the pool crosses a fill threshold, capped
+        by the physical carve.
+     4. **Guest-side grow adoption.** The swap subsystem does NOT adopt a
+        grown device automatically — needs `swapoff`/`swapon` of that
+        device after a grow. Likely shape: a `devd(8)` rule matching a
+        GEOM disk-resize event, not a custom polling daemon. NOT written,
+        NOT researched beyond "this is probably the right primitive."
+        Shrinking an active swap device live is NOT safe (data loss risk
+        for already-swapped pages) — never do it while `swapon` is active.
+   - Resume by starting at (1); the logic layer underneath it is already
+     done and tested.
 4. **Wear counters in `bzdctl status`.** eMMC exposes wear via
    `EXT_CSD[268]`/`[269]` (`DEVICE_LIFE_TIME_EST_A/B`) and `EXT_CSD[267]`
    (`PRE_EOL_INFO`); not read anywhere today. SD wear is vendor-specific and
