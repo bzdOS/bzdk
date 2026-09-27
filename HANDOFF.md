@@ -78,12 +78,46 @@ unless resumed with the same state file).
      these with DMA below, where they should finally show a difference.
    - Verified with fsck -n + parallel md5, same as the SD series, at every
      step above.
-2. **DMA (IDMAC) for both controllers.** Today's SD/eMMC I/O is a vCPU
-   spinning in PIO inside its own trap handler — CMD25/CMD18 batching cut
-   the number of traps, not the PIO cost of each one. IDMAC descriptor-chain
-   DMA hands the transfer to the controller and frees the vCPU; this is the
-   real fix for "vCPU burns cycles doing I/O" and matters more as guest load
-   goes up (soak's mixed profile is the regression test for this once built).
+2. **DMA (IDMAC) for both controllers — DONE 2026-09-27.** Multi-block
+   transfers on both eMMC and SD now move their data phase via the
+   controller's IDMAC (`emmc_bio_*_dma`, `sd_bio_*_dma`; register map,
+   descriptor chain and sequence transcribed from FreeBSD's `aw_mmc.c`),
+   with the PIO multi-block pair as an automatic fallback
+   (`emmc_multi_*` in `vblk_emmc.c`, `sd_multi_*` in `vblk_sd.c`). Counters
+   (plain statics, read with `nm` + dbgmon): `g_dma_ok`/`g_dma_fallback`,
+   `g_sd_dma_ok`/`g_sd_dma_skip`/`g_sd_dma_fallback`.
+   - **The rule that cost a day: any buffer an IDMAC *reads into* must be
+     whole cache lines.** The engine writes DRAM behind the cache; a
+     partial edge line shared with a variable another core dirties
+     mid-transfer gets written back on top of the DMA'd bytes. With the
+     eMMC bounce at 0x...3d8 this produced ld-elf "Unhandled relocation"
+     / SIGILL boots and garbage UFS indirect blocks after ~75k
+     clean-reporting transfers (disk stayed fsck-clean — memory only), and
+     almost certainly the SD boot-hang regression (direct-to-guest reads
+     overwriting guest kernel data). Both bounces are `aligned(64)` and
+     both `*_read_dma()` return -102 for a partial-line buffer, which the
+     wrappers route to PIO. Keep both halves of that.
+   - Verification: `hwtest/filerace.sh` (4 concurrent streams over 4.6 GB
+     of root files, x2, all md5 identical), `hwtest/sdwr.sh` (2.5 GB
+     written to /opt and verified, 0 bad), 5/5 clean back-to-back resets,
+     ~90k eMMC + ~81k SD IDMAC transfers with 0 fallbacks and
+     `g_ioerrs=0`. The raw-device read test does NOT exercise the
+     per-descriptor path (physio splits the buffer) — use file reads.
+   - Single-reader throughput is unchanged (~10.8 MB/s eMMC); the point is
+     that the vCPU no longer spins in a FIFO drain loop. The completion
+     wait is still a poll (`emmc_dma_wait_complete`), so the vCPU is not
+     yet actually handed back to the guest during a transfer — wiring the
+     IDMAC completion IRQ is the step that turns this into real overlap.
+   - **Not yet soaked.** `soak72.py --profile mixed` stopped at ~15 min
+     twice, on a pure-PIO build and on the IDMAC build alike: `limabench`
+     SIGSEGV (rc=139) in Mesa's CPU-side shader linker
+     (`set_search_or_add` <- `nir_lower_io` <- `gl_nir_link_varyings`),
+     not in the GPU. One `ntpd` SIGSEGV was also seen during the SD test.
+     Unexplained. Suspects, none checked: CPU instability at 1152 MHz x4
+     under powerd with the SoC at 85-86 C (the DVFS memory notes micro-USB
+     brownouts at that point), or a Mesa bug. First step: rerun the soak
+     with the frequency capped (`sysctl dev.cpu.0.freq=816`, powerd off);
+     if it passes, it is the power/thermal envelope, not the storage.
 3. **Compressed swap (vzram) — mechanism agreed, one number still open.**
    - `lz4.c`/`lz4.h` are written and validated (NOT YET committed — new
      untracked files in this tree): 20000-case round-trip fuzz across
