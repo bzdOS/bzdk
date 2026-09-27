@@ -213,7 +213,12 @@ static inline uint8_t *bounce(void) { return (uint8_t *)(uintptr_t)&g_bounce_q[0
  * vblk-sd-shared-bounce-under-lock) -- same size cap (EMMC_MULTI_MAX_BLOCKS
  * == SD_MULTI_MAX_BLOCKS == 128, one whole SEG_MAX=16 x 4 KiB request), same
  * EL2-private, lock-bracketed contract. See emmc_serve_gathered() below. */
-static uint64_t g_bounce_run[EMMC_MULTI_MAX_BLOCKS * VBLK_SECTOR_BYTES / 8];
+/* Cache-line aligned: a DMA read into a buffer whose first/last line is
+ * shared with a neighbouring variable loses those bytes when another core
+ * dirties the neighbour mid-transfer and the line is written back (found
+ * 2026-09-27: garbage UFS indirect blocks with eMMC IDMAC wired in). */
+static uint64_t g_bounce_run[EMMC_MULTI_MAX_BLOCKS * VBLK_SECTOR_BYTES / 8]
+	__attribute__((aligned(64)));
 #define BOUNCE_RUN_PA  ((uint64_t)(uintptr_t)&g_bounce_run[0])
 
 /* ------------------------------------------------------------------ *
@@ -772,7 +777,44 @@ static uint32_t g_lock_giveups;     /* [60] gave up -> S_IOERR       */
  * emmc_bio.c's own multi-block stats -- consistent with that file's
  * decision not to add breadcrumb slots for these. */
 static uint32_t g_gathered;         /* [63] whole-request CMD18/CMD25 runs */
-static uint32_t g_gather_fails;     /* attempted (lock held) but emmc_bio_*_multi() failed */
+static uint32_t g_gather_fails;     /* attempted (lock held) but neither DMA nor PIO multi worked */
+static uint32_t g_dma_ok;           /* multi-block moved via IDMAC (emmc_bio_*_dma) */
+static uint32_t g_dma_fallback;     /* IDMAC attempt failed, PIO multi (emmc_bio_*_multi) rescued it */
+
+/* Try the IDMAC DMA path first (frees the vCPU instead of spinning in a PIO
+ * drain loop -- see HANDOFF.md item 2), falling back to the already
+ * hardware-proven PIO multi-block functions on ANY failure. Both share the
+ * identical contract (nblk in [2, EMMC_MULTI_MAX_BLOCKS], same packed
+ * failure codes), so the fallback is a plain second call with no special
+ * cases -- exactly the "layered optimization, never a hard dependency"
+ * shape already used for emmc_bio_set_highspeed() and the async CPU2
+ * offload. Called with the eMMC lock already held by the caller (same
+ * contract as emmc_bio_read_multi()/write_multi() themselves). */
+static int emmc_multi_read(uint32_t lba, uint64_t pa, uint32_t n)
+{
+	int rc = emmc_bio_read_dma(lba, pa, n);
+	if (rc == 0) {
+		g_dma_ok++;
+		return 0;
+	}
+	rc = emmc_bio_read_multi(lba, pa, n);
+	if (rc == 0)
+		g_dma_fallback++;
+	return rc;
+}
+
+static int emmc_multi_write(uint32_t lba, uint64_t pa, uint32_t n)
+{
+	int rc = emmc_bio_write_dma(lba, pa, n);
+	if (rc == 0) {
+		g_dma_ok++;
+		return 0;
+	}
+	rc = emmc_bio_write_multi(lba, pa, n);
+	if (rc == 0)
+		g_dma_fallback++;
+	return rc;
+}
 
 /* The exact eMMC LBA serve_data() was on when it last failed. A request's
  * chain can die several sectors into a descriptor, so neither the request's
@@ -887,7 +929,7 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 					vblk_pet_wdt();
 				}
 			}
-			rc = emmc_bio_read_multi(lba, BOUNCE_RUN_PA, n);
+			rc = emmc_multi_read(lba, BOUNCE_RUN_PA, n);
 			/* The scatter MUST stay under the lock (same rule as
 			 * emmc_serve_gathered() below): g_bounce_run is shared by
 			 * every vCPU/CPU2, and once unlocked another request's CMD18
@@ -938,7 +980,7 @@ static int serve_data(uint32_t is_read, uint64_t gpa, uint32_t len,
 			}
 			gmem_read(buf_gpa, (uint8_t *)g_bounce_run, bytes);
 			__asm__ volatile("dsb sy" ::: "memory");
-			rc = emmc_bio_write_multi(lba, BOUNCE_RUN_PA, n);
+			rc = emmc_multi_write(lba, BOUNCE_RUN_PA, n);
 			vblk_emmc_unlock();
 			vblk_pet_wdt();
 			if (rc == 0) {
@@ -1241,12 +1283,12 @@ static int emmc_serve_gathered(uint32_t is_read, const uint64_t *addr,
 	g_serve_fail_lba = (uint32_t)sector;
 
 	if (is_read) {
-		rc = emmc_bio_read_multi((uint32_t)sector, BOUNCE_RUN_PA, nblk);
+		rc = emmc_multi_read((uint32_t)sector, BOUNCE_RUN_PA, nblk);
 	} else {
 		for (i = 0, off = 0; i < n; off += len[i], i++)
 			gmem_read(addr[i], (uint8_t *)g_bounce_run + off, len[i]);
 		__asm__ volatile("dsb sy" ::: "memory");
-		rc = emmc_bio_write_multi((uint32_t)sector, BOUNCE_RUN_PA, nblk);
+		rc = emmc_multi_write((uint32_t)sector, BOUNCE_RUN_PA, nblk);
 	}
 	/* The scatter MUST stay under the lock: g_bounce_run is shared by every
 	 * vCPU/CPU2, each serving its own request in its own trap/poll --
