@@ -40,6 +40,8 @@ BMC_HEALTH_MAGIC = 0x424D4331  # "BMC1"
 # 32-bit word except the lo/hi pairs which we recombine below.
 # v1.1 appends AXP803 battery telemetry (vbat_mv..axp_ok) — these fill what
 # was reserved padding in v1.0, so a v1.0-only board just reads zeros here.
+# v1.2 appends eMMC wear telemetry (emmc_pre_eol_info..emmc_wear_ok) the
+# same way, filling what was reserved padding in v1.1.
 HEALTH_WORDS = [
     "magic", "version", "uptime_lo", "uptime_hi", "tick_lo", "tick_hi",
     "tick_delta", "exc_count", "last_exc_kind", "last_exc_esr",
@@ -47,6 +49,7 @@ HEALTH_WORDS = [
     "hb_cpu0", "hb_cpu1", "hb_cpu2", "hb_cpu3",
     "cons_bytes", "cons_faults", "temp_mc", "flags", "wdt_hold", "ffv_count",
     "vbat_mv", "ichg_ma", "idischg_ma", "batt_ts_mv", "batt_status", "axp_ok",
+    "emmc_pre_eol_info", "emmc_life_est_a", "emmc_life_est_b", "emmc_wear_ok",
 ]
 
 FLAG_BITS = [
@@ -261,6 +264,21 @@ def print_health(d, motion=None):
           f"ffv={d['ffv_count']}")
     t = d["temp_mc"]
     print(f"  temperature {'n/a' if t == 0 else f'{t/1000:.1f} C'}")
+    if d.get("emmc_wear_ok"):
+        eol = {0: "n/a", 1: "normal", 2: "WARNING (80%)", 3: "URGENT"}.get(
+            d["emmc_pre_eol_info"], f"unknown({d['emmc_pre_eol_info']})")
+
+        def life(v):
+            # EXT_CSD's DEVICE_LIFE_TIME_EST fields are a BAND index, not a
+            # direct percentage: 1 = 0-10% of the rated lifetime used, up to
+            # 10 = 90-100%. Show the band, not a false-precision number.
+            return "n/a" if v == 0 else f"{(v-1)*10}-{v*10}% used" if 1 <= v <= 10 else f"reserved({v})"
+
+        print(f"  eMMC wear   pre_eol={eol}  "
+              f"life_est_a={life(d['emmc_life_est_a'])}  "
+              f"life_est_b={life(d['emmc_life_est_b'])}")
+    else:
+        print("  eMMC wear   not read (controller busy, or EXT_CSD unsupported)")
     print(f"  flags       0x{d['flags']:x}  {d['flag_names']}")
     print(f"  wdt_hold    {d['wdt_hold']}")
     if d.get("axp_ok"):
@@ -332,6 +350,8 @@ def _mkwords(**overrides):
         flags=0, wdt_hold=0, ffv_count=0,
         vbat_mv=4000, ichg_ma=100, idischg_ma=0, batt_ts_mv=1500,
         batt_status=0x1, axp_ok=1,
+        emmc_pre_eol_info=1, emmc_life_est_a=2, emmc_life_est_b=0,
+        emmc_wear_ok=1,
     )
     base.update(overrides)
     return [base[name] for name in HEALTH_WORDS]
@@ -470,6 +490,26 @@ def case_print_health_no_axp_detected():
     assert "no AXP803 detected" in text
 
 
+def case_print_health_emmc_wear_shown():
+    d = _FakeWordsBMC(_mkwords(emmc_wear_ok=1, emmc_pre_eol_info=2,
+                                emmc_life_est_a=3, emmc_life_est_b=0)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "WARNING" in text          # pre_eol_info=2
+    assert "20-30%" in text           # life_est_a=3 is a BAND, not "3%"
+    assert "n/a" in text              # life_est_b=0
+
+
+def case_print_health_emmc_wear_not_read():
+    """emmc_wear_ok=0 must say so plainly, never print stale/zeroed fields
+    as if they were a real (if boring) reading -- same trap this module
+    already avoids for battery telemetry (case_print_health_no_axp_detected)."""
+    d = _FakeWordsBMC(_mkwords(emmc_wear_ok=0, emmc_pre_eol_info=0,
+                                emmc_life_est_a=0, emmc_life_est_b=0)).health_raw()
+    _out, text = _captured(print_health, d)
+    assert "not read" in text
+    assert "pre_eol" not in text
+
+
 _ST_CASES = [
     ("avail_32bit_sentinel_is_none",         case_avail_32bit_sentinel_is_none),
     ("avail_64bit_sentinel_is_none",         case_avail_64bit_sentinel_is_none),
@@ -495,6 +535,8 @@ _ST_CASES = [
     ("print_health_battery_real_readings_shown",
      case_print_health_battery_real_readings_shown),
     ("print_health_no_axp_detected",         case_print_health_no_axp_detected),
+    ("print_health_emmc_wear_shown",         case_print_health_emmc_wear_shown),
+    ("print_health_emmc_wear_not_read",      case_print_health_emmc_wear_not_read),
 ]
 
 
