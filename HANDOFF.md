@@ -180,11 +180,31 @@ unless resumed with the same state file).
         for already-swapped pages) — never do it while `swapon` is active.
    - Resume by starting at (1); the logic layer underneath it is already
      done and tested.
-4. **Wear counters in `bzdctl status`.** eMMC exposes wear via
-   `EXT_CSD[268]`/`[269]` (`DEVICE_LIFE_TIME_EST_A/B`) and `EXT_CSD[267]`
-   (`PRE_EOL_INFO`); not read anywhere today. SD wear is vendor-specific and
-   may not be exposed by this card at all — check, don't assume. Publish
-   next to temperature once read.
+4. **Wear counters in `bzdctl status` — DONE 2026-09-27 (eMMC only).**
+   `emmc_bio_read_wear()` reads EXT_CSD[267]/[268]/[269] (PRE_EOL_INFO,
+   DEVICE_LIFE_TIME_EST_TYP_A/B) via a new `emmc_bio_read_block()` helper
+   shared with `emmc_bio_read()` (CMD8 vs CMD17 — the exact same
+   single-block PIO drain, factored rather than copied). `bmc.c`'s
+   `bmc_health_snapshot()` calls it every snapshot, bracketed by
+   `vblk_emmc_trylock()`/`unlock()` (non-blocking — a failed trylock just
+   reports `emmc_wear_ok=0` for that round, never stale data), and
+   publishes it next to temperature in `bmc health`, `bmc_client.py`, and
+   the `bzdctl.py` HTML dashboard (protocol bumped to v1.2). Committed:
+   `0f556cc` (emmc_bio), `16ffae1` (bmc), `6cf8b58` (bmc_client/bzdctl).
+   - **Hardware-verified 2026-09-27**, board rebuilt+reset onto `6cf8b58`:
+     `bmc health` returns `pre_eol=1 life_est_a=1 life_est_b=1` (all
+     "normal"/lowest-wear band) consistently across 8 back-to-back calls,
+     several of them while the guest was actively reading the eMMC
+     (`g_reads` climbing in the VBK1 breadcrumbs at the same time) — no
+     hang, no `g_ioerrs` movement (stayed 0), guest booted clean and
+     `fsck -n /` on the eMMC root came back clean (92562 files, 0%
+     fragmentation, no errors). The controller-lock bracketing does not
+     visibly contend with guest I/O at this call rate.
+   - **SD wear NOT implemented** — confirmed genuinely unexplored, not
+     just undocumented (no ACMD13/SD_STATUS or ACMD51/SCR read anywhere in
+     `sd_bio.c`). Vendor-specific wear-leveling fields live in
+     vendor-reserved bits with no universal standard; scope this
+     separately if it turns out to matter for the SD card actually in use.
 5. **Guest cleanup + kernel rebuild.** `zfs.ko` is loaded on the guest for
    no reason (ARC eats RAM on a 2 GiB board) — drop it from the module set.
    Rebuild the kernel from the clean `bpi-m64-15.1` branch
