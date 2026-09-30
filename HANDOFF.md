@@ -158,68 +158,32 @@ unless resumed with the same state file).
      brownouts at that point), or a Mesa bug. First step: rerun the soak
      with the frequency capped (`sysctl dev.cpu.0.freq=816`, powerd off);
      if it passes, it is the power/thermal envelope, not the storage.
-3. **Compressed swap (vzram) — PAUSED 2026-09-27, on purpose. Logic layer
-   done, hardware wiring is deliberate tech debt (not started).**
-   - **Decided:** don't fix the exposed capacity to a permanent number —
-     grow it live under swap pressure instead, using the config-change
-     -interrupt resize path `freebsd-src-bpi`'s `virtio_blk.c` already
-     supports (see below). Start with whatever numbers get the mechanism
-     working; retune later from real usage, not from a guess made now.
-   - **DONE, committed, hosted-tested (`fdaafa9`, `f709ec1`):**
-     - `lz4.c`/`lz4.h` — LZ4 block codec, no board asm. `test_lz4.c`
-       compiles the real source directly (like `test_zstage.c` does for
-       `zstage.c`): round-trip across every fill pattern and edge size
-       0..4096, undersized-dst refusal, decompress() bounds safety under
-       truncation/byte-flip corruption (no OOB write ever — a flip inside
-       literal payload legitimately decodes to wrong bytes, this format
-       has no checksum, that's expected not a bug), and a hand-built
-       stream pinning down the match-offset guard.
-     - `vzram_pool.c`/`vzram_pool.h` — the compressed-page store: a slab
-       allocator (fixed classes 256/512/1024/2048/4096, per-class free
-       lists over a shared bump pointer — no cross-class coalescing, a
-       named limitation, not a bug) plus a slot table per logical 4 KiB
-       page whose `nslots` `vzram_pool_grow()` can raise without touching
-       pages that predate the grow. `test_vzram_pool.c` compiles the real
-       source (same reasoning as above): unwritten-page zero-read,
-       round-trip across mixed compressibility, 5000 overwrites of one
-       page (free-list reclaim), pool exhaustion leaves the page's PRIOR
-       content untouched, grow() leaves old pages alone and refuses to
-       shrink. Both are plain hosted C, no board dependency at all.
-   - **NOT STARTED — tech debt, explicitly deferred, not forgotten:**
-     1. `vblk_zram.c`, a new virtio-blk device wired to `vzram_pool.c`
-        (same shape as `vblk_sd.c`) — next free MMIO slot per
-        `board-config.xml`'s documented SPI gap 0x68..0x73 is 109/0x6D,
-        base `0x0A005000`. One lock across the whole compress/decompress
-        /copy path (this project's one proven bug class here — see the SD
-        gather postmortem) — do not skip that the way `vblk_sd.c`'s own
-        header warns against.
-     2. **Physical DRAM carve** via the existing `dtb-memory-size`
-        machinery (`board-config.xml` + `gen_config.py`, the same path
-        `guest_dram_2g` already uses) — a slice taken from BELOW the
-        ~113 MiB U-Boot reservation at the top of the 2 GiB (do NOT touch
-        that strip; repeat offender in this project's history). Stage-2
-        already maps the whole 2 GiB 1:1 regardless
-        (`STAGE2_DRAM_L1_BLOCKS`), so EL2 can use the un-advertised slice
-        as backing store with zero guest coordination. Size is an open
-        question again (the owner said "start with any numbers", meaning
-        get the mechanism working first — not that this step is free to
-        skip the conversation about the real number before it touches
-        `board-config.xml`).
-     3. **Config-change-interrupt-driven growth.** `virtio_blk.c`'s
-        `vtblk_config_change()` → `vtblk_resize_disk()` DOES support a live
-        GEOM-disk capacity change (confirmed in `freebsd-src-bpi`, not
-        assumed) — `vblk_zram.c` needs to raise `config.capacity` and
-        raise the interrupt when the pool crosses a fill threshold, capped
-        by the physical carve.
-     4. **Guest-side grow adoption.** The swap subsystem does NOT adopt a
-        grown device automatically — needs `swapoff`/`swapon` of that
-        device after a grow. Likely shape: a `devd(8)` rule matching a
-        GEOM disk-resize event, not a custom polling daemon. NOT written,
-        NOT researched beyond "this is probably the right primitive."
-        Shrinking an active swap device live is NOT safe (data loss risk
-        for already-swapped pages) — never do it while `swapon` is active.
-   - Resume by starting at (1); the logic layer underneath it is already
-     done and tested.
+3. **Compressed swap (vzram) — hypervisor side DONE 2026-09-30 (`08affdd`);
+   guest adoption NOT done, and needs a decision first.**
+   - `vblk_zram.c`: third guest disk `vtbd2` (0x0A005000, SPI 109) over
+     `vzram_pool.c`/`lz4.c`, backed by [0xB0000000, 0xB8000000) — the
+     `vzram` feature in `board-config.xml` shrinks `/memory` to 0x70000000
+     (guest now has 1792 MiB), `gen_config.py` applies the smallest enabled
+     `dtb-memory-size`. One lock over everything. Needs GUEST_DRAM_2G.
+   - Geometry: exposes 128 MiB, grows by 128 MiB (config-change IRQ, live
+     GEOM resize — verified 128 -> 256 MiB) up to 1 GiB while data proves
+     compressible (>= 3/4 of it written, pool <= 1/2 used). Starting
+     numbers; retune from real use.
+   - Measured: 100 MiB compressible written at 72 MB/s, random at 33 MB/s,
+     read back identical; as the ONLY swap, a 1700 MiB working set on
+     1523 MiB free RAM verified every page, 0 bad, ~70k swap I/Os,
+     `g_zr_errs`=0. Counters: `g_zr_*` via nm.
+   - **Not swapped on at boot.** Open questions, the owner's call:
+     (a) FreeBSD has no swap priorities — with both `vtbd0p4` (eMMC) and
+     `vtbd2` in fstab, pages interleave across both, so "zram first, eMMC
+     as overflow" is not expressible; pick one or accept the interleave.
+     (b) A grown disk is only used after `swapoff`/`swapon`, and swapoff
+     under the very pressure that caused the growth has to page everything
+     back in — the devd-rule idea in the old plan is unsafe as stated.
+     Likely better: stop growing live, size it once at boot.
+   - A test note that cost an hour: a read-only pass over a working set
+     bigger than RAM keeps every swapped-in page's slot, so it needs swap
+     the size of the whole set — OOM there is FreeBSD, not the device.
 4. **Wear counters in `bzdctl status` — DONE 2026-09-27 (eMMC only).**
    `emmc_bio_read_wear()` reads EXT_CSD[267]/[268]/[269] (PRE_EOL_INFO,
    DEVICE_LIFE_TIME_EST_TYP_A/B) via a new `emmc_bio_read_block()` helper
@@ -251,21 +215,23 @@ unless resumed with the same state file).
    (`/opt/bzdos/freebsd-src-bpi`, 12 commits on 15.1-RELEASE, byte-identical
    tree to what's running today, replaces the dirty `earlyboot-wt` lineage)
    with `-mcpu=cortex-a53`.
-6. **DE2 hardware-layer compositor (HWC-style) — the biggest perceived-speed
-   lever, do after eMMC/DMA/swap.** `bzkms` today does one zero-copy window;
-   DE2 has ~4 real hardware mixer layers. Both Android (SurfaceFlinger +
-   Hardware Composer: per-frame, hand as many surfaces as possible straight
-   to hardware planes, GPU-composite only the overflow into one client
-   layer) and iOS (render server + the SoC's display co-processor, same
-   idea, plus always-on-display composition with the GPU never woken) are
-   proof this is the standard mobile pattern, not a novel bet. Missing
-   piece is exactly the negotiation logic HWC provides — which surfaces get
-   a plane vs fall back to GPU — layered on top of the already-working
-   zero-copy `bzkms` path.
-7. **VE (video engine) hardware decode** — deferred; large (register-level
-   reverse-engineering from linux-sunxi, one path per codec, an ffmpeg
-   hwaccel module) and depends on #6's DE2 layer plumbing to land the
-   decoded frame on its own hardware plane with zero GPU/CPU touch.
+6. **DE2 hardware-layer compositor (HWC-style) — hypervisor half DONE
+   2026-09-30 (`ac87eea`); the compositor itself is guest work.** DE2 is
+   EL2's; HDMI goes through mixer1 (one VI + one UI channel). UI layers 0/1
+   are HUD/guest window; **scanout v2** now exposes UI layers 2 and 3 as
+   guest overlay planes (scanout.h `SCANOUT_R_OVL_*`: stage ADDR/PITCH/
+   SIZE/COORD, CTRL applies at vblank; XRGB/ARGB, global alpha). Verified at
+   register level from the guest via /dev/mem, rejects checked. **Not
+   verified what the panel shows** (left enabled once: a translucent copy
+   of the guest console at 1300,820 — look, then `python3 /tmp/ovl.py off`
+   on the guest). Left for the guest: bzkms planes + the negotiation logic.
+   Still hypervisor work if wanted: the VI channel (YUV + scaler), which is
+   what #7 needs to show decoded video without a copy.
+7. **VE (video engine) hardware decode — nothing left on the hypervisor
+   side.** The DTB node is present, its MMIO is identity-mapped to the
+   guest, clocks/SRAM-C are the guest's; dmesg: `video-codec@1c0e000 ...
+   (no driver attached)`. It is a guest driver (cedrus-like) plus the VI
+   plane above.
 8. **Second SoC port** (H616/H618/H6 first; Rockchip — RK3566/RK3588 —
    after) and the resulting core/soc/board split of this tree: do it when
    actually starting that port, not speculatively now.
