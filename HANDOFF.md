@@ -104,35 +104,50 @@ unless resumed with the same state file).
      `g_ioerrs=0`. The raw-device read test does NOT exercise the
      per-descriptor path (physio splits the buffer) — use file reads.
    - Single-reader throughput is unchanged (~10.8 MB/s eMMC); the point is
-     that the vCPU no longer spins in a FIFO drain loop. The completion
-     wait is still a poll (`emmc_dma_wait_complete`), so the vCPU is not
-     yet actually handed back to the guest during a transfer — wiring the
-     IDMAC completion IRQ is the step that turns this into real overlap.
-   - **IDMAC IRQ, phase 1 (2026-09-30, `1f23bb8` + `8b17cbc`): wired, gives
-     NOTHING measurable yet, and cannot until phase 2.** SPI94 (eMMC) and
-     SPI92 (SD) are armed at the GICD, EL2-owned (no guest driver attaches
-     to either node), with a 32/tick storm throttle; the completion wait
-     executes `wfi` between polls. Measured on hardware:
-     - The IRQ is never *taken* in steady state, and that is correct by
-       construction: `g_vblk_async_ready=0` (CPU2 is a guest vCPU), so every
-       DMA runs synchronously inside CPU0's trap handler with DAIF.I=1. The
-       line goes pending, the poll sees IDST, W1C-clears it, the line drops
-       before `eret`. It can at most wake the `wfi`.
-     - It does not even matter for that: with SPI92/94 masked by priority
-       (IPRIORITYR=0xF0 vs PMR) throughput was identical — 64 KiB raw reads
-       10.7/16.6 MB/s (eMMC/SD) vs 10.6/17.0 on; 8 KiB (2-block DMA)
-       ~1 ms/request both ways. Something else already wakes `wfi` in
-       well under a tick (guest timer, other pending PPIs).
-     - The boot-time counts (`g_dma_irqs`=1766 vs `g_dma_ok`=1081;
-       SD 12258 vs 4990 — more IRQs than transfers; throttles 85/993) are a
-       level-line storm taken while CPU0 runs with IRQs unmasked, not
-       completions. Harmless (throttle holds), but it is the only thing the
-       IRQ currently does.
-     - Keep it: the dispatch path is proven (breadcrumb == `irq_counter[]`
-       exactly), and **phase 2** needs it — return to the guest right after
-       arming, complete the request (used-ring publish + virtio IRQ) from
-       this handler with the handler W1C-clearing IDST itself. Only then
-       does the vCPU actually overlap with the transfer.
+     that the vCPU no longer spins in a FIFO drain loop. (The completion
+     wait was still a poll then; the IRQ step below removed that.)
+   - **IDMAC completion IRQ — DONE 2026-09-30 (phase 2: `addef30`,
+     `77a6eef` eMMC; `a88c542`, `868d678` SD).** An eligible request (whole
+     sectors, 2..128 of them) is queued (16 deep) and the trap returns to
+     the guest at once; the queue owns the controller lock while non-empty,
+     and whoever sees a transfer end publishes it and starts the next. That
+     is normally the IDMAC IRQ (SPI94 eMMC / SPI92 SD, EL2-owned, CPU0), with
+     every core's tick and the controller-lock spin as backstops — needed,
+     because the IRQ cannot be taken while CPU0 is inside a trap and the
+     card-busy tail after AUTO_STOP raises nothing. Split-phase controller
+     API: `emmc_bio_dma_start/poll`, `sd_bio_dma_start/poll`; the old
+     synchronous functions are untouched and still serve everything
+     ineligible. A failed transfer is re-served via `serve_data()`.
+     Live switches: `g_vblk_idma_on`, `g_vblk_sd_idma_on` (0 = old path).
+     Measured on hardware, A/B in the same boot, 4 CPU-bound jobs alongside:
+     - eMMC: 99% of transfers finish inside the IRQ; reads under load
+       10.36 -> 10.7-10.9 MB/s; the jobs lose ~0.14 s instead of ~0.24 s.
+       Raw md5 identical on/off; 4 x 256 MiB concurrent writes to the
+       swapped-off swap partition read back identical; `filerace.sh` 314
+       files x2 passes, 0 diffs; 187k queued transfers, 0 re-serves,
+       `g_ioerrs`=0.
+     - SD: 99.9% inside the IRQ; raw reads 17.1 -> 20.1 MB/s even with no
+       other load (the next request starts from the completion, no trap
+       round-trip); the jobs lose ~0.09 s instead of ~0.2 s. SD gained the
+       used-ring lock, InterruptACK lost-completion re-notify and locked
+       reset teardown the eMMC side already had — async completions need
+       them. Raw md5 identical on/off; `sdwr.sh` 40 x 64 MiB written
+       to /opt and verified by 4 readers, 0 bad; ~82k queued transfers,
+       0 re-serves.
+     - Both at once (eMMC + SD raw readers, SD file write/verify, CPU
+       load): raw md5 identical to a quiet re-read, 0 bad files.
+     - Open, harmless: the SD line still fires more often than transfers
+       end (`g_sd_dma_irqs` 130k vs 109k DMA) -- a synchronous DMA on
+       another core, or a handler that loses the queue lock, leaves the
+       level line up until the 32/tick throttle masks it. Only the
+       throttle's cost; nothing is lost. Not soaked beyond these tests.
+     - Phase 1 on its own (arming the SPI, `wfi` in the poll) measured
+       nothing: every DMA ran inside a trap with IRQs masked, so the IRQ was
+       never taken and `wfi` was woken by other sources anyway.
+     - Found on the way, not ours: `reliable_load.py` wrote 1 into every
+       0x40 of 0x4201d000..0x42030000 of the freshly booted hypervisor on
+       every reload (fixed `7a1f302`, see its message) — suspect it for any
+       odd behaviour after a reload before that commit.
    - **Not yet soaked.** `soak72.py --profile mixed` stopped at ~15 min
      twice, on a pure-PIO build and on the IDMAC build alike: `limabench`
      SIGSEGV (rc=139) in Mesa's CPU-side shader linker
