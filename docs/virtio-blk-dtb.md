@@ -114,3 +114,21 @@ breadcrumb window (`bc 0x50005000`) and the checklist in
 `docs/virtio-blk-integration.md §6`. Ensure the guest has enabled INTID 137 in
 `GICD_ISENABLER` (part of `bus_setup_intr` on the node) — otherwise completions
 set-pend but never deliver.
+
+## SPI allocation in the free gap (as of 2026-09-30)
+
+`board-config.xml`'s `<devices>` is the source of truth, and `gen_config.py`
+refuses a duplicate or an SPI outside `0x68..0x73`. Current use:
+
+| SPI | INTID | device | base |
+|---|---|---|---|
+| 105 (0x69) | 137 | vblk_emmc (`vtbd0`) | 0x0A000000 |
+| 106 (0x6A) | 138 | vnet_emac | 0x0A001000 |
+| — | — | scanout (no IRQ, no DTB node) | 0x0A002000 |
+| 107 (0x6B) | 139 | vinput | 0x0A003000 |
+| 108 (0x6C) | 140 | vblk_sd (`vtbd1`) | 0x0A004000 |
+| 109 (0x6D) | 141 | vblk_zram (`vtbd2`, feature `vzram`) | 0x0A005000 |
+
+`vtbdN` follows DTB child order, which `gen_config.py` keeps sorted by
+address (see `reorder_virtio_nodes()`), so a new disk at a higher address
+never renumbers the existing ones.

@@ -1,3 +1,32 @@
+# Handoff — 2026-09-30: hypervisor side of the roadmap is done on this board (read this first)
+
+What changed today, all hardware-verified unless marked, details in the
+numbered items of the 2026-09-27 section below:
+
+- **IDMAC completion IRQ, both controllers (item 2).** Eligible requests are
+  queued and completed from the IDMAC IRQ; the vCPU returns at once. SD raw
+  reads 17.1 -> 20.1 MB/s; CPU jobs lose half as much time to I/O on both.
+  An IRQ no queued transfer owns is masked at once (`49ff44d`).
+- **vzram (item 3), hypervisor side.** `vtbd2`, 128 MiB growing to 1 GiB,
+  LZ4 in [0xB0000000, 0xB8000000); guest RAM 1920 -> 1792 MiB. **Not swapped
+  on at boot** — and note the tension with the framing below: swap here is
+  meant to be idle insurance (target 0), so whether 128 MiB of RAM should
+  sit behind it at all is the owner's call. `docs/vzram.md`.
+- **DE2 overlay planes (item 6), hypervisor half.** scanout v2 hands the
+  guest UI layers 2/3 of the HDMI mixer. Register-level verified; **what the
+  panel shows is not yet verified.** `docs/zero-copy-scanout.md` §7.
+- **VE (item 7): no hypervisor work exists** — node, MMIO and clocks are the
+  guest's; it needs a guest driver.
+- **Tooling:** `reliable_load.py` no longer writes 1s into the freshly
+  booted image (`7a1f302` — it had on every reload); repl/fbsd/gdb/hdmi link
+  again (`61c829d`). Build with `LC_ALL=C`: gcc's Russian "ошибка" slipped
+  past a grep for "error" twice today.
+
+Hypervisor work left on this board: the VI channel (YUV + scaler) if video
+should reach the panel without a copy; a long soak of the IDMAC queues;
+U-Boot's MUSB gadget root cause (a ~5 h catch soak). Everything else on the
+roadmap is guest work: item 5, bzkms planes + HWC logic, a VE driver.
+
 # Handoff — 2026-09-27: the board is the reference "weak mobile" benchmark; agreed roadmap below (read this first)
 
 ## Framing agreed with the owner
