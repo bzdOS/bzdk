@@ -73,6 +73,13 @@
          implementation would cost ~2 MiB of page tables per GiB instead and
          retire this trade entirely. -->
     <feature name="guest_dram_2g" mkvar="GUEST_DRAM_2G" enabled="true" dtb-memory-size="0x78000000"/>
+    <!-- vzram: compressed-RAM swap disk (vblk_zram.h, HANDOFF item 3). Backed
+         by the top 128 MiB of the guest's DRAM, [0xB0000000, 0xB8000000)
+         (hv_addrmap.h's HVMAP_VZRAM_*), so /memory shrinks by exactly that:
+         gen_config.py applies the SMALLEST enabled dtb-memory-size. Needs
+         guest_dram_2g (compile error otherwise). The size is a starting
+         number, meant to be retuned from real swap use. -->
+    <feature name="vzram" mkvar="VZRAM" enabled="true" dtb-memory-size="0x70000000"/>
 
     <!-- Guest hardware-enablement features (2026-08-27 survey of the "dark"
          A64 peripheral list, docs/guest-hw-enablement.md). Each flips ONLY a
@@ -216,6 +223,7 @@
     <virtio-mmio name="scanout"   base="0x0A002000" spi="none" device-id="none" enabled-by="hv_hdmi" no-dtb-node="true" owner="hv"/>
     <virtio-mmio name="vinput"    base="0x0A003000" spi="107" device-id="18" always="true" owner="hv"/>
     <virtio-mmio name="vblk_sd"   base="0x0A004000" spi="108" device-id="2"  always="true" owner="hv"/>
+    <virtio-mmio name="vblk_zram" base="0x0A005000" spi="109" device-id="2"  enabled-by="vzram" owner="hv"/>
   </devices>
 
   <!-- Real A64 silicon nodes whose `status` gen_config.py flips to track one

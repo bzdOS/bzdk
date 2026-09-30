@@ -1136,10 +1136,14 @@ def main():
     # that stage-2 no longer maps means the guest faults the moment it allocates
     # up there, which is exactly how it presented (translation fault, level 1,
     # IPA 0xBFFF0000) when the two halves were briefly out of step.
+    # The SMALLEST one wins: each such feature is a ceiling (guest_dram_2g's
+    # U-Boot margin, vzram's carve below it), and taking whichever came
+    # last in the file would make the result depend on XML order.
     want = None
     for name, f in features.items():
         if f["enabled"] and f["dtb_memory_size"]:
-            want = f["dtb_memory_size"]
+            if want is None or int(f["dtb_memory_size"], 0) < int(want, 0):
+                want = f["dtb_memory_size"]
     ensure_memory_size(dtb_path, dts_text, want or DEFAULT_MEMORY_SIZE,
                        args.dry_run)
 
