@@ -946,6 +946,18 @@ static void sd_dma_disarm(void)
 	wreg(REG_DMAC, 0);
 }
 
+static uint32_t g_sd_dma_irqs;   /* sdbc[1]: real IDMAC completion IRQs
+                                  * observed (gic_timer.c's SD_DMA_IRQ_INTID
+                                  * arm) -- diagnostic only, see
+                                  * emmc_bio.c's g_dma_irqs comment */
+
+void sd_bio_dma_irq_note(void)
+{
+	sdbc(1, ++g_sd_dma_irqs);
+}
+
+/* WFI between iterations, same rationale and same unchanged correctness
+ * logic as emmc_dma_wait_complete() -- see its 2026-09-30 comment. */
 static int sd_dma_wait_complete(uint32_t is_read, uint32_t *ri_out)
 {
 	uint64_t start = rd_cntpct();
@@ -969,6 +981,7 @@ static int sd_dma_wait_complete(uint32_t is_read, uint32_t *ri_out)
 			*ri_out = ri;
 			return -1;
 		}
+		__asm__ volatile("wfi" ::: "memory");
 	}
 }
 

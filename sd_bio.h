@@ -34,6 +34,19 @@
 #define BZDOS_SD_BIO_H
 #include <stdint.h>
 
+/* Real hardware SPI for mmc@1c0f000 (SMHC0/SD), per the guest DTB's own
+ * `interrupts = <0 0x3c 0x04>` (bananapi-min.dts) -- SPI 60, INTID 32+60.
+ * Same "EL2-owned unconditionally" reasoning as EMMC_DMA_IRQ_INTID
+ * (emmc_bio.h): the guest's own dmesg confirms "no driver attached" for
+ * this node (verified live 2026-09-30). */
+#define SD_DMA_IRQ_SPI    60u
+#define SD_DMA_IRQ_INTID  (32u + SD_DMA_IRQ_SPI)   /* 92 */
+
+/* Called from gic_timer.c's IRQ dispatch (SD_DMA_IRQ_INTID arm) every time
+ * the real hardware SPI fires -- see emmc_bio_dma_irq_note()'s comment,
+ * same contract, same "no controller register touched here" safety. */
+void sd_bio_dma_irq_note(void);
+
 /* One-time (idempotent) SD-card bring-up: PF0..5 pinmux -> mmc0, 400 kHz init
  * clock, controller reset, then GO_IDLE / SEND_IF_COND / ACMD41(HCS) /
  * ALL_SEND_CID / SEND_RELATIVE_ADDR / SEND_CSD / SELECT / SET_BLOCKLEN(512).

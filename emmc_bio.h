@@ -29,6 +29,25 @@
 #define BZDOS_EMMC_BIO_H
 #include <stdint.h>
 
+/* Real hardware SPI for mmc@1c11000 (SMHC2/eMMC), per the guest DTB's own
+ * `interrupts = <0 0x3e 0x04>` (bananapi-min.dts) -- SPI 62, INTID 32+62.
+ * The guest's own DTB node for this exact device is "okay" but FreeBSD's
+ * dmesg confirms "no driver attached" (verified live 2026-09-30: aw_mmc
+ * only ever attaches to mmc@1c10000, the WiFi SDIO controller) -- so this
+ * SPI is EL2-owned unconditionally, same reasoning gic_timer.c already
+ * gives MUSB_IRQ_INTID/HDMI_TCON1_IRQ_INTID for their real device SPIs. */
+#define EMMC_DMA_IRQ_SPI    62u
+#define EMMC_DMA_IRQ_INTID  (32u + EMMC_DMA_IRQ_SPI)   /* 94 */
+
+/* Called from gic_timer.c's IRQ dispatch (EMMC_DMA_IRQ_INTID arm) every
+ * time the real hardware SPI fires -- purely a diagnostic counter (EBIO
+ * breadcrumb slot [31]), proving on hardware that the IDMAC completion IRQ
+ * actually fires once per DMA transfer. Does NOT touch REG_IDST/any
+ * controller register (that stays exclusively the job of whichever core
+ * holds the eMMC controller lock and is inside emmc_dma_wait_complete()) --
+ * safe to call from ANY core's IRQ context with no locking at all. */
+void emmc_bio_dma_irq_note(void);
+
 /* One-time (idempotent) controller bring-up: PC5 pinmux -> func3, 400 kHz
  * init clock, controller reset, GO_IDLE/SEND_OP_COND/ALL_SEND_CID/SET_RCA/
  * SEND_CSD/SELECT/SET_BLOCKLEN(512) card-identification sequence.
