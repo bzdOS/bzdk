@@ -1,5 +1,9 @@
 # bzdOS microkernel — progress checkpoint (internal task, Chimp / BPI-M64 / A64)
 
+> **2026-09-30:** this file is a historical checkpoint (last rewritten
+> 2026-08-11). Current state lives at the top of `HANDOFF.md`; the
+> milestone list in `ROADMAP.md` ("Срез на 2026-09-30").
+
 **MILESTONE 2026-08-10 — TWO guests run concurrently on real hardware.** A real
 Zephyr RTOS v4.4.1 image runs on CPU3 (its own banner, its own heartbeats,
 climbing steadily) at the same time as the FreeBSD guest on CPU0 serves `ssh` and

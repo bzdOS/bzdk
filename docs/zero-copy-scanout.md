@@ -747,3 +747,53 @@ Collected in one place, per the task's own "do not pad" instruction:
 No code path in this feature has ever executed on real hardware. Every claim
 above that sounds load-bearing is a citation to a specific file and line this task
 read or a command this task actually ran, not a hardware measurement.
+
+## 9. Scanout v2 — guest overlay planes (2026-09-30, `ac87eea`)
+
+This document predates the guest window (UI1 layer 1, `hdmi_guestwin_*`) and
+the real vblank mirror; both have long been live. Version 2 adds planes.
+
+**Why these layers.** HDMI on the A64 goes through mixer1 (mux1), which has
+one VI channel (YUV, scaler) and one UI channel with four layers. Layer 0 is
+the HUD, layer 1 the guest window; 2 and 3 were idle. Overlay plane `p`
+(0..1) is UI1 layer `2 + p`. Same channel as the guest window, so they
+composite inside it by layer index (3 over 2 over 1 over 0) and need no
+blender or route change.
+
+**Registers** (`scanout.h`, `SCANOUT_VERSION` = 2):
+
+| offset | name | |
+|---|---|---|
+| 0x50 | `OVL_NUM` | R: planes (2) |
+| 0x54 | `OVL_COUNT` | R: accepted applies |
+| 0x58 | `OVL_REJECT` | R: rejected applies |
+| 0x60 + 0x20·p + 0x00 | `ADDR` | RW, staged: physical base |
+| … + 0x04 | `PITCH` | RW, staged: bytes per line |
+| … + 0x08 | `SIZE` | RW, staged: `w \| h << 16` |
+| … + 0x0C | `COORD` | RW, staged: `x \| y << 16`, output pixels |
+| … + 0x10 | `CTRL` | RW: **the write applies** the staged state |
+
+`CTRL` bits (`hdmi.h`): `HDMI_OVL_EN` (bit 0; CTRL without it turns the plane
+off), `HDMI_OVL_ARGB` (bit 1: ARGB8888 with per-pixel alpha, else XRGB8888),
+`HDMI_OVL_GALPHA_ON` (bit 2: apply bits 31:24 as a global alpha, combined
+with per-pixel alpha when both are set). An apply is one `DE_GLB_DBUFF`
+strobe, i.e. it lands at the next vblank.
+
+**Refused** (`OVL_REJECT`, plane left as it was): zero size, a rectangle
+past the output, pitch not a multiple of 4 or below `w*4`, and any address
+the guest window itself would be refused (`scanout_addr_allowed()`: outside
+guest DRAM, HV image, hv-scratch, hv-fb) — which now also excludes the
+vzram slice and U-Boot's top, both mapped by stage-2 but not guest memory.
+
+**Verified** from the guest (root, `/dev/mem` mmap of `0x0A002000`): layer 2
+read back exactly as requested (attr `c0000403` = enable, global alpha
+0xC0, XRGB; 560x200 at 1300,820 showing the guest window's buffer); an
+address in the vzram slice and an off-screen rectangle were both refused;
+layer 3 untouched. **Not verified: the panel.** Nobody has looked at the
+monitor yet, and `screenshot.py` composes only the HUD and the guest window
+from register state.
+
+**Left for the guest:** planes in bzkms and the HWC-style negotiation
+(which surface gets a plane, which falls back to GPU composition). Left for
+the hypervisor if video should reach the panel without a copy: the VI
+channel (YUV formats, the VSU scaler, CSC) as a third kind of plane.
