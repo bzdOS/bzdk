@@ -1628,6 +1628,9 @@ gic_timer_irq(struct el2_frame *frame)
 	 * needs resetting is the right core to do it. Unconditional idempotent
 	 * writes, same reasoning as the MUSB/HDMI refreshes. */
 	gt->emmc_dma_irqs = 0;
+	/* Backstop for an IRQ-completed IDMAC transfer: the card-busy tail
+	 * raises no interrupt, and CPU0 may be inside a trap (vblk_emmc.c). */
+	emmc_bio_dma_tick();
 	GICD_ISENABLER(GICD_WORD(EMMC_DMA_IRQ_INTID)) =
 	    (1u << GICD_BIT(EMMC_DMA_IRQ_INTID));
 	gt->sd_dma_irqs = 0;
