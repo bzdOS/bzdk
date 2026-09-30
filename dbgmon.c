@@ -1084,6 +1084,8 @@ static void cmd_call(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_
  * memory AND flush the I-cache for that line, so the change is visible to
  * the instruction stream immediately. Use for hot-patching code without
  * a board reset. */
+extern void scrub_accept(uint64_t pa) __attribute__((weak));
+
 static void cmd_patch(uint64_t pa, uint32_t word)
 {
 	volatile uint32_t *p = (volatile uint32_t *)(unsigned long)pa;
@@ -1095,6 +1097,8 @@ static void cmd_patch(uint64_t pa, uint32_t word)
 		"dsb ish\n\t"
 		"isb"
 		:: "r"(p) : "memory");
+	if (scrub_accept)
+		scrub_accept(pa);   /* intentional: keep the scrubber from undoing it */
 	cputs("patched "); print_addr(pa); cputs(" = "); print_hex32(word); newline();
 }
 

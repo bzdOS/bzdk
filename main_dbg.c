@@ -18,6 +18,7 @@
  * bounded ~16s, no human, no manual reset. See SESSION-RULES.md. */
 #include <stdint.h>
 #include "emac.h"
+#include "scrub.h"
 #include "exceptions.h"
 #include "kload.h"
 #include "stage2.h"
@@ -273,6 +274,7 @@ int main(void)
 	 * has run, so ordering here is belt-and-braces, not load-bearing. */
 	trace_init();
 	profiler_init();
+	scrub_init();              /* golden copy of .text/.rodata, see scrub.h */
 	dbgmon_init();
 	bmc_init();                /* lay down BMC1 breadcrumb + first health record */
 	/* Zero the per-core fault-attribution window (el2_exc.c's pcore_bc): it

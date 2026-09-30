@@ -27,6 +27,8 @@ SECTIONS
     .rodata : {
         *(.rodata)
         *(.rodata.*)
+        . = ALIGN(8);
+        _rodata_end = .;           /* scrub.c covers [_text_start, here) */
     } > RAM
 
     .data : {
