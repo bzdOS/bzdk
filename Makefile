@@ -451,9 +451,10 @@ DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o w
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \
             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o \
-            $(SNAP_OBJS) $(ZRAM_OBJS)
-$(DBG_ELF): $(DBG_OBJS) link.ld
+            scrub.o $(SNAP_OBJS) $(ZRAM_OBJS)
+$(DBG_ELF): $(DBG_OBJS) link.ld scrub_crc.py
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
+	python3 scrub_crc.py $@
 	$(SIZE) $@
 $(DBG_BIN): $(DBG_ELF)
 	$(OBJCOPY) -O binary $< $@
