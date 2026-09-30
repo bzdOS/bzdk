@@ -132,6 +132,24 @@ int emmc_bio_write_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 int emmc_bio_read_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 int emmc_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 
+/* Split-phase form of the pair above (IRQ phase 2, see emmc_bio.c):
+ * start() issues the command and returns; poll() advances it without
+ * blocking longer than spin_us and returns EMMC_DMA_RUNNING until it is
+ * finished, then 0 or the same packed failure code the synchronous pair
+ * returns (controller already settled). -103 = none / one already in
+ * flight. The eMMC lock must be held from start() until poll() != RUNNING. */
+#define EMMC_DMA_RUNNING 1
+int emmc_bio_dma_start(uint32_t is_read, uint32_t lba, uint64_t buf_pa,
+                       uint32_t nblk);
+int emmc_bio_dma_poll(uint32_t spin_us);
+
+/* The completion owner's entry point, called from the IDMAC IRQ
+ * (emmc_bio_dma_irq_note) and from every core's tick (emmc_bio_dma_tick,
+ * the backstop for the BUSY phase, which raises no interrupt). */
+#define EMMC_DMA_IRQ_SPIN_US 1000u   /* the IRQ's poll budget, see vblk_emmc.c */
+void emmc_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us));
+void emmc_bio_dma_tick(void);
+
 /* Arm/disarm WRITE fault injection. OFF by default; nothing in a normal boot
  * touches this.
  *
