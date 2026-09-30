@@ -2015,9 +2015,31 @@ static void emmc_dma_disarm(void)
 	wreg(REG_DMAC, 0);
 }
 
+/* Who finishes a split-phase transfer (vblk_emmc.c). A hook, not a direct
+ * call, so every build that links this file but not vblk_emmc.o still
+ * links. NULL until the owner registers. */
+static void (*volatile g_dma_done_hook)(uint32_t spin_us);
+
+void emmc_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us))
+{
+	g_dma_done_hook = fn;
+}
+
 void emmc_bio_dma_irq_note(void)
 {
+	void (*fn)(uint32_t) = g_dma_done_hook;
+
 	ebio_bc(31, ++g_dma_irqs);
+	if (fn)
+		fn(EMMC_DMA_IRQ_SPIN_US);
+}
+
+void emmc_bio_dma_tick(void)
+{
+	void (*fn)(uint32_t) = g_dma_done_hook;
+
+	if (fn)
+		fn(0);
 }
 
 /* Stall-based wait for the IDMAC's own completion (IDST TX/RX_INT) alongside
@@ -2187,6 +2209,166 @@ fail_closed:
 	 * emmc_bio_write()/emmc_bio_write_multi(). */
 	ebio_fail_settle_full(0);
 	return -2;
+}
+
+/* Split-phase IDMAC (HANDOFF item 2, IRQ phase 2): the same register
+ * sequence as emmc_bio_read_dma()/write_dma() above, cut at the one place
+ * the caller has to wait. emmc_bio_dma_start() is everything up to and
+ * including the CMDR write; emmc_bio_dma_poll() is everything after it,
+ * one non-blocking step at a time, so vblk_emmc.c can return to the guest
+ * while the transfer runs and finish it from the completion IRQ.
+ *
+ * Deliberately NOT a rewrite of the synchronous pair: those stay the
+ * hardware-verified path (the sync fallback, dbgmon `call`, SD's mirror),
+ * and this is compared against them rather than replacing them.
+ *
+ * Two phases, because a transfer has two waits and only one raises an IRQ:
+ *   DATA -- IDST RX/TX_INT plus RINT DATA_OVER (the IDMAC IRQ fires here);
+ *   BUSY -- AUTO_STOP's CMD12 is R1b, the card holds DAT0 until it is done
+ *           (programming, for a write). Nothing interrupts on that, so it
+ *           is polled, from the IRQ handler's short spin or the next tick.
+ * Timeouts are the synchronous path's own caps, measured from the start of
+ * each phase, and a cap must be seen exceeded on two separate polls before
+ * it counts -- the same CNTPCT two-read discipline as wait_card_idle_timed(),
+ * for the same reason (consecutive reads have disagreed by seconds here).
+ *
+ * The caller must hold the eMMC lock from start until poll returns != 1.
+ * Only one transfer can be in flight: start refuses (-103) while one is. */
+#define ADMA_DATA 0u
+#define ADMA_BUSY 1u
+static struct {
+	volatile uint32_t active;
+	uint32_t is_read, phase, total, over;
+	uint64_t buf_pa, t0;
+} g_adma;
+
+int emmc_bio_dma_start(uint32_t is_read, uint32_t lba, uint64_t buf_pa,
+                       uint32_t nblk)
+{
+	uint32_t total, ndesc;
+
+	if (g_adma.active)
+		return -103;
+	if (nblk < 2 || nblk > EMMC_MULTI_MAX_BLOCKS)
+		return -101;
+	total = nblk * 512u;
+	/* Same whole-cache-line rule as emmc_bio_read_dma(). */
+	if (is_read && ((buf_pa | total) & 63u))
+		return -102;
+
+	wait_card_idle_timed(EMMC_SETTLE_BUSY_TIMEOUT_MS);
+
+	ndesc = emmc_dma_build_desc(buf_pa, total);
+	emmc_dma_cmo(buf_pa, total);
+	emmc_dma_arm(ndesc);
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, total);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, lba);
+
+	g_adma.is_read = is_read ? 1u : 0u;
+	g_adma.phase = ADMA_DATA;
+	g_adma.total = total;
+	g_adma.over = 0;
+	g_adma.buf_pa = buf_pa;
+	g_adma.t0 = rd_cntpct();
+	g_adma.active = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	wreg(REG_CMDR, is_read ? CMD18_READ_CMDR : CMD25_WRITE_CMDR);
+	return 0;
+}
+
+/* 1 = over the phase's cap on this poll, confirmed by the previous one too. */
+static int adma_timed_out(uint32_t ms)
+{
+	uint64_t now = rd_cntpct();
+	uint64_t el = (now >= g_adma.t0) ? (now - g_adma.t0) : 0ull;
+
+	if (el <= ms_to_ticks(ms)) {
+		if (g_adma.over)
+			ebio_bc(18, ++g_cnt_anom);
+		g_adma.over = 0;
+		return 0;
+	}
+	return ++g_adma.over >= 2u;
+}
+
+/* One step. 1 = still running, 0 = done OK, anything else = done with the
+ * synchronous pair's own packed failure code, controller already settled. */
+static int adma_step(void)
+{
+	uint32_t ri = 0;
+
+	if (g_adma.phase == ADMA_DATA) {
+		uint32_t want = g_adma.is_read ? IDST_RX_INT : IDST_TX_INT;
+		uint32_t idst = rreg(REG_IDST);
+
+		ri = rreg(REG_RINT);
+		if ((idst & IDST_ERROR) ||
+		    (ri & (RINT_READ_ERR_MASK | RINT_RESP_TIMEOUT)))
+			goto fail_open;
+		if (!((idst & want) && (ri & RINT_DATA_OVER))) {
+			if (adma_timed_out(EMMC_WRITE_DATA_TIMEOUT_MS))
+				goto fail_open;
+			return 1;
+		}
+		/* W1C drops the IDMAC's level line: this ack is what ends the
+		 * interrupt, the GIC EOI alone does not. */
+		wreg(REG_IDST, idst);
+		g_adma.phase = ADMA_BUSY;
+		g_adma.over = 0;
+		g_adma.t0 = rd_cntpct();
+	}
+
+	if (rreg(REG_STAR) & STAR_CARD_BUSY) {
+		if (adma_timed_out(EMMC_WRITE_BUSY_TIMEOUT_MS))
+			goto fail_closed;
+		return 1;
+	}
+	if (g_adma.is_read) {
+		ri = rreg(REG_RINT);
+		if (ri & RINT_READ_ERR_MASK)
+			goto fail_closed;
+	}
+
+	emmc_dma_disarm();
+	if (g_adma.is_read)
+		emmc_dma_cmo(g_adma.buf_pa, g_adma.total);
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_adma.active = 0;
+	return 0;
+
+fail_open:
+	emmc_dma_disarm();
+	ebio_fail_settle_full(1);
+	g_adma.active = 0;
+	return (int)(0x60000000u | (ri & 0x3fffu));
+fail_closed:
+	emmc_dma_disarm();
+	ebio_fail_settle_full(0);
+	g_adma.active = 0;
+	return g_adma.is_read ? (int)(0x70000000u | (ri & 0x3fffu)) : -2;
+}
+
+int emmc_bio_dma_poll(uint32_t spin_us)
+{
+	uint64_t start = rd_cntpct();
+	uint64_t cap = ms_to_ticks(1) * spin_us / 1000ull;
+
+	if (!g_adma.active)
+		return -103;
+	for (;;) {
+		int rc = adma_step();
+		uint64_t now;
+
+		if (rc != 1)
+			return rc;
+		now = rd_cntpct();
+		if (now < start || now - start >= cap)
+			return 1;
+	}
 }
 
 /* Arm or disarm write fault injection. See the g_fi_* block for the rationale.
