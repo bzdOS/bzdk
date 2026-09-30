@@ -789,11 +789,47 @@ vzram slice and U-Boot's top, both mapped by stage-2 but not guest memory.
 read back exactly as requested (attr `c0000403` = enable, global alpha
 0xC0, XRGB; 560x200 at 1300,820 showing the guest window's buffer); an
 address in the vzram slice and an off-screen rectangle were both refused;
-layer 3 untouched. **Not verified: the panel.** Nobody has looked at the
-monitor yet, and `screenshot.py` composes only the HUD and the guest window
-from register state.
+layer 3 untouched. Verified on the panel by the owner (a translucent copy
+of the guest console where it was placed). `screenshot.py` still composes
+only the HUD and the guest window.
 
 **Left for the guest:** planes in bzkms and the HWC-style negotiation
 (which surface gets a plane, which falls back to GPU composition). Left for
-the hypervisor if video should reach the panel without a copy: the VI
-channel (YUV formats, the VSU scaler, CSC) as a third kind of plane.
+the hypervisor: nothing -- the VI channel is §10.
+
+## 10. Scanout v3 — the video plane (2026-09-30, `3aca0aa`)
+
+The HDMI mixer's VI channel (channel 0) as one guest plane: NV12, NV21,
+YUYV or XRGB8888, scaled by the VSU from SRC to DST, YUV converted by the
+channel's CCSC, drawn **over** everything (it feeds blender pipe 1; pipe 0
+is the UI channel). `hdmi_video_set()` in `hdmi.c`, contract in
+`scanout.h` (`SCANOUT_R_VID_*`, 0xA0..0xC8): stage ADDR0/1, PITCH0/1,
+SRC_SIZE, DST_COORD, DST_SIZE, FORMAT, then `VID_CTRL` (`HDMI_VID_EN`,
+`HDMI_VID_BT709`) applies at the next vblank.
+
+**Refused** (`VID_REJECT`): odd sizes for a subsampled format, SRC wider
+than 2048, a downscale beyond 2x in either axis (the 4-tap vertical filter
+and the VSU's line throughput both run out past that), DST off screen, a
+pitch below the width, and any Y or chroma plane address the guest window
+would be refused.
+
+**Where the numbers come from.** Register layout and programming order
+follow Linux's `sun8i_vi_layer.c`/`sun8i_vi_scaler.c`/`sun8i_csc.c` for
+this exact mixer (`sun50i_a64_mixer1_cfg`). The scaler coefficients and
+colour matrices are **computed**, not copied — those tables are GPL and
+come from the vendor BSP: a Catmull-Rom kernel, widened by the downscale
+ratio, 32 phases, 8 taps horizontal (offsets -3..+4) / 4 vertical
+(-1..+2), signed bytes summing to 64; BT.601/709 limited range from Kr/Kb
+in 1/1024. Both were checked against the hardware format: generated phases
+0/1/16 equal the reference words `00004000`/`000140ff`/`fc2424fc`, and the
+BT.601 matrix equals the known 1192/1634/-401/-832/2065.
+
+**One hardware fact found on the way:** the VSU drops coefficient writes
+while it is disabled — every coefficient read back as power-on garbage
+until the unit was enabled before loading them.
+
+**Verified:** from the guest via `/dev/mem` (an XRGB plane 1120x276 ->
+1680x414 programmed exactly; odd NV12, 3x downscale, a vzram address,
+off-screen and short pitch all refused), and on the panel by the owner:
+`hdmi_video_selftest()` (dbgmon `call`, NV12 colour bars 320x180 -> 960x540)
+shows the eight bars with correct colours.
