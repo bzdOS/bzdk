@@ -199,6 +199,8 @@
 #include "dbgmon.h"  /* dbgmon_service() — ditto */
 #include "musb.h"    /* MUSB_IRQ_SPI/MUSB_IRQ_INTID — cited constants, see musb.h */
 #include "usbacm.h"  /* usbacm_poll() — CPU1 MUSB-IRQ path, see musb_irq_arm_cpu1() */
+#include "emmc_bio.h" /* EMMC_DMA_IRQ_INTID/emmc_bio_dma_irq_note() — see dispatch below */
+#include "sd_bio.h"   /* SD_DMA_IRQ_INTID/sd_bio_dma_irq_note() — ditto, SD controller */
 #include "sdbox.h"   /* sdbox_record() on the tick's two silent reset paths */
 #include "emac.h"    /* emac_link_watchdog() — link self-heal, see the CPU1 tick block */
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
@@ -511,6 +513,21 @@ struct gt_percpu {
 	 * 2026-08-26, when they were the whole story rather than a corner case. */
 	uint32_t musb_wrong_core;
 	uint32_t hdmi_wrong_core;
+	/* eMMC/SD IDMAC completion IRQ storm throttles (2026-09-30), same shape
+	 * and same defensive reasoning as the MUSB/HDMI pair above: a
+	 * level-triggered device line that fails to fully de-assert at the
+	 * source is a failure mode THIS PROJECT HAS HIT TWICE ALREADY on this
+	 * exact GIC, so the budget is applied preemptively rather than waiting
+	 * to reproduce it a third time. Unlike MUSB/HDMI, no _wrong_core
+	 * counter: this IRQ is intentionally NOT core-targeted (see
+	 * gic_timer_init()'s arm comment) -- whichever core's CPU interface
+	 * takes it is fine, since the handler never touches a controller
+	 * register (see emmc_bio_dma_irq_note()'s contract), only a per-core
+	 * GIC EOI/DIR and a cross-core DRAM breadcrumb counter. */
+	uint32_t emmc_dma_irqs;       /* IDMAC IRQs taken since the last tick   */
+	uint32_t emmc_dma_throttles;  /* times the budget ran out and we masked */
+	uint32_t sd_dma_irqs;
+	uint32_t sd_dma_throttles;
 #ifdef HV_HDMI
 	/* TCON1 vblank storm throttle, same shape as the MUSB pair above and
 	 * for the same reason (HDMI_IRQ_BUDGET_PER_TICK comment at the
@@ -871,6 +888,33 @@ gic_timer_init(uint32_t period_us)
 
 	GICD_IPRIORITYR_BYTE(TIMER_INTID) = (uint8_t)TIMER_PRIORITY;
 	GICD_ISENABLER(GICD_WORD(TIMER_INTID)) = (1u << GICD_BIT(TIMER_INTID));
+
+	/* --- eMMC/SD IDMAC completion SPIs (HANDOFF item 2's open follow-up,
+	 * 2026-09-30) -- EMMC_DMA_IRQ_INTID (94, SPI 62) / SD_DMA_IRQ_INTID (92,
+	 * SPI 60). Armed here, once, at boot, on CPU0 -- UNLIKE MUSB_IRQ_INTID/
+	 * HDMI_TCON1_IRQ_INTID (armed later, per-call, only for the vcpu1
+	 * build), because these two have no per-core-targeting requirement to
+	 * wait for (see the dispatch site's comment in gic_timer_irq() for why:
+	 * the eMMC controller lock already serializes which core is ever
+	 * actually waiting on a transfer, so whichever core's CPU interface
+	 * happens to take this SPI is fine). Deliberately NOT written to
+	 * GICD_ITARGETSR -- left as whatever firmware/ATF already set, same
+	 * "trust the existing device-SPI precedent" reasoning
+	 * musb_irq_arm_cpu1()'s TODO #1/#3 give, now doubly so since this one
+	 * doesn't even need a SPECIFIC core.
+	 *
+	 * TODO(board), UNVERIFIED like every new device-SPI wiring in this
+	 * file: confirm GICD_ICFGR reads level (DTB says <0 0x3e 0x04> / <0
+	 * 0x3c 0x04>, both level-high) and that irq_counter[94]/[96]
+	 * increments 1:1 with EBIO/SD breadcrumb DMA-transfer counts once
+	 * traffic flows -- see emmc_bio.c's g_dma_irqs / sd_bio.c's
+	 * g_sd_dma_irqs. */
+	GICD_IPRIORITYR_BYTE(EMMC_DMA_IRQ_INTID) = (uint8_t)TIMER_PRIORITY;
+	GICD_ISENABLER(GICD_WORD(EMMC_DMA_IRQ_INTID)) =
+	    (1u << GICD_BIT(EMMC_DMA_IRQ_INTID));
+	GICD_IPRIORITYR_BYTE(SD_DMA_IRQ_INTID) = (uint8_t)TIMER_PRIORITY;
+	GICD_ISENABLER(GICD_WORD(SD_DMA_IRQ_INTID)) =
+	    (1u << GICD_BIT(SD_DMA_IRQ_INTID));
 
 	/* --- GIC distributor group-enable + CPU interface ---------------- *
 	 * Factored into gic_timer_cpuif_init() (see gic_timer.h) so a caller
@@ -1383,6 +1427,50 @@ gic_timer_irq(struct el2_frame *frame)
 	}
 #endif
 
+	/* EMMC_DMA_IRQ_INTID (94, real "mmc@1c11000" SPI 62 — emmc_bio.h) /
+	 * SD_DMA_IRQ_INTID (92, real "mmc@1c0f000" SPI 60 — sd_bio.h): checked
+	 * early, same reason as MUSB/HDMI above — EL2-owned unconditionally
+	 * (the guest's own dmesg confirms "no driver attached" for either real
+	 * mmc node, verified live 2026-09-30), must never fall into
+	 * vgic_inject_hw()'s generic forwarding path (the guest has no ithread
+	 * for a device its own DTB status says is there but nothing claimed).
+	 *
+	 * No wrong-core drop, unlike MUSB/HDMI: this SPI is intentionally not
+	 * core-targeted (see the arm site in gic_timer_init()), so whichever
+	 * core's CPU interface takes it is the expected case, not a fault to
+	 * detect. Nothing here touches REG_IDST/REG_RINT — that stays
+	 * exclusively the job of whichever core holds the eMMC/SD controller
+	 * lock and is inside emmc_dma_wait_complete()/sd_dma_wait_complete();
+	 * this handler only EOI/DIRs the GIC-level interrupt and bumps a
+	 * diagnostic counter, so it carries none of the cross-core
+	 * controller-register hazard vblk_emmc.h's lock exists to prevent. */
+#define EMMC_DMA_IRQ_BUDGET_PER_TICK 32u
+#define SD_DMA_IRQ_BUDGET_PER_TICK   32u
+	if (intid == EMMC_DMA_IRQ_INTID) {
+		emmc_bio_dma_irq_note();
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		if (++gt->emmc_dma_irqs >= EMMC_DMA_IRQ_BUDGET_PER_TICK) {
+			/* Same self-healing mask-at-the-distributor shape as MUSB's
+			 * throttle — the tick below re-enables this unconditionally. */
+			GICD_ICENABLER(GICD_WORD(EMMC_DMA_IRQ_INTID)) =
+			    (1u << GICD_BIT(EMMC_DMA_IRQ_INTID));
+			gt->emmc_dma_throttles++;
+		}
+		return;
+	}
+	if (intid == SD_DMA_IRQ_INTID) {
+		sd_bio_dma_irq_note();
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		if (++gt->sd_dma_irqs >= SD_DMA_IRQ_BUDGET_PER_TICK) {
+			GICD_ICENABLER(GICD_WORD(SD_DMA_IRQ_INTID)) =
+			    (1u << GICD_BIT(SD_DMA_IRQ_INTID));
+			gt->sd_dma_throttles++;
+		}
+		return;
+	}
+
 	/* --- Interrupt-virtualization milestone: full vGIC forwarding ------ *
 	 * Only taken once vgic_init() has actually run (main_dbg.c's policy —
 	 * see vgic_active()'s doc comment). REPL/GDB builds link this same file
@@ -1531,6 +1619,20 @@ gic_timer_irq(struct el2_frame *frame)
 	GICC_DIR = iar;
 
 	gt->ticks++;
+
+	/* Refresh the eMMC/SD IDMAC-completion storm budgets and un-mask if the
+	 * previous window exhausted one -- same self-healing shape as the MUSB/
+	 * HDMI refreshes below, but placed HERE (every core's own regular tick,
+	 * not the CPU1-only vcpu1 block) because this SPI is deliberately not
+	 * core-targeted: whichever core happens to be running when the budget
+	 * needs resetting is the right core to do it. Unconditional idempotent
+	 * writes, same reasoning as the MUSB/HDMI refreshes. */
+	gt->emmc_dma_irqs = 0;
+	GICD_ISENABLER(GICD_WORD(EMMC_DMA_IRQ_INTID)) =
+	    (1u << GICD_BIT(EMMC_DMA_IRQ_INTID));
+	gt->sd_dma_irqs = 0;
+	GICD_ISENABLER(GICD_WORD(SD_DMA_IRQ_INTID)) =
+	    (1u << GICD_BIT(SD_DMA_IRQ_INTID));
 
 	/* Undo our own CNTV mask if the guest never cleared it. Deliberately
 	 * placed on EVERY tick, not inside the REPORT_EVERY block below: the
