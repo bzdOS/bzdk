@@ -698,10 +698,15 @@ static uint32_t g_fi_seq;         /* internal: eligible writes since last hit  *
 #define CMD12_STOP_TRANSMISSION  12u
 static uint32_t g_stop_cmds;      /* [29] CMD12s issued from the settle        */
 static uint32_t g_stop_fails;     /* [30] of those, ones that did not complete */
+static uint32_t g_dma_irqs;       /* [31] real IDMAC completion IRQs observed
+                                   * (gic_timer.c's EMMC_DMA_IRQ_INTID arm) --
+                                   * cross-check against vblk_emmc.c's g_dma_ok
+                                   * to confirm the interrupt fires ~once per
+                                   * DMA transfer, not a control-flow signal */
 
 /* See the call site in emmc_bio_init() for why this exists. EBIO_BC_NWORDS
  * covers every slot any ebio_bc() caller writes, so no stale field survives. */
-#define EBIO_BC_NWORDS 31u
+#define EBIO_BC_NWORDS 32u
 /* hv_addrmap.h's assert chain proves this window does not overlap its
  * NEIGHBOURS; it cannot know how many slots this file writes. Without this the
  * two drifted: the declared size said 8 words while the code wrote 13, and the
@@ -2010,11 +2015,42 @@ static void emmc_dma_disarm(void)
 	wreg(REG_DMAC, 0);
 }
 
+void emmc_bio_dma_irq_note(void)
+{
+	ebio_bc(31, ++g_dma_irqs);
+}
+
 /* Stall-based wait for the IDMAC's own completion (IDST TX/RX_INT) alongside
  * the data-phase RINT the PIO paths already check -- aw_mmc_intr() treats
  * `idst & AW_MMC_IDST_ERROR` and `rint & AW_MMC_INT_ERR_BIT` as two
  * independent failure sources (see aw_mmc.c's interrupt handler), so this
- * checks both every iteration rather than assuming one implies the other. */
+ * checks both every iteration rather than assuming one implies the other.
+ *
+ * WFI BETWEEN ITERATIONS (2026-09-30, HANDOFF item 2's open follow-up): the
+ * correctness logic above is UNCHANGED -- every register read, every error
+ * check, the timeout cap, all exactly as hardware-verified before. The only
+ * change is what the core does between one check and the next: instead of
+ * spinning back to the top of the loop immediately (burning cycles hammering
+ * REG_IDST/REG_RINT), it executes `wfi` first. gic_timer.c now arms the
+ * controller's real hardware SPI (EMMC_DMA_IRQ_INTID) at the distributor, so
+ * a genuine IDMAC completion wakes this core almost immediately; if that
+ * interrupt is ever missed or misrouted (see gic_timer.c's dispatch comment
+ * for why that is a live, hardware-observed failure mode for a level line --
+ * MUSB and HDMI both needed a throttle for exactly this), the very next
+ * regular ~10 ms CNTP tick wakes it anyway, since WFI wakes on ANY pending
+ * exception whether or not it is separately masked -- so the timeout cap
+ * above remains the actual correctness backstop, completely unaffected by
+ * whether the new interrupt path works at all. This is deliberately NOT the
+ * bigger change HANDOFF's own wording points at ("vCPU handed back to the
+ * guest during a transfer") -- the guest's trap into this code is still
+ * synchronous end-to-end, so its vCPU is still blocked for the whole
+ * transfer. That would need the request's completion (used-ring publish +
+ * virtio IRQ injection) to happen FROM the real IRQ handler, asynchronously,
+ * after an early return to the guest -- a materially bigger change (new
+ * per-request state surviving across a trap boundary, reusing vblk_async.c's
+ * already-proven used-ring-lock discipline rather than inventing a new one)
+ * that deserves its own careful, separately-verified step, not a rider on
+ * this one. See HANDOFF.md. */
 static int emmc_dma_wait_complete(uint32_t is_read, uint32_t *ri_out)
 {
 	uint64_t start = rd_cntpct();
@@ -2042,6 +2078,7 @@ static int emmc_dma_wait_complete(uint32_t is_read, uint32_t *ri_out)
 				return -1;
 			}
 		}
+		__asm__ volatile("wfi" ::: "memory");
 	}
 }
 
