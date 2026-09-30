@@ -821,9 +821,63 @@ static int psci_guest_filter(uint64_t fnid, uint64_t x1, uint64_t x2,
 	}
 }
 
+/* Virtio-mmio trap cost (ROADMAP §6.5 step 1). Per device (index = the
+ * device's page in 0x0A00x000) and per register class: how many guest
+ * accesses trapped and how many CNTPCT ticks (24 MHz) el2_trap spent on
+ * them, from its C entry to the handler's return. The asm entry/exit
+ * (frame save/restore, eret) is NOT in these numbers. Read with nm +
+ * hvdbg; cleared by writing zeros the same way. One copy per physical
+ * core (first index), so no atomics are needed; sum them when reading.
+ * A delta over 1 ms is a counter-erratum jump or a handler that waited
+ * on hardware, and lands in g_vtrap_long instead of the sums. */
+#define VTRAP_DEVS    11   /* 0..5 virtio page index, 6 vconsole, 7 vgicd,
+				    8 wdogtrap, 9 rsbtrap, 10 scanout */
+#define VTRAP_NOTIFY  0     /* 0x050 QueueNotify      */
+#define VTRAP_ISR     1     /* 0x060 InterruptStatus  */
+#define VTRAP_ACK     2     /* 0x064 InterruptACK     */
+#define VTRAP_OTHER   3
+struct vtrap_stat { uint64_t n, ticks, max; };
+struct vtrap_stat g_vtrap[4][VTRAP_DEVS][4];
+uint64_t g_vtrap_long[4][VTRAP_DEVS];
+/* Of the above: ticks from el2_trap's C entry to the start of the data-
+ * abort device dispatch (the prologue every guest sync trap pays), per
+ * core: {n, ticks}. */
+uint64_t g_vtrap_pre[4][2];
+
+static void vtrap_account(unsigned dev, const struct el2_frame *frame,
+			  uint64_t t0)
+{
+	uint64_t t1, d;
+	unsigned off = (unsigned)(frame->far & 0xFFFu);
+	unsigned cls = dev == 7u ? (off == 0xF00u ? VTRAP_NOTIFY : VTRAP_OTHER) :
+		       dev >= 6u ? VTRAP_OTHER :
+		       off == 0x050u ? VTRAP_NOTIFY :
+		       off == 0x060u ? VTRAP_ISR :
+		       off == 0x064u ? VTRAP_ACK : VTRAP_OTHER;
+	unsigned c = smp_cpu_id() & 3u;
+	struct vtrap_stat *st;
+
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t1));
+	d = t1 - t0;
+	if (dev >= VTRAP_DEVS)
+		return;
+	if (t1 < t0 || d > 24000u) {
+		g_vtrap_long[c][dev]++;
+		return;
+	}
+	st = &g_vtrap[c][dev][cls];
+	st->n++;
+	st->ticks += d;
+	if (d > st->max)
+		st->max = d;
+}
+
 void el2_trap(struct el2_frame *frame, unsigned long kind)
 {
 	unsigned t = (unsigned)(kind & 3u);
+	uint64_t vtrap_t0;
+
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(vtrap_t0));
 
 	/* Dead-man's switch: pet the hardware watchdog on EVERY EL2 exception.
 	 * The WDT is armed (~16s) in main_dbg.c. As long as EL2 is servicing
@@ -1398,7 +1452,18 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * normal guest progress, NOT a fault, so we return without
 			 * recording. Only genuinely unhandled aborts fall through to
 			 * the fault record below. */
+			{
+				uint64_t tp;
+				unsigned c = smp_cpu_id() & 3u;
+
+				__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(tp));
+				if (tp >= vtrap_t0 && tp - vtrap_t0 < 24000u) {
+					g_vtrap_pre[c][0]++;
+					g_vtrap_pre[c][1] += tp - vtrap_t0;
+				}
+			}
 			if (vconsole_handle_fault(frame, 0)) {
+				vtrap_account(6, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
@@ -1410,6 +1475,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * polices the two affinity fields that can reach across the
 			 * partition boundary -- see vgicd.h. */
 			if (vgicd_handle_fault(frame)) {
+				vtrap_account(7, frame, vtrap_t0);
 				return;
 			}
 			/* The trapped CCU/PIO/WDOG page (wdogtrap.c). Same "handled ->
@@ -1419,12 +1485,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * wdogtrap_handle_fault()'s address check always returns 0
 			 * here -- see wdogtrap.h. */
 			if (wdogtrap_handle_fault(frame)) {
+				vtrap_account(8, frame, vtrap_t0);
 				return;
 			}
 #ifdef HV_RSBTRAP
 			/* The emulated RSB controller (rsbtrap.c): the guest's PMIC
 			 * traffic, serialised with EL2's own under one bus lock. */
 			if (rsbtrap_handle_fault(frame)) {
+				vtrap_account(9, frame, vtrap_t0);
 				return;
 			}
 #endif
@@ -1436,6 +1504,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * arbitrary. A QueueNotify write here drains the ring straight to the
 			 * real eMMC and injects INTID 82. See docs/virtio-blk-design.md. */
 			if (vblk_mmio_fault(frame)) {
+				vtrap_account(0, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
@@ -1449,6 +1518,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * straight to the real EMAC (muxed with the debug-protocol traffic —
 			 * see vnet_emac.c's TX ethertype filter) and injects VNET_INTID. */
 			if (vnet_mmio_fault(frame)) {
+				vtrap_account(1, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
@@ -1461,6 +1531,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * they are injected by vinput_send_key()/vinput_send_ascii() from
 			 * dbgmon.c's `type`/`key` commands, on CPU1. */
 			if (vinput_mmio_fault(frame)) {
+				vtrap_account(3, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
@@ -1470,12 +1541,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * the boot-critical eMMC. Same "handled -> return without
 			 * recording" contract as every device above. */
 			if (vblk_sd_mmio_fault(frame)) {
+				vtrap_account(4, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
 			}
 			/* Compressed-RAM swap disk at 0x0A005000 (vblk_zram.h). */
 			if (vblk_zram_mmio_fault(frame)) {
+				vtrap_account(5, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
@@ -1492,6 +1565,7 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * flip, and this keeps every non-HV_HDMI target's link exactly
 			 * as it was before this device existed. */
 			if (scanout_mmio_fault(frame)) {
+				vtrap_account(10, frame, vtrap_t0);
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;
