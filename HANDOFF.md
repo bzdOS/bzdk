@@ -23,6 +23,15 @@
   the 900 s reachability watchdog. The hold loop now services dbgmon on
   CPU0 and pets through `wdt_debug_kick()`. (`dbg_no_guest`'s loop has the
   same shape and is left as it was: a diagnostic.)
+- **Open: no USB console in a boot that was held.** USB (MUSB/usbacm) is
+  serviced from CPU1's MUSB IRQ path, and a held boot keeps CPU1 parked, so
+  the gadget never enumerates (host: `error -71`, then gives up) and stays
+  absent for that whole boot, even after `release`. The fix is one
+  `usbacm_poll()` in main_dbg.c's hold loop; it has NOT been built or
+  tested. soak72 refuses to start without the gadget (`board-off-usb`), so
+  after a safe-mode boot do a clean reload (`shutdown -r`) first.
+- **72 h soak: not started.** The first attempt stopped at once on the
+  above; then the host went down for a reboot.
 - **screenshot.py `--what both`** composes every plane from the mixer's
   registers (HUD, guest window, overlays, video with the hardware's CSC).
 - **A/B eMMC slots: not done.** Staging images on the ESP from the guest was
