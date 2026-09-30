@@ -108,6 +108,31 @@ unless resumed with the same state file).
      wait is still a poll (`emmc_dma_wait_complete`), so the vCPU is not
      yet actually handed back to the guest during a transfer — wiring the
      IDMAC completion IRQ is the step that turns this into real overlap.
+   - **IDMAC IRQ, phase 1 (2026-09-30, `1f23bb8` + `8b17cbc`): wired, gives
+     NOTHING measurable yet, and cannot until phase 2.** SPI94 (eMMC) and
+     SPI92 (SD) are armed at the GICD, EL2-owned (no guest driver attaches
+     to either node), with a 32/tick storm throttle; the completion wait
+     executes `wfi` between polls. Measured on hardware:
+     - The IRQ is never *taken* in steady state, and that is correct by
+       construction: `g_vblk_async_ready=0` (CPU2 is a guest vCPU), so every
+       DMA runs synchronously inside CPU0's trap handler with DAIF.I=1. The
+       line goes pending, the poll sees IDST, W1C-clears it, the line drops
+       before `eret`. It can at most wake the `wfi`.
+     - It does not even matter for that: with SPI92/94 masked by priority
+       (IPRIORITYR=0xF0 vs PMR) throughput was identical — 64 KiB raw reads
+       10.7/16.6 MB/s (eMMC/SD) vs 10.6/17.0 on; 8 KiB (2-block DMA)
+       ~1 ms/request both ways. Something else already wakes `wfi` in
+       well under a tick (guest timer, other pending PPIs).
+     - The boot-time counts (`g_dma_irqs`=1766 vs `g_dma_ok`=1081;
+       SD 12258 vs 4990 — more IRQs than transfers; throttles 85/993) are a
+       level-line storm taken while CPU0 runs with IRQs unmasked, not
+       completions. Harmless (throttle holds), but it is the only thing the
+       IRQ currently does.
+     - Keep it: the dispatch path is proven (breadcrumb == `irq_counter[]`
+       exactly), and **phase 2** needs it — return to the guest right after
+       arming, complete the request (used-ring publish + virtio IRQ) from
+       this handler with the handler W1C-clearing IDST itself. Only then
+       does the vCPU actually overlap with the transfer.
    - **Not yet soaked.** `soak72.py --profile mixed` stopped at ~15 min
      twice, on a pure-PIO build and on the IDMAC build alike: `limabench`
      SIGSEGV (rc=139) in Mesa's CPU-side shader linker
