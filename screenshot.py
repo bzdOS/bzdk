@@ -21,8 +21,10 @@ WHAT CAN BE CAPTURED
                   register, NOT from a breadcrumb (see live_layer_addr() for
                   why that distinction cost a wrong screenshot) -- so this
                   follows a client's page flips
-  --what both     the composition: the HUD with the window pasted at the
-                  coordinates the mixer places it, which is what the panel shows
+  --what both     the composition, which is what the panel shows: every
+                  enabled plane (HUD, guest window, both overlays, the video
+                  plane) recomposed from the mixer's own registers -- see
+                  read_planes()/compose()
 
 The two are separate DE2 layers composited by hardware; there is no single
 buffer in memory holding the composed image, which is exactly why `both` has to
@@ -242,6 +244,222 @@ def live_layer_addr(hv, fb_base, guestwin_default, layer):
     return (lv[0], "live, from the DE2 layer %d register" % layer, stale)
 
 
+# ---------------------------------------------------------------------------
+# `--what both`: the whole screen, composed from the mixer's own registers.
+#
+# Every plane the hypervisor can put on the panel, read back from DE2 rather
+# than from hdmi.h or a breadcrumb: UI channel 1 layers 0..3 (HUD, guest
+# window, the two overlays -- hdmi_overlay_set()) and the VI channel (the video
+# plane -- hdmi_video_set()). Geometry, pitch, format, alpha, the scaler's
+# output size, the blender pipe that places the video, and the CSC matrix are
+# all what the hardware holds right now. The hardware composes on the fly and
+# no buffer in memory holds the result, so it is recomposed here in the same
+# order: layers by index inside the UI channel, then blender pipe 1 (VI) over
+# pipe 0 (UI). Not bit-exact in two places, both stated in the output: the
+# video plane is scaled nearest-neighbour (the VSU uses an 8/4-tap filter),
+# and alpha is blended in straight 8-bit arithmetic.
+# ---------------------------------------------------------------------------
+DE_CHAN = 0x01202000          # DE_CHAN_REGS_BASE; channel n at +0x1000*n
+DE_UI1 = DE_CHAN + 0x1000
+DE_VI0 = DE_CHAN + 0x0000
+DE_BLD = 0x01201000           # DE_BLD_BASE
+DE_VSU = 0x01220000           # DE_VSU_REGS
+DE_CCSC0 = 0x012A0000         # DE_CCSC0_BASE (CCSC10)
+UI_FMT_ARGB, UI_FMT_XRGB = 0, 4
+VI_RGB_MODE = 1 << 15
+
+
+def _wh(v):
+    return (v & 0x1FFF) + 1, ((v >> 16) & 0x1FFF) + 1
+
+
+def _sext(v, bits):
+    v &= (1 << bits) - 1
+    return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
+
+def fetch_raw(hv, iface, base, length, slow, label):
+    """Raw bytes of [base, base+length), by either transport."""
+    if slow:
+        words = hv.read_words(base, (length + 3) // 4)
+        if not words:
+            print("  %s: no reply -- channel down?" % label)
+            return None
+        return struct.pack("<%dI" % len(words), *words)[:length]
+    try:
+        data, missing = fbdump_recv.fetch(base, length, hv=hv, iface=iface)
+    except (PermissionError, OSError) as e:
+        print("  %s: raw fbdump socket unavailable (%s) -- retry with --slow"
+              % (label, e))
+        return None
+    if missing:
+        print("  %s: %d bytes MISSING after retries -- they read as black"
+              % (label, sum(e - s for s, e in missing)))
+    return bytes(data)
+
+
+def read_planes(hv):
+    """Every enabled plane as a dict, from the DE2 registers. None if the
+    register map does not fit (layer 0 must be enabled and in DRAM)."""
+    planes = []
+    ui = hv.read_words(DE_UI1, 0x20)            # 4 layers x 8 words
+    if not ui or len(ui) < 0x20:
+        return None
+    for n in range(4):
+        attr, size, coord, pitch, addr = ui[8 * n:8 * n + 5]
+        if not attr & 1:
+            continue
+        w, h = _wh(size)
+        fmt = (attr >> 8) & 0xF
+        amode = (attr >> 1) & 3
+        galpha = (attr >> 24) & 0xFF
+        planes.append(dict(kind="ui", layer=n, addr=addr, pitch=pitch, w=w, h=h,
+                           x=coord & 0xFFFF, y=coord >> 16, fmt=fmt,
+                           amode=amode, galpha=galpha, dst_w=w, dst_h=h))
+    if not planes or planes[0]["layer"] != 0:
+        return None
+    vi = hv.read_words(DE_VI0, 8)
+    bld = hv.read_words(DE_BLD, 4 * 4)
+    if vi and len(vi) == 8 and vi[0] & 1 and bld and len(bld) == 16 and \
+            bld[0] & (1 << 9):
+        attr = vi[0]
+        w, h = _wh(vi[1])
+        vsu = hv.read_words(DE_VSU, 1)
+        if vsu and vsu[0] & 1:
+            ow = hv.read_words(DE_VSU + 0x40, 1)
+            dst_w, dst_h = _wh(ow[0]) if ow else (w, h)
+        else:
+            dst_w, dst_h = w, h
+        coord = bld[1 * 4 + 3]                  # ATTR_COORD(1)
+        csc = None
+        cc = hv.read_words(DE_CCSC0, 1)
+        if cc and cc[0] & 1:
+            m = hv.read_words(DE_CCSC0 + 0x10, 12)
+            if m and len(m) == 12:
+                # read back as 13-bit coefficients and 20-bit offsets
+                # (0x1e6f is -401), whatever width hdmi.c wrote
+                csc = [_sext(v, 20 if i % 4 == 3 else 13)
+                       for i, v in enumerate(m)]
+        planes.append(dict(kind="vi", addr=vi[6], addr1=vi[7], pitch=vi[3],
+                           pitch1=vi[4], w=w, h=h, x=coord & 0xFFFF,
+                           y=coord >> 16, fmt=(attr >> 8) & 0x1F,
+                           rgb=bool(attr & VI_RGB_MODE), dst_w=dst_w,
+                           dst_h=dst_h, csc=csc))
+    return planes
+
+
+def _describe(p):
+    if p["kind"] == "ui":
+        f = {UI_FMT_ARGB: "ARGB", UI_FMT_XRGB: "XRGB"}.get(p["fmt"],
+                                                         "fmt%d" % p["fmt"])
+        a = ["pixel", "global %d" % p["galpha"], "pixel*global %d" %
+             p["galpha"], "?"][p["amode"]]
+        name = {0: "HUD", 1: "guest window"}.get(p["layer"],
+                                                "overlay %d" % (p["layer"] - 2))
+        return ("UI1 layer %d (%s): %dx%d %s at (%d,%d), pitch %d, %#x, alpha %s"
+                % (p["layer"], name, p["w"], p["h"], f, p["x"], p["y"],
+                   p["pitch"], p["addr"], a))
+    f = "XRGB" if p["rgb"] else {8: "NV12", 9: "NV21", 0: "YUYV"}.get(
+        p["fmt"], "fmt%d" % p["fmt"])
+    return ("VI0 (video): %dx%d %s -> %dx%d at (%d,%d), %#x/%#x, CSC %s" %
+            (p["w"], p["h"], f, p["dst_w"], p["dst_h"], p["x"], p["y"],
+             p["addr"], p["addr1"], "from hardware" if p["csc"] else "off"))
+
+
+def _yuv_rgb(csc, y, u, v):
+    """The CCSC as the hardware holds it: rows [Y, Cb-slot, Cr-slot, off],
+    Q10. Byte 0 of a chroma pair goes to the Cb slot for NV12 and NV21
+    alike, the model hdmi.c's ccsc_load() programs to (it swaps the
+    matrix columns for NV21)."""
+    out = []
+    for r in range(3):
+        c = csc[4 * r:4 * r + 4]
+        val = (c[0] * y + c[1] * u + c[2] * v + c[3] + 512) >> 10
+        out.append(0 if val < 0 else 255 if val > 255 else val)
+    return out
+
+
+def _vi_sampler(p, data, data1):
+    """(sx, sy) in source pixels -> (r, g, b)."""
+    fmt, pitch = p["fmt"], p["pitch"]
+    csc = p["csc"] or [1024, 0, 0, 0] * 3       # CSC off: luma as grey
+    if p["rgb"]:
+        def f(sx, sy):
+            o = sy * pitch + sx * 4
+            v = struct.unpack_from("<I", data, o)[0] if o + 4 <= len(data) else 0
+            return ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+    elif fmt in (8, 9):
+        p1 = p["pitch1"]
+
+        def f(sx, sy):
+            o = sy * pitch + sx
+            y = data[o] if o < len(data) else 16
+            oc = (sy // 2) * p1 + (sx // 2) * 2
+            u, v = (data1[oc], data1[oc + 1]) if oc + 1 < len(data1) else (128, 128)
+            return _yuv_rgb(csc, y, u, v)
+    else:                                       # YUYV: Y0 U Y1 V
+        def f(sx, sy):
+            o = sy * pitch + (sx // 2) * 4
+            if o + 3 >= len(data):
+                return (0, 0, 0)
+            y = data[o + (2 if sx & 1 else 0)]
+            return _yuv_rgb(csc, y, data[o + 1], data[o + 3])
+    return f
+
+
+def compose(hv, iface, planes, scr_w, scr_h, step, slow):
+    """Recompose the screen at 1/step resolution. Returns RGB rows."""
+    ow, oh = len(range(0, scr_w, step)), len(range(0, scr_h, step))
+    img = [bytearray(ow * 3) for _ in range(oh)]
+    for p in planes:
+        label = "UI1.%d" % p["layer"] if p["kind"] == "ui" else "VI0"
+        data = fetch_raw(hv, iface, p["addr"], p["pitch"] * p["h"], slow, label)
+        if data is None:
+            return None
+        data1 = b""
+        if p["kind"] == "vi" and not p["rgb"] and p["fmt"] in (8, 9):
+            data1 = fetch_raw(hv, iface, p["addr1"],
+                              p["pitch1"] * ((p["h"] + 1) // 2), slow, "VI0 uv")
+            if data1 is None:
+                return None
+        vi = _vi_sampler(p, data, data1) if p["kind"] == "vi" else None
+        opaque = p["kind"] == "vi" or (
+            p["amode"] == 0 and p["fmt"] == UI_FMT_XRGB) or (
+            p["amode"] == 1 and p["galpha"] == 0xFF)
+        # output pixels whose screen coordinate falls inside the plane
+        xs = [i for i, x in enumerate(range(0, scr_w, step))
+              if p["x"] <= x < p["x"] + p["dst_w"]]
+        ys = [j for j, y in enumerate(range(0, scr_h, step))
+              if p["y"] <= y < p["y"] + p["dst_h"]]
+        for j in ys:
+            sy = (j * step - p["y"]) * p["h"] // p["dst_h"]
+            row = img[j]
+            for i in xs:
+                sx = (i * step - p["x"]) * p["w"] // p["dst_w"]
+                if vi is not None:
+                    r, g, b = vi(sx, sy)
+                    a = 255
+                else:
+                    o = sy * p["pitch"] + sx * 4
+                    v = struct.unpack_from("<I", data, o)[0] \
+                        if o + 4 <= len(data) else 0
+                    r, g, b = (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF
+                    if opaque:
+                        a = 255
+                    else:
+                        pa = (v >> 24) if p["fmt"] == UI_FMT_ARGB else 255
+                        a = [pa, p["galpha"], pa * p["galpha"] // 255, 255][
+                            p["amode"]]
+                k = i * 3
+                if a == 255:
+                    row[k], row[k + 1], row[k + 2] = r, g, b
+                elif a:
+                    row[k] = (r * a + row[k] * (255 - a)) // 255
+                    row[k + 1] = (g * a + row[k + 1] * (255 - a)) // 255
+                    row[k + 2] = (b * a + row[k + 2] * (255 - a)) // 255
+    return [bytes(r) for r in img]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--what", default="window",
@@ -296,12 +514,30 @@ def main():
     step = max(1, a.step)
     out = a.out or ("/tmp/bzdos-%s-%s.png" % (a.what, time.strftime("%H%M%S")))
 
-    if a.what in ("window", "both"):
+    if a.what == "both":
+        planes = read_planes(hv)
+        if planes is None:
+            print("  WARNING: the DE2 layer registers do not fit this build "
+                  "(layer 0 not enabled) -- no composition")
+            return 1
+        for p in planes:
+            print("  " + _describe(p))
+        t0 = time.time()
+        comp = compose(hv, a.iface, planes, scr_w, scr_h, max(1, a.step),
+                       a.slow)
+        if comp is None:
+            return 1
+        print("  composed %d plane(s) in %.1fs%s" %
+              (len(planes), time.time() - t0,
+               "; video plane scaled nearest-neighbour, not the VSU filter"
+               if any(p["kind"] == "vi" and (p["w"], p["h"]) !=
+                      (p["dst_w"], p["dst_h"]) for p in planes) else ""))
+    if a.what == "window":
         wrows, wcols = grab(hv, a.iface, win_pa, gw, gh, gstride, step,
                             "window", a.slow)
         if wrows is None:
             return 1
-    if a.what in ("hud", "both"):
+    if a.what == "hud":
         hrows, hcols = grab(hv, a.iface, d["HDMI_FB_BASE"], scr_w, scr_h,
                             scr_w * 4, step, "HUD", a.slow)
         if hrows is None:
@@ -314,18 +550,8 @@ def main():
         png(out, hcols, len(hrows), hrows)
         w, h = hcols, len(hrows)
     else:
-        # Paste the window layer where the mixer puts it. This is a composition
-        # done here because the hardware composes it on the fly and no buffer in
-        # memory ever holds the result.
-        comp = [bytearray(r) for r in hrows]
-        for j, wr in enumerate(wrows):
-            dy = (gy // step) + j
-            if dy >= len(comp):
-                break
-            dx = (gx // step) * 3
-            comp[dy][dx:dx + len(wr)] = wr
-        png(out, hcols, len(comp), [bytes(r) for r in comp])
-        w, h = hcols, len(comp)
+        png(out, len(comp[0]) // 3, len(comp), comp)
+        w, h = len(comp[0]) // 3, len(comp)
 
     nz = 0
     total = 0
