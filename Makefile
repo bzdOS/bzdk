@@ -304,7 +304,11 @@ $(REPL_BIN): $(REPL_ELF)
 
 hdmi: config-check $(HDMI_BIN)
 
-HDMI_OBJS := start.o main_hdmi.o hdmi.o fb.o timer.o wdt.o libmin.o reboot.o smp.o
+# smp.o comes in for its small helpers only; main_hdmi never calls
+# smp_init(), so the CPU1-debug symbols it names only need inert stand-ins --
+# what hdmi_stub.c provides. rsb.o: hdmi.c's dldo1 re-enable.
+HDMI_OBJS := start.o main_hdmi.o hdmi.o fb.o timer.o wdt.o libmin.o reboot.o smp.o \
+             hdmi_stub.o rsb.o
 $(HDMI_ELF): $(HDMI_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(HDMI_OBJS)
 	$(SIZE) $@
@@ -430,13 +434,24 @@ ifeq ($(GUEST_DRAM_2G),1)
 SNAP_OBJS :=
 endif
 
+# VZRAM — compressed-RAM swap disk (vblk_zram.h, HANDOFF item 3). Takes the
+# top 128 MiB of the guest's DRAM (board-config.xml shrinks /memory to
+# match), so it needs GUEST_DRAM_2G -- hv_addrmap.h makes the other case a
+# compile error.
+VZRAM ?= 0
+ZRAM_OBJS :=
+ifeq ($(VZRAM),1)
+CFLAGS += -DVZRAM=1
+ZRAM_OBJS := vblk_zram.o vzram_pool.o lz4.o
+endif
+
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o rsbtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \
             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o \
-            $(SNAP_OBJS)
+            $(SNAP_OBJS) $(ZRAM_OBJS)
 $(DBG_ELF): $(DBG_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(DBG_OBJS)
 	$(SIZE) $@
@@ -515,7 +530,7 @@ gdb: config-check $(GDB_BIN)
 GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
-            musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o dbgtools.o
+            musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o dbgtools.o rsb.o
 $(GDB_ELF): $(GDB_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(GDB_OBJS)
 	$(SIZE) $@
@@ -525,7 +540,7 @@ $(GDB_BIN): $(GDB_ELF)
 fbsd: config-check $(FBSD_BIN)
 
 FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
-             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o
+             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o rsb.o
 $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(FBSD_OBJS)
 	$(SIZE) $@

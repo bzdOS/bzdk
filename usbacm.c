@@ -9,6 +9,13 @@
 #include "musb.h"
 #include "vconsole.h"
 #include "dbgmon.h"      /* dbgmon_bzdbg_post / bzdbg_reply_* -- BZDBG lifeline */
+
+/* Weak: the lifeline is dbgmon's; a build without dbgmon.o (fbsd, gdb, repl)
+ * still gets the ACM console, and BZDBG lines are simply dropped. */
+#pragma weak dbgmon_bzdbg_post
+#pragma weak bzdbg_reply_ready
+#pragma weak bzdbg_reply_len
+#pragma weak bzdbg_reply_buf
 #include "wdt.h"        /* wdt_debug_hold -- fixed-address macro, see wdt.h */
 
 /* Bounded per-poll drain limits, so a single usbacm_poll() call can never
@@ -117,7 +124,8 @@ static void usbacm_bzdbg_feed(uint8_t b)
 	/* inside the line body */
 	if (b == '\r' || b == '\n') {
 		bz_line[bz_len] = '\0';
-		dbgmon_bzdbg_post(bz_line);
+		if (dbgmon_bzdbg_post)
+			dbgmon_bzdbg_post(bz_line);
 		bz_len = 0;
 		bz_pos = 0;
 		return;                      /* line is ours; nothing reaches the guest */
@@ -139,7 +147,7 @@ static void usbacm_bzdbg_tx_drain(void)
 	static const char tag[] = "~BZDBG< ";
 	uint32_t budget;
 
-	if (!bzdbg_reply_ready)
+	if (!&bzdbg_reply_ready || !bzdbg_reply_ready)
 		return;
 	if (bz_reply_off == 0) {
 		for (uint32_t k = 0; k < sizeof(tag) - 1; k++)
