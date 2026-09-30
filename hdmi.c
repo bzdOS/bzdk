@@ -1125,6 +1125,55 @@ int hdmi_guestwin_set_addr(uint32_t pa)
 	return 0;
 }
 
+/* ====================================================================
+ * hdmi_overlay_set() -- extra guest planes (HANDOFF item 6, the hardware
+ * layers an HWC-style compositor hands surfaces to).
+ *
+ * UI1 layers 2 and 3, the two this mixer's UI channel has left after the HUD
+ * (0) and the guest window (1). Same channel, so -- exactly as for the guest
+ * window -- no blender or route change: they composite inside the channel by
+ * layer index, 2 over 1 and 3 over 2. The caller (scanout.c) has already
+ * validated geometry and address; this only programs and commits.
+ *
+ * ctrl: HDMI_OVL_EN, HDMI_OVL_ARGB (per-pixel alpha from an ARGB8888
+ * buffer; otherwise XRGB8888), HDMI_OVL_GALPHA(a) (a global alpha, applied
+ * on top of per-pixel alpha when both are set). One DE_GLB_DBUFF strobe
+ * commits the whole layer at the next vblank.
+ * ==================================================================== */
+#define DE2_FORMAT_ARGB8888       0u
+#define DE2_UI_ATTR_ALPHA_MODE(m) (((m) & 0x3u) << 1)   /* 0 pixel, 1 global, 2 both */
+#define DE2_UI_ATTR_ALPHA(a)      (((a) & 0xFFu) << 24)
+
+int hdmi_overlay_set(uint32_t idx, uint32_t pa, uint32_t pitch, uint32_t w,
+                     uint32_t h, uint32_t x, uint32_t y, uint32_t ctrl)
+{
+	uint32_t layer = HDMI_OVL_FIRST_LAYER + idx, attr, mode;
+
+	if (g_timeout_latched != 0 || idx >= HDMI_OVL_COUNT)
+		return -1;
+	if (!(ctrl & HDMI_OVL_EN)) {
+		wr32(DE_UI1_L_ATTR(layer), 0);
+		wr32(DE_GLB_DBUFF, 1);
+		return 0;
+	}
+	if (ctrl & HDMI_OVL_ARGB)
+		mode = (ctrl & HDMI_OVL_GALPHA_ON) ? 2u : 0u;
+	else
+		mode = (ctrl & HDMI_OVL_GALPHA_ON) ? 1u : 0u;
+	attr = DE2_UI_ATTR_EN | DE2_UI_ATTR_ALPHA_MODE(mode) |
+	       DE2_UI_ATTR_FMT((ctrl & HDMI_OVL_ARGB) ? DE2_FORMAT_ARGB8888
+	                                              : DE2_FORMAT_XRGB8888) |
+	       DE2_UI_ATTR_ALPHA((ctrl & HDMI_OVL_GALPHA_ON) ?
+	                         HDMI_OVL_GALPHA_GET(ctrl) : 0xFFu);
+	wr32(DE_UI1_L_SIZE(layer), DE2_WH(w, h));
+	wr32(DE_UI1_L_COORD(layer), (y << 16) | x);
+	wr32(DE_UI1_L_PITCH(layer), pitch);
+	wr32(DE_UI1_L_TOP_LADDR(layer), pa);
+	wr32(DE_UI1_L_ATTR(layer), attr);
+	wr32(DE_GLB_DBUFF, 1);
+	return 0;
+}
+
 /* ── real vblank observation (ROADMAP: bzkms's vblank was a callout) ──────
  *
  * TCON_INT0 (SUN4I_TCON_GINT0_REG) carries a vblank STATUS bit per channel,

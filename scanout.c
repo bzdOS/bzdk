@@ -80,6 +80,8 @@ struct scanout_dev {
 	uint32_t vblank_count;
 	uint32_t vblank_stamp_lo;
 	uint32_t vblank_stamp_hi;
+	struct { uint32_t addr, pitch, size, coord, ctrl; } ovl[HDMI_OVL_COUNT];
+	uint32_t ovl_count, ovl_reject;
 };
 
 static struct scanout_dev g_scan;
@@ -146,7 +148,18 @@ static uint32_t scanout_reg_read(const struct scanout_dev *d, uint32_t off)
 	case SCANOUT_R_VBLANK_COUNT:    return d->vblank_count;
 	case SCANOUT_R_VBLANK_STAMP_LO: return d->vblank_stamp_lo;
 	case SCANOUT_R_VBLANK_STAMP_HI: return d->vblank_stamp_hi;
-	default:                     return 0u;
+	case SCANOUT_R_OVL_NUM:      return HDMI_OVL_COUNT;
+	case SCANOUT_R_OVL_COUNT:    return d->ovl_count;
+	case SCANOUT_R_OVL_REJECT:   return d->ovl_reject;
+	default:
+		if (off >= SCANOUT_R_OVL_BASE &&
+		    off < SCANOUT_R_OVL(HDMI_OVL_COUNT, 0)) {
+			uint32_t p = (off - SCANOUT_R_OVL_BASE) / SCANOUT_R_OVL_STRIDE;
+			const uint32_t *r = &d->ovl[p].addr;
+			uint32_t k = (off - SCANOUT_R_OVL(p, 0)) / 4u;
+			return k < 5u ? r[k] : 0u;
+		}
+		return 0u;
 	}
 }
 
@@ -261,6 +274,10 @@ int scanout_addr_allowed(uint32_t pa, uint32_t stride, uint32_t height)
 		return 0;
 	if (SCANOUT_OVERLAPS(HVMAP_FB_BASE, HVMAP_FB_WINDOW_SIZE))
 		return 0;
+	/* Not guest memory either, though stage-2 maps it: the vzram backing
+	 * store and U-Boot's no-overwrite top (stage2.h), up to 0xC0000000. */
+	if (SCANOUT_OVERLAPS(HVMAP_VZRAM_BASE, 0xC0000000ULL - HVMAP_VZRAM_BASE))
+		return 0;
 #undef SCANOUT_OVERLAPS
 	return 1;
 }
@@ -268,9 +285,47 @@ int scanout_addr_allowed(uint32_t pa, uint32_t stride, uint32_t height)
 /* Register WRITE. Only FLIP_REQUEST and GUESTWIN_ADDR do anything; every other offset
  * (including unknown ones) is silently ignored — matches vblk/vnet's own
  * "write to a read-only/unknown register is a no-op, not a fault" policy. */
+/* Validate one plane's staged state and hand it to hdmi.c. */
+static void scanout_ovl_apply(struct scanout_dev *d, uint32_t p, uint32_t ctrl)
+{
+	uint32_t w = d->ovl[p].size & 0xFFFFu, h = d->ovl[p].size >> 16;
+	uint32_t x = d->ovl[p].coord & 0xFFFFu, y = d->ovl[p].coord >> 16;
+	uint32_t pitch = d->ovl[p].pitch, pa = d->ovl[p].addr;
+
+	if (ctrl & HDMI_OVL_EN) {
+		if (w == 0u || h == 0u ||
+		    x + w > (uint32_t)hdmi_width() || y + h > (uint32_t)hdmi_height() ||
+		    (pitch & 3u) || pitch < w * 4u ||
+		    !scanout_addr_allowed(pa, pitch, h)) {
+			d->ovl_reject++;
+			return;
+		}
+	}
+	if (hdmi_overlay_set(p, pa, pitch, w, h, x, y, ctrl) != 0) {
+		d->ovl_reject++;
+		return;
+	}
+	d->ovl[p].ctrl = ctrl;
+	d->ovl_count++;
+}
+
 static void scanout_reg_write(struct scanout_dev *d, uint32_t off, uint32_t val)
 {
 	uint32_t new_pa;
+
+	if (off >= SCANOUT_R_OVL_BASE && off < SCANOUT_R_OVL(HDMI_OVL_COUNT, 0)) {
+		uint32_t p = (off - SCANOUT_R_OVL_BASE) / SCANOUT_R_OVL_STRIDE;
+
+		switch (off - SCANOUT_R_OVL(p, 0)) {
+		case SCANOUT_OVL_ADDR:  d->ovl[p].addr = val;  break;
+		case SCANOUT_OVL_PITCH: d->ovl[p].pitch = val; break;
+		case SCANOUT_OVL_SIZE:  d->ovl[p].size = val;  break;
+		case SCANOUT_OVL_COORD: d->ovl[p].coord = val; break;
+		case SCANOUT_OVL_CTRL:  scanout_ovl_apply(d, p, val); break;
+		default: break;
+		}
+		return;
+	}
 
 	if (off == SCANOUT_R_GUESTWIN_ADDR) {
 		/* The GUEST WINDOW's geometry, not d->stride/d->height -- those
