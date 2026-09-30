@@ -35,6 +35,7 @@
 #include "wdt.h"            /* wdt_note_progress / wdt_pet — keep the HW WDOG fed */
 #include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO/FLTR_K_IRQ, ...) */
 #include "cntpct.h"
+#include "gic_timer.h"     /* gic_timer_spi_enable() -- IDMAC queue re-arm */
 #include "stage2.h"        /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 
 /* OWNER MARKER — linker-level mutual exclusion for the eMMC/virtio-blk
@@ -546,7 +547,7 @@ static inline uint64_t vblk_ms_to_ticks(uint32_t ms)
  * 180 s software progress window (wdt.c). A wedged holder still yields a
  * clean S_IOERR (return 0) instead of hanging CPU0 forever. */
 #define VBLK_EMMC_LOCK_TIMEOUT_MS  6000u
-static void vblk_idma_service(uint32_t spin_us);
+static int vblk_idma_service(uint32_t spin_us);
 static int emmc_lock_acquire_bounded(void)
 {
 	uint64_t start = read_cntpct();
@@ -1806,6 +1807,8 @@ static void idma_advance(int emmc_held)
 		                       BOUNCE_RUN_PA,
 		                       r->total / VBLK_SECTOR_BYTES) == 0) {
 			g_idmaq_running = 1;
+			/* A foreign assertion may have masked the line. */
+			gic_timer_spi_enable(EMMC_DMA_IRQ_INTID);
 			return;
 		}
 		vblk_emmc_unlock();
@@ -1844,15 +1847,22 @@ static void idma_complete(int rc)
 	idma_advance(1);
 }
 
-static void vblk_idma_service(uint32_t spin_us)
+/* 1 = a queued transfer is on the controller (it may have finished now):
+ * the IDMAC line is ours. 0 = nothing of ours is running (a synchronous
+ * DMA somewhere, or a stale assertion) -- gic_timer.c masks the line until
+ * the next queued start. */
+static int vblk_idma_service(uint32_t spin_us)
 {
-	int rc;
+	int rc, owned = 0;
 
 	if (!g_idma_pending)
-		return;
+		return 0;
 	if (!idmaq_trylock())
-		return;                   /* someone else is on it */
+		/* Held by a poster or another finisher. Unlocked peek: if ours is
+		 * running, keep the line live rather than wait for a tick. */
+		return *(volatile uint32_t *)&g_idmaq_running != 0;
 	if (g_idmaq_running) {
+		owned = 1;
 		rc = emmc_bio_dma_poll(spin_us);
 		if (rc != EMMC_DMA_RUNNING) {
 			if (spin_us)
@@ -1861,14 +1871,15 @@ static void vblk_idma_service(uint32_t spin_us)
 		}
 	}
 	idmaq_unlock();
+	return owned;
 }
 
 /* emmc_bio_dma_irq_note() spins EMMC_DMA_IRQ_SPIN_US -- enough for DATA_OVER
  * lagging IDST and the usual sub-millisecond busy tail, so most transfers
  * end inside the interrupt itself; emmc_bio_dma_tick() does not spin. */
-static void vblk_idma_hook(uint32_t spin_us)
+static int vblk_idma_hook(uint32_t spin_us)
 {
-	vblk_idma_service(spin_us);
+	return vblk_idma_service(spin_us);
 }
 
 static void idma_sync_enter(void)

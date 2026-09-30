@@ -15,6 +15,7 @@
 #include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 #include "wdt.h"       /* wdt_debug_kick() -- fed during a bounded lock wait */
 #include "cntpct.h"
+#include "gic_timer.h"   /* gic_timer_spi_enable() -- IDMAC queue re-arm */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode — identical convention to every device in this tree.
@@ -98,7 +99,7 @@ void vblk_sd_unlock(void)
 
 #define SD_LOCK_RETRIES 64u   /* bounded -- see vblk_sd.h: fail, don't stall forever */
 
-static void vblk_sd_idma_service(uint32_t spin_us);
+static int vblk_sd_idma_service(uint32_t spin_us);
 
 static int sd_lock_acquire_bounded(void)
 {
@@ -816,6 +817,7 @@ static void sdq_advance(int sd_held)
 		                     SD_BOUNCE_RUN_PA,
 		                     r->total / VBLK_SD_SECTOR_BYTES) == 0) {
 			g_sdq_running = 1;
+			gic_timer_spi_enable(SD_DMA_IRQ_INTID);   /* see vblk_emmc.c */
 			return;
 		}
 		vblk_sd_unlock();
@@ -855,15 +857,17 @@ static void sdq_complete(int rc)
 	sdq_advance(1);
 }
 
-static void vblk_sd_idma_service(uint32_t spin_us)
+/* Same ownership contract as vblk_emmc.c's vblk_idma_service(). */
+static int vblk_sd_idma_service(uint32_t spin_us)
 {
-	int rc;
+	int rc, owned = 0;
 
 	if (!g_sdq_pending)
-		return;
+		return 0;
 	if (!sdq_trylock())
-		return;
+		return *(volatile uint32_t *)&g_sdq_running != 0;   /* see emmc */
 	if (g_sdq_running) {
+		owned = 1;
 		rc = sd_bio_dma_poll(spin_us);
 		if (rc != SD_DMA_RUNNING) {
 			if (spin_us)
@@ -872,11 +876,12 @@ static void vblk_sd_idma_service(uint32_t spin_us)
 		}
 	}
 	sdq_unlock();
+	return owned;
 }
 
-static void vblk_sd_idma_hook(uint32_t spin_us)
+static int vblk_sd_idma_hook(uint32_t spin_us)
 {
-	vblk_sd_idma_service(spin_us);
+	return vblk_sd_idma_service(spin_us);
 }
 
 static void sdq_sync_enter(void)

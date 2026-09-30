@@ -145,6 +145,8 @@ void hdmi_irq_arm_cpu1(void);
 void gic_timer_irq(struct el2_frame *frame);
 
 /* Total ticks handled so far (monotonic, wraps only after 2^64 ticks). */
+/* GICD_ISENABLER for one SPI (the IDMAC queues re-arm their line). */
+void gic_timer_spi_enable(uint32_t intid);
 uint64_t gic_timer_ticks(void);
 
 /* Read-only access to the internal jitter tracker so a REPL command can

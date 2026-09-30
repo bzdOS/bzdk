@@ -46,7 +46,7 @@
  * controller register (that stays exclusively the job of whichever core
  * holds the eMMC controller lock and is inside emmc_dma_wait_complete()) --
  * safe to call from ANY core's IRQ context with no locking at all. */
-void emmc_bio_dma_irq_note(void);
+int emmc_bio_dma_irq_note(void);   /* 1 = a queued transfer owned it */
 
 /* One-time (idempotent) controller bring-up: PC5 pinmux -> func3, 400 kHz
  * init clock, controller reset, GO_IDLE/SEND_OP_COND/ALL_SEND_CID/SET_RCA/
@@ -147,7 +147,7 @@ int emmc_bio_dma_poll(uint32_t spin_us);
  * (emmc_bio_dma_irq_note) and from every core's tick (emmc_bio_dma_tick,
  * the backstop for the BUSY phase, which raises no interrupt). */
 #define EMMC_DMA_IRQ_SPIN_US 1000u   /* the IRQ's poll budget, see vblk_emmc.c */
-void emmc_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us));
+void emmc_bio_set_dma_done_hook(int (*fn)(uint32_t spin_us));
 void emmc_bio_dma_tick(void);
 
 /* Arm/disarm WRITE fault injection. OFF by default; nothing in a normal boot

@@ -2018,28 +2018,27 @@ static void emmc_dma_disarm(void)
 /* Who finishes a split-phase transfer (vblk_emmc.c). A hook, not a direct
  * call, so every build that links this file but not vblk_emmc.o still
  * links. NULL until the owner registers. */
-static void (*volatile g_dma_done_hook)(uint32_t spin_us);
+static int (*volatile g_dma_done_hook)(uint32_t spin_us);
 
-void emmc_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us))
+void emmc_bio_set_dma_done_hook(int (*fn)(uint32_t spin_us))
 {
 	g_dma_done_hook = fn;
 }
 
-void emmc_bio_dma_irq_note(void)
+int emmc_bio_dma_irq_note(void)
 {
-	void (*fn)(uint32_t) = g_dma_done_hook;
+	int (*fn)(uint32_t) = g_dma_done_hook;
 
 	ebio_bc(31, ++g_dma_irqs);
-	if (fn)
-		fn(EMMC_DMA_IRQ_SPIN_US);
+	return fn ? fn(EMMC_DMA_IRQ_SPIN_US) : 0;
 }
 
 void emmc_bio_dma_tick(void)
 {
-	void (*fn)(uint32_t) = g_dma_done_hook;
+	int (*fn)(uint32_t) = g_dma_done_hook;
 
 	if (fn)
-		fn(0);
+		(void)fn(0);
 }
 
 /* Stall-based wait for the IDMAC's own completion (IDST TX/RX_INT) alongside

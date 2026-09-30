@@ -952,28 +952,27 @@ static uint32_t g_sd_dma_irqs;   /* sdbc[1]: real IDMAC completion IRQs
                                   * emmc_bio.c's g_dma_irqs comment */
 
 /* Completion owner (vblk_sd.c) -- same contract as emmc_bio.c's hook. */
-static void (*volatile g_sd_dma_done_hook)(uint32_t spin_us);
+static int (*volatile g_sd_dma_done_hook)(uint32_t spin_us);
 
-void sd_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us))
+void sd_bio_set_dma_done_hook(int (*fn)(uint32_t spin_us))
 {
 	g_sd_dma_done_hook = fn;
 }
 
-void sd_bio_dma_irq_note(void)
+int sd_bio_dma_irq_note(void)
 {
-	void (*fn)(uint32_t) = g_sd_dma_done_hook;
+	int (*fn)(uint32_t) = g_sd_dma_done_hook;
 
 	sdbc(1, ++g_sd_dma_irqs);
-	if (fn)
-		fn(SD_DMA_IRQ_SPIN_US);
+	return fn ? fn(SD_DMA_IRQ_SPIN_US) : 0;
 }
 
 void sd_bio_dma_tick(void)
 {
-	void (*fn)(uint32_t) = g_sd_dma_done_hook;
+	int (*fn)(uint32_t) = g_sd_dma_done_hook;
 
 	if (fn)
-		fn(0);
+		(void)fn(0);
 }
 
 /* WFI between iterations, same rationale and same unchanged correctness
