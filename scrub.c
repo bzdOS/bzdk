@@ -175,3 +175,11 @@ void scrub_accept(uint64_t pa)
 	g_scrub_golden_bad[i] = 0;
 	g_scrub_accepts++;
 }
+
+uint32_t scrub_image_id(void)
+{
+	if (g_scrub_table.magic != SCRUB_TABLE_MAGIC ||
+	    g_scrub_table.chunks > SCRUB_CHUNKS_MAX)
+		return 0;
+	return scrub_crc32(g_scrub_table.crc, g_scrub_table.chunks * 4u);
+}

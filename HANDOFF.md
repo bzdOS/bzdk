@@ -1,3 +1,39 @@
+# Handoff — 2026-09-30 evening: trap cost, scrubber, safe mode, all planes in screenshots
+
+- **Trap cost measured** (ROADMAP §6.5, `vtrap.py`): 6118 guest traps/s
+  under the soak's mixed load = 3.8% of one core (~1% of the machine). 80%
+  are the guest's IPIs (`GICD_SGIR`); disk `QueueNotify` is ~190/s, so
+  NO_NOTIFY / EVENT_IDX would save ~0.13% of a core — not done.
+- **CRC scrubber** (`scrub.[ch]`, `scrub_crc.py`, `scrub.py`): build-time
+  CRC table over `.text`+`.rodata`, golden copy at boot, one 4 KiB chunk per
+  CPU1 tick (full pass 0.56 s), word-level repair. Fault injection over the
+  debug channel: `.rodata` and `.text` flips repaired in 0.19 s; a corrupt
+  golden copy is counted unrepairable, never written; dbgmon `patch` is
+  kept (`scrub_accept`).
+- **Boot counter + safe mode** (`dbgtools.c`, `safemode.py`): 5 boots in a
+  row of the same image that each die within 90 s arm the entry-hold gate —
+  hypervisor and debug channel up, guest held until `safemode.py release`.
+  A new image or a cold boot restarts the count; 90 s up with the guest not
+  held clears it. **Heads-up:** five quick `shutdown -r` reloads of one
+  unchanged image will trip it too; a rebuild does not.
+- **The entry-hold gate was dark since vcpu1 became the default.** Held,
+  CPU0 sat in `wfe`; CPU1 is parked in `vcpu1_run()` until the guest's
+  CPU_ON, so nothing serviced EMAC and the pet relied on guest progress.
+  The first safe-mode test went dark exactly that way and came back through
+  the 900 s reachability watchdog. The hold loop now services dbgmon on
+  CPU0 and pets through `wdt_debug_kick()`. (`dbg_no_guest`'s loop has the
+  same shape and is left as it was: a diagnostic.)
+- **screenshot.py `--what both`** composes every plane from the mixer's
+  registers (HUD, guest window, overlays, video with the hardware's CSC).
+- **A/B eMMC slots: not done.** Staging images on the ESP from the guest was
+  refused by the session's permission classifier, so nothing was written
+  to boot media and the saved U-Boot env is unchanged. `uboot-ab/abtest.c`
+  (uncommitted, untested) is the RAM-only way to try the fallback bootcmd
+  once slots exist: served over TFTP as the uImage it `env_set`s `boothv`
+  in U-Boot's RAM env and returns; old hush copies the command string
+  before parsing (`cli_hush.c` parse_string_outer), so redefining the
+  running `boothv` is safe.
+
 # Handoff — 2026-09-30: hypervisor side of the roadmap is done on this board (read this first)
 
 What changed today, all hardware-verified unless marked, details in the

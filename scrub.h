@@ -46,6 +46,10 @@ void scrub_init(void);            /* CPU0, before the guest starts          */
 void scrub_tick(void);            /* CPU1 tick: one chunk                   */
 void scrub_accept(uint64_t pa);   /* an intentional write at pa: rebase it  */
 
+/* Identity of the image as built: a hash of the build-time CRC table, 0 if
+ * the table was not patched in. dbgtools.c's boot counter keys on it. */
+uint32_t scrub_image_id(void);
+
 /* CRC-32 (IEEE, reflected; same value as zlib.crc32). */
 uint32_t scrub_crc32(const void *p, uint32_t len);
 

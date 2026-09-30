@@ -663,12 +663,25 @@ int main(void)
 	 * for DBG_BC(1, 0x60008) below over `bc 0x50000e00` to confirm it's
 	 * actually held before proceeding. */
 	if (dbgtools_hold_get()) {
+		extern volatile uint32_t dbg_core_active;
+		extern struct el2_frame g_last_guest_frame;
+
 		DBG_BC(1, 0x60008);
+		/* CPU0 must keep the board reachable itself while held. With the
+		 * default vcpu1 CPU1 is parked in vcpu1_run() until the guest's
+		 * CPU_ON, dbg_core_active stays 0, and the debug channel is
+		 * serviced only from CPU0's traps -- of which a held CPU0 takes
+		 * none. The old `wfe` loop here therefore left EMAC unserviced and
+		 * the watchdog fed on guest progress that never came: the board
+		 * went dark (found 2026-09-30 by the boot counter's safe mode,
+		 * which is this gate armed automatically). Same pet rule as CPU1's
+		 * tick: fed while the host is reachable, not otherwise. */
 		for (;;) {
-			wdt_pet();
+			wdt_debug_kick();
+			if (!dbg_core_active)
+				dbgmon_service(&g_last_guest_frame);
 			if (dbgtools_release_get())
 				break;
-			__asm__ volatile("wfe" ::: "memory");
 		}
 		DBG_BC(1, 0x60009);   /* released -- falling through to kload_enter() */
 	}

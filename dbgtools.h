@@ -79,6 +79,9 @@
  * way) so the NEXT reset -- warm or cold -- can tell which kind it was.
  */
 void dbgtools_init(void);
+/* CPU1 tick: clears the boot counter once this boot has proven healthy
+ * (dbgtools.c, "boot counter + safe mode"). */
+void dbgtools_tick(void);
 
 /* Durable (dc civac + dsb, reaches physical DRAM before returning) setters
  * for the entry-hold gate -- deliberately NOT exposed only via dbgmon's
