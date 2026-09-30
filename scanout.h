@@ -156,7 +156,7 @@
                                                * spelling convention as every
                                                * other magic in this tree
                                                * (see hdmi.h's BC_HDMI_MAGIC) */
-#define SCANOUT_VERSION        1u
+#define SCANOUT_VERSION        2u   /* 2: overlay planes (0x50..) */
 #define SCANOUT_FORMAT_XRGB8888 0u
 
 /* One-time setup: populates the register file's read-only fields from
@@ -168,6 +168,25 @@
  * (buffer 0 is exactly what stage_de2() already programmed at boot), and
  * writes the SCAN breadcrumb (hv_addrmap.h HVMAP_SCANOUT_BC). Call once,
  * after hdmi_init() — see main_dbg.c's existing `#ifdef HV_HDMI` block. */
+/* Version 2: overlay planes on the mixer's spare UI layers (hdmi.h's
+ * HDMI_OVL_*), drawn over the guest window. Per plane p, at
+ * SCANOUT_R_OVL(p, reg): stage ADDR/PITCH/SIZE/COORD, then write CTRL to
+ * apply all of them at once (next vblank). CTRL bits are hdmi.h's
+ * HDMI_OVL_EN/_ARGB/_GALPHA_ON + global alpha in 31:24; CTRL without EN
+ * turns the plane off. A rejected apply (bad address, off-screen, pitch
+ * too small) leaves the plane as it was and counts in OVL_REJECT. */
+#define SCANOUT_R_OVL_NUM       0x50u   /* R: number of overlay planes */
+#define SCANOUT_R_OVL_COUNT     0x54u   /* R: accepted applies */
+#define SCANOUT_R_OVL_REJECT    0x58u   /* R: rejected applies */
+#define SCANOUT_R_OVL_BASE      0x60u
+#define SCANOUT_R_OVL_STRIDE    0x20u
+#define SCANOUT_OVL_ADDR        0x00u   /* RW: physical base */
+#define SCANOUT_OVL_PITCH       0x04u   /* RW: bytes per line */
+#define SCANOUT_OVL_SIZE        0x08u   /* RW: w | h << 16 */
+#define SCANOUT_OVL_COORD       0x0Cu   /* RW: x | y << 16, output pixels */
+#define SCANOUT_OVL_CTRL        0x10u   /* RW: write applies */
+#define SCANOUT_R_OVL(p, r) (SCANOUT_R_OVL_BASE + SCANOUT_R_OVL_STRIDE * (p) + (r))
+
 void scanout_init(void);
 
 /* el2_trap dispatch entry. Same contract as vblk_mmio_fault()/

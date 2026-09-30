@@ -436,6 +436,17 @@ int hdmi_guestwin_enable(void);
  * Returns 0 on success, -1 if the display never came up. */
 int hdmi_guestwin_set_addr(uint32_t pa);
 
+/* Extra guest planes on UI1 layers 2..3 (see hdmi.c hdmi_overlay_set()).
+ * idx 0..HDMI_OVL_COUNT-1; geometry/address validated by the caller. */
+#define HDMI_OVL_FIRST_LAYER   2u
+#define HDMI_OVL_COUNT         2u
+#define HDMI_OVL_EN            (1u << 0)
+#define HDMI_OVL_ARGB          (1u << 1)   /* ARGB8888, per-pixel alpha */
+#define HDMI_OVL_GALPHA_ON     (1u << 2)   /* apply bits 31:24 as global alpha */
+#define HDMI_OVL_GALPHA_GET(c) (((c) >> 24) & 0xFFu)
+int hdmi_overlay_set(uint32_t idx, uint32_t pa, uint32_t pitch, uint32_t w,
+                     uint32_t h, uint32_t x, uint32_t y, uint32_t ctrl);
+
 #define BC_HDMI_BASE   0x50011800UL
 _Static_assert(BC_HDMI_BASE == HVMAP_LOW_HDMI_BC,
                "BC_HDMI_BASE drifted from hv_addrmap.h -- the map owns this address");
