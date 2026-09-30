@@ -536,6 +536,11 @@ struct gt_percpu {
 	uint32_t emmc_dma_throttles;  /* times the budget ran out and we masked */
 	uint32_t sd_dma_irqs;
 	uint32_t sd_dma_throttles;
+	/* Line up with no queued transfer to own it (a synchronous DMA on some
+	 * core, or the queue busy elsewhere): masked at once instead of
+	 * re-taken up to the budget. The next queued start unmasks it. */
+	uint32_t emmc_dma_foreign;
+	uint32_t sd_dma_foreign;
 #ifdef HV_HDMI
 	/* TCON1 vblank storm throttle, same shape as the MUSB pair above and
 	 * for the same reason (HDMI_IRQ_BUDGET_PER_TICK comment at the
@@ -1455,8 +1460,13 @@ gic_timer_irq(struct el2_frame *frame)
 #define EMMC_DMA_IRQ_BUDGET_PER_TICK 32u
 #define SD_DMA_IRQ_BUDGET_PER_TICK   32u
 	if (intid == EMMC_DMA_IRQ_INTID) {
-		if (emmc_bio_dma_irq_note)
-			emmc_bio_dma_irq_note();
+		int owned = emmc_bio_dma_irq_note ? emmc_bio_dma_irq_note() : 0;
+
+		if (!owned) {
+			GICD_ICENABLER(GICD_WORD(EMMC_DMA_IRQ_INTID)) =
+			    (1u << GICD_BIT(EMMC_DMA_IRQ_INTID));
+			gt->emmc_dma_foreign++;
+		}
 		GICC_EOIR = iar;
 		GICC_DIR = iar;
 		if (++gt->emmc_dma_irqs >= EMMC_DMA_IRQ_BUDGET_PER_TICK) {
@@ -1469,8 +1479,13 @@ gic_timer_irq(struct el2_frame *frame)
 		return;
 	}
 	if (intid == SD_DMA_IRQ_INTID) {
-		if (sd_bio_dma_irq_note)
-			sd_bio_dma_irq_note();
+		int owned = sd_bio_dma_irq_note ? sd_bio_dma_irq_note() : 0;
+
+		if (!owned) {
+			GICD_ICENABLER(GICD_WORD(SD_DMA_IRQ_INTID)) =
+			    (1u << GICD_BIT(SD_DMA_IRQ_INTID));
+			gt->sd_dma_foreign++;
+		}
 		GICC_EOIR = iar;
 		GICC_DIR = iar;
 		if (++gt->sd_dma_irqs >= SD_DMA_IRQ_BUDGET_PER_TICK) {
@@ -1993,6 +2008,13 @@ gic_timer_irq(struct el2_frame *frame)
 			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(bc_ptr) : "memory");
 		}
 	}
+}
+
+/* Unmask one SPI at the distributor -- the queued-IDMAC start calls this so
+ * a completion is never left masked by an earlier foreign assertion. */
+void gic_timer_spi_enable(uint32_t intid)
+{
+	GICD_ISENABLER(GICD_WORD(intid)) = (1u << GICD_BIT(intid));
 }
 
 uint64_t

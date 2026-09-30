@@ -45,7 +45,7 @@
 /* Called from gic_timer.c's IRQ dispatch (SD_DMA_IRQ_INTID arm) every time
  * the real hardware SPI fires -- see emmc_bio_dma_irq_note()'s comment,
  * same contract, same "no controller register touched here" safety. */
-void sd_bio_dma_irq_note(void);
+int sd_bio_dma_irq_note(void);   /* 1 = a queued transfer owned it */
 
 /* One-time (idempotent) SD-card bring-up: PF0..5 pinmux -> mmc0, 400 kHz init
  * clock, controller reset, then GO_IDLE / SEND_IF_COND / ACMD41(HCS) /
@@ -100,7 +100,7 @@ int sd_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 int sd_bio_dma_start(uint32_t is_read, uint32_t lba, uint64_t buf_pa,
                      uint32_t nblk);
 int sd_bio_dma_poll(uint32_t spin_us);
-void sd_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us));
+void sd_bio_set_dma_done_hook(int (*fn)(uint32_t spin_us));
 void sd_bio_dma_tick(void);
 
 /* Best-effort reclock from the 400 kHz identification clock to SD Default
