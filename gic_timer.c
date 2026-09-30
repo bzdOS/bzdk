@@ -197,6 +197,7 @@
 #include "flightrec.h"
 /* scrub.c is linked only into `dbg`; weak so the other targets link. */
 extern void scrub_tick(void) __attribute__((weak));
+extern void dbgtools_tick(void) __attribute__((weak));
 #include "wdt.h"     /* wdt_debug_kick() — CPU1-as-vCPU2 tick-path kick, see below */
 #include "dbgmon.h"  /* dbgmon_service() — ditto */
 #include "musb.h"    /* MUSB_IRQ_SPI/MUSB_IRQ_INTID — cited constants, see musb.h */
@@ -1690,6 +1691,8 @@ gic_timer_irq(struct el2_frame *frame)
 		wdt_debug_kick();
 		if (scrub_tick)
 			scrub_tick();      /* one 4 KiB chunk of HV code (scrub.h) */
+		if (dbgtools_tick)
+			dbgtools_tick();   /* boot counter / safe mode (dbgtools.c) */
 
 		/* Refresh the MUSB storm budget and un-mask the line if the previous
 		 * window exhausted it (see MUSB_IRQ_BUDGET_PER_TICK above). Written

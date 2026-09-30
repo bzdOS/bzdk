@@ -39,6 +39,81 @@ static inline uint32_t bc_rd32(uint32_t off)
 	return *(volatile uint32_t *)(HVMAP_DBGTOOLS_BASE + off);
 }
 
+/* ---- boot counter + safe mode (words 0x30..0x3c) ------------------------
+ * Counts consecutive boots of the SAME image that did not stay up for
+ * BOOTCNT_HEALTHY_S. At BOOTCNT_SAFE_BOOTS the boot enters SAFE MODE: it
+ * arms the entry-hold gate below, so the hypervisor, EMAC and dbgmon come
+ * up and the guest does not -- a guest that panics during boot, or kills
+ * the board a minute in, cannot keep the board in a reset loop that also
+ * takes the debug channel down with it. The host inspects and fixes, then
+ * `release` (or a new image) lets the guest boot. A cold boot or a
+ * different image (scrub_image_id(), a hash of the build-time CRC table)
+ * starts the count at 1; CPU1's tick clears it once the hypervisor has
+ * been up BOOTCNT_HEALTHY_S with the guest not held. Read with safemode.py. */
+#define BOOTCNT_MAGIC       0x544F4F42u   /* "BOOT" */
+#define BOOTCNT_OFF_MAGIC   0x30u
+#define BOOTCNT_OFF_COUNT   0x34u
+#define BOOTCNT_OFF_IMAGE   0x38u
+#define BOOTCNT_OFF_SAFE    0x3cu
+#define BOOTCNT_SAFE_BOOTS  5u
+#define BOOTCNT_HEALTHY_S   90u
+
+extern uint32_t scrub_image_id(void) __attribute__((weak));
+static uint64_t bootcnt_t0;
+
+static inline uint64_t bootcnt_now(void)
+{
+	uint64_t v;
+
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static void bootcnt_boot(uint32_t warm)
+{
+	uint32_t id = scrub_image_id ? scrub_image_id() : 0u, n = 1u;
+
+	bootcnt_t0 = bootcnt_now();
+	if (warm && bc_rd32(BOOTCNT_OFF_MAGIC) == BOOTCNT_MAGIC &&
+	    bc_rd32(BOOTCNT_OFF_IMAGE) == id)
+		n = bc_rd32(BOOTCNT_OFF_COUNT) + 1u;
+	bc_wr32(BOOTCNT_OFF_MAGIC, BOOTCNT_MAGIC);
+	bc_wr32(BOOTCNT_OFF_COUNT, n);
+	bc_wr32(BOOTCNT_OFF_IMAGE, id);
+	if (n >= BOOTCNT_SAFE_BOOTS) {
+		bc_wr32(BOOTCNT_OFF_SAFE, 1u);
+		bc_wr32(0x0c, 0);    /* RELEASE */
+		bc_wr32(0x08, 1);    /* HOLD: main_dbg.c's gate keeps the guest out */
+	} else if (bc_rd32(BOOTCNT_OFF_SAFE)) {
+		/* a new image or a cold count ends safe mode: disarm the hold
+		 * safe mode armed, or this boot would be held without a reason */
+		bc_wr32(BOOTCNT_OFF_SAFE, 0);
+		bc_wr32(0x08, 0);
+		bc_wr32(0x0c, 0);
+	}
+}
+
+void dbgtools_tick(void)
+{
+	uint64_t freq;
+
+	if (bc_rd32(BOOTCNT_OFF_COUNT) == 0u)
+		return;
+	if (dbgtools_hold_get() && !dbgtools_release_get())
+		return;              /* guest held: this boot proves nothing */
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+	if (bootcnt_now() - bootcnt_t0 < (uint64_t)BOOTCNT_HEALTHY_S * freq)
+		return;
+	bc_wr32(BOOTCNT_OFF_COUNT, 0);
+	if (bc_rd32(BOOTCNT_OFF_SAFE)) {
+		/* safe mode was released and the guest has stayed up: disarm the
+		 * hold it armed, so the next warm reset boots straight through */
+		bc_wr32(BOOTCNT_OFF_SAFE, 0);
+		bc_wr32(0x08, 0);
+		bc_wr32(0x0c, 0);
+	}
+}
+
 void dbgtools_init(void)
 {
 	uint32_t warm = (bc_rd32(0x00) == HVMAP_DBGTOOLS_MAGIC);
@@ -58,6 +133,8 @@ void dbgtools_init(void)
 	}
 	/* else: warm reset — our own magic survived, so DRAM here is exactly
 	 * what a host tool last wrote. Leave HOLD/RELEASE untouched. */
+
+	bootcnt_boot(warm);
 
 	/* Build-id: always refreshed (reflects whatever's ACTUALLY running
 	 * right now — no reason to preserve a stale string across a
