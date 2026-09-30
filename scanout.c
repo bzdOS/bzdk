@@ -82,6 +82,9 @@ struct scanout_dev {
 	uint32_t vblank_stamp_hi;
 	struct { uint32_t addr, pitch, size, coord, ctrl; } ovl[HDMI_OVL_COUNT];
 	uint32_t ovl_count, ovl_reject;
+	/* VID staging, in register order from SCANOUT_R_VID_ADDR0 */
+	uint32_t vid[9];
+	uint32_t vid_count, vid_reject;
 };
 
 static struct scanout_dev g_scan;
@@ -151,7 +154,11 @@ static uint32_t scanout_reg_read(const struct scanout_dev *d, uint32_t off)
 	case SCANOUT_R_OVL_NUM:      return HDMI_OVL_COUNT;
 	case SCANOUT_R_OVL_COUNT:    return d->ovl_count;
 	case SCANOUT_R_OVL_REJECT:   return d->ovl_reject;
+	case SCANOUT_R_VID_COUNT:    return d->vid_count;
+	case SCANOUT_R_VID_REJECT:   return d->vid_reject;
 	default:
+		if (off >= SCANOUT_R_VID_ADDR0 && off <= SCANOUT_R_VID_CTRL)
+			return d->vid[(off - SCANOUT_R_VID_ADDR0) / 4u];
 		if (off >= SCANOUT_R_OVL_BASE &&
 		    off < SCANOUT_R_OVL(HDMI_OVL_COUNT, 0)) {
 			uint32_t p = (off - SCANOUT_R_OVL_BASE) / SCANOUT_R_OVL_STRIDE;
@@ -309,9 +316,61 @@ static void scanout_ovl_apply(struct scanout_dev *d, uint32_t p, uint32_t ctrl)
 	d->ovl_count++;
 }
 
+/* Validate the staged video plane and hand it to hdmi.c. */
+static void scanout_vid_apply(struct scanout_dev *d, uint32_t ctrl)
+{
+	struct hdmi_video v;
+	uint32_t bpp, hsub, vsub;
+
+	v.addr[0] = d->vid[0];  v.addr[1] = d->vid[1];
+	v.pitch[0] = d->vid[2]; v.pitch[1] = d->vid[3];
+	v.src_w = d->vid[4] & 0xFFFFu; v.src_h = d->vid[4] >> 16;
+	v.dst_x = d->vid[5] & 0xFFFFu; v.dst_y = d->vid[5] >> 16;
+	v.dst_w = d->vid[6] & 0xFFFFu; v.dst_h = d->vid[6] >> 16;
+	v.format = d->vid[7];
+	v.ctrl = ctrl;
+
+	if (ctrl & HDMI_VID_EN) {
+		switch (v.format) {
+		case HDMI_VID_NV12:
+		case HDMI_VID_NV21:     bpp = 1; hsub = 2; vsub = 2; break;
+		case HDMI_VID_YUYV:     bpp = 2; hsub = 2; vsub = 1; break;
+		case HDMI_VID_XRGB8888: bpp = 4; hsub = 1; vsub = 1; break;
+		default: goto reject;
+		}
+		if (v.src_w == 0u || v.src_h == 0u || v.dst_w == 0u || v.dst_h == 0u ||
+		    v.src_w > 2048u || (v.src_w % hsub) || (v.src_h % vsub) ||
+		    v.src_w > 2u * v.dst_w || v.src_h > 2u * v.dst_h ||
+		    v.dst_x + v.dst_w > (uint32_t)hdmi_width() ||
+		    v.dst_y + v.dst_h > (uint32_t)hdmi_height() ||
+		    v.pitch[0] < v.src_w * bpp ||
+		    !scanout_addr_allowed(v.addr[0], v.pitch[0], v.src_h))
+			goto reject;
+		if (vsub == 2 &&
+		    (v.pitch[1] < v.src_w ||
+		     !scanout_addr_allowed(v.addr[1], v.pitch[1], v.src_h / 2u)))
+			goto reject;
+	}
+	if (hdmi_video_set(&v) != 0)
+		goto reject;
+	d->vid[8] = ctrl;
+	d->vid_count++;
+	return;
+reject:
+	d->vid_reject++;
+}
+
 static void scanout_reg_write(struct scanout_dev *d, uint32_t off, uint32_t val)
 {
 	uint32_t new_pa;
+
+	if (off >= SCANOUT_R_VID_ADDR0 && off <= SCANOUT_R_VID_CTRL) {
+		if (off == SCANOUT_R_VID_CTRL)
+			scanout_vid_apply(d, val);
+		else
+			d->vid[(off - SCANOUT_R_VID_ADDR0) / 4u] = val;
+		return;
+	}
 
 	if (off >= SCANOUT_R_OVL_BASE && off < SCANOUT_R_OVL(HDMI_OVL_COUNT, 0)) {
 		uint32_t p = (off - SCANOUT_R_OVL_BASE) / SCANOUT_R_OVL_STRIDE;
