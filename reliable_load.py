@@ -121,11 +121,11 @@ def reboot_clean_via_emac():
     """BUILD-INDEPENDENT clean reset over EMAC. Does NOT rely on reboot_clean's
     address (that shifts per build; a stale addr no-ops). Instead:
       1. drop the MUSB D+/D- pull-up (clean USB disconnect, no host -71),
-      2. set wdt_debug_hold=1 across the ~0x4201e6a0 range so the CPU1 debug
-         core STOPS petting the HW WDOG (else it re-kicks and the reset never
-         fires — see smp-debug-core-working),
+      2. set wdt_debug_hold=1 (fixed address, B.WDT_DEBUG_HOLD_PA) so the CPU1
+         debug core STOPS petting the HW WDOG (else it re-kicks and the reset
+         never fires — see smp-debug-core-working),
       3. arm the A64 WDOG for a whole-system reset.
-    All fixed MMIO / a small BSS range -> works regardless of which build ran."""
+    All fixed addresses -> works regardless of which build ran."""
     try:
         hv = HV()
         MUSB = B.MUSB_BASE
@@ -142,40 +142,16 @@ def reboot_clean_via_emac():
         poww = r1(MUSB + 0x40)
         if poww is not None:
             hv.write_word(MUSB + 0x40, poww & ~0x40)                  # clear SOFTCONN
-        # wdt_debug_hold's address SHIFTS per build (BSS moves ~0x2000 between
-        # builds). Resolve it from the elf we load (after a successful load the
-        # running build IS this elf), and also sweep a wide window to cover a
-        # stale/mismatched build. nm the elf; center a ±0x80 tight range on the
-        # real symbol, plus a coarse sweep 0x4201d000..0x42030000 (covers every
-        # observed location: 0x4201e6a0 old, 0x420206a0 virtio-blk) so the reset
-        # fires regardless of which build is actually resident.
-        import subprocess
-        hold = None
-        try:
-            out = subprocess.check_output(
-                ["aarch64-linux-gnu-nm", C.HYP_ELF],
-                stderr=subprocess.DEVNULL).decode()
-            for line in out.splitlines():
-                p = line.split()
-                if len(p) == 3 and p[2] == "wdt_debug_hold":
-                    hold = int(p[0], 16); break
-        except Exception:
-            pass
-        if hold is not None:
-            for a in range(hold - 0x80, hold + 0x84, 4):
-                hv.write_word(a, 1)
-        else:
-            # Fallback ONLY: nm failed to resolve wdt_debug_hold (unknown/
-            # unreadable ELF). Root-caused 2026-07-24 (see project memory
-            # reboot-clean-usb-pullup-drop-slows-cpu1.md): dropping the MUSB
-            # pullup above degrades CPU1's EMAC response latency to a steady
-            # ~1.05-1.07s/write afterward, turning this 1216-write sweep into
-            # ~20 minutes for what the tight sweep above already accomplishes
-            # in under a second whenever `hold` resolves (which it reliably
-            # does in the normal reload-what-we-just-built workflow). Keeping
-            # this here only for the genuinely-unknown-build case.
-            for a in range(0x4201d000, 0x42030000, 0x40):   # coarse safety sweep
-                hv.write_word(a, 1)
+        # wdt_debug_hold is a FIXED address now (hv_addrmap.h's
+        # HVMAP_WDT_DEBUG_HOLD == B.WDT_DEBUG_HOLD_PA), no longer a linked
+        # symbol. This used to nm the elf for it and, when that failed, fall
+        # back to writing 1 into every 0x40 of 0x4201d000..0x42030000. Since
+        # the symbol went away the fallback ran on EVERY reload -- and with
+        # the pull-up dropped each EMAC write takes ~1 s, so the tail of the
+        # sweep landed in the NEW hypervisor after it booted: found
+        # 2026-09-30 as eight 0x00000001 words in its .text/.rodata, one of
+        # them the guest's virtio MAC (vtnet0 came up 01:00:00:00:00:01).
+        hv.write_word(B.WDT_DEBUG_HOLD_PA, 1)
         time.sleep(0.4)
         for pa, val in B.WDOG_ARM_SEQUENCE:
             hv.write_word(pa, val)                                    # arm WDOG

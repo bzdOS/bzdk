@@ -41,12 +41,13 @@ CYCLE, per the T1 brief:
      can't recover from) never loses the run.
 
 BOUNDED RELOAD + BREAK-GLASS ESCALATION (the T1 brief's point 2):
-reliable_load.py's reboot_clean_via_emac() legitimately does a "coarse safety
-sweep" of ~1216 individually-bounded-timeout MMIO writes
-(range(0x4201d000, 0x42030000, 0x40), each a `cmd()` with its own ~1s wait)
-when the precise wdt_debug_hold symbol address can't be resolved narrowly.
-Under a slow/degraded EMAC that alone can legitimately take on the order of
-10-20 minutes and is NOT itself a failure. So the per-cycle reload is run as
+reliable_load.py's reboot_clean_via_emac() used to do a "coarse safety
+sweep" of ~1216 MMIO writes (range(0x4201d000, 0x42030000, 0x40)) when the
+wdt_debug_hold symbol could not be resolved -- which, once it became a fixed
+address, was every time, and the sweep's tail landed in the freshly booted
+hypervisor (removed 2026-09-30; it now writes the one fixed address). A
+reload under a slow/degraded EMAC can still take many minutes and is NOT
+itself a failure. So the per-cycle reload is run as
 a subprocess under a generous --per-cycle-timeout-s (default 30 min, comfor-
 tably past that worst case) — only exceeding THAT outer bound is treated as
 "the normal EMAC path is stuck", at which point the harness gives up on EMAC
