@@ -47,6 +47,7 @@
 #include "vnet_emac.h"   /* vnet_mmio_fault() -- ROADMAP C1 virtio-net-over-EMAC */
 #include "vinput.h"      /* vinput_mmio_fault() -- virtual keyboard */
 #include "vblk_sd.h"     /* vblk_sd_mmio_fault() -- virtio-blk over microSD */
+#include "vblk_zram.h"   /* vblk_zram_mmio_fault() -- compressed-RAM swap disk */
 #include "stage2.h"      /* stage2_wx_fault() -- opt-in dynamic W^X, see
                            * stage2.h's STAGE2_WX_DYNAMIC block and
                            * docs/wx-enforcement.md. The prototype itself is
@@ -439,6 +440,13 @@ __attribute__((weak)) int vinput_mmio_fault(struct el2_frame *frame)
 /* virtio-blk over the microSD card (vblk_sd.c). Same weak-fallback pattern
  * as vinput_mmio_fault immediately above. */
 __attribute__((weak)) int vblk_sd_mmio_fault(struct el2_frame *frame)
+{
+	(void)frame;
+	return 0;
+}
+
+/* Compressed-RAM disk (vblk_zram.c), linked only with VZRAM=1. */
+__attribute__((weak)) int vblk_zram_mmio_fault(struct el2_frame *frame)
 {
 	(void)frame;
 	return 0;
@@ -1462,6 +1470,12 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * the boot-critical eMMC. Same "handled -> return without
 			 * recording" contract as every device above. */
 			if (vblk_sd_mmio_fault(frame)) {
+				if (!dbg_core_active)
+					dbgmon_service(frame);
+				return;
+			}
+			/* Compressed-RAM swap disk at 0x0A005000 (vblk_zram.h). */
+			if (vblk_zram_mmio_fault(frame)) {
 				if (!dbg_core_active)
 					dbgmon_service(frame);
 				return;

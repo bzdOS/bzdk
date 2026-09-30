@@ -4,7 +4,13 @@
  * for lz4.c). */
 #include "vzram_pool.h"
 #include "lz4.h"
-#include <string.h>
+#if __STDC_HOSTED__
+#include <string.h>      /* test_vzram_pool.c builds this file hosted */
+#else
+#include <stddef.h>      /* the board build: libmin.c provides these */
+void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
+#endif
 
 const uint32_t vzram_class_size[VZRAM_NCLASS] = { 256, 512, 1024, 2048, 4096 };
 

@@ -893,4 +893,20 @@ _Static_assert(HVMAP_CORESAMP >= HVMAP_RSBTRAP_END,
 _Static_assert(HVMAP_CORESAMP + HVMAP_CORESAMP_SIZE <= 0x50100000UL,
                "core samples run into emac.c's DMA scratch");
 
+/* vzram backing store (vblk_zram.h): the top 128 MiB of what the guest was
+ * given under GUEST_DRAM_2G. board-config.xml's `vzram` feature shrinks the
+ * DTB /memory node to end exactly at HVMAP_VZRAM_BASE (dtb-memory-size
+ * 0x70000000); the slice ends exactly where U-Boot's no-overwrite region
+ * begins to matter (0xB8000000, see stage2.h) and must never cross it.
+ * Needs GUEST_DRAM_2G: without it this is snapshot.c's mirror GiB. */
+#define HVMAP_VZRAM_BASE   0xB0000000UL
+#define HVMAP_VZRAM_SIZE   0x08000000UL
+_Static_assert(HVMAP_VZRAM_BASE + HVMAP_VZRAM_SIZE == 0xB8000000UL,
+               "vzram must end at the guest's old /memory top, below U-Boot");
+_Static_assert(HVMAP_VZRAM_BASE == 0x40000000UL + 0x70000000UL,
+               "vzram base must equal the vzram feature's dtb-memory-size top");
+#if defined(VZRAM) && VZRAM && !(defined(GUEST_DRAM_2G) && GUEST_DRAM_2G)
+#error "VZRAM needs GUEST_DRAM_2G: its slice is snapshot's mirror otherwise"
+#endif
+
 #endif /* HV_ADDRMAP_H */

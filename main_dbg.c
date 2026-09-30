@@ -46,6 +46,7 @@
 #include "vnet_emac.h"   /* ROADMAP C1: virtio-net multiplexed onto this EMAC */
 #include "vinput.h"      /* virtual keyboard, multiplexed onto the same trap block */
 #include "vblk_sd.h"     /* virtio-blk over the microSD card */
+#include "vblk_zram.h"
 #include "el2_ncmap.h"
 #include "dbgtools.h"    /* CPU1 heartbeat / build-id / entry-hold (2026-07-26) */
 
@@ -237,6 +238,11 @@ int main(void)
 	 * as vblk_init() above). Must run before stage2_init()/stage2_enable(),
 	 * same ordering as every other virtio-mmio device here. */
 	vblk_sd_init();
+#if defined(VZRAM) && VZRAM
+	/* Compressed-RAM swap disk (vblk_zram.h): pure RAM, nothing to probe;
+	 * same "before stage2" ordering as its siblings. */
+	vblk_zram_init();
+#endif
 
 	/* USB-OTG CDC-ACM interactive console bridge (usbacm.c): brings up the
 	 * MUSB gadget (musb_init()) so the CPU1 debug core's usbacm_poll()
