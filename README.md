@@ -620,7 +620,7 @@ useful without the others:
 
 ## Status
 
-Current release: **0.2.0 "banana"** — see `RELEASE-0.2.0.md` for what changed,
+Current release: **0.2.0 "pirozhok"** — see `RELEASE-0.2.0.md` for what changed,
 the measured numbers and an explicit list of what is known broken (earlier:
 `RELEASE-0.0.2.md`, `RELEASE-0.0.1.md`). Short version: it runs on one board,
 the hypervisor's roadmap for that board is done, and the instrumentation is
