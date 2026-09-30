@@ -201,6 +201,14 @@
 #include "usbacm.h"  /* usbacm_poll() — CPU1 MUSB-IRQ path, see musb_irq_arm_cpu1() */
 #include "emmc_bio.h" /* EMMC_DMA_IRQ_INTID/emmc_bio_dma_irq_note() — see dispatch below */
 #include "sd_bio.h"   /* SD_DMA_IRQ_INTID/sd_bio_dma_irq_note() — ditto, SD controller */
+
+/* Weak: not every target links emmc_bio.o/sd_bio.o, and this file must not
+ * be what makes one of those stop linking. Absent -> the IRQ is still
+ * acked and throttled, just not handed to anyone. */
+#pragma weak emmc_bio_dma_irq_note
+#pragma weak emmc_bio_dma_tick
+#pragma weak sd_bio_dma_irq_note
+#pragma weak sd_bio_dma_tick
 #include "sdbox.h"   /* sdbox_record() on the tick's two silent reset paths */
 #include "emac.h"    /* emac_link_watchdog() — link self-heal, see the CPU1 tick block */
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
@@ -1447,7 +1455,8 @@ gic_timer_irq(struct el2_frame *frame)
 #define EMMC_DMA_IRQ_BUDGET_PER_TICK 32u
 #define SD_DMA_IRQ_BUDGET_PER_TICK   32u
 	if (intid == EMMC_DMA_IRQ_INTID) {
-		emmc_bio_dma_irq_note();
+		if (emmc_bio_dma_irq_note)
+			emmc_bio_dma_irq_note();
 		GICC_EOIR = iar;
 		GICC_DIR = iar;
 		if (++gt->emmc_dma_irqs >= EMMC_DMA_IRQ_BUDGET_PER_TICK) {
@@ -1460,7 +1469,8 @@ gic_timer_irq(struct el2_frame *frame)
 		return;
 	}
 	if (intid == SD_DMA_IRQ_INTID) {
-		sd_bio_dma_irq_note();
+		if (sd_bio_dma_irq_note)
+			sd_bio_dma_irq_note();
 		GICC_EOIR = iar;
 		GICC_DIR = iar;
 		if (++gt->sd_dma_irqs >= SD_DMA_IRQ_BUDGET_PER_TICK) {
@@ -1630,10 +1640,13 @@ gic_timer_irq(struct el2_frame *frame)
 	gt->emmc_dma_irqs = 0;
 	/* Backstop for an IRQ-completed IDMAC transfer: the card-busy tail
 	 * raises no interrupt, and CPU0 may be inside a trap (vblk_emmc.c). */
-	emmc_bio_dma_tick();
+	if (emmc_bio_dma_tick)
+		emmc_bio_dma_tick();
 	GICD_ISENABLER(GICD_WORD(EMMC_DMA_IRQ_INTID)) =
 	    (1u << GICD_BIT(EMMC_DMA_IRQ_INTID));
 	gt->sd_dma_irqs = 0;
+	if (sd_bio_dma_tick)   /* same backstop as emmc_bio_dma_tick() */
+		sd_bio_dma_tick();
 	GICD_ISENABLER(GICD_WORD(SD_DMA_IRQ_INTID)) =
 	    (1u << GICD_BIT(SD_DMA_IRQ_INTID));
 
