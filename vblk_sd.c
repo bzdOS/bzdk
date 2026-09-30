@@ -14,6 +14,7 @@
 #include "sd_bio.h"
 #include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
 #include "wdt.h"       /* wdt_debug_kick() -- fed during a bounded lock wait */
+#include "cntpct.h"
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode — identical convention to every device in this tree.
@@ -97,12 +98,17 @@ void vblk_sd_unlock(void)
 
 #define SD_LOCK_RETRIES 64u   /* bounded -- see vblk_sd.h: fail, don't stall forever */
 
+static void vblk_sd_idma_service(uint32_t spin_us);
+
 static int sd_lock_acquire_bounded(void)
 {
 	uint32_t tries = 0;
 	while (!vblk_sd_trylock()) {
 		if (++tries >= SD_LOCK_RETRIES)
 			return 0;
+		/* The holder may be the IDMAC queue, which only a poll can
+		 * advance from inside a trap -- see vblk_sd_idma_service(). */
+		vblk_sd_idma_service(0);
 		wdt_debug_kick();
 	}
 	return 1;
@@ -223,7 +229,13 @@ static int vq_pop_avail(struct vblk_sd_vq *vq, uint16_t *head)
 
 static void vq_push_used(struct vblk_sd_vq *vq, uint16_t head, uint32_t used_len)
 {
-	uint16_t used_idx = gmem_ld16(vq->used + 2u);
+	uint16_t used_idx;
+
+	/* A queued completion can land after a reset tore the ring down (the
+	 * drain before teardown is bounded); never write through a NULL ring. */
+	if (vq->num == 0 || vq->used == 0)
+		return;
+	used_idx = gmem_ld16(vq->used + 2u);
 	uint16_t slot = (uint16_t)(used_idx % vq->num);
 	uint64_t e = vq->used + 4u + (uint64_t)slot * 8u;
 	uint32_t id = head;
@@ -235,6 +247,14 @@ static void vq_push_used(struct vblk_sd_vq *vq, uint16_t head, uint32_t used_len
 	gmem_st16(vq->used + 2u, new_idx);
 	__asm__ volatile("dsb sy" ::: "memory");
 }
+
+static inline uint16_t sd_used_idx(struct vblk_sd_vq *vq)
+{
+	return vq->used ? gmem_ld16(vq->used + 2u) : 0u;
+}
+
+/* used->idx when the guest ISR last read InterruptStatus (see ACK). */
+static uint16_t g_sd_isr_scan_used_idx;
 
 /* ------------------------------------------------------------------ *
  * IRQ injection (IMO=0) -- identical mechanism to every device here.
@@ -584,6 +604,378 @@ static int sd_serve_gathered(uint32_t is_read, const struct vblk_sd_desc *chain,
 	return SD_RC_OK;
 }
 
+/* ------------------------------------------------------------------ *
+ * Used-ring publish lock. Every completion used to happen inside the
+ * notifying vCPU's own trap, which FreeBSD's vtblk already serializes
+ * (it notifies with its queue mutex held), so nothing here needed one.
+ * With the IDMAC queue below a completion can land from the IRQ or a tick
+ * on any core, concurrently with a trap's pop/push -- same race, same fix
+ * as vblk_emmc.c's VBLK_USED_LOCK_PA. Local word: only this file uses it.
+ * ------------------------------------------------------------------ */
+static volatile uint32_t g_sd_used_lock;
+
+static int sd_used_trylock(void)
+{
+	uint32_t prev, status, one = 1u;
+
+	__asm__ volatile(
+		"	ldaxr	%w0, [%3]\n"
+		"	cbnz	%w0, 1f\n"
+		"	stlxr	%w1, %w2, [%3]\n"
+		"	b	2f\n"
+		"1:	mov	%w1, #1\n"
+		"2:\n"
+		: "=&r"(prev), "=&r"(status)
+		: "r"(one), "r"(&g_sd_used_lock)
+		: "memory");
+	if (prev == 0u && status == 0u) {
+		__asm__ volatile("dsb sy" ::: "memory");
+		return 1;
+	}
+	return 0;
+}
+
+/* The section is a handful of guest-memory stores; never held across I/O. */
+static void sd_used_lock(void)
+{
+	while (!sd_used_trylock())
+		__asm__ volatile("yield" ::: "memory");
+}
+
+static void sd_used_unlock(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_sd_used_lock = 0u;
+	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
+/* push + notify as one step, the only way a completion is published. */
+static void sd_complete(uint16_t head, uint32_t used_len)
+{
+	sd_used_lock();
+	vq_push_used(&g_sd_blk.vq[VBLK_SD_QUEUE], head, used_len);
+	vblk_sd_inject_irq();
+	sd_used_unlock();
+}
+
+static inline uint64_t sd_cntfrq(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+	return v ? v : 24000000ull;
+}
+
+static inline uint64_t sd_ms_to_ticks(uint32_t ms)
+{
+	return (sd_cntfrq() * (uint64_t)ms) / 1000ull;
+}
+
+#define SD_QLOCK_TIMEOUT_MS 6000u
+
+/* ------------------------------------------------------------------ *
+ * IRQ-COMPLETED IDMAC QUEUE -- the SD mirror of vblk_emmc.c's (read that
+ * block comment for the design: who advances it, lock ownership, the sync
+ * waiter handshake, failure re-serve). Differences here are only names:
+ * the SD lock, sd_serve_data(), sd_complete(), SPI 92.
+ *
+ * One more reason the sync handshake matters on this side: the SD lock's
+ * acquire gives up after SD_LOCK_RETRIES tries, far too few to outwait a
+ * queue that owns the lock, so a synchronous request drains the queue
+ * before it touches the controller at all.
+ * ------------------------------------------------------------------ */
+#define SD_IDMA_QLEN 16u
+#define SD_IDMA_MAX_DESC (VBLK_SD_MAX_CHAIN - 2u)
+
+struct sd_idma_req {
+	uint16_t head;
+	uint16_t is_read;
+	uint64_t sector;
+	uint64_t status_gpa;
+	uint32_t ndesc;
+	uint32_t total;
+	uint64_t data_addr[SD_IDMA_MAX_DESC];
+	uint32_t data_len[SD_IDMA_MAX_DESC];
+};
+
+static struct sd_idma_req g_sdq[SD_IDMA_QLEN];
+static uint32_t g_sdq_head, g_sdq_count, g_sdq_running, g_sdq_sync_waiters;
+static volatile uint32_t g_sdq_lock;
+static volatile uint32_t g_sdq_pending;
+
+volatile uint32_t g_vblk_sd_idma_on = 1u;
+uint32_t g_sd_idma_posts, g_sd_idma_done, g_sd_idma_redo, g_sd_idma_irq_done,
+         g_sd_idma_busy_skips, g_sd_idma_qmax, g_sd_irq_rearms;
+
+static int sdq_trylock(void)
+{
+	uint32_t prev, status, one = 1u;
+
+	__asm__ volatile(
+		"	ldaxr	%w0, [%3]\n"
+		"	cbnz	%w0, 1f\n"
+		"	stlxr	%w1, %w2, [%3]\n"
+		"	b	2f\n"
+		"1:	mov	%w1, #1\n"
+		"2:\n"
+		: "=&r"(prev), "=&r"(status)
+		: "r"(one), "r"(&g_sdq_lock)
+		: "memory");
+	if (prev == 0u && status == 0u) {
+		__asm__ volatile("dsb sy" ::: "memory");
+		return 1;
+	}
+	return 0;
+}
+
+static void sdq_unlock(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_sdq_lock = 0u;
+	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
+static int sdq_lock_bounded(void)
+{
+	uint64_t start = cntpct_read();
+	uint64_t cap = sd_ms_to_ticks(SD_QLOCK_TIMEOUT_MS);
+	uint32_t i = 0;
+
+	while (!sdq_trylock()) {
+		if ((i++ & 0xFFFFu) == 0u)
+			wdt_debug_kick();
+		if (cntpct_read() - start > cap)
+			return 0;
+		__asm__ volatile("yield" ::: "memory");
+	}
+	return 1;
+}
+
+static void sdq_pop(void)
+{
+	g_sdq_head = (g_sdq_head + 1u) % SD_IDMA_QLEN;
+	g_sdq_count--;
+	g_sdq_pending = g_sdq_count;
+}
+
+static void sdq_publish(struct sd_idma_req *r, uint8_t status,
+                        uint32_t used_len)
+{
+	if (status == VIRTIO_BLK_S_OK)
+		vblk_sd_bc(r->is_read ? 4 : 5,
+		           r->is_read ? ++g_reads : ++g_writes);
+	gmem_write(r->status_gpa, &status, 1);
+	sd_complete(r->head, used_len);
+	g_sd_idma_done++;
+}
+
+/* SD lock NOT held: sd_serve_data() takes it per chunk. */
+static void sdq_serve_sync(struct sd_idma_req *r)
+{
+	uint8_t  status = VIRTIO_BLK_S_OK;
+	uint32_t used_len = 0, sfill = 0, i;
+	uint64_t sector = r->sector;
+
+	g_sd_idma_redo++;
+	for (i = 0; i < r->ndesc; i++) {
+		if (sd_serve_data(r->is_read, r->data_addr[i], r->data_len[i],
+		                  &sector, &sfill) != SD_RC_OK) {
+			status = VIRTIO_BLK_S_IOERR;
+			break;
+		}
+		if (r->is_read)
+			used_len += r->data_len[i];
+	}
+	wdt_debug_kick();
+	sdq_publish(r, status, used_len);
+}
+
+/* g_sdq_lock held, !g_sdq_running. Leaves the SD lock held iff a transfer
+ * is running. */
+static void sdq_advance(int sd_held)
+{
+	while (g_sdq_count) {
+		struct sd_idma_req *r = &g_sdq[g_sdq_head];
+		uint32_t i, off;
+
+		if (!sd_held) {
+			if (!sd_lock_acquire_bounded()) {
+				sdq_serve_sync(r);   /* will fail BUSY -> S_IOERR */
+				sdq_pop();
+				continue;
+			}
+			sd_held = 1;
+		}
+		if (!r->is_read) {
+			for (i = 0, off = 0; i < r->ndesc; off += r->data_len[i], i++)
+				gmem_read(r->data_addr[i], (uint8_t *)g_bounce_run + off,
+				          r->data_len[i]);
+			__asm__ volatile("dsb sy" ::: "memory");
+		}
+		vblk_sd_bc(12, (uint32_t)r->sector);
+		if (sd_bio_dma_start(r->is_read, (uint32_t)r->sector,
+		                     SD_BOUNCE_RUN_PA,
+		                     r->total / VBLK_SD_SECTOR_BYTES) == 0) {
+			g_sdq_running = 1;
+			return;
+		}
+		vblk_sd_unlock();
+		sd_held = 0;
+		sdq_serve_sync(r);
+		sdq_pop();
+	}
+	if (sd_held)
+		vblk_sd_unlock();
+}
+
+static void sdq_complete(int rc)
+{
+	struct sd_idma_req *r = &g_sdq[g_sdq_head];
+	uint32_t i, off;
+
+	g_sdq_running = 0;
+	if (rc != 0) {
+		vblk_sd_bc(r->is_read ? 19 : 15,
+		           r->is_read ? ++g_multi_rfails : ++g_multi_fails);
+		vblk_sd_bc(16, (uint32_t)rc);
+		vblk_sd_bc(17, (uint32_t)r->sector);
+		vblk_sd_unlock();
+		sdq_serve_sync(r);
+		sdq_pop();
+		sdq_advance(0);
+		return;
+	}
+	g_sd_dma_ok++;
+	vblk_sd_bc(20, ++g_gathered);
+	if (r->is_read)   /* under the SD lock -- g_bounce_run is shared */
+		for (i = 0, off = 0; i < r->ndesc; off += r->data_len[i], i++)
+			gmem_write(r->data_addr[i], (uint8_t *)g_bounce_run + off,
+			           r->data_len[i]);
+	sdq_publish(r, VIRTIO_BLK_S_OK, r->is_read ? r->total : 0u);
+	sdq_pop();
+	sdq_advance(1);
+}
+
+static void vblk_sd_idma_service(uint32_t spin_us)
+{
+	int rc;
+
+	if (!g_sdq_pending)
+		return;
+	if (!sdq_trylock())
+		return;
+	if (g_sdq_running) {
+		rc = sd_bio_dma_poll(spin_us);
+		if (rc != SD_DMA_RUNNING) {
+			if (spin_us)
+				g_sd_idma_irq_done++;
+			sdq_complete(rc);
+		}
+	}
+	sdq_unlock();
+}
+
+static void vblk_sd_idma_hook(uint32_t spin_us)
+{
+	vblk_sd_idma_service(spin_us);
+}
+
+static void sdq_sync_enter(void)
+{
+	if (sdq_lock_bounded()) {
+		g_sdq_sync_waiters++;
+		sdq_unlock();
+	}
+}
+
+static void sdq_sync_exit(void)
+{
+	if (sdq_lock_bounded()) {
+		if (g_sdq_sync_waiters)
+			g_sdq_sync_waiters--;
+		sdq_unlock();
+	}
+}
+
+static void vblk_sd_idma_drain_bounded(void)
+{
+	uint64_t start, cap;
+	uint32_t i = 0;
+
+	if (!g_sdq_pending)
+		return;
+	sdq_sync_enter();
+	start = cntpct_read();
+	cap = sd_ms_to_ticks(SD_QLOCK_TIMEOUT_MS);
+	while (g_sdq_pending) {
+		vblk_sd_idma_service(0);
+		if ((i++ & 0xFFFFu) == 0u)
+			wdt_debug_kick();
+		if (cntpct_read() - start > cap)
+			break;
+		__asm__ volatile("yield" ::: "memory");
+	}
+	sdq_sync_exit();
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* 1 = accepted (possibly already completed). */
+static int vblk_sd_idma_post(uint16_t head, uint32_t is_read, uint64_t sector,
+                             uint64_t status_gpa,
+                             const struct vblk_sd_desc *chain, uint32_t n)
+{
+	uint32_t ndata = n - 2u, total = 0, i;
+	struct sd_idma_req *r;
+
+	if (!g_vblk_sd_idma_on || n < 3u || ndata > SD_IDMA_MAX_DESC)
+		return 0;
+	for (i = 0; i < ndata; i++) {
+		uint32_t len = chain[1 + i].len;
+
+		if (len == 0 || (len % VBLK_SD_SECTOR_BYTES) != 0 ||
+		    !gpa_in_range(chain[1 + i].addr, len))
+			return 0;
+		total += len;
+		if (total > sizeof(g_bounce_run))
+			return 0;
+	}
+	if (total < 2u * VBLK_SD_SECTOR_BYTES)
+		return 0;
+
+	if (!sdq_lock_bounded())
+		return 0;
+	if (g_sdq_sync_waiters || g_sdq_count >= SD_IDMA_QLEN) {
+		sdq_unlock();
+		return 0;
+	}
+	if (g_sdq_count == 0 && !vblk_sd_trylock()) {
+		g_sd_idma_busy_skips++;
+		sdq_unlock();
+		return 0;
+	}
+
+	r = &g_sdq[(g_sdq_head + g_sdq_count) % SD_IDMA_QLEN];
+	r->head       = head;
+	r->is_read    = (uint16_t)is_read;
+	r->sector     = sector;
+	r->status_gpa = status_gpa;
+	r->ndesc      = ndata;
+	r->total      = total;
+	for (i = 0; i < ndata; i++) {
+		r->data_addr[i] = chain[1 + i].addr;
+		r->data_len[i]  = chain[1 + i].len;
+	}
+	g_sdq_count++;
+	g_sdq_pending = g_sdq_count;
+	if (g_sdq_count > g_sd_idma_qmax)
+		g_sd_idma_qmax = g_sdq_count;
+	g_sd_idma_posts++;
+
+	if (g_sdq_count == 1u)
+		sdq_advance(1);
+	sdq_unlock();
+	return 1;
+}
+
 static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 {
 	struct vblk_sd_vq *vq = &d->vq[VBLK_SD_QUEUE];
@@ -603,14 +995,12 @@ static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 			 * vblk_emmc.c's vblk_request()/its caller: EVERY exit path there
 			 * is treated as "served" and gets exactly one inject_irq() call.
 			 * Mirror that contract here. */
-			vq_push_used(vq, head, 0);
-			vblk_sd_inject_irq();
+			sd_complete(head, 0);
 			return;
 		}
 		vq_read_desc(vq, idx, &chain[n]);
 		if (chain[n].flags & VBLK_SD_VRING_DESC_F_INDIRECT) {
-			vq_push_used(vq, head, 0);
-			vblk_sd_inject_irq();
+			sd_complete(head, 0);
 			return;
 		}
 		uint16_t flags = chain[n].flags;
@@ -621,8 +1011,7 @@ static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 		idx = next;
 	}
 	if (n < 2) {
-		vq_push_used(vq, head, 0);
-		vblk_sd_inject_irq();
+		sd_complete(head, 0);
 		return;
 	}
 
@@ -638,27 +1027,37 @@ static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 	if (!d->sd_ready) {
 		status = VIRTIO_BLK_S_IOERR;
 	} else if ((hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) &&
-	           sd_serve_gathered(hdr.type == VIRTIO_BLK_T_IN, chain, n,
-	                             hdr.sector, &used_len) == SD_RC_OK) {
-		vblk_sd_bc(hdr.type == VIRTIO_BLK_T_IN ? 4 : 5,
-		           hdr.type == VIRTIO_BLK_T_IN ? ++g_reads : ++g_writes);
+	           vblk_sd_idma_post(head, hdr.type == VIRTIO_BLK_T_IN,
+	                             hdr.sector, stdesc->addr, chain, n)) {
+		return;                   /* the IDMAC IRQ completes it */
 	} else if (hdr.type == VIRTIO_BLK_T_IN || hdr.type == VIRTIO_BLK_T_OUT) {
 		uint32_t is_read = (hdr.type == VIRTIO_BLK_T_IN);
 		uint32_t i;
 
-		used_len = 0;
-		for (i = 1; i < n - 1; i++) {
-			int rc = sd_serve_data(is_read, chain[i].addr, chain[i].len,
-			                       &sector, &sfill);
-			if (rc != SD_RC_OK) {
-				status = VIRTIO_BLK_S_IOERR;
-				break;
-			}
-			if (is_read)
-				used_len += chain[i].len;
-		}
-		if (status == VIRTIO_BLK_S_OK)
+		/* Queue refused: take it synchronously, but only once the queue
+		 * has let go of the controller -- see sdq's block comment. */
+		sdq_sync_enter();
+		vblk_sd_idma_drain_bounded();
+		if (sd_serve_gathered(is_read, chain, n, hdr.sector,
+		                      &used_len) == SD_RC_OK) {
 			vblk_sd_bc(is_read ? 4 : 5, is_read ? ++g_reads : ++g_writes);
+		} else {
+			used_len = 0;
+			for (i = 1; i < n - 1; i++) {
+				int rc = sd_serve_data(is_read, chain[i].addr,
+				                       chain[i].len, &sector, &sfill);
+				if (rc != SD_RC_OK) {
+					status = VIRTIO_BLK_S_IOERR;
+					break;
+				}
+				if (is_read)
+					used_len += chain[i].len;
+			}
+			if (status == VIRTIO_BLK_S_OK)
+				vblk_sd_bc(is_read ? 4 : 5,
+				           is_read ? ++g_reads : ++g_writes);
+		}
+		sdq_sync_exit();
 	} else if (hdr.type == VIRTIO_BLK_T_GET_ID) {
 		static const char id[] = "bzdk-sd0";
 		uint8_t buf[VBLK_SD_ID_BYTES];
@@ -668,15 +1067,15 @@ static void vblk_sd_request(struct vblk_sd_dev *d, uint16_t head)
 		gmem_write(chain[1].addr, buf, sizeof(buf));
 		used_len = sizeof(buf);
 	} else if (hdr.type == VIRTIO_BLK_T_FLUSH) {
-		/* Nothing buffered on our side to flush -- every write above is
-		 * already synchronous. */
+		/* Every write the queue accepted before this FLUSH must be on the
+		 * card before it reports success; the sync paths are synchronous. */
+		vblk_sd_idma_drain_bounded();
 	} else {
 		status = VIRTIO_BLK_S_UNSUPP;
 	}
 
 	gmem_write(stdesc->addr, &status, 1);
-	vq_push_used(vq, head, used_len);
-	vblk_sd_inject_irq();
+	sd_complete(head, used_len);
 }
 
 /* ------------------------------------------------------------------ *
@@ -699,7 +1098,9 @@ static uint32_t vblk_sd_reg_read(struct vblk_sd_dev *d, uint32_t off)
 		if (d->queue_sel < VBLK_SD_NUM_QUEUES)
 			return d->vq[d->queue_sel].ready;
 		return 0u;
-	case VBLK_SD_R_INTERRUPT_STATUS: return d->int_status;
+	case VBLK_SD_R_INTERRUPT_STATUS:
+		g_sd_isr_scan_used_idx = sd_used_idx(&d->vq[VBLK_SD_QUEUE]);
+		return d->int_status;
 	case VBLK_SD_R_STATUS:        return d->status;
 	case VBLK_SD_R_CONFIG_GENERATION: return d->config_gen;
 	default:
@@ -802,7 +1203,10 @@ static void vblk_sd_reg_write(struct vblk_sd_dev *d, uint32_t off, uint32_t val)
 				__asm__ volatile("dsb sy" ::: "memory");
 				vblk_sd_bc(2, 1);
 			} else {
+				vblk_sd_idma_drain_bounded();
+				sd_used_lock();
 				vq->ready = 0u;
+				sd_used_unlock();
 				vblk_sd_bc(2, 0);
 			}
 		}
@@ -816,18 +1220,33 @@ static void vblk_sd_reg_write(struct vblk_sd_dev *d, uint32_t off, uint32_t val)
 		}
 		break;
 	case VBLK_SD_R_INTERRUPT_ACK:
+		/* vblk_emmc.c's LOST-COMPLETION FIX, needed here since completions
+		 * went asynchronous: an entry pushed after the ISR sampled
+		 * InterruptStatus would have its notification acked away unseen,
+		 * and the guest would wait for it forever. Re-notify if the ring
+		 * moved since that sample. */
+		sd_used_lock();
 		d->int_status &= ~val;
+		if ((val & VBLK_SD_INT_VRING) &&
+		    sd_used_idx(&d->vq[VBLK_SD_QUEUE]) != g_sd_isr_scan_used_idx) {
+			vblk_sd_inject_irq();
+			g_sd_irq_rearms++;
+		}
+		sd_used_unlock();
 		break;
 	case VBLK_SD_R_STATUS:
 		d->status = val;
 		vblk_sd_bc(1, val);
 		if (val == 0u) {
+			vblk_sd_idma_drain_bounded();
+			sd_used_lock();
 			for (uint32_t q = 0; q < VBLK_SD_NUM_QUEUES; q++) {
 				struct vblk_sd_vq *vq = &d->vq[q];
 				vq->ready = 0; vq->num = 0; vq->last_avail = 0;
 				vq->desc = vq->avail = vq->used = 0;
 			}
 			d->int_status = 0;
+			sd_used_unlock();
 			vblk_sd_bc(2, 0);
 		}
 		break;
@@ -893,6 +1312,10 @@ void vblk_sd_init(void)
 	for (uint32_t i = 0; i < sizeof(g_sd_blk); i++)
 		((uint8_t *)&g_sd_blk)[i] = 0;
 	*sd_lock_word() = 0u;
+	g_sd_used_lock = 0u;
+	g_sdq_lock = 0u;
+	g_sdq_head = g_sdq_count = g_sdq_running = g_sdq_sync_waiters = 0;
+	g_sdq_pending = 0;
 
 	g_sd_blk.base = VBLK_SD_MMIO_BASE;
 	g_reads = g_writes = g_irqs = g_faults = g_gmem_oob = 0;
@@ -902,6 +1325,7 @@ void vblk_sd_init(void)
 
 	rc = sd_bio_init();
 	g_sd_blk.sd_ready = (rc == 0);
+	sd_bio_set_dma_done_hook(vblk_sd_idma_hook);
 
 	/* Every counter slot starts at 0: the event-only ones ([10]-[20])
 	 * are otherwise whatever DRAM held (warm resets keep it), and a stale
