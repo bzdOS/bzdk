@@ -511,7 +511,7 @@ class Board:
     def guest_alive(self):
         if not self._a2:
             return False
-        rc, out, _ = self._a2.guest("echo UP", 20)
+        rc, out, _ = self._a2.guest("echo UP", 90)   # banner ~27 s, see a2_cycle.SSH
         ok = (rc == 0 and "UP" in out)
         self._ssh_ok_last = ok
         return ok
@@ -588,7 +588,12 @@ class Board:
                f"kill -TERM -$G 2>/dev/null; sleep 1; fi; "
                f"cat > {LOAD_DIR}/load.sh <<'BZDEOF'\n{body}BZDEOF\n"
                f"chmod +x {LOAD_DIR}/load.sh; "
-               f"daemon -o {LOAD_DIR}/load.out {LOAD_DIR}/load.sh; "
+               # daemon's own stdio detached: otherwise the supervisor keeps
+               # the ssh session's stdout open, ssh never returns, the call
+               # times out, and the harness falls back to the console and
+               # hangs there (measured 2026-09-30: 2 min for a 100 s job).
+               f"daemon -o {LOAD_DIR}/load.out {LOAD_DIR}/load.sh "
+               f"</dev/null >/dev/null 2>&1; "
                f"sleep 2; echo STARTED-`cat {LOAD_DIR}/pid 2>/dev/null`")
         out = self.guest_exec(cmd, timeout=120)
         return bool(out and "STARTED-" in out and

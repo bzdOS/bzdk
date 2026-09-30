@@ -54,7 +54,11 @@ sys.path.insert(0, HERE)
 
 GUEST = "192.168.88.82"
 KEY = "/root/.ssh/chimp_ed25519"
-SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=8",
+# ConnectTimeout 60, not 8: sshd in the guest does a reverse lookup of the
+# host that the LAN resolver never answers (10 s per try, measured
+# 2026-09-30), so the banner arrives ~27 s late and an 8 s timeout made
+# every soak probe fall back to the slow, lossy console.
+SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=60",
        "-o", "BatchMode=yes", "-i", KEY, f"root@{GUEST}"]
 UBOOT_USB_ID = "1f3a:efe8"      # U-Boot's own gadget
 HV_USB_ID = "1d6b:0010"         # the HV's CDC-ACM console
@@ -75,7 +79,7 @@ def guest(cmd, timeout=60):
 def guest_up(timeout_s):
     t0 = time.time()
     while time.time() - t0 < timeout_s:
-        rc, out, _ = guest("echo UP", 15)
+        rc, out, _ = guest("echo UP", 90)   # banner ~27 s, see SSH
         if rc == 0 and "UP" in out:
             return True
         time.sleep(10)
