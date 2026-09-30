@@ -12,9 +12,10 @@ numbered items of the 2026-09-27 section below:
   on at boot** — and note the tension with the framing below: swap here is
   meant to be idle insurance (target 0), so whether 128 MiB of RAM should
   sit behind it at all is the owner's call. `docs/vzram.md`.
-- **DE2 overlay planes (item 6), hypervisor half.** scanout v2 hands the
-  guest UI layers 2/3 of the HDMI mixer. Register-level verified; **what the
-  panel shows is not yet verified.** `docs/zero-copy-scanout.md` §7.
+- **DE2 planes (item 6), hypervisor half.** scanout v2 hands the guest UI
+  layers 2/3 of the HDMI mixer; scanout v3 the VI channel as a scaled
+  NV12/NV21/YUYV/XRGB video plane (`3aca0aa`). Both verified on the panel
+  by the owner. `docs/zero-copy-scanout.md` §9-10.
 - **VE (item 7): no hypervisor work exists** — node, MMIO and clocks are the
   guest's; it needs a guest driver.
 - **Tooling:** `reliable_load.py` no longer writes 1s into the freshly
@@ -22,8 +23,7 @@ numbered items of the 2026-09-27 section below:
   again (`61c829d`). Build with `LC_ALL=C`: gcc's Russian "ошибка" slipped
   past a grep for "error" twice today.
 
-Hypervisor work left on this board: the VI channel (YUV + scaler) if video
-should reach the panel without a copy; a long soak of the IDMAC queues;
+Hypervisor work left on this board: a long soak of the IDMAC queues;
 U-Boot's MUSB gadget root cause (a ~5 h catch soak). Everything else on the
 roadmap is guest work: item 5, bzkms planes + HWC logic, a VE driver.
 

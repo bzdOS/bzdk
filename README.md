@@ -7,15 +7,18 @@
 
 A bare-metal, hand-written type-1 hypervisor (no KVM/Xen/Jailhouse ancestry, no
 vendor SDK) that runs **FreeBSD 15.1 arm64 as an EL1 guest** on a **Banana Pi
-M64** — Allwinner A64, 4× Cortex-A53, 1 GiB of guest DRAM
-(`STAGE2_DRAM_SIZE = 0x40000000`, `stage2.h:88`).
+M64** — Allwinner A64, 4× Cortex-A53, four guest vCPUs and 1792 MiB of guest
+DRAM in the default build (`GUEST_DRAM_2G` + the `vzram` carve, see
+`stage2.h` and `docs/vzram.md`).
 
 Everything below the guest is in this tree: the stage-2 MMU tables
-(`stage2.c`), the GICv2 virtualisation (`vgic.c`, `gic_timer.c`), the eMMC PIO
-driver (`emmc_bio.c`), the Ethernet MAC (`emac.c`), the USB-OTG gadget
-(`musb.c`, `usbacm.c`), virtio-mmio block and net devices (`vblk_emmc.c`,
-`vnet_emac.c`), a 16550 emulation (`vconsole.c`), and the DE2/HDMI display
-pipeline (`hdmi.c`, `scanout.c`, `hud.c`). The board has **no physical UART**:
+(`stage2.c`), the GICv2 virtualisation (`vgic.c`, `gic_timer.c`), the eMMC and
+SD drivers with IDMAC DMA and IRQ completion (`emmc_bio.c`, `sd_bio.c`), the
+Ethernet MAC (`emac.c`), the USB-OTG gadget (`musb.c`, `usbacm.c`), virtio-mmio
+block, net and input devices (`vblk_emmc.c`, `vblk_sd.c`, `vblk_zram.c`,
+`vnet_emac.c`, `vinput.c`), a 16550 emulation (`vconsole.c`), and the DE2/HDMI
+display pipeline with guest overlay and video planes (`hdmi.c`, `scanout.c`,
+`hud.c`). The board has **no physical UART**:
 bring-up and every debugging session run over a raw-Ethernet debug protocol
 (ethertype `0x88B5`) plus a USB CDC-ACM gadget, both written here.
 
@@ -617,6 +620,8 @@ useful without the others:
 
 ## Status
 
-See `RELEASE-0.0.1.md` — measured numbers, and an explicit list of what is known
-broken. Short version: it runs on one board, it is pre-alpha, and the
-instrumentation is the point.
+Current release: **0.2.0 "banana"** — see `RELEASE-0.2.0.md` for what changed,
+the measured numbers and an explicit list of what is known broken (earlier:
+`RELEASE-0.0.2.md`, `RELEASE-0.0.1.md`). Short version: it runs on one board,
+the hypervisor's roadmap for that board is done, and the instrumentation is
+the point.
