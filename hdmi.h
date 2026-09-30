@@ -447,6 +447,24 @@ int hdmi_guestwin_set_addr(uint32_t pa);
 int hdmi_overlay_set(uint32_t idx, uint32_t pa, uint32_t pitch, uint32_t w,
                      uint32_t h, uint32_t x, uint32_t y, uint32_t ctrl);
 
+/* The VI channel as a guest video plane (hdmi.c hdmi_video_set()): YUV or
+ * RGB, hardware-scaled src -> dst, drawn over everything. Validated by the
+ * caller (scanout.c). addr/pitch[1] is the chroma plane for NV12/NV21. */
+#define HDMI_VID_EN        (1u << 0)
+#define HDMI_VID_BT709     (1u << 1)   /* else BT.601; limited range */
+#define HDMI_VID_NV12      0u
+#define HDMI_VID_NV21      1u
+#define HDMI_VID_YUYV      2u
+#define HDMI_VID_XRGB8888  3u
+struct hdmi_video {
+	uint32_t addr[2], pitch[2];
+	uint32_t src_w, src_h, dst_x, dst_y, dst_w, dst_h;
+	uint32_t format, ctrl;
+};
+int hdmi_video_set(const struct hdmi_video *v);
+/* dbgmon `call` self-test: NV12 colour bars 320x180 -> 960x540 at (x,y). */
+int hdmi_video_selftest(uint32_t on, uint32_t x, uint32_t y);
+
 #define BC_HDMI_BASE   0x50011800UL
 _Static_assert(BC_HDMI_BASE == HVMAP_LOW_HDMI_BC,
                "BC_HDMI_BASE drifted from hv_addrmap.h -- the map owns this address");

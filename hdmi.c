@@ -1174,6 +1174,319 @@ int hdmi_overlay_set(uint32_t idx, uint32_t pa, uint32_t pitch, uint32_t w,
 	return 0;
 }
 
+/* ====================================================================
+ * hdmi_video_set() -- the mixer's VI channel as a guest plane (HANDOFF item
+ * 6/7): YUV or RGB, hardware-scaled, drawn OVER everything else.
+ *
+ * Register map and sequence from Linux's sun8i_vi_layer.c/sun8i_vi_scaler.c
+ * /sun8i_csc.c for this exact mixer (sun50i_a64_mixer1_cfg: 1 VI + 1 UI,
+ * CCSC_MIXER1_LAYOUT). Only the register LAYOUT is taken from there; the
+ * scaler coefficients and CSC matrices are computed here from their
+ * definitions (Catmull-Rom; BT.601/BT.709), not copied -- that driver is
+ * GPL-2.0 and its tables come from the vendor BSP.
+ *
+ * Placement: a VI channel's screen position is not its layer COORD but its
+ * blender pipe's -- the channel (after the VSU scaler) feeds pipe 1, whose
+ * ATTR_COORD/INSIZE put the scaled output on screen. Pipe 1 blends over
+ * pipe 0 (the UI channel: HUD + guest window + overlays), so the video is
+ * on top; route stays as boot set it (pipe0 <- ch1, pipe1 <- ch0).
+ * ==================================================================== */
+#define DE_VI0_BASE            (DE_CHAN_REGS_BASE + DE_CHAN_SZ * 0u)
+#define DE_VI0_ATTR            (DE_VI0_BASE + 0x00)
+#define DE_VI0_SIZE            (DE_VI0_BASE + 0x04)
+#define DE_VI0_COORD           (DE_VI0_BASE + 0x08)
+#define DE_VI0_PITCH(n)        (DE_VI0_BASE + 0x0C + 4u * (n))
+#define DE_VI0_TOP_LADDR(n)    (DE_VI0_BASE + 0x18 + 4u * (n))
+#define DE_VI0_OVL_SIZE        (DE_VI0_BASE + 0xE8)
+#define DE_VI0_HDS_Y           (DE_VI0_BASE + 0xF0)
+#define DE_VI0_HDS_UV          (DE_VI0_BASE + 0xF4)
+#define DE_VI0_VDS_Y           (DE_VI0_BASE + 0xF8)
+#define DE_VI0_VDS_UV          (DE_VI0_BASE + 0xFC)
+#define DE2_VI_ATTR_RGB_MODE   (1u << 15)
+
+#define VSU(r)                 (DE_VSU_REGS + (r))
+#define VSU_CTRL               VSU(0x00)
+#define VSU_OUTSIZE            VSU(0x40)
+#define VSU_YINSIZE            VSU(0x80)
+#define VSU_YHSTEP             VSU(0x88)
+#define VSU_YVSTEP             VSU(0x8C)
+#define VSU_YHPHASE            VSU(0x90)
+#define VSU_YVPHASE            VSU(0x98)
+#define VSU_CINSIZE            VSU(0xC0)
+#define VSU_CHSTEP             VSU(0xC8)
+#define VSU_CVSTEP             VSU(0xCC)
+#define VSU_CHPHASE            VSU(0xD0)
+#define VSU_CVPHASE            VSU(0xD8)
+#define VSU_YHCOEFF0(i)        VSU(0x200 + 4u * (i))
+#define VSU_YHCOEFF1(i)        VSU(0x300 + 4u * (i))
+#define VSU_YVCOEFF(i)         VSU(0x400 + 4u * (i))
+#define VSU_CHCOEFF0(i)        VSU(0x600 + 4u * (i))
+#define VSU_CHCOEFF1(i)        VSU(0x700 + 4u * (i))
+#define VSU_CVCOEFF(i)         VSU(0x800 + 4u * (i))
+#define VSU_CTRL_EN            (1u << 0)
+#define VSU_CTRL_COEFF_RDY     (1u << 4)
+#define VSU_STEP_FRAC          20u
+
+#define DE_CCSC0_BASE          (DE2_MUX1_BASE + 0xA0000)   /* CCSC10 */
+#define DE_CCSC0_CTRL          (DE_CCSC0_BASE + 0x00)
+#define DE_CCSC0_COEFF(i)      (DE_CCSC0_BASE + 0x10 + 4u * (i))
+
+#define DE_BLD_ATTR_FCOLOR(n)  (DE_BLD_BASE + 0x04 + 0x10u * (n))
+#define DE_BLD_ATTR_INSIZE(n)  (DE_BLD_BASE + 0x08 + 0x10u * (n))
+#define DE_BLD_ATTR_COORD(n)   (DE_BLD_BASE + 0x0C + 0x10u * (n))
+#define DE_BLD_MODE(n)         (DE_BLD_BASE + 0x90 + 0x04u * (n))
+#define DE_BLD_PIPE_EN(n)      (1u << (8u + (n)))
+#define DE_BLD_PIPE_FC_EN(n)   (1u << (n))
+
+/* Catmull-Rom (a = -0.5) in Q16, x in Q16, |x| < 2. */
+static int64_t cubic_q16(int64_t x)
+{
+	int64_t ax = x < 0 ? -x : x, x2, x3;
+
+	if (ax >= (2 << 16))
+		return 0;
+	x2 = (ax * ax) >> 16;
+	x3 = (x2 * ax) >> 16;
+	if (ax < (1 << 16))                     /* 1.5x^3 - 2.5x^2 + 1 */
+		return (3 * x3) / 2 - (5 * x2) / 2 + (1 << 16);
+	return -x3 / 2 + (5 * x2) / 2 - 4 * ax + (2 << 16);   /* -0.5x^3+2.5x^2-4x+2 */
+}
+
+/* One phase of an ntaps filter, packed 4 signed bytes per word (tap 0 in
+ * the low byte), taps summing to 64 -- the VSU's format. Tap k sits at
+ * offset k - center from the current sample; `phase` in [0,32) is the
+ * fraction toward the next one. `s_q16` >= 1.0 widens the kernel for
+ * downscaling (a plain cubic would alias). Same convention as the
+ * hardware's own reference tables: phase 16 of the 4-tap unscaled filter
+ * comes out [-4, 36, 36, -4]. */
+static void vsu_phase(uint32_t ntaps, uint32_t center, uint32_t phase,
+                      int64_t s_q16, uint32_t *out)
+{
+	int32_t tap[8], sum = 0, best = (int32_t)center;
+	uint32_t k;
+
+	for (k = 0; k < ntaps; k++) {
+		int64_t d = ((int64_t)k - (int64_t)center) * 65536 -
+		            (int64_t)phase * 65536 / 32;          /* Q16 */
+		int64_t w = cubic_q16((d << 16) / s_q16);         /* K(d/s) */
+		w = (w << 16) / s_q16;                             /* /s */
+		/* round half away from zero; >> would floor the negatives */
+		tap[k] = (int32_t)((w * 64 + (w >= 0 ? 32768 : -32768)) / 65536);
+		sum += tap[k];
+	}
+	for (k = 0; k < ntaps; k++)                 /* put the rounding error on */
+		if (tap[k] > tap[best])                 /* the heaviest tap          */
+			best = (int32_t)k;
+	tap[best] += 64 - sum;
+	for (k = 0; k < ntaps; k++) {
+		if (tap[k] > 127) tap[k] = 127;
+		if (tap[k] < -128) tap[k] = -128;
+	}
+	out[0] = ((uint32_t)(tap[0] & 0xFF)) | ((uint32_t)(tap[1] & 0xFF) << 8) |
+	         ((uint32_t)(tap[2] & 0xFF) << 16) | ((uint32_t)(tap[3] & 0xFF) << 24);
+	if (ntaps == 8)
+		out[1] = ((uint32_t)(tap[4] & 0xFF)) | ((uint32_t)(tap[5] & 0xFF) << 8) |
+		         ((uint32_t)(tap[6] & 0xFF) << 16) | ((uint32_t)(tap[7] & 0xFF) << 24);
+}
+
+/* Kernel widening for a step (Q20 src/dst): 1.0 when upscaling, else the
+ * ratio, capped where the tap count stops covering the kernel. */
+static int64_t vsu_widen(uint32_t step_q20, uint32_t cap)
+{
+	int64_t s = ((int64_t)step_q20) >> (VSU_STEP_FRAC - 16);
+
+	if (s < 65536)
+		s = 65536;
+	if (s > (int64_t)cap * 65536)
+		s = (int64_t)cap * 65536;
+	return s;
+}
+
+static void vsu_load_coeffs(uint32_t hstep, uint32_t vstep, uint32_t chstep,
+                            uint32_t cvstep)
+{
+	uint32_t p, w[2];
+
+	for (p = 0; p < 32; p++) {
+		vsu_phase(8, 3, p, vsu_widen(hstep, 2), w);
+		wr32(VSU_YHCOEFF0(p), w[0]);
+		wr32(VSU_YHCOEFF1(p), w[1]);
+		vsu_phase(8, 3, p, vsu_widen(chstep, 2), w);
+		wr32(VSU_CHCOEFF0(p), w[0]);
+		wr32(VSU_CHCOEFF1(p), w[1]);
+		vsu_phase(4, 1, p, vsu_widen(vstep, 1), w);
+		wr32(VSU_YVCOEFF(p), w[0]);
+		vsu_phase(4, 1, p, vsu_widen(cvstep, 1), w);
+		wr32(VSU_CVCOEFF(p), w[0]);
+	}
+}
+
+/* YCbCr (limited range) -> RGB, 3 rows of [Y, Cb, Cr, offset], 1/1024
+ * units, offset in 1/1024 too. From Kr/Kb: R = Y' + 2(1-Kr)Cr,
+ * B = Y' + 2(1-Kb)Cb, G from the luma equation; Y' = 255/219 (Y-16),
+ * chroma scaled 255/224 around 128. swap_uv serves NV21. */
+static void ccsc_load(int bt709, int swap_uv)
+{
+	/* Q10: 1024 * 255/219 = 1192; chroma 255/224 folded into each term. */
+	int64_t kr = bt709 ? 2126 : 2990, kb = bt709 ? 722 : 1140;   /* x1e4 */
+	int64_t kg = 10000 - kr - kb;
+	int64_t yk = 1192;
+	int64_t cr_r = (2 * (10000 - kr) * 1024 * 255) / (224 * 10000);
+	int64_t cb_b = (2 * (10000 - kb) * 1024 * 255) / (224 * 10000);
+	int64_t cb_g = -(cb_b * kb) / kg;
+	int64_t cr_g = -(cr_r * kr) / kg;
+	int64_t m[3][3] = {
+		{ yk, 0,    cr_r },
+		{ yk, cb_g, cr_g },
+		{ yk, cb_b, 0    },
+	};
+	uint32_t r;
+
+	for (r = 0; r < 3; r++) {
+		int64_t cb = swap_uv ? m[r][2] : m[r][1];
+		int64_t cr = swap_uv ? m[r][1] : m[r][2];
+		int64_t off = -(m[r][0] * 16 + m[r][1] * 128 + m[r][2] * 128);
+
+		wr32(DE_CCSC0_COEFF(4 * r + 0), (uint32_t)m[r][0]);
+		wr32(DE_CCSC0_COEFF(4 * r + 1), (uint32_t)cb);
+		wr32(DE_CCSC0_COEFF(4 * r + 2), (uint32_t)cr);
+		wr32(DE_CCSC0_COEFF(4 * r + 3), (uint32_t)off);
+	}
+	wr32(DE_CCSC0_CTRL, 1);
+}
+
+int hdmi_video_set(const struct hdmi_video *v)
+{
+	uint32_t fmt, rgb, hsub, vsub, insize, outsize, hstep, vstep;
+
+	if (g_timeout_latched != 0)
+		return -1;
+	if (!v || !(v->ctrl & HDMI_VID_EN)) {
+		wr32(DE_VI0_ATTR, 0);
+		wr32(VSU_CTRL, 0);
+		wr32(DE_CCSC0_CTRL, 0);
+		wr32(DE_BLD_FCOLOR_CTL, DE_BLD_PIPE_EN(0) | DE_BLD_PIPE_FC_EN(0));
+		wr32(DE_GLB_DBUFF, 1);
+		return 0;
+	}
+	switch (v->format) {
+	case HDMI_VID_NV12:    fmt = 8;  rgb = 0; hsub = 2; vsub = 2; break;
+	case HDMI_VID_NV21:    fmt = 9;  rgb = 0; hsub = 2; vsub = 2; break;
+	case HDMI_VID_YUYV:    fmt = 0;  rgb = 0; hsub = 2; vsub = 1; break;
+	case HDMI_VID_XRGB8888: fmt = 4; rgb = 1; hsub = 1; vsub = 1; break;
+	default: return -1;
+	}
+
+	insize  = DE2_WH(v->src_w, v->src_h);
+	outsize = DE2_WH(v->dst_w, v->dst_h);
+	hstep = (uint32_t)(((uint64_t)v->src_w << VSU_STEP_FRAC) / v->dst_w);
+	vstep = (uint32_t)(((uint64_t)v->src_h << VSU_STEP_FRAC) / v->dst_h);
+
+	/* layer: source geometry, fetched at channel coord 0 */
+	wr32(DE_VI0_ATTR, 0);
+	wr32(DE_VI0_SIZE, insize);
+	wr32(DE_VI0_COORD, 0);
+	wr32(DE_VI0_OVL_SIZE, insize);
+	wr32(DE_VI0_PITCH(0), v->pitch[0]);
+	wr32(DE_VI0_PITCH(1), v->pitch[1]);
+	wr32(DE_VI0_TOP_LADDR(0), v->addr[0]);
+	wr32(DE_VI0_TOP_LADDR(1), v->addr[1]);
+	wr32(DE_VI0_HDS_Y, 0);
+	wr32(DE_VI0_HDS_UV, 0);
+	wr32(DE_VI0_VDS_Y, 0);
+	wr32(DE_VI0_VDS_UV, 0);
+
+	/* scaler: required for any size change and for subsampled chroma */
+	if (insize != outsize || hsub > 1 || vsub > 1) {
+		uint32_t cvphase = 0;
+
+		if (hsub == 2 && vsub == 2)             /* 4:2:0 chroma siting */
+			cvphase = (uint32_t)(-(int32_t)(1u << (VSU_STEP_FRAC - 2)));
+		wr32(VSU_OUTSIZE, outsize);
+		wr32(VSU_YINSIZE, insize);
+		wr32(VSU_YHSTEP, hstep);
+		wr32(VSU_YVSTEP, vstep);
+		wr32(VSU_YHPHASE, 0);
+		wr32(VSU_YVPHASE, 0);
+		wr32(VSU_CINSIZE, DE2_WH(v->src_w / hsub, v->src_h / vsub));
+		wr32(VSU_CHSTEP, hstep / hsub);
+		wr32(VSU_CVSTEP, vstep / vsub);
+		wr32(VSU_CHPHASE, 0);
+		wr32(VSU_CVPHASE, cvphase);
+		/* Enable BEFORE loading: with the unit off its coefficient RAM
+		 * drops writes (measured 2026-09-30: every coefficient read back
+		 * as power-on garbage, while a write with the unit on stuck). */
+		wr32(VSU_CTRL, VSU_CTRL_EN);
+		vsu_load_coeffs(hstep, vstep, hstep / hsub, vstep / vsub);
+		wr32(VSU_CTRL, VSU_CTRL_EN | VSU_CTRL_COEFF_RDY);
+	} else {
+		wr32(VSU_CTRL, 0);
+	}
+
+	if (rgb)
+		wr32(DE_CCSC0_CTRL, 0);
+	else
+		ccsc_load((v->ctrl & HDMI_VID_BT709) != 0, v->format == HDMI_VID_NV21);
+
+	/* blender pipe 1 places the scaled channel output on screen */
+	wr32(DE_BLD_ATTR_FCOLOR(1), 0xff000000u);
+	wr32(DE_BLD_ATTR_INSIZE(1), outsize);
+	wr32(DE_BLD_ATTR_COORD(1), (v->dst_y << 16) | v->dst_x);
+	wr32(DE_BLD_MODE(1), 0x03010301);
+	wr32(DE_BLD_FCOLOR_CTL, DE_BLD_PIPE_EN(0) | DE_BLD_PIPE_FC_EN(0) |
+	                        DE_BLD_PIPE_EN(1));
+
+	wr32(DE_VI0_ATTR, DE2_UI_ATTR_EN | DE2_UI_ATTR_FMT(fmt) |
+	                  (rgb ? DE2_VI_ATTR_RGB_MODE : 0u));
+	wr32(DE_GLB_DBUFF, 1);
+	return 0;
+}
+
+/* Board self-test for the VI plane, callable over dbgmon `call`: eight
+ * BT.601 colour bars (white yellow cyan green magenta red blue black) as a
+ * 320x180 NV12 frame in EL2's own memory, upscaled 3x to 960x540 at
+ * (x, y). Exercises layer, VSU, CCSC and blender pipe 1 without any guest
+ * driver. arg 0 turns the plane off. Returns hdmi_video_set()'s result. */
+#define VIDTEST_W 320u
+#define VIDTEST_H 180u
+static uint8_t g_vidtest[VIDTEST_W * VIDTEST_H * 3u / 2u] __attribute__((aligned(64)));
+
+int hdmi_video_selftest(uint32_t on, uint32_t x, uint32_t y)
+{
+	static const uint8_t bars[8][3] = {   /* Y, Cb, Cr, limited range */
+		{235, 128, 128}, {210, 16, 146}, {170, 166, 16}, {145, 54, 34},
+		{106, 202, 222}, { 81, 90, 240}, { 41, 240, 110}, { 16, 128, 128},
+	};
+	struct hdmi_video v;
+	uint32_t r, c;
+	uint64_t p;
+
+	if (!on)
+		return hdmi_video_set(0);
+	for (r = 0; r < VIDTEST_H; r++)
+		for (c = 0; c < VIDTEST_W; c++)
+			g_vidtest[r * VIDTEST_W + c] = bars[c * 8u / VIDTEST_W][0];
+	for (r = 0; r < VIDTEST_H / 2u; r++)
+		for (c = 0; c < VIDTEST_W; c += 2) {
+			uint8_t *uv = &g_vidtest[VIDTEST_W * VIDTEST_H + r * VIDTEST_W + c];
+			uv[0] = bars[c * 8u / VIDTEST_W][1];
+			uv[1] = bars[c * 8u / VIDTEST_W][2];
+		}
+	for (p = (uint64_t)(uintptr_t)g_vidtest & ~63ull;
+	     p < (uint64_t)(uintptr_t)g_vidtest + sizeof(g_vidtest); p += 64)
+		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	v.addr[0] = (uint32_t)(uintptr_t)g_vidtest;
+	v.addr[1] = v.addr[0] + VIDTEST_W * VIDTEST_H;
+	v.pitch[0] = v.pitch[1] = VIDTEST_W;
+	v.src_w = VIDTEST_W; v.src_h = VIDTEST_H;
+	v.dst_x = x; v.dst_y = y; v.dst_w = 3u * VIDTEST_W; v.dst_h = 3u * VIDTEST_H;
+	v.format = HDMI_VID_NV12;
+	v.ctrl = HDMI_VID_EN;
+	return hdmi_video_set(&v);
+}
+
 /* ── real vblank observation (ROADMAP: bzkms's vblank was a callout) ──────
  *
  * TCON_INT0 (SUN4I_TCON_GINT0_REG) carries a vblank STATUS bit per channel,

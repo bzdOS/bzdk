@@ -156,7 +156,7 @@
                                                * spelling convention as every
                                                * other magic in this tree
                                                * (see hdmi.h's BC_HDMI_MAGIC) */
-#define SCANOUT_VERSION        2u   /* 2: overlay planes (0x50..) */
+#define SCANOUT_VERSION        3u   /* 2: overlay planes (0x50..), 3: video plane (0xA0..) */
 #define SCANOUT_FORMAT_XRGB8888 0u
 
 /* One-time setup: populates the register file's read-only fields from
@@ -186,6 +186,27 @@
 #define SCANOUT_OVL_COORD       0x0Cu   /* RW: x | y << 16, output pixels */
 #define SCANOUT_OVL_CTRL        0x10u   /* RW: write applies */
 #define SCANOUT_R_OVL(p, r) (SCANOUT_R_OVL_BASE + SCANOUT_R_OVL_STRIDE * (p) + (r))
+
+/* Version 3: one video plane on the mixer's VI channel (hdmi.h's
+ * struct hdmi_video): NV12/NV21/YUYV/XRGB8888, hardware-scaled SRC -> DST,
+ * drawn over everything else. Stage the fields, then write VID_CTRL
+ * (HDMI_VID_EN, HDMI_VID_BT709) to apply at the next vblank; CTRL without
+ * EN turns it off. Refused (VID_REJECT, plane unchanged): odd sizes for a
+ * subsampled format, src wider than 2048, a downscale beyond 2x, DST off
+ * screen, a pitch too small for the width, or a Y/chroma plane the guest
+ * window would be refused. ADDR1/PITCH1 are the chroma plane (NV12/NV21
+ * only). */
+#define SCANOUT_R_VID_ADDR0     0xA0u
+#define SCANOUT_R_VID_ADDR1     0xA4u
+#define SCANOUT_R_VID_PITCH0    0xA8u
+#define SCANOUT_R_VID_PITCH1    0xACu
+#define SCANOUT_R_VID_SRC_SIZE  0xB0u   /* w | h << 16 */
+#define SCANOUT_R_VID_DST_COORD 0xB4u   /* x | y << 16 */
+#define SCANOUT_R_VID_DST_SIZE  0xB8u   /* w | h << 16 */
+#define SCANOUT_R_VID_FORMAT    0xBCu   /* HDMI_VID_NV12 .. _XRGB8888 */
+#define SCANOUT_R_VID_CTRL      0xC0u   /* write applies */
+#define SCANOUT_R_VID_COUNT     0xC4u   /* R */
+#define SCANOUT_R_VID_REJECT    0xC8u   /* R */
 
 void scanout_init(void);
 
