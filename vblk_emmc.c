@@ -546,6 +546,7 @@ static inline uint64_t vblk_ms_to_ticks(uint32_t ms)
  * 180 s software progress window (wdt.c). A wedged holder still yields a
  * clean S_IOERR (return 0) instead of hanging CPU0 forever. */
 #define VBLK_EMMC_LOCK_TIMEOUT_MS  6000u
+static void vblk_idma_service(uint32_t spin_us);
 static int emmc_lock_acquire_bounded(void)
 {
 	uint64_t start = read_cntpct();
@@ -555,6 +556,9 @@ static int emmc_lock_acquire_bounded(void)
 	for (;;) {
 		if (vblk_emmc_trylock())
 			return 1;
+		/* The holder may be an IRQ-completed IDMAC transfer that only a
+		 * poll can finish from here -- see vblk_idma_service(). */
+		vblk_idma_service(0);
 		if ((i++ & 0xFFFFu) == 0u) {       /* periodically keep the HW WDOG fed */
 			wdt_note_progress();
 			wdt_pet();
@@ -1602,6 +1606,383 @@ async_gathered_done:
 }
 
 /* ------------------------------------------------------------------ *
+ * IRQ-COMPLETED IDMAC QUEUE (HANDOFF item 2, IRQ phase 2).
+ *
+ * The CPU2 mailbox above is off while CPU2 is a guest vCPU, so every
+ * request used to be served inside the requesting vCPU's own trap, which
+ * therefore sat out the whole transfer. Now an eligible request is queued
+ * and the trap returns to the guest at once; the controller works through
+ * the queue one IDMAC transfer at a time, and whoever sees a transfer end
+ * -- normally the IDMAC completion IRQ (SPI 94, EL2-owned, CPU0) --
+ * publishes it (scatter, status byte, used ring, virtio IRQ, exactly as
+ * vblk_async_poll() does) and starts the next one.
+ *
+ * A queue, not a single slot: FreeBSD hands several requests to one
+ * QueueNotify, and with one slot the second went synchronous and waited
+ * out the first in the trap -- measured, no overlap left at all.
+ *
+ * WHO ADVANCES IT. The IRQ is the fast path, never the only one:
+ *   - it only reaches CPU0, and not while CPU0 is inside a trap (DAIF.I=1);
+ *   - the card-busy tail after AUTO_STOP raises no interrupt at all.
+ * So vblk_idma_service() also runs from every core's tick
+ * (emmc_bio_dma_tick) and from emmc_lock_acquire_bounded()'s spin -- the
+ * last one matters most: a vCPU waiting for the eMMC lock is waiting for
+ * this queue, and on CPU0 nothing else could ever run to drain it.
+ * Callers race for g_idmaq_lock; a loser just returns.
+ *
+ * LOCKING. g_idmaq_lock guards the queue itself. The eMMC lock belongs to
+ * the queue for as long as it is non-empty: taken by the poster that finds
+ * it empty, released by whoever pops the last entry, possibly on another
+ * core (the lock is a plain word; nothing ties it to its taker). Holding it
+ * across trap returns keeps g_bounce_run and the controller ours; every
+ * other user sees it busy and waits -- which is also what drives the queue.
+ * A synchronous request announces itself (g_idma_sync_waiters) so posters
+ * stop queueing and the queue drains instead of starving it; FLUSH and a
+ * device reset do the same through vblk_idma_drain_bounded().
+ *
+ * FAILURE. A transfer that fails, or cannot start, is not an I/O error
+ * yet: the entry is served again with the lock dropped, through the same
+ * per-descriptor path the synchronous code uses (serve_data(): PIO
+ * multi-block, per-sector, write retries), then the queue carries on.
+ *
+ * Only requests the gathered path could have served are eligible (whole
+ * sectors, 2..EMMC_MULTI_MAX_BLOCKS of them, one bounce's worth); anything
+ * else takes the synchronous path unchanged. g_vblk_idma_on=0 turns the
+ * whole thing off live (checked per post).
+ * ------------------------------------------------------------------ */
+#define IDMA_QLEN 16u
+
+struct vblk_idma_req {
+	uint16_t head;
+	uint16_t is_read;
+	uint64_t sector;
+	uint64_t status_gpa;
+	uint32_t ndesc;
+	uint32_t chain_len;
+	uint32_t total;
+	uint64_t data_addr[VBLK_ASYNC_MAX_DESC];
+	uint32_t data_len[VBLK_ASYNC_MAX_DESC];
+};
+
+/* All under g_idmaq_lock. */
+static struct vblk_idma_req g_idmaq[IDMA_QLEN];
+static uint32_t g_idmaq_head, g_idmaq_count, g_idmaq_running;
+static uint32_t g_idma_sync_waiters;
+static volatile uint32_t g_idmaq_lock;
+/* == g_idmaq_count, for the lock-free "anything to do?" checks. */
+static volatile uint32_t g_idma_pending;
+
+volatile uint32_t g_vblk_idma_on = 1u;
+/* Read over the debug channel via nm; no breadcrumb slots left. */
+uint32_t g_idma_posts, g_idma_done, g_idma_redo, g_idma_irq_done,
+         g_idma_busy_skips, g_idma_qmax;
+
+static int idmaq_trylock(void)
+{
+	uint32_t prev, status, one = 1u;
+
+	__asm__ volatile(
+		"	ldaxr	%w0, [%3]\n"
+		"	cbnz	%w0, 1f\n"
+		"	stlxr	%w1, %w2, [%3]\n"
+		"	b	2f\n"
+		"1:	mov	%w1, #1\n"
+		"2:\n"
+		: "=&r"(prev), "=&r"(status)
+		: "r"(one), "r"(&g_idmaq_lock)
+		: "memory");
+	if (prev == 0u && status == 0u) {
+		__asm__ volatile("dsb sy" ::: "memory");
+		return 1;
+	}
+	return 0;
+}
+
+static void idmaq_unlock(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_idmaq_lock = 0u;
+	__asm__ volatile("dsb sy\n\tsev" ::: "memory");
+}
+
+/* Patient: a holder may be serving a failed entry synchronously. Bounded
+ * like the eMMC acquire; 0 = gave up. */
+static int idmaq_lock_bounded(void)
+{
+	uint64_t start = read_cntpct();
+	uint64_t cap = vblk_ms_to_ticks(VBLK_EMMC_LOCK_TIMEOUT_MS);
+	uint32_t i = 0;
+
+	while (!idmaq_trylock()) {
+		if ((i++ & 0xFFFFu) == 0u)
+			vblk_pet_wdt();
+		if (read_cntpct() - start > cap)
+			return 0;
+		__asm__ volatile("yield" ::: "memory");
+	}
+	return 1;
+}
+
+static void idmaq_pop(void)
+{
+	g_idmaq_head = (g_idmaq_head + 1u) % IDMA_QLEN;
+	g_idmaq_count--;
+	g_idma_pending = g_idmaq_count;
+}
+
+static void idma_publish(struct vblk_idma_req *r, uint8_t status,
+                         uint32_t used_len)
+{
+	uint16_t new_idx;
+
+	if (r->is_read) g_reads++; else g_writes++;
+	vblk_bc(6, g_reads);
+	vblk_bc(7, g_writes);
+
+	gmem_write(r->status_gpa, &status, 1);
+	vblk_bc(9, status);
+
+	vblk_used_lock_acquire();
+	new_idx = vq_push_used(&g_blk.vq[VBLK_QUEUE], r->head, used_len + 1u);
+	g_blk.int_status |= VBLK_INT_VRING;
+	vblk_inject_irq();
+	vblk_used_unlock();
+	vblk_diag(r->head, r->chain_len, used_len, r->status_gpa, new_idx);
+	g_idma_done++;
+}
+
+/* The synchronous code's own per-descriptor path. eMMC lock NOT held:
+ * serve_data() takes it per chunk. */
+static void idma_serve_sync(struct vblk_idma_req *r)
+{
+	uint8_t  status = VIRTIO_BLK_S_OK;
+	uint32_t used_len = 0, sfill = 0, i;
+	uint64_t sector = r->sector;
+
+	g_idma_redo++;
+	for (i = 0; i < r->ndesc; i++) {
+		int rc = serve_data(r->is_read, r->data_addr[i], r->data_len[i],
+		                    &sector, &sfill);
+		if (rc != 0) {
+			status = VIRTIO_BLK_S_IOERR;
+			vblk_note_ioerr(VBLK_IOERR_SERVE, rc, g_serve_fail_lba,
+			                used_len, r->head, r->is_read, 1u);
+			break;
+		}
+		if (r->is_read)
+			used_len += r->data_len[i];
+	}
+	vblk_pet_wdt();
+	idma_publish(r, status, used_len);
+}
+
+/* Start the head entry; entries that cannot start are served synchronously
+ * and popped. Leaves the eMMC lock held iff a transfer is running.
+ * g_idmaq_lock held, !g_idmaq_running. */
+static void idma_advance(int emmc_held)
+{
+	while (g_idmaq_count) {
+		struct vblk_idma_req *r = &g_idmaq[g_idmaq_head];
+		uint32_t i, off;
+
+		if (!emmc_held) {
+			/* Its spin calls vblk_idma_service(), which fails our
+			 * trylock and returns -- no recursion. */
+			if (!emmc_lock_acquire_bounded()) {
+				idma_serve_sync(r);   /* will fail BUSY -> S_IOERR */
+				idmaq_pop();
+				continue;
+			}
+			emmc_held = 1;
+		}
+		if (!r->is_read) {
+			for (i = 0, off = 0; i < r->ndesc; off += r->data_len[i], i++)
+				gmem_read(r->data_addr[i], (uint8_t *)g_bounce_run + off,
+				          r->data_len[i]);
+			__asm__ volatile("dsb sy" ::: "memory");
+		}
+		g_serve_fail_lba = (uint32_t)r->sector;
+		if (emmc_bio_dma_start(r->is_read, (uint32_t)r->sector,
+		                       BOUNCE_RUN_PA,
+		                       r->total / VBLK_SECTOR_BYTES) == 0) {
+			g_idmaq_running = 1;
+			return;
+		}
+		vblk_emmc_unlock();
+		emmc_held = 0;
+		idma_serve_sync(r);
+		idmaq_pop();
+	}
+	if (emmc_held)
+		vblk_emmc_unlock();
+}
+
+/* The running (head) transfer ended with rc. g_idmaq_lock and the eMMC lock
+ * held. */
+static void idma_complete(int rc)
+{
+	struct vblk_idma_req *r = &g_idmaq[g_idmaq_head];
+	uint32_t i, off;
+
+	g_idmaq_running = 0;
+	if (rc != 0) {
+		g_gather_fails++;
+		vblk_emmc_unlock();
+		idma_serve_sync(r);
+		idmaq_pop();
+		idma_advance(0);
+		return;
+	}
+	g_dma_ok++;
+	vblk_bc(63, ++g_gathered);
+	if (r->is_read)   /* under the eMMC lock -- g_bounce_run is shared */
+		for (i = 0, off = 0; i < r->ndesc; off += r->data_len[i], i++)
+			gmem_write(r->data_addr[i], (uint8_t *)g_bounce_run + off,
+			           r->data_len[i]);
+	idma_publish(r, VIRTIO_BLK_S_OK, r->is_read ? r->total : 0u);
+	idmaq_pop();
+	idma_advance(1);
+}
+
+static void vblk_idma_service(uint32_t spin_us)
+{
+	int rc;
+
+	if (!g_idma_pending)
+		return;
+	if (!idmaq_trylock())
+		return;                   /* someone else is on it */
+	if (g_idmaq_running) {
+		rc = emmc_bio_dma_poll(spin_us);
+		if (rc != EMMC_DMA_RUNNING) {
+			if (spin_us)
+				g_idma_irq_done++;
+			idma_complete(rc);
+		}
+	}
+	idmaq_unlock();
+}
+
+/* emmc_bio_dma_irq_note() spins EMMC_DMA_IRQ_SPIN_US -- enough for DATA_OVER
+ * lagging IDST and the usual sub-millisecond busy tail, so most transfers
+ * end inside the interrupt itself; emmc_bio_dma_tick() does not spin. */
+static void vblk_idma_hook(uint32_t spin_us)
+{
+	vblk_idma_service(spin_us);
+}
+
+static void idma_sync_enter(void)
+{
+	if (idmaq_lock_bounded()) {
+		g_idma_sync_waiters++;
+		idmaq_unlock();
+	}
+}
+
+static void idma_sync_exit(void)
+{
+	if (idmaq_lock_bounded()) {
+		if (g_idma_sync_waiters)
+			g_idma_sync_waiters--;
+		idmaq_unlock();
+	}
+}
+
+/* Trap side. 1 = accepted (possibly already completed): the caller must not
+ * touch this head again. */
+static int vblk_idma_post(uint16_t head, uint32_t is_read, uint64_t sector,
+                          uint64_t status_gpa, struct vblk_desc *chain,
+                          uint32_t n)
+{
+	uint32_t ndata = n - 2u, total = 0, i;
+	struct vblk_idma_req *r;
+
+	if (!g_vblk_idma_on)
+		return 0;
+	if (ndata < 1u || ndata > VBLK_ASYNC_MAX_DESC)
+		return 0;
+	for (i = 0; i < ndata; i++) {
+		uint32_t len = chain[1 + i].len;
+
+		if (len == 0 || (len % VBLK_SECTOR_BYTES) != 0 ||
+		    !gpa_in_range(chain[1 + i].addr, len))
+			return 0;
+		total += len;
+		if (total > sizeof(g_bounce_run))
+			return 0;
+	}
+	if (total < 2u * VBLK_SECTOR_BYTES ||
+	    sector + total / VBLK_SECTOR_BYTES > g_blk.capacity)
+		return 0;
+	if (!is_read && sector < VBLK_BOOT_GUARD_LBA)
+		return 0;                 /* sync path refuses and counts it */
+
+	if (!idmaq_lock_bounded())
+		return 0;
+	if (g_idma_sync_waiters || g_idmaq_count >= IDMA_QLEN) {
+		idmaq_unlock();
+		return 0;
+	}
+	/* An empty queue does not own the eMMC lock yet. One try: contention
+	 * means another user is mid-transfer, and the sync path's patient
+	 * acquire is the right place to wait for that. */
+	if (g_idmaq_count == 0 && !vblk_emmc_trylock()) {
+		g_idma_busy_skips++;
+		idmaq_unlock();
+		return 0;
+	}
+
+	r = &g_idmaq[(g_idmaq_head + g_idmaq_count) % IDMA_QLEN];
+	r->head       = head;
+	r->is_read    = (uint16_t)is_read;
+	r->sector     = sector;
+	r->status_gpa = status_gpa;
+	r->ndesc      = ndata;
+	r->chain_len  = n;
+	r->total      = total;
+	for (i = 0; i < ndata; i++) {
+		r->data_addr[i] = chain[1 + i].addr;
+		r->data_len[i]  = chain[1 + i].len;
+	}
+	g_idmaq_count++;
+	g_idma_pending = g_idmaq_count;
+	if (g_idmaq_count > g_idma_qmax)
+		g_idma_qmax = g_idmaq_count;
+	g_idma_posts++;
+
+	if (g_idmaq_count == 1u)
+		idma_advance(1);
+	idmaq_unlock();
+	return 1;
+}
+
+/* Run the queue dry: FLUSH, reset and the sync path need everything queued
+ * before them finished. Announced as a sync waiter so posters stop feeding
+ * it meanwhile. Same bound and watchdog feeding as the mailbox drain below;
+ * on a timeout the eMMC lock still serializes whatever follows. */
+static void vblk_idma_drain_bounded(void)
+{
+	uint64_t start, cap;
+	uint32_t i = 0;
+
+	if (!g_idma_pending)
+		return;
+	idma_sync_enter();
+	start = read_cntpct();
+	cap = vblk_ms_to_ticks(VBLK_EMMC_LOCK_TIMEOUT_MS);
+	while (g_idma_pending) {
+		vblk_idma_service(0);
+		if ((i++ & 0xFFFFu) == 0u)
+			vblk_pet_wdt();
+		if (read_cntpct() - start > cap)
+			break;
+		__asm__ volatile("yield" ::: "memory");
+	}
+	idma_sync_exit();
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* ------------------------------------------------------------------ *
  * D1 fix: bounded drain of the CPU2 async mailbox.
  *
  * Two CPU0 call sites need this, both BEFORE they act on it:
@@ -1639,6 +2020,7 @@ static void vblk_async_drain_bounded(void)
 	uint64_t start, cap;
 	uint32_t i = 0;
 
+	vblk_idma_drain_bounded();
 	if (!g_vblk_async_ready)
 		return;                       /* no CPU2 loop -> mailbox can't be POSTED */
 	if (g_async.state == VBLK_MBOX_EMPTY)
@@ -1787,6 +2169,9 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		posted = vblk_async_post(head, is_read, sector, stdesc->addr,
 		                          chain, 1, n - 1);
 		vblk_bc(39, (uint32_t)posted);
+		if (!posted && n >= 3 &&
+		    vblk_idma_post(head, is_read, sector, stdesc->addr, chain, n))
+			return 0;                 /* the IDMAC IRQ completes it */
 		if (posted) {
 			/* Handed off to CPU2 (ROADMAP C2): it will do the PIO, write
 			 * the status byte, push the used-ring entry and inject the
@@ -1802,6 +2187,10 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 		 * way, synchronously, right here — always correct, just not
 		 * accelerated. */
 		g_async_fallbacks++;
+		/* Stop the IDMAC queue taking new work until this request is
+		 * done, so the drain below converges and the queue cannot keep
+		 * the eMMC lock away from us. */
+		idma_sync_enter();
 
 		/* ...but do NOT go straight at the controller. The commonest reason
 		 * we are here at all is "mailbox busy", which means CPU2 is mid
@@ -1878,6 +2267,7 @@ static int vblk_request(struct vblk_dev *d, uint16_t head)
 				used_len += dd->len;     /* device wrote these bytes          */
 		}
 sync_gathered_done:
+		idma_sync_exit();
 		if (is_read) g_reads++; else g_writes++;
 		vblk_bc(6, g_reads);
 		vblk_bc(7, g_writes);
@@ -2374,6 +2764,11 @@ int vblk_init(void)
 	int rc = emmc_bio_init();
 	g_blk.emmc_ready = (rc == 0) ? 1u : 0u;
 	vblk_bc(11, g_blk.emmc_ready);
+	g_idmaq_head = g_idmaq_count = g_idmaq_running = 0;
+	g_idma_sync_waiters = 0;
+	g_idmaq_lock = 0;
+	g_idma_pending = 0;
+	emmc_bio_set_dma_done_hook(vblk_idma_hook);
 
 	/* Advertised capacity, in 512-byte sectors.
 	 * TODO(board): derive from the eMMC CSD/EXT_CSD (SEC_COUNT) so the guest
