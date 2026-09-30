@@ -951,9 +951,29 @@ static uint32_t g_sd_dma_irqs;   /* sdbc[1]: real IDMAC completion IRQs
                                   * arm) -- diagnostic only, see
                                   * emmc_bio.c's g_dma_irqs comment */
 
+/* Completion owner (vblk_sd.c) -- same contract as emmc_bio.c's hook. */
+static void (*volatile g_sd_dma_done_hook)(uint32_t spin_us);
+
+void sd_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us))
+{
+	g_sd_dma_done_hook = fn;
+}
+
 void sd_bio_dma_irq_note(void)
 {
+	void (*fn)(uint32_t) = g_sd_dma_done_hook;
+
 	sdbc(1, ++g_sd_dma_irqs);
+	if (fn)
+		fn(SD_DMA_IRQ_SPIN_US);
+}
+
+void sd_bio_dma_tick(void)
+{
+	void (*fn)(uint32_t) = g_sd_dma_done_hook;
+
+	if (fn)
+		fn(0);
 }
 
 /* WFI between iterations, same rationale and same unchanged correctness
@@ -1078,6 +1098,134 @@ fail:
 	sd_dma_disarm();
 	sd_multi_abort();
 	return (int)(0x40000000u | (ri & 0xffffu));
+}
+
+/* Split-phase form of sd_bio_read_dma()/write_dma() -- the SD mirror of
+ * emmc_bio_dma_start()/poll() (see emmc_bio.c for the design). Same
+ * sequence, caps and failure handling (sd_multi_abort, 0x4000xxxx code) as
+ * the synchronous pair above, cut at the CMDR write; the only addition is
+ * emmc's two-poll confirmation of a timeout, since a poll here is one
+ * sample, not a loop. Caller holds the SD lock from start until poll()
+ * returns != SD_DMA_RUNNING. */
+#define SADMA_DATA 0u
+#define SADMA_BUSY 1u
+static struct {
+	volatile uint32_t active;
+	uint32_t is_read, phase, total, over;
+	uint64_t buf_pa, t0;
+} g_sadma;
+
+int sd_bio_dma_start(uint32_t is_read, uint32_t lba, uint64_t buf_pa,
+                     uint32_t nblk)
+{
+	uint32_t total;
+
+	if (!g_sd_inited)
+		return -100;
+	if (g_sadma.active)
+		return -103;
+	if (nblk < 2 || nblk > SD_MULTI_MAX_BLOCKS)
+		return -101;
+	total = nblk * 512u;
+	if (is_read && ((buf_pa | total) & 63u))
+		return -102;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	(void)sd_dma_build_desc(buf_pa, total);
+	sd_dma_cmo(buf_pa, total);
+	sd_dma_arm();
+
+	wreg(REG_BKSR, 512);
+	wreg(REG_BYCR, total);
+	wreg(REG_RINT, RINT_ALL);
+	wreg(REG_CAGR, sd_addr(lba));
+
+	g_sadma.is_read = is_read ? 1u : 0u;
+	g_sadma.phase = SADMA_DATA;
+	g_sadma.total = total;
+	g_sadma.over = 0;
+	g_sadma.buf_pa = buf_pa;
+	g_sadma.t0 = rd_cntpct();
+	g_sadma.active = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	wreg(REG_CMDR, is_read ? CMD18_READ_CMDR : CMD25_WRITE_CMDR);
+	return 0;
+}
+
+static int sadma_timed_out(uint32_t ms)
+{
+	uint64_t now = rd_cntpct();
+	uint64_t el = (now >= g_sadma.t0) ? (now - g_sadma.t0) : 0ull;
+
+	if (el <= ms_to_ticks(ms)) {
+		g_sadma.over = 0;
+		return 0;
+	}
+	return ++g_sadma.over >= 2u;
+}
+
+static int sadma_step(void)
+{
+	uint32_t ri = 0;
+
+	if (g_sadma.phase == SADMA_DATA) {
+		uint32_t want = g_sadma.is_read ? IDST_RX_INT : IDST_TX_INT;
+		uint32_t idst = rreg(REG_IDST);
+
+		ri = rreg(REG_RINT);
+		if ((idst & IDST_ERROR) || (ri & RINT_ERR_MASK))
+			goto fail;
+		if (!((idst & want) && (ri & RINT_DATA_OVER))) {
+			if (sadma_timed_out(SD_WRITE_DATA_TIMEOUT_MS))
+				goto fail;
+			return 1;
+		}
+		wreg(REG_IDST, idst);   /* W1C: drops the level line */
+		g_sadma.phase = SADMA_BUSY;
+		g_sadma.over = 0;
+		g_sadma.t0 = rd_cntpct();
+	}
+
+	if (rreg(REG_STAR) & STAR_CARD_BUSY) {
+		if (sadma_timed_out(SD_WRITE_BUSY_TIMEOUT_MS)) {
+			ri = STAR_CARD_BUSY;
+			goto fail;
+		}
+		return 1;
+	}
+
+	sd_dma_disarm();
+	if (g_sadma.is_read)
+		sd_dma_cmo(g_sadma.buf_pa, g_sadma.total);
+	__asm__ volatile("dsb sy" ::: "memory");
+	g_sadma.active = 0;
+	return 0;
+
+fail:
+	sd_dma_disarm();
+	sd_multi_abort();
+	g_sadma.active = 0;
+	return (int)(0x40000000u | (ri & 0xffffu));
+}
+
+int sd_bio_dma_poll(uint32_t spin_us)
+{
+	uint64_t start = rd_cntpct();
+	uint64_t cap = ms_to_ticks(1) * spin_us / 1000ull;
+
+	if (!g_sadma.active)
+		return -103;
+	for (;;) {
+		int rc = sadma_step();
+		uint64_t now;
+
+		if (rc != 1)
+			return rc;
+		now = rd_cntpct();
+		if (now < start || now - start >= cap)
+			return 1;
+	}
 }
 
 /* ------------------------------------------------------------------ */
