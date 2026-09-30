@@ -91,6 +91,18 @@ int sd_bio_read_multi(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 int sd_bio_read_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 int sd_bio_write_dma(uint32_t lba, uint64_t buf_pa, uint32_t nblk);
 
+/* Split-phase form of the pair above, same contract as emmc_bio.h's
+ * emmc_bio_dma_start()/poll()/hook: SD_DMA_RUNNING until finished, then 0
+ * or the synchronous pair's own failure code; -103 = none / busy. The SD
+ * lock must be held from start() until poll() != SD_DMA_RUNNING. */
+#define SD_DMA_RUNNING 1
+#define SD_DMA_IRQ_SPIN_US 1000u
+int sd_bio_dma_start(uint32_t is_read, uint32_t lba, uint64_t buf_pa,
+                     uint32_t nblk);
+int sd_bio_dma_poll(uint32_t spin_us);
+void sd_bio_set_dma_done_hook(void (*fn)(uint32_t spin_us));
+void sd_bio_dma_tick(void);
+
 /* Best-effort reclock from the 400 kHz identification clock to SD Default
  * Speed (25 MHz), FAIL-SAFE by construction: unlike eMMC's HS_TIMING switch,
  * SD cards support the whole 0-25 MHz default-speed range with NO CMD6
