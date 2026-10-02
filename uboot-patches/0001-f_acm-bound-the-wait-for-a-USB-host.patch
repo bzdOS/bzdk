@@ -1,0 +1,39 @@
+--- a/drivers/usb/gadget/f_acm.c
++++ b/drivers/usb/gadget/f_acm.c
+@@ -16,6 +16,7 @@
+ #include <malloc.h>
+ #include <memalign.h>
+ #include <stdio_dev.h>
++#include <time.h>
+ #include <version.h>
+ #include <watchdog.h>
+ 
+@@ -628,6 +629,7 @@
+ static int acm_stdio_start(struct stdio_dev *dev)
+ {
+ 	struct udevice *udc;
++	ulong start;
+ 	int ret;
+ 
+ 	if (dev->priv) { /* function already exist */
+@@ -651,9 +653,20 @@
+ 	else
+ 		return -ENODEV;
+ 
++	/* bzdOS: wait for a USB host for at most 3 s.
++	 * Upstream waits for ever, and schedule() keeps the watchdog fed, so a
++	 * board with nothing on its OTG port never reached bootcmd (dark for
++	 * 18.7 h on 2026-10-02). On timeout the gadget stays registered and
++	 * dev->priv stays set: this console is dropped from the current mux,
++	 * a later assignment (preboot) takes it back at once, putc only
++	 * buffers while disconnected, and a host that shows up later still
++	 * enumerates it. */
++	start = get_timer(0);
+ 	while (!acm_connected(dev)) {
+ 		if (ctrlc())
+ 			return -ECANCELED;
++		if (get_timer(start) > 3000)
++			return -ETIMEDOUT;
+ 
+ 		schedule();
+ 	}
