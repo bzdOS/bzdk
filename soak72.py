@@ -179,6 +179,10 @@ def do_reload(board, ev, state, cfg, why):
     attempts with one break-glass reset between them. Churning through reload
     attempts on a board that is not coming back is precisely what an unattended
     harness must not do — it produces a longer log and nothing else."""
+    if board.usb() == "gone":
+        # No USB console exists (network-only mode): there is nothing to
+        # reload — the board recovers ITSELF over EMAC. See do_reload_net().
+        return do_reload_net(board, ev, state, cfg, why)
     os.makedirs(cfg["logdir"], exist_ok=True)
     for attempt in (1, 2):
         n = state.bump("reloads")
@@ -212,6 +216,62 @@ def do_reload(board, ev, state, cfg, why):
         f"reset in between. The board is not coming back on its own — "
         f"stopping. State is on disk: fix the board and re-run the same "
         f"command to resume.")
+
+
+def do_reload_net(board, ev, state, cfg, why):
+    """Network-only recovery: there is no console to catch U-Boot on, so the
+    harness does NOT reload anything. The board's self-recovery IS the design
+    (reset -> U-Boot autoboot -> eMMC -> hypervisor and guest return on their
+    own); the harness waits for EMAC + ssh within the same reload window and
+    then puts the load back over ssh.
+
+    Bounded and flat: ONE wait, no retries, no break-glass (break-glass writes
+    the magic to /dev/ttyACM0, which does not exist in this mode). A board
+    that does not come back on EMAC needs its BMC reset, and that is not a
+    path this harness has — it stops loudly with the state on disk."""
+    os.makedirs(cfg["logdir"], exist_ok=True)
+    n = state.bump("reloads")
+    log_path = os.path.join(cfg["logdir"], f"reload-{n:04d}.log")
+    ev.emit("reload-start", "info", why=why, attempt=1, mode="net",
+            log=log_path)
+    started = state.clock.now()
+    deadline = started + cfg["reload_timeout_s"]
+    with open(log_path, "a", buffering=1) as log:
+        while True:
+            st = board.status()
+            reachable = bool(st.get("reachable"))
+            alive = reachable and board.guest_alive()
+            log.write(f"{state.clock.now():.0f}s reachable={reachable} "
+                      f"guest_alive={alive}\n")
+            if alive:
+                break
+            if state.clock.now() >= deadline:
+                log.write("TIMEOUT\n")
+                ev.emit("reload-done", FAIL, ok=False, mode="net",
+                        elapsed_s=round(state.clock.now() - started, 1),
+                        timed_out=True,
+                        detail="board never answered on EMAC+ssh within the "
+                               "reload window")
+                L.ledger_record(False, "soak72-reload",
+                                note=f"net reload timed out ({why})")
+                raise HarnessStop(
+                    f"net reload for {why}: EMAC/ssh never came back within "
+                    f"{cfg['reload_timeout_s']:.0f}s. No console and no "
+                    f"break-glass exist in network mode; the board needs its "
+                    f"BMC reset (owner's path). State is on disk: fix the "
+                    f"board and re-run the same command to resume.")
+            state.clock.sleep(min(30.0, cfg["poll_s"]))
+    ev.emit("reload-done", "info", ok=True, mode="net",
+            elapsed_s=round(state.clock.now() - started, 1), timed_out=False)
+    L.ledger_record(True, "soak72-reload", note=why)
+    if not start_load(board, cfg):
+        raise HarnessStop("net reload: guest answers on ssh but the load "
+                          "would not start")
+    ev.emit("load-restarted", "info")
+    state.d["last_load_gen"] = None
+    state.d["last_load_gen_ts"] = state.clock.now()
+    state.save()
+    return True
 
 
 def do_guest_recovery(board, ev, state, cfg, why):
@@ -260,23 +320,47 @@ def handle_reset(board, ev, state, cfg, kind, detail):
             f"{cfg['max_resets']}. Each one is individually by design, but this "
             f"many means the board is not stable enough for the 72 h claim.")
     if kind == "wedge":
-        if not board.break_glass():
-            raise HarnessStop("break-glass could not be sent (tty unavailable)")
-        state.bump("breakglass_sent")
-        L.ledger_record(True, "soak72-breakglass",
-                        note="EMAC dark under load; break-glass")
-        state.clock.sleep(cfg["breakglass_settle_s"])
+        if board.usb() == "gone":
+            # Network mode: break-glass writes the magic to /dev/ttyACM0,
+            # which does not exist here — and no reset needs *causing*: the
+            # wedge we are recovering from already reset the board. The
+            # net-wait reload below IS the recovery.
+            ev.emit("breakglass-skipped", "info",
+                    detail="no USB console in network mode; recovery is the "
+                           "net-wait reload itself")
+        else:
+            if not board.break_glass():
+                raise HarnessStop("break-glass could not be sent "
+                                  "(tty unavailable)")
+            state.bump("breakglass_sent")
+            L.ledger_record(True, "soak72-breakglass",
+                            note="EMAC dark under load; break-glass")
+            state.clock.sleep(cfg["breakglass_settle_s"])
     do_reload(board, ev, state, cfg, why=kind)
-    do_guest_recovery(board, ev, state, cfg, why="after-" + kind)
+    if board.usb() == "gone":
+        # Network mode: the console-based fsck/mount/netif/sshd recovery has
+        # no channel to run on. The guest boots itself; do_reload_net() has
+        # already restarted the load over ssh.
+        ev.emit("guest-recovery-skipped", "info",
+                detail="network mode: no console for guest recovery; guest "
+                       "self-boots, load restarted over ssh")
+    else:
+        do_guest_recovery(board, ev, state, cfg, why="after-" + kind)
     state.d["emac_dark_since"] = None
     state.save()
 
 
 # ── the run ──────────────────────────────────────────────────────────────
 def run(board, clock, ev, state, cfg):
+    # Network mode is a property of the BOARD, not of an operator flag: no USB
+    # gadget enumerates => there is no console to catch U-Boot on, and the only
+    # recovery channel is EMAC/ssh (2026-10 rule: the board is reachable over
+    # the network ONLY). A run WITH the gadget present keeps the USB reload
+    # path unchanged -- that is the swap-the-build scenario.
+    cfg["net_mode"] = bool(cfg.get("net_mode")) or board.usb() == "gone"
     target_s = cfg["hours"] * 3600.0
     ev.emit("run-start", "info",
-            resumed=state.resumed, board=board.kind,
+            resumed=state.resumed, board=board.kind, net_mode=cfg["net_mode"],
             load_h=round(state.d["load_s"] / 3600.0, 3),
             target_h=cfg["hours"], poll_s=cfg["poll_s"])
 
@@ -288,7 +372,11 @@ def run(board, clock, ev, state, cfg):
     if cfg.get("restart"):
         lp = None
     if not (lp and lp.get("running")):
-        if board.usb() == "hv" and board.status().get("reachable"):
+        # net mode: liveness is EMAC + ssh (no "hv" USB identity exists to
+        # wait for); usb mode: unchanged.
+        up = board.status().get("reachable") and (
+            board.guest_alive() if cfg["net_mode"] else board.usb() == "hv")
+        if up:
             if start_load(board, cfg):
                 ev.emit("load-started", "info", size_mb=cfg["size_mb"],
                         idle_s=cfg["idle_s"])
@@ -581,6 +669,21 @@ DRY_CASES = [
      "the board stays present and reachable in U-Boot but the reload itself "
      "never lands twice in a row -- do_reload()'s OTHER failure ending, "
      "distinct from board-off-usb"),
+    # Network-mode coverage (2026-10 rule: the board is reachable over the
+    # network ONLY). usb()=="gone" for the WHOLE run is the mode's norm; these
+    # pin its own semantics: a healthy run closes the gate with no USB console
+    # at all, an EMAC wedge recovers via the net-wait reload (break-glass and
+    # console guest-recovery skipped), and a board that never returns on EMAC
+    # stops the run loudly (the USB board-off-usb gate cannot fire where USB
+    # never existed).
+    ("happy-net", True, ["healthy", "load-started", "verdict"],
+     "net mode: a healthy run closes the gate with no USB console at all"),
+    ("wedge-net", True,
+     ["wedge", "breakglass-skipped", "reload-done", "load-restarted"],
+     "net mode: EMAC dark past grace -> net-wait reload, break-glass skipped, "
+     "load restarted over ssh"),
+    ("dead-board-net", False, ["reload-done"],
+     "net mode: a board that never comes back on EMAC stops the run loudly"),
 ]
 
 
@@ -977,7 +1080,8 @@ def new_state_defaults():
 
 
 def make_cfg(a):
-    return {"hours": a.hours, "poll_s": a.poll_s, "size_mb": a.size_mb,
+    return {"hours": a.hours, "net_mode": getattr(a, "net_mode", False),
+            "poll_s": a.poll_s, "size_mb": a.size_mb,
             "idle_s": a.idle_s, "max_resets": a.max_resets,
             "fsck_passes": a.fsck_passes,
             "reload_timeout_s": a.reload_timeout_s,

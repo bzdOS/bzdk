@@ -726,11 +726,15 @@ def classify_sample(s, prev, cfg):
     st = s.get("status") or {}
 
     # --- reachability ---------------------------------------------------
-    if usb == "gone":
+    if usb == "gone" and not cfg.get("net_mode"):
         ev.append((FAIL, "board-off-usb",
                    "board vanished from the USB bus — the ONE case with no "
                    "remote recovery path (supervise.py's GONE state)"))
         return ev
+    # net_mode: no USB gadget exists BY DESIGN (the board is network-only), so
+    # "gone" carries no signal here; liveness rides on the EMAC/ssh gates
+    # below, and a board that stays dark is do_reload_net()'s timeout, not a
+    # USB event.
     if usb == "uboot":
         # SESSION-RULES R2: the hardware watchdog resetting the board back into
         # U-Boot is DELIBERATE anti-brick behaviour, not a fault. It must be
@@ -750,8 +754,11 @@ def classify_sample(s, prev, cfg):
             ev.append((BENIGN, "emac-flap",
                        f"EMAC did not answer (dark {dark:.0f}s < grace)"))
         else:
+            chan = ("network mode: board not answering on EMAC"
+                    if cfg.get("net_mode") else
+                    "HV gadget present but EMAC dark")
             ev.append((RESET, "wedge",
-                       f"HV gadget present but EMAC dark for {dark:.0f}s — "
+                       f"{chan} for {dark:.0f}s — "
                        f"break-glass, exactly as supervise.py does live"))
         return ev
 
@@ -985,7 +992,7 @@ class FakeBoard:
         self.reload_always_fails = False  # board stays put, reload never lands
         self.breakglass_ineffective = False  # bytes "sent", watchdog never fires
         self.rate_schedule = []           # [(poll_threshold, gen_period), ...]
-        self.never_returns = (scenario == "dead-board")
+        self.never_returns = scenario in ("dead-board", "dead-board-net")
         self.script = {}                  # poll index -> callable(self)
         self._build_scenario()
         try:
@@ -1017,6 +1024,23 @@ class FakeBoard:
             self.script[3] = wedge
         elif s == "dead-board":
             self.script[3] = wd_reset
+        elif s in ("happy-net", "wedge-net", "dead-board-net"):
+            # Network-mode variants (2026-10 rule: the board is reachable over
+            # the network ONLY). usb() says "gone" for the WHOLE run -- that is
+            # the mode's norm, not a fault -- so the USB branch of every gate
+            # must stay out of the way and liveness rides on EMAC/ssh. A
+            # net-mode reload "brings the board back" the same way the real
+            # one does: the board's own autoboot, modelled as the scheduled
+            # return of EMAC while the harness's net-wait polls status().
+            self.usb_override = "gone"
+            if s == "wedge-net":
+                self.script[3] = wedge
+
+                def net_back(b):
+                    b.emac = True
+                self.script[8] = net_back
+            elif s == "dead-board-net":
+                self.script[3] = wd_reset
         elif s == "isolation-breach":
             def breach(b):
                 b.isol = 0
