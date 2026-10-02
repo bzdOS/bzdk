@@ -1,62 +1,188 @@
-# Autoboot: the USB cable is no longer needed to boot
+# Booting the board: no USB cable needed, U-Boot log over the network
 
-**Hardware-verified 2026-08-20, including a genuine cold power-on with the host
-not touching the console at all.** The board brings up U-Boot -> hypervisor ->
-FreeBSD guest by itself; swapping the hypervisor image is now "copy a file into
-the TFTP root and reset over EMAC", with no ymodem and no serial interaction.
+**Current state, verified on hardware on 2026-10-02.**
 
-## The U-Boot environment that does it
+- The board boots U-Boot → hypervisor → FreeBSD guest by itself, with
+  nothing plugged into the micro-USB port.
+- With the cable plugged in, everything works as before.
+- U-Boot's console is copied to the network (netconsole, UDP 6666).
+
+The Ethernet cable and the TFTP server on `fedora` (192.168.88.2) are still
+required.
+
+> History: this file used to claim "the USB cable is optional" from
+> 2026-08-20. That was true only by accident: the cable was always plugged in.
+> On 2026-10-02 the board sat dark for 18.7 h after a reload with no USB
+> host. U-Boot was waiting for one forever. The fix is described below.
+
+## Boot path
 
 ```
-bootdelay=3
-boothv=setenv autostart no; tftpboot 0x44000000 kernel && tftpboot 0x4a000000 bananapi-min.dtb && tftpboot 0x48000000 microkernel-dbg.elf && setenv autostart yes && bootelf -p 0x48000000
-wdreset=mw.l 0x1c20cb4 1; mw.l 0x1c20cb8 0xb1; mw.l 0x1c20cb0 0x14af; echo [wdreset] SoC watchdog armed; sleep 30
-bootcmd=for i in 1 2 3 4 5 6 7 8 9 10; do run boothv; echo [bootcmd] retry $i; sleep 3; done; echo [bootcmd] gave up; run wdreset
+power-on / WDOG reset
+  BROM -> SPL (eMMC LBA 16, untouched since July)
+       -> FIT at eMMC LBA 0x50  = tftpboot/u-boot-nc.itb  (U-Boot 2026.07-rc5, "Oct 02 2026 - 21:44:45")
+       -> env from ESP:uboot.env (vtbd0p2, FAT)
+       -> preboot: stdio = serial,nc,usbacm   (waits <= 3 s for a USB host)
+       -> bootcmd: up to 10x boothv, then arm the WDOG
+            boothv: tftpboot bananapi-min.dtb, kernel, microkernel-dbg.uimg ; bootm 0x48000000
+       -> hypervisor (EL2) -> FreeBSD guest
 ```
 
-Four things in there are load-bearing:
+The `boothv` stage takes ~10 s from reset to `bootm`. A full guest reload
+(`shutdown -r` in the guest) takes ~50 s until ssh answers.
 
-1. **The `autostart` split.** `autostart=yes` makes `tftpboot` try to BOOT what
-   it just fetched, which is why it cannot be left on for the kernel and DTB
-   transfers -- but `bootelf` only JUMPS when it is on. So: off for the
-   transfers, on immediately before `bootelf`. A `boothv` without this loads the
-   ELF and silently returns to the prompt.
-2. **`bootdelay=3`, never `-1`.** The delay is the only window in which the
-   prompt can be caught once autoboot works, and catching it needs interrupt
-   spam (`loady_over_acm.catch_uboot()`), not a bare newline. `bootdelay=-1`
-   removes the window entirely and with it the ability to load anything else.
-3. **The fallback arms the WATCHDOG, not `reset`.** `reset` at the U-Boot prompt
-   on this platform prints "System reset not supported on this platform" and
-   calls `hang()`: the CLI dies, the USB gadget stops being serviced, and NO
-   remote lever recovers it (not uhubctl -- the root hub has no `ppps`; not the
-   port `disable` -- it drops the link without cutting VBUS; not `sunxi-fel` --
-   `1f3a:efe8` here is U-Boot's own download gadget, not BROM FEL). That costs a
-   physical power-cycle. Verified: `run wdreset` resets and autoboots cleanly.
-4. **Quoting.** This U-Boot honours single quotes in `setenv`, so a multi-command
-   value keeps its `;` separators. Without quotes the parser splits the line and
-   only the first fragment lands in the variable.
+## The U-Boot environment (ESP `uboot.env`)
 
-## Why the previous attempt was believed impossible
+```
+bootdelay=-2
+preboot=setenv stdout serial,nc,usbacm ; setenv stderr serial,nc,usbacm ; setenv stdin serial,nc,usbacm
+stdin=serial,nc,usbacm   stdout=serial,nc,usbacm   stderr=serial,nc,usbacm
+ncip=192.168.88.2        ipaddr=192.168.88.7       serverip=192.168.88.2
+autostart=yes
+boothv=setenv autostart no; tftpboot 0x4a000000 bananapi-min.dtb && tftpboot 0x44000000 kernel && tftpboot 0x48000000 microkernel-dbg.uimg && setenv autostart yes && bootm 0x48000000
+bootcmd=for i in 1 2 3 4 5 6 7 8 9 10; do run boothv; echo [bootcmd] retry $i; sleep 3; done; echo [bootcmd] gave up; mw.l 0x1c20cb4 1; mw.l 0x1c20cb8 0xb1; mw.l 0x1c20cb0 0x14af; ...
+```
 
-The old note said `bootelf` cannot boot a TFTP'd ELF because of a stale dcache.
-That is **wrong**. Two ordinary problems were being read as one exotic one:
+Read and change it from the host with `microkernel/uboot_env.py`. It mounts
+the ESP in the guest over ssh, recomputes the CRC, and verifies the write by
+reading it back.
 
-- `autostart` was `no`, so `bootelf` never jumped (point 1 above);
-- `/opt/bzdos/tftpboot/microkernel-dbg.elf` was a **stale 371856-byte file from
-  five weeks earlier**. `cp` is aliased to `cp -i` on this host and had been
-  silently declining to overwrite it; the transfer log showing
-  `Bytes transferred = 371856` is what gave it away. Use `install -m 0644`.
+```sh
+python3 uboot_env.py get bootdelay
+python3 uboot_env.py backup /var/tmp/uboot.env.bak
+python3 uboot_env.py set NAME=VALUE ...      # owner-approved changes only
+```
 
-There is no `dcache` command in this U-Boot build at all, so the flush that the
-old theory called for could never have been the fix.
+A copy of the env from before netconsole is in
+`microkernel/uboot.env.bak-2026-10-02-usbacm`.
 
-## Operating notes
+These settings are load-bearing:
 
-- Keep the TFTP root current: `install -m 0644 microkernel/microkernel-dbg.elf
-  /opt/bzdos/tftpboot/microkernel-dbg.elf` and check the size in U-Boot's
-  transfer log.
-- To reload: write 1 to `HVMAP_WDT_DEBUG_HOLD` (0x50095000) over EMAC; CPU1 stops
-  petting, the watchdog fires within 16 s, and the board comes back on the new
-  image. `wdt_arm()` clears the flag on the way up.
-- The Ethernet cable IS still required -- the boot fetches over TFTP from
-  192.168.88.2. Only the USB cable is now optional.
+1. **`bootdelay=-2`.** Autoboot cannot be interrupted, so nothing can park U-Boot
+   at a prompt. Tools that need the prompt (`uboot_flash_fit.py`,
+   `uboot_chainload_test.py`) open a `bootdelay=3` window through
+   `uboot_maint.py` and close it again in a `finally`.
+2. **The `autostart` split.** Autostart is off for the transfers and on right
+   before `bootm`. With `autostart=yes`, `tftpboot` would try to boot every
+   file it fetches.
+3. **The fallback arms the watchdog, never `reset`.** `reset` at this
+   U-Boot's prompt calls `hang()`.
+4. **`usbacm` stays in stdio.** It costs nothing without a host, which is the
+   point of the patch below, and the U-Boot console over the cable still works.
+
+## Why it no longer needs a USB host
+
+Upstream `acm_stdio_start()` (`drivers/usb/gadget/f_acm.c`) does this:
+
+```c
+while (!acm_connected(dev)) { if (ctrlc()) return -ECANCELED; schedule(); }
+```
+
+So it waits **forever** for a host to enumerate the gadget, and `schedule()`
+keeps the watchdog fed. Any boot with no host on the OTG port therefore never
+reached `bootcmd`:
+- no TFTP request reached the host;
+- EMAC sent no frame at all (the RJ45 LEDs still blink, from RX);
+- the WDOG never fired.
+
+This can happen in several ways: the cable is unplugged, it goes to a phone or
+a charger, or the host is rebooting.
+
+`microkernel/uboot-patches/0001-f_acm-bound-the-wait-for-a-USB-host.patch`
+stops waiting after **3 s** and returns `-ETIMEDOUT`.
+- The console mux drops `usbacm` from that assignment.
+- The gadget stays registered, so the next assignment (`preboot`) takes it
+  back at once, without a second wait.
+- While disconnected, `putc` only buffers.
+- A host that appears later still enumerates the gadget.
+
+Build: the 09-26 config that was flashed before
+(`build/patch/u-boot.config.flashed-2026-09-26`) plus `CONFIG_NETCONSOLE=y`;
+the full config is in `build/patch/u-boot.config.nc-2026-10-02`. Source tree:
+`/opt/bzdos/build/u-boot-nc`. BL31 is `build/atf/build/sun50i_a64/release/bl31.bin`,
+and there is no SCP. The FIT is cut from `u-boot-sunxi-with-spl.bin` at
+offset 32 KiB.
+
+## Netconsole
+
+Watch every boot from the host:
+
+```sh
+tcpdump -l -ni br0 -A 'udp port 6666'
+```
+
+Each boot prints `U-Boot 2026.07-rc5-dirty (Oct 02 2026 - 21:44:45 +0300)`,
+`In: serial,nc,usbacm`, the TFTP transfers, and `Image Name: bzdk-hv`.
+TFTP output is suppressed while a transfer runs, which is normal for
+netconsole.
+
+For an interactive U-Boot over the network, `bootdelay` must be ≥ 1, which
+is a deliberate env change. Then run `nc -u -l 6666` on the host and type
+into it; the replies go to 192.168.88.7:6666. With `bootdelay=-2` there is no
+window to type into, and that is intended.
+
+## Testing a U-Boot candidate without touching the media
+
+**Never write an untested loader to the eMMC.** First chain-load it from
+the loader that works. The script below needs neither a prompt nor an env
+change:
+
+```sh
+tools/chainload/uimg_chainload_test.sh <candidate/u-boot.bin> <tag> [nousb]
+```
+
+It wraps the candidate in `tools/chainload/chainload_uimg.S` and serves the
+result once as `microkernel-dbg.uimg`. The stub copies the candidate to
+0x4a000000, cleans caches by set/way, turns the MMU off, **arms the 16 s
+WDOG**, and jumps. The script then puts the real HV back right away.
+
+If the candidate hangs, the cost is one watchdog reset into the stock loader,
+which then boots the normal HV. With `nousb`, the host stops configuring new
+USB devices once the stock loader has reached TFTP
+(`echo 0 > /sys/bus/usb/devices/usb2/authorized_default`). That is exactly the
+"no USB host" case. The script re-authorizes the port when it exits.
+
+Logs go to `/var/tmp/uimg-chainload-<tag>.{log,nc}`.
+
+## Flashing a FIT and rolling back
+
+The owner runs the flash (media writes are not delegated):
+
+```sh
+python3 uboot_flash_fit.py --fit <new>.itb --current <on-card>.itb --expect-version "<build stamp>"
+```
+
+What it does:
+1. Opens a `bootdelay=3` window and resets the board.
+2. Catches the prompt over USB, so the cable must be plugged in for this step.
+3. Checks that the card holds `--current`, then writes the FIT at LBA 0x50.
+4. Reads it back, compares it with `cmp.b`, and resets into the new FIT.
+
+It never touches the SPL. Afterwards, check the card from the guest
+read-only:
+`dd if=/dev/vtbd0 bs=512 skip=80 count=1719` and compare with the `.itb`.
+
+The previous FIT is `tftpboot/u-boot-retry.itb` (09-26, no netconsole, waits
+forever for USB). To roll back:
+
+```sh
+python3 uboot_flash_fit.py --fit u-boot-retry.itb --current u-boot-nc.itb --expect-version "Sep 26 2026 - 13:46"
+```
+
+Gotcha: if the flash tool reports `!!! no tty` while the gadget shows up
+in `dmesg`, look at `/tmp/chimp-acm.lock`. If another user created it,
+`fs.protected_regular` keeps root from opening it. Remove the stale file
+(`fuser` must show no holder).
+
+## Board dark after a reload: checklist
+
+1. `ping 192.168.88.82` and `safemode.py show`. If the channel answers but
+   ssh does not, look for safe mode / the hold gate first.
+2. `journalctl -t in.tftpd --since -10min`. No RRQs from 192.168.88.7 means
+   the board is stuck in or before U-Boot. Watch netconsole: no `U-Boot`
+   banner means it is before U-Boot (SPL/BROM) or the env failed to load.
+3. `tcpdump -eni br0 ether host 02:bd:05:00:00:01` to see whether the HV sends
+   anything at all.
+4. Since 2026-10-02 a missing USB host is **not** a reason to hang. If the
+   board still parks waiting for USB, the card does not hold
+   `u-boot-nc.itb`.

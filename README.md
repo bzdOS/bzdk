@@ -419,7 +419,7 @@ Deep dives, all in this tree:
 | `war-stories.md` | bring-up on real, unfamiliar silicon — twelve incidents, each with the wrong answers that preceded the right one |
 | `soak-and-breakglass.md` | the two long unattended runs: 72 h soak and 20 break-glass resets |
 | `wx-enforcement.md` | W^X on guest DRAM: can it be enforced, and is it |
-| `autoboot-no-cable.md` | the board boots the whole stack with no host interaction |
+| `autoboot-no-cable.md` | how the board boots (no USB needed), U-Boot env, netconsole, testing/flashing U-Boot |
 | `brick-recovery.md` | the 2026-08-12 "brick" that was not one, and what it taught |
 | `dual-guest.md` | FreeBSD (CPU0) + Zephyr (CPU3), genuinely concurrent |
 | `phase2-all-cores.md` | making all four cores available to guests (not started) |
@@ -484,32 +484,24 @@ error.
 
 ### Loading
 
-**The board now autoboots the whole stack with no host interaction** —
-hardware-verified 2026-08-20 including a genuine cold power-on with the host not
-touching the console at all (`docs/autoboot-no-cable.md`). U-Boot's `bootcmd`
-TFTPs kernel + DTB + hypervisor and `bootelf`s it, retrying ten times and arming
-the SoC watchdog if it never succeeds. So swapping the hypervisor is:
+**The board boots the whole stack by itself, with or without the micro-USB
+cable**: hardware-verified 2026-10-02 from the eMMC loader with no USB host
+(`docs/autoboot-no-cable.md`). U-Boot's `bootcmd` TFTPs DTB + kernel +
+`microkernel-dbg.uimg` from 192.168.88.2 and `bootm`s it. It retries ten
+times, then arms the SoC watchdog. U-Boot waits at most 3 s for a USB host
+(our `f_acm` patch; upstream waits forever), and its console is copied to
+the network: `tcpdump -l -ni br0 -A 'udp port 6666'`.
 
-```sh
-install -m 0644 microkernel-dbg.elf /opt/bzdos/tftpboot/microkernel-dbg.elf
-# then write 1 to HVMAP_WDT_DEBUG_HOLD (0x50095000) over EMAC:
-# CPU1 stops petting, the watchdog fires within 16 s, the board returns on the new image
-```
+Swapping the hypervisor is `make dbg && make hv-uimage` (it writes
+`/opt/bzdos/tftpboot/microkernel-dbg.uimg`), then a clean reload:
+`ssh … root@192.168.88.82 'shutdown -r now'`.
 
-Use `install`, not `cp` — `cp` is aliased to `cp -i` on this host and silently
-declined to overwrite the TFTP image for five weeks, which is how a stale
-371856-byte ELF came to be blamed on a U-Boot dcache bug that does not exist.
-Check the size in U-Boot's transfer log.
+Load-bearing env details:
+- `bootdelay=-2`: nothing can park U-Boot at a prompt;
+- the `autostart` split: off for the transfers, on right before `bootm`;
+- the fallback arms the **watchdog**: `reset` at this prompt calls `hang()`.
 
-Three things in that U-Boot environment are load-bearing and non-obvious: the
-`autostart` split (off for the transfers, on immediately before `bootelf`, which
-only *jumps* when it is on), `bootdelay=3` and never `-1` (the delay is the only
-window in which the prompt can still be caught), and a fallback that arms the
-**watchdog** rather than calling `reset` — `reset` at this U-Boot prompt prints
-"System reset not supported on this platform" and calls `hang()`, killing the CLI
-and the USB gadget with no remote lever left. The Ethernet cable is still
-required (the boot fetches over TFTP from 192.168.88.2); only the USB cable is
-now optional.
+The Ethernet cable is still required.
 
 ## Layout
 

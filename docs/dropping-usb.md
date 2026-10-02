@@ -1,5 +1,13 @@
 # Getting off the microUSB cable
 
+> **Status 2026-10-02.**
+> - Booting with no USB host works. It is verified from the eMMC loader, and
+>   before that date it did not: U-Boot waited for a host forever.
+> - U-Boot netconsole is on (step 1 below: done).
+> - Current reference: `autoboot-no-cable.md`.
+> - What is left: steps 3–6, plus switched power for the two cases software
+>   cannot reach.
+
 ## The premise
 
 **There is no serial adapter, and there is not going to be one.** That is not
@@ -96,7 +104,10 @@ attached.
 
 ## Order of work
 
-1. `CONFIG_NETCONSOLE=y`, rebuild U-Boot, verify the prompt over Ethernet and
+1. **DONE 2026-10-02** (`u-boot-nc.itb`, chain-load tested, flashed, verified;
+   see `autoboot-no-cable.md`). Shipped together with the 3 s bound on
+   U-Boot's wait for a USB host.
+   Original text: `CONFIG_NETCONSOLE=y`, rebuild U-Boot, verify the prompt over Ethernet and
    that `bootcmd` can still be changed. **Demoted, and no longer urgent** --
    step 2 below turned out to deliver the thing this was wanted for, without
    flashing anything. Netconsole is still worth having for interactive work,

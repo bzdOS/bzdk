@@ -1,5 +1,13 @@
 # The 2026-08-12 "brick" that was not one — and what it actually taught
 
+> **Current loader (2026-10-02):** the eMMC FIT at LBA 0x50 is
+> `tftpboot/u-boot-nc.itb` (netconsole on, waits at most 3 s for USB). The
+> SPL at LBA 16 is unchanged. The previous FIT is `tftpboot/u-boot-retry.itb`.
+> Roll back with
+> `uboot_flash_fit.py --fit u-boot-retry.itb --current u-boot-nc.itb --expect-version "Sep 26 2026 - 13:46"`
+> (that needs the USB cable for the prompt). Test any new loader with
+> `tools/chainload/uimg_chainload_test.sh` first; see `autoboot-no-cable.md`.
+
 ## CORRECTION FIRST: the board was never bricked, and this file said it was
 
 Everything below the next section was written while I believed the board had lost
