@@ -30,8 +30,12 @@
   - **Verified from the card with no USB host:** the gadget was "not
     authorized" at 21:57:23, TFTP followed at 21:57:29, and the guest was up
     at 21:58:06.
-  - Netconsole is built in but not enabled until the env gets
-    `ncip=192.168.88.2` and `nc` in stdin/stdout/stderr/preboot.
+  - **Netconsole is ON** (env set by the owner at 21:59, md5 bfbb5075…):
+    `ncip=192.168.88.2`, stdin/stdout/stderr and preboot = `serial,nc,usbacm`.
+    Verified at the next boot: `U-Boot … (Oct 02 2026 - 21:44:45)`,
+    `In: serial,nc,usbacm` and the TFTP log all arrived on UDP 6666. To watch:
+    `tcpdump -l -ni br0 -A 'udp port 6666'`. Interactive with `bootdelay>=1`:
+    `nc -u -l 6666` on the host, then answer to 192.168.88.7:6666.
   - The first flash attempt failed with "no tty": `/tmp/chimp-acm.lock` was
     created by user `agent`, and `fs.protected_regular` stops root opening it
     with O_CREAT. It was removed.
