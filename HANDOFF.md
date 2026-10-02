@@ -1,4 +1,4 @@
-# Handoff — 2026-10-02: 18.7 h dark board was U-Boot waiting for a USB host
+# Handoff — 2026-10-02: 18.7 h dark board was U-Boot waiting for a USB host — FIXED (boots with no USB)
 
 - **What happened.** The guest did a `shutdown -r` at 02:03 MSK. The
   micro-USB was not on the host (a phone had the host port). No TFTP request
@@ -13,12 +13,28 @@
   watchdog. So a reload with no USB host never reaches bootcmd.
   76907c1 ("network-only recovery") assumes autoboot recovers by itself; it
   does not.
-- **Not fixed.** The fix is to drop `usbacm` from `preboot` (or patch
-  `acm_stdio_start` to time out). Either one writes boot config or the
-  bootloader to media, which needs the owner's decision and a live test
-  first. Until then, keep the micro-USB in the host. A dark board after a
-  reload means: check `journalctl | grep in.tftpd` for RRQs from
-  192.168.88.7. If there are none, plug the micro-USB in.
+- **FIXED 2026-10-02 21:55: the eMMC FIT is now `u-boot-nc.itb`** (md5
+  6b7a0e6f…, `U-Boot 2026.07-rc5-dirty (Oct 02 2026 - 21:44:45)`). It is the
+  flashed 09-26 config plus `CONFIG_NETCONSOLE=y`, plus
+  `uboot-patches/0001-f_acm-bound-the-wait-for-a-USB-host.patch`:
+  `acm_stdio_start` gives up after 3 s and leaves the gadget registered, so a
+  host that comes later still enumerates. The SPL was not touched, and the
+  previous FIT is `tftpboot/u-boot-retry.itb`.
+  - Before flashing, it was chain-loaded with no media write, via a one-shot
+    `microkernel-dbg.uimg` wrapper: the stub copies U-Boot to 0x4a000000,
+    cleans by set/way and arms the WDOG. It was tested with a USB host, with
+    no host (`echo 0 > /sys/bus/usb/devices/usb2/authorized_default`), and
+    with the real env.
+  - Flashed by the owner with `uboot_flash_fit.py`: "verify: Total of 879749
+    byte(s) were the same". A read-back of the card from the guest matches.
+  - **Verified from the card with no USB host:** the gadget was "not
+    authorized" at 21:57:23, TFTP followed at 21:57:29, and the guest was up
+    at 21:58:06.
+  - Netconsole is built in but not enabled until the env gets
+    `ncip=192.168.88.2` and `nc` in stdin/stdout/stderr/preboot.
+  - The first flash attempt failed with "no tty": `/tmp/chimp-acm.lock` was
+    created by user `agent`, and `fs.protected_regular` stops root opening it
+    with O_CREAT. It was removed.
 - The running HV is the 01:59 TFTP image (image id 0x9c049663, adds
   `usbacm_poll()` in the hold loop, built from a worktree;
   `main_dbg.c.fixed-inworktree`, not committed).
