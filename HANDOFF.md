@@ -1,3 +1,28 @@
+# Handoff — 2026-10-02: 18.7 h dark board was U-Boot waiting for a USB host
+
+- **What happened.** The guest did a `shutdown -r` at 02:03 MSK. The
+  micro-USB was not on the host (a phone had the host port). No TFTP request
+  arrived until 20:46:57, and EMAC sent no frames, while the RJ45 LEDs blinked
+  on RX. When the owner plugged the micro-USB into the host, U-Boot's "USB
+  download gadget" (1f3a:efe8) enumerated, TFTP followed 4 s later, and the
+  board booted with no reset.
+- **Root cause.** The ESP `uboot.env` has `preboot=setenv stdin usbacm,serial`
+  (and the same for stdout and stderr). In `acm_stdio_start()`
+  (`build/u-boot/drivers/usb/gadget/f_acm.c:654`), U-Boot spins
+  `while (!acm_connected) schedule();`, and `schedule()` pets the U-Boot
+  watchdog. So a reload with no USB host never reaches bootcmd.
+  76907c1 ("network-only recovery") assumes autoboot recovers by itself; it
+  does not.
+- **Not fixed.** The fix is to drop `usbacm` from `preboot` (or patch
+  `acm_stdio_start` to time out). Either one writes boot config or the
+  bootloader to media, which needs the owner's decision and a live test
+  first. Until then, keep the micro-USB in the host. A dark board after a
+  reload means: check `journalctl | grep in.tftpd` for RRQs from
+  192.168.88.7. If there are none, plug the micro-USB in.
+- The running HV is the 01:59 TFTP image (image id 0x9c049663, adds
+  `usbacm_poll()` in the hold loop, built from a worktree;
+  `main_dbg.c.fixed-inworktree`, not committed).
+
 # Handoff — 2026-09-30 evening: trap cost, scrubber, safe mode, all planes in screenshots
 
 - **Trap cost measured** (ROADMAP §6.5, `vtrap.py`): 6118 guest traps/s
