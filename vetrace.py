@@ -21,5 +21,6 @@ while i < cnt * 2:
 for e in range(cnt):
     w0, v = words[2 * e], words[2 * e + 1]
     off, wnr, sas, cpu, rep = w0 & 0xffff, (w0 >> 16) & 1, (w0 >> 17) & 3, (w0 >> 19) & 3, w0 >> 24
-    print("%5d cpu%d %s%d %04x %08x%s" % (start + e, cpu, "W" if wnr else "R",
-          8 << sas, off, v, (" x%d" % (rep + 1)) if rep else ""))
+    pg = "VE SC CCU DRAMC".split()[(off >> 12) & 3]
+    print("%5d cpu%d %s%d %s %04x %08x%s" % (start + e, cpu, "W" if wnr else "R",
+          8 << sas, pg, off & 0xfff, v, (" x%d" % (rep + 1)) if rep else ""))

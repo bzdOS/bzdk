@@ -1,0 +1,173 @@
+/*
+ * bpi_m64_trace.dts — devicetree for a mainline Linux/arm64 EL1 guest on the
+ * real Banana Pi M64 under the bzdOS EL2 hypervisor, built for ONE purpose:
+ * run the kernel's V4L2 stateless video-engine driver while the hypervisor's
+ * vetrap.c records every register access (hardware observation for the
+ * clean-room Cedrus facts).  Only what that needs is described: one CPU,
+ * GIC, timer, UART0, the clock/reset controller, the SRAM controller and the
+ * video engine.  Everything the hypervisor owns (EMAC, display, PMIC bus,
+ * eMMC/SD) is deliberately absent so Linux never touches it.
+ *
+ * Node contents mirror the board DTB the FreeBSD guest boots (same hardware
+ * facts: addresses, clock/reset indexes, interrupts).
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	interrupt-parent = <&gic>;
+	model = "Banana Pi M64 (bzdOS EL2 hypervisor, Linux trace guest)";
+	compatible = "sinovoip,bananapi-m64", "allwinner,sun50i-a64";
+
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0x1c28000,115200n8 console=ttyS0,115200n8 rdinit=/init clk_ignore_unused pd_ignore_unused printk.devkmsg=on loglevel=8 cma=0";
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	/* Linux owns only the 48 MiB below the guest framebuffer; the
+	 * hypervisor windows (0x42000000, 0x50000000...) are outside it. */
+	memory@48000000 {
+		device_type = "memory";
+		reg = <0x48000000 0x03000000>;
+	};
+
+	/* The video engine needs physically contiguous buffers.  A fixed pool in
+	 * the last 12 MiB of Linux's memory (below the guest framebuffer) is the
+	 * default DMA pool; no CMA/migration machinery needed. */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		dma_pool: dma-pool@4a400000 {
+			compatible = "shared-dma-pool";
+			reg = <0x4a400000 0x00c00000>;
+			no-map;
+			linux,dma-default;
+		};
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0>;
+			enable-method = "psci";
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		allwinner,erratum-unknown1;
+		arm,no-tick-in-suspend;
+		interrupts = <1 13 0xf04>, <1 14 0xf04>, <1 11 0xf04>, <1 10 0xf04>;
+	};
+
+	osc24M: osc24M-clk {
+		#clock-cells = <0>;
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "osc24M";
+	};
+
+	osc32k: osc32k-clk {
+		#clock-cells = <0>;
+		compatible = "fixed-clock";
+		clock-frequency = <32768>;
+		clock-output-names = "ext-osc32k";
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		syscon@1c00000 {
+			compatible = "allwinner,sun50i-a64-system-control";
+			reg = <0x1c00000 0x1000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges;
+
+			sram_c: sram@18000 {
+				compatible = "mmio-sram";
+				reg = <0x18000 0x28000>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+				ranges = <0 0x18000 0x28000>;
+
+				de2_sram: sram-section@0 {
+					compatible = "allwinner,sun50i-a64-sram-c";
+					reg = <0 0x28000>;
+				};
+			};
+
+			sram_c1: sram@1d00000 {
+				compatible = "mmio-sram";
+				reg = <0x1d00000 0x40000>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+				ranges = <0 0x1d00000 0x40000>;
+
+				ve_sram: sram-section@0 {
+					compatible = "allwinner,sun50i-a64-sram-c1",
+						     "allwinner,sun4i-a10-sram-c1";
+					reg = <0 0x40000>;
+				};
+			};
+		};
+
+		ccu: clock@1c20000 {
+			compatible = "allwinner,sun50i-a64-ccu";
+			reg = <0x1c20000 0x400>;
+			clocks = <&osc24M>, <&osc32k>;
+			clock-names = "hosc", "losc";
+			#clock-cells = <1>;
+			#reset-cells = <1>;
+		};
+
+		video-codec@1c0e000 {
+			compatible = "allwinner,sun50i-a64-video-engine";
+			reg = <0x1c0e000 0x1000>;
+			clocks = <&ccu 46>, <&ccu 106>, <&ccu 95>;
+			clock-names = "ahb", "mod", "ram";
+			resets = <&ccu 23>;
+			interrupts = <0 58 4>;
+			allwinner,sram = <&ve_sram 1>;
+			memory-region = <&dma_pool>;
+		};
+
+		uart0: serial@1c28000 {
+			compatible = "ns16550a";
+			reg = <0x1c28000 0x400>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			clock-frequency = <24000000>;
+			current-speed = <115200>;
+			interrupts = <0 0 4>;
+			status = "okay";
+		};
+
+		gic: interrupt-controller@1c81000 {
+			compatible = "arm,gic-400";
+			reg = <0x1c81000 0x1000>, <0x1c82000 0x2000>;
+			interrupt-controller;
+			#interrupt-cells = <3>;
+		};
+	};
+};

@@ -346,8 +346,8 @@ endif
 # Passive trace of the guest's video-engine register accesses (vetrap.c).
 # Off by default: `make dbg HV_VETRAP=1`.
 HV_VETRAP ?= 0
-ifeq ($(HV_VETRAP),1)
-dbg: CFLAGS += -DHV_VETRAP
+ifneq ($(HV_VETRAP),0)
+dbg: CFLAGS += -DHV_VETRAP=$(HV_VETRAP)
 endif
 # Boot a Linux arm64 Image (TFTP'd as "kernel") instead of FreeBSD.
 HV_LINUX_GUEST ?= 0

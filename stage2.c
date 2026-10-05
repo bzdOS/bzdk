@@ -425,7 +425,7 @@ stage2_build_mmio_tables(void)
 		}
 
 #ifdef HV_VETRAP
-		if (pa == VETRAP_PAGE_BASE) {   /* INVALID: video engine, traced */
+		if (vetrap_pa_traced(pa)) {   /* INVALID: video engine (and neighbours), traced */
 			stage2_l3_uart[j] = 0;
 			continue;
 		}

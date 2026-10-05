@@ -17,6 +17,13 @@
 #define ESR_WNR_BIT       (1u << 6)
 #define SRT_XZR           31u
 
+const unsigned long vetrap_pages[VETRAP_NPAGES] = {
+	VETRAP_PAGE_BASE,
+#if HV_VETRAP >= 2
+	0x01C00000UL, 0x01C20000UL, 0x01C62000UL,
+#endif
+};
+
 #define VE_RING_N ((HVMAP_VETRAP_SIZE - 0x40u) / 8u)
 
 static volatile uint32_t *hdr = (volatile uint32_t *)HVMAP_VETRAP;
@@ -60,18 +67,21 @@ int vetrap_handle_fault(struct el2_frame *frame)
 {
 	uint32_t esr = (uint32_t)frame->esr;
 	uint64_t hpfar, addr;
-	uint32_t off, wnr, srt, sas;
+	uint32_t off, wnr, srt, sas, page;
 	volatile void *p;
 
 	if (((esr >> ESR_EC_SHIFT) & ESR_EC_MASK) != ESR_EC_DABT_LOWER)
 		return 0;
 	__asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
 	addr = ((hpfar & 0xFFFFFFFFF0ULL) << 8) | (frame->far & 0xFFFull);
-	if (addr < VETRAP_PAGE_BASE || addr >= VETRAP_PAGE_BASE + VETRAP_PAGE_SIZE)
+	for (page = 0; page < VETRAP_NPAGES; page++)
+		if ((addr & ~0xFFFUL) == vetrap_pages[page])
+			break;
+	if (page == VETRAP_NPAGES)
 		return 0;
 
 	init_once();
-	off = (uint32_t)(addr - VETRAP_PAGE_BASE);
+	off = (uint32_t)(addr & 0xFFFu);
 	if (!(esr & ESR_ISV_BIT)) {
 		hdr[3]++;
 		frame->elr += 4;
@@ -84,7 +94,8 @@ int vetrap_handle_fault(struct el2_frame *frame)
 
 	if (wnr) {
 		uint32_t v = (srt == SRT_XZR) ? 0u : (uint32_t)frame->x[srt];
-		log_access(off, 1, sas, v);
+		if (page != 2u || off < 0x400u)
+			log_access(off | (page << 12), 1, sas, v);
 		switch (sas) {
 		case 0: *(volatile uint8_t *)p = (uint8_t)v; break;
 		case 1: *(volatile uint16_t *)p = (uint16_t)v; break;
@@ -98,7 +109,8 @@ int vetrap_handle_fault(struct el2_frame *frame)
 		case 1: v = *(volatile uint16_t *)p; break;
 		default: v = *(volatile uint32_t *)p; break;
 		}
-		log_access(off, 0, sas, v);
+		if (page != 2u || off < 0x400u)
+			log_access(off | (page << 12), 0, sas, v);
 		if (srt != SRT_XZR)
 			frame->x[srt] = v;
 	}
