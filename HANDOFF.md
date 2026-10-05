@@ -38,7 +38,9 @@
     `nc -u -l 6666` on the host, then answer to 192.168.88.7:6666.
   - The first flash attempt failed with "no tty": `/tmp/chimp-acm.lock` was
     created by user `agent`, and `fs.protected_regular` stops root opening it
-    with O_CREAT. It was removed.
+    with O_CREAT. It was removed. **Fixed properly 2026-10-05:** the lock is
+    `/run/chimp/acm.lock` (setgid root:fleet, 0660, from
+    `/etc/tmpfiles.d/chimp.conf`); `test_port_lock.py` covers root <-> agent.
 - The running HV is the 01:59 TFTP image (image id 0x9c049663, adds
   `usbacm_poll()` in the hold loop, built from a worktree;
   `main_dbg.c.fixed-inworktree`, not committed).

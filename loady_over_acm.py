@@ -51,8 +51,30 @@ DEFAULT_ADDR = 0x42000000
 # across processes: if a previous script is still mid-command, the next one
 # blocks here instead of racing the port. flock auto-releases if the holder
 # dies/crashes, so a stuck lock can't itself wedge future runs.
-_PORT_LOCK_PATH = "/tmp/chimp-acm.lock"
+#
+# 2026-10-05: the lock lives in /run/chimp (root:fleet, setgid 2775, created at
+# boot from tools/host/chimp-tmpfiles.conf), no longer in /tmp. In a sticky
+# /tmp, fs.protected_regular refuses O_CREAT on a file another user owns even
+# to root, so a lock left by the agent user made a root flash run fail with
+# "no tty"; and the process umask turned the 0666 request into 0644, so the
+# other user could not open the file at all. CHIMP_LOCK_PATH overrides the
+# path (tests only: two paths would defeat the mutual exclusion).
+_PORT_LOCK_PATH = os.environ.get("CHIMP_LOCK_PATH", "/run/chimp/acm.lock")
 _port_lock_fd = None
+
+
+def _open_port_lock():
+    d = os.path.dirname(_PORT_LOCK_PATH)
+    if not os.path.isdir(d):
+        raise RuntimeError(
+            "lock directory %s does not exist: install tools/host/chimp-tmpfiles.conf "
+            "as /etc/tmpfiles.d/chimp.conf and run: systemd-tmpfiles --create chimp.conf" % d)
+    fd = os.open(_PORT_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o660)
+    try:
+        os.fchmod(fd, 0o660)    # the umask must not take the group's access away
+    except PermissionError:
+        pass                    # somebody else's file: its creator already set it
+    return fd
 
 
 def _lock_holder_desc():
@@ -87,7 +109,7 @@ def acquire_port_lock(settle=0.5, timeout=None):
     if _port_lock_fd is not None:
         return   # already held by this process
     import fcntl
-    _port_lock_fd = os.open(_PORT_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+    _port_lock_fd = _open_port_lock()
 
     # Try without blocking FIRST, purely so that blocking can be announced.
     # A bare flock(LOCK_EX) here waits silently and forever, so a run that is

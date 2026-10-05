@@ -169,10 +169,17 @@ forever for USB). To roll back:
 python3 uboot_flash_fit.py --fit u-boot-retry.itb --current u-boot-nc.itb --expect-version "Sep 26 2026 - 13:46"
 ```
 
-Gotcha: if the flash tool reports `!!! no tty` while the gadget shows up
-in `dmesg`, look at `/tmp/chimp-acm.lock`. If another user created it,
-`fs.protected_regular` keeps root from opening it. Remove the stale file
-(`fuser` must show no holder).
+Gotcha, fixed 2026-10-05: the port lock used to be `/tmp/chimp-acm.lock`. A
+lock created by user `agent` there could not be opened by root
+(`fs.protected_regular`), and the umask made it 0644, so the other user could
+not open it either. The flash tool then reported `!!! no tty` while the gadget
+was in `dmesg`. The lock is now `/run/chimp/acm.lock` in a setgid
+`root:fleet` directory, mode 0660. The directory comes from
+`/etc/tmpfiles.d/chimp.conf` (copy `tools/host/chimp-tmpfiles.conf`, then
+`systemd-tmpfiles --create chimp.conf`); without it the tools stop with a
+message that says so. `python3 test_port_lock.py` (as root) checks the lock in
+both directions between root and `agent`. If a flash still fails with
+`no tty`, look at who holds the lock: `fuser -v /run/chimp/acm.lock`.
 
 ## Board dark after a reload: checklist
 
