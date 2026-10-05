@@ -391,7 +391,7 @@ def _elf_sha():
         return None
 
 
-def reliable_load(expect_vbk=False, max_cycles=5, boot_to_shell=False,
+def reliable_load(expect_vbk=False, max_cycles=1, boot_to_shell=False,
                   ledger_source="reliable_load"):
     check_uimg_fresh()
     for cyc in range(1, max_cycles + 1):
