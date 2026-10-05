@@ -1,0 +1,8 @@
+Register-trace rig, Linux side. init.c is the initramfs /init: it decodes the MPEG-2 slice
+data in i64.h (generated: bytes of vectors/i64.m2v from the first slice start code) through
+the kernel's V4L2 stateless interface, prints flags and the output frame to the console.
+Build: aarch64-linux-gnu-gcc -O1 -ffreestanding -nostdlib -static -fno-stack-protector
+ -Istub -I<linux uapi headers> -o init init.c ; kernel config: minimal arm64 with
+ ARCH_SUNXI, SUN50I_A64_CCU, CEDRUS, CMA, COMPACTION, INITRAMFS_SOURCE=rootfs.list.
+After editing init, delete build/vmlinux* so the initramfs object is really relinked.
+Boot: HV built with HV_LINUX_GUEST=1 (and HV_VETRAP=2 for the trace), bpi_m64_trace.dts.

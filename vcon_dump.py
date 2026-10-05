@@ -18,8 +18,14 @@ if not hd or len(hd) != 4:
 tb = hd[1]
 want = int(sys.argv[1]) if len(sys.argv) > 1 else 65536
 total = min(tb, 0x10000)
-if tb > 0x10000:
-    sys.exit("ring wrapped (%d bytes written): tail dump only" % tb)
+wrapped = tb > 0x10000
+if wrapped and tb % 0x10000 >= want:
+    # the wanted tail does not cross the wrap point: read just that
+    k = tb % 0x10000
+    total = k
+    wrapped = False
+elif wrapped:
+    want = 0x10000
 n = min(want, total)
 start = (total - n) & ~3
 out = bytearray()
@@ -35,5 +41,11 @@ while left > 0:
         out += b'<<chunk %#x lost>>' ; pa += 4 * k; left -= k; continue
     out += struct.pack('<%dI' % k, *w)
     pa += 4 * k; left -= k
+data = bytes(out[:total - start])
+if wrapped:
+    k = tb % 0x10000
+    data = data[k:] + data[:k]
+    if want < 0x10000:
+        data = data[-want:]
 sys.stdout.write("total_bytes %d\n" % tb)
-sys.stdout.write(out[:total - start].decode('latin1'))
+sys.stdout.write(data.decode('latin1'))

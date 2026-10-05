@@ -1,0 +1,3 @@
+dir /dev 755 0 0
+dir /proc 755 0 0
+file /init /opt/bzdos/linux-work/initramfs/init 755 0 0
