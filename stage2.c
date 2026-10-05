@@ -263,6 +263,9 @@ static uint64_t stage2_l2_mmio[STAGE2_L2_ENTRIES]
 static uint64_t stage2_l3_uart[STAGE2_L3_ENTRIES]
 	__attribute__((aligned(STAGE2_L3_ENTRIES * 8u)));
 
+#ifdef HV_VETRAP
+#include "vetrap.h"
+#endif
 #ifdef HV_RSBTRAP
 /* The 2 MiB block 0x01E00000 (R_ peripherals: R_PRCM, R_PIO, R_RSB, R_PWM),
  * split to 4 KiB so the one page holding rsb@1f03400 can be invalid: every
@@ -421,6 +424,12 @@ stage2_build_mmio_tables(void)
 			continue;
 		}
 
+#ifdef HV_VETRAP
+		if (pa == VETRAP_PAGE_BASE) {   /* INVALID: video engine, traced */
+			stage2_l3_uart[j] = 0;
+			continue;
+		}
+#endif
 		stage2_l3_uart[j] = stage2_page_desc(pa,
 			S2_MEMATTR_DEVICE_nGnRE, S2_SH_OUTER, /*xn=*/1);
 	}

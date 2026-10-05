@@ -24,6 +24,9 @@
 #include "hv_addrmap.h"
 #include "vgicd.h"   /* vgicd_handle_fault() -- trapped GIC distributor */
 #include "wdogtrap.h"
+#ifdef HV_VETRAP
+#include "vetrap.h"
+#endif
 #ifdef HV_RSBTRAP
 #include "rsbtrap.h"
 #endif   /* wdogtrap_handle_fault() -- CCU/PIO/WDOG page, see
@@ -1488,6 +1491,10 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 				vtrap_account(8, frame, vtrap_t0);
 				return;
 			}
+#ifdef HV_VETRAP
+			if (vetrap_handle_fault(frame))
+				return;
+#endif
 #ifdef HV_RSBTRAP
 			/* The emulated RSB controller (rsbtrap.c): the guest's PMIC
 			 * traffic, serialised with EL2's own under one bus lock. */

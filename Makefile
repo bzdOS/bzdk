@@ -343,6 +343,13 @@ dbg: CFLAGS += -DHV_HDMI
 dbg: CFLAGS += -DHV_RSBTRAP
 endif
 
+# Passive trace of the guest's video-engine register accesses (vetrap.c).
+# Off by default: `make dbg HV_VETRAP=1`.
+HV_VETRAP ?= 0
+ifeq ($(HV_VETRAP),1)
+dbg: CFLAGS += -DHV_VETRAP
+endif
+
 # 1080p is the DEFAULT display mode as of 2026-08-20, and this is a correctness
 # fix rather than a preference. The HUD layout in hud.c is sized for a
 # 1920-wide screen: GW_W is 1150, so RC_W (the right-hand column) works out to
@@ -445,7 +452,7 @@ CFLAGS += -DVZRAM=1
 ZRAM_OBJS := vblk_zram.o vzram_pool.o lz4.o
 endif
 
-DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o rsbtrap.o guest.o \
+DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o rsbtrap.o vetrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \

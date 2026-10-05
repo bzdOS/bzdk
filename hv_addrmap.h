@@ -893,6 +893,16 @@ _Static_assert(HVMAP_CORESAMP >= HVMAP_RSBTRAP_END,
 _Static_assert(HVMAP_CORESAMP + HVMAP_CORESAMP_SIZE <= 0x50100000UL,
                "core samples run into emac.c's DMA scratch");
 
+/* vetrap.c: passive trace ring of the guest's video-engine register accesses
+ * (see vetrap.h).  In the free gap between the core samples and emac.c's DMA
+ * scratch; 256 KiB = 32k entries. */
+#define HVMAP_VETRAP            0x500A0000UL
+#define HVMAP_VETRAP_SIZE       0x00040000UL
+_Static_assert(HVMAP_VETRAP >= HVMAP_CORESAMP + HVMAP_CORESAMP_SIZE,
+               "vetrap ring overlaps the core samples");
+_Static_assert(HVMAP_VETRAP + HVMAP_VETRAP_SIZE <= 0x50100000UL,
+               "vetrap ring runs into emac.c's DMA scratch");
+
 /* vzram backing store (vblk_zram.h): the top 128 MiB of what the guest was
  * given under GUEST_DRAM_2G. board-config.xml's `vzram` feature shrinks the
  * DTB /memory node to end exactly at HVMAP_VZRAM_BASE (dtb-memory-size
