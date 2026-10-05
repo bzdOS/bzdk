@@ -23,7 +23,7 @@
 	compatible = "sinovoip,bananapi-m64", "allwinner,sun50i-a64";
 
 	chosen {
-		bootargs = "earlycon=uart8250,mmio32,0x1c28000,115200n8 console=ttyS0,115200n8 rdinit=/init clk_ignore_unused pd_ignore_unused printk.devkmsg=on loglevel=8 cma=0";
+		bootargs = "earlycon=uart8250,mmio32,0x1c28000,115200n8 console=ttyS0,115200n8 rdinit=/init clk_ignore_unused pd_ignore_unused printk.devkmsg=on loglevel=8 cma=32M";
 		stdout-path = "serial0:115200n8";
 	};
 
@@ -33,9 +33,12 @@
 
 	/* Linux owns only the 48 MiB below the guest framebuffer; the
 	 * hypervisor windows (0x42000000, 0x50000000...) are outside it. */
-	memory@48000000 {
+	/* RAM starts at the real DRAM base (0x40000000): the video engine's
+	 * addresses are relative to it and the driver derives them from the
+	 * kernel's own RAM start.  Hypervisor and staging areas are reserved. */
+	memory@40000000 {
 		device_type = "memory";
-		reg = <0x48000000 0x03000000>;
+		reg = <0x40000000 0x0b000000>;
 	};
 
 	/* The video engine needs physically contiguous buffers.  A fixed pool in
@@ -46,12 +49,16 @@
 		#size-cells = <1>;
 		ranges;
 
-		dma_pool: dma-pool@4a400000 {
-			compatible = "shared-dma-pool";
-			reg = <0x4a400000 0x00c00000>;
+		hv-image@42000000 {
+			reg = <0x42000000 0x00200000>;
 			no-map;
-			linux,dma-default;
 		};
+
+		boot-staging@44000000 {
+			reg = <0x44000000 0x02000000>;
+			no-map;
+		};
+
 	};
 
 	cpus {
@@ -96,6 +103,8 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges;
+		/* bus address 0 is DRAM at 0x40000000 (the engine's own view) */
+		dma-ranges = <0x0 0x40000000 0x40000000>;
 
 		syscon@1c00000 {
 			compatible = "allwinner,sun50i-a64-system-control";
@@ -149,7 +158,6 @@
 			resets = <&ccu 23>;
 			interrupts = <0 58 4>;
 			allwinner,sram = <&ve_sram 1>;
-			memory-region = <&dma_pool>;
 		};
 
 		uart0: serial@1c28000 {

@@ -1487,14 +1487,14 @@ void el2_trap(struct el2_frame *frame, unsigned long kind)
 			 * this page is never trapped, so this fault can never occur and
 			 * wdogtrap_handle_fault()'s address check always returns 0
 			 * here -- see wdogtrap.h. */
-			if (wdogtrap_handle_fault(frame)) {
-				vtrap_account(8, frame, vtrap_t0);
-				return;
-			}
 #ifdef HV_VETRAP
 			if (vetrap_handle_fault(frame))
 				return;
 #endif
+			if (wdogtrap_handle_fault(frame)) {
+				vtrap_account(8, frame, vtrap_t0);
+				return;
+			}
 #ifdef HV_RSBTRAP
 			/* The emulated RSB controller (rsbtrap.c): the guest's PMIC
 			 * traffic, serialised with EL2's own under one bus lock. */
