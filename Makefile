@@ -349,6 +349,11 @@ HV_VETRAP ?= 0
 ifeq ($(HV_VETRAP),1)
 dbg: CFLAGS += -DHV_VETRAP
 endif
+# Boot a Linux arm64 Image (TFTP'd as "kernel") instead of FreeBSD.
+HV_LINUX_GUEST ?= 0
+ifeq ($(HV_LINUX_GUEST),1)
+dbg: CFLAGS += -DHV_LINUX_GUEST
+endif
 
 # 1080p is the DEFAULT display mode as of 2026-08-20, and this is a correctness
 # fix rather than a preference. The HUD layout in hud.c is sized for a

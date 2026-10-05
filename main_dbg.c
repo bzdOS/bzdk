@@ -90,6 +90,7 @@ __attribute__((weak)) void zguest_stage_copyin(void) { }
 #define DTB_DST   0x47200000UL   /* DTB copied here, just above _end, in-window  */
 #define MODINFO   0x47400000UL   /* modinfo scratch, above the relocated DTB     */
 #define SP_EL1    0x4c000000UL
+#define LX_BASE   0x48000000UL   /* Linux Image load base (HV_LINUX_GUEST) */
 #define TICK_US   10000u        /* 10 ms tick -> ~100 debug services/sec */
 
 /* Debug console rides the EMAC network channel (raw 0x88B5), same as the REPL.
@@ -332,10 +333,44 @@ int main(void)
 	el2_ncmap_apply();
 #endif
 
+#ifdef HV_LINUX_GUEST
+	/* Linux/arm64 guest (register-trace rig, see vetrap.h): the file TFTP'd
+	 * as "kernel" is a raw arm64 `Image` (booting.rst: 64-byte header,
+	 * magic "ARM\x64" at +0x38, text_offset at +8, image_size at +16).
+	 * Copy it to a 2 MiB aligned base, hand the DTB straight over in x0,
+	 * and enter at the base with the MMU off. */
+	{
+		volatile uint64_t *src = (volatile uint64_t *)K_ELF;
+		volatile uint64_t *dst = (volatile uint64_t *)LX_BASE;
+		uint64_t sz = ((volatile uint64_t *)K_ELF)[2];
+		uint64_t a, n;
+
+		if (((volatile uint32_t *)K_ELF)[14] != 0x644d5241u) {   /* "ARM\x64" */
+			DBG_BC(1, 0xBAD2); for (;;) { }
+		}
+		if (sz == 0 || sz > 0x03000000UL) { DBG_BC(1, 0xBAD3); for (;;) { } }
+		sz = ((volatile uint64_t *)K_ELF)[2];   /* image_size */
+		/* the file may be shorter than image_size (bss): copy what exists */
+		n = (sz + 7u) / 8u;
+		for (uint64_t i = 0; i < n; i++)
+			dst[i] = src[i];
+		for (a = LX_BASE; a < LX_BASE + sz; a += 64)
+			__asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
+		for (a = DTB_SRC; a < DTB_SRC + 0x10000; a += 64)
+			__asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
+		__asm__ volatile("dsb ish");
+		for (a = LX_BASE; a < LX_BASE + sz; a += 64)
+			__asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+		__asm__ volatile("dsb ish\n\tisb");
+		mi = DTB_SRC;
+		entry = LX_BASE + ((volatile uint64_t *)K_ELF)[1];
+	}
+#else
 	if (!kload_parse_elf(K_ELF)) { DBG_BC(1, 0xBAD1); for (;;) { } }
 	kload_place_segments(K_ELF, K_PABASE);
 	mi = kload_build_modinfo(DTB_SRC, DTB_DST, MODINFO);   /* returns modulep KVA */
 	entry = kload_entry_pa();
+#endif
 	DBG_BC(1, 4);
 	DBG_BC(6, (uint32_t)entry);
 

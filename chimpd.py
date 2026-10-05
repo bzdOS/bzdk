@@ -68,6 +68,8 @@ KERNEL    = "/opt/bzdos/tftpboot/kernel"
 # the default for every other run: CHIMPD_DTB=/path/to.dtb python3 chimpd.py
 DTB       = os.environ.get("CHIMPD_DTB",
                            "/opt/bzdos/tftpboot/bananapi-min.dtb")
+# Same idea for the kernel file name (e.g. a Linux Image for the register-trace rig).
+KERNEL_NAME = os.environ.get("CHIMPD_KERNEL", "kernel")
 KADDR     = 0x44000000
 DTBADDR   = 0x4a000000
 STAGE     = 0x48000000
@@ -422,7 +424,7 @@ def serial_load(sess):
         return False
 
     slog(f"  [serial] TFTP kernel → 0x{KADDR:x} (~55s for 16MB, линк уже прогрет)")
-    if not tftp_retry(KADDR, "kernel", 90, tries=3):
+    if not tftp_retry(KADDR, KERNEL_NAME, 90, tries=3):
         slog("  [serial] ⛔ TFTP kernel failed после ретраев")
         try: os.close(fd)
         except: pass
