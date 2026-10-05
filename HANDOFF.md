@@ -409,7 +409,7 @@ explicitly speculative, kept here so the reasoning isn't lost:
   `bootdelay=-2` makes impossible and which was the trigger of the gadget
   wedge. Its fallback role -- loading the HV over USB when TFTP fails -- is
   covered by `bootcmd` (10 tries, then a WDOG reset and try again).
-- **Guest drm-kmod** = exactly the upstream PRs (#512-#515) + one backport
+- **Guest drm-kmod** = exactly the upstream PRs (#512-#515) + one backport (+ a local 0006, 2026-10-05: lets dma_buf_get() take descriptors of the native dmabuf core, see bsdOS docs/specs/SPEC_media_v4l2_native.md)
   (2026-10-04: #512 and #514 are MERGED into drm-kmod master, identical to our
   0003/0002; #513 open without review, #515 waits on a reply to review --
   status in `bsdOS/hal/lima/patches/UPSTREAM-INDEX.md`),
