@@ -1,6 +1,6 @@
 # Peripheral status
 
-State of the A64 peripherals as seen by the FreeBSD guest. Updated 2026-09-26.
+State of the A64 peripherals as seen by the FreeBSD guest. Updated 2026-10-10 (video decode, V4L2, DE2 plane, audio rate, WiFi scan).
 Each "not done" entry says why, so the next person does not re-derive it.
 
 ## Working
@@ -10,11 +10,13 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | SD / eMMC | via virtio-blk from the hypervisor |
 | USB host | EHCI + OHCI on PHY1, hub enumerates |
 | Networking | virtio-net |
-| WiFi | BCM43430 SDIO, WPA2-PSK, real traffic. See the brcmfmac work |
+| WiFi | BCM43430 SDIO, WPA2-PSK, real traffic. Scan, regulatory/channels, events, `kldunload` work; the interface is always `wlan0` (guest kernel #24). See the brcmfmac work |
+| Video decode, V4L2 | `freebsd-media` (bzdOS/freebsd-media): own V4L2 core + Cedrus MPEG-2/H.264 stateless decoders, FFmpeg `v4l2request` playback; decoded frames reach KMS without a CPU copy |
+| DE2 video plane | hypervisor scanout v3 video registers + guest `bzkms` overlay plane (NV12/NV21/YUYV/XRGB8888, dma-buf import); register-level verified, panel output not looked at (bsdOS branch `de2-plane`, not merged) |
 | Bluetooth | AP6212 (BCM43438A1) on uart1: new `bcmbt(4)` + `ng_h4(4)` + `bcmbtattach`, up at boot, inquiry/name/l2ping to a laptop. See `bsdOS/hal/bluetooth/README.md` (2026-09-26) |
 | GPU / DRM / KMS | Mali-400 via the lima port |
 | HDMI | driven by the hypervisor, guest gets a framebuffer |
-| Audio | analog codec, `pcm0` play/rec. Needed the DAI un-forbidden — see below |
+| Audio | analog codec, `pcm0` play/rec. Needed the DAI un-forbidden — see below. Sample rate exact since guest kernel #23 (the A64 audio PLL's M field was ORed with a fixed factor; `aw_clk_nkmp` fix). Audibility not checked by ear |
 | SPI | `aw_spi`, PIO only |
 | I2C | four buses |
 | PWM | `pwm0`/`pwmbus0`/`pwmc0`. Driver is a module, `kldload aw_pwm` |
@@ -32,24 +34,22 @@ resistor-ladder buttons. Not worth writing.
 
 ## Not done: needs a subsystem FreeBSD does not have
 
-**Camera (`csi@1cb0000`)** and **video decode (`video-codec@1c0e000`, Cedrus)**
-both require V4L2, videobuf2 and the media controller. FreeBSD has none of
-them, natively or under LinuxKPI. Each driver is small; the framework beneath
-it is not. There is also no camera sensor attached to this board. See
-`csi-camera-assessment.md` and `cedrus-assessment.md`.
+**Camera (`csi@1cb0000`)** needs the V4L2 core that now exists (`freebsd-media`),
+but there is no camera sensor on this board and no CSI driver yet. See
+`csi-camera-assessment.md`. Video decode (Cedrus) is done: see the table above;
+`cedrus-assessment.md` is the pre-work and is outdated.
 
 **DSI display** is disabled. HDMI already works through the hypervisor, so
 there is no need pulling on it.
 
-### These three are one project, not three
+### Camera and DSI are one project
 
-Camera, video decode and DSI all sit on the same side of the same missing
-work: the guest does not own a display/media pipeline. The hypervisor drives
-HDMI and hands over a framebuffer, which is why display works at all today.
-Giving the guest the display engine, DSI and a V4L2 stack would be one
-coordinated effort against the same silicon block and the same absent
-frameworks — and is a far larger undertaking than the sum of the individual
-drivers suggests. Do not start any one of them in isolation.
+Camera and DSI sit on the same side of the same missing work: the guest does not
+own the display pipeline. The hypervisor drives HDMI and hands over a framebuffer
+(plus, since 2026-10, a hardware video plane), which is why display works at all
+today. Giving the guest the display engine and DSI would be one coordinated effort
+against the same silicon block, and a CSI driver would sit on the V4L2 core that
+`freebsd-media` already provides. Do not start either in isolation.
 
 ## Not given to the guest, by design
 
