@@ -1651,7 +1651,21 @@ async_gathered_done:
  * else takes the synchronous path unchanged. g_vblk_idma_on=0 turns the
  * whole thing off live (checked per post).
  * ------------------------------------------------------------------ */
-#define IDMA_QLEN 16u
+/*
+ * Sized so the queue can hold every request the guest can have in flight: one
+ * that finds it full is served in the doorbell trap after the whole queue has
+ * been drained there (vblk_idma_drain_bounded()), with the guest's vCPU stuck
+ * in EL2 and its interrupts masked for the length of the backlog. With 16
+ * slots a guest read of 1 MiB (about 17 requests queued together) did that
+ * once per MiB and the vCPU stood still for 90..180 ms (measured 2026-10-10:
+ * a display flip event arrived up to 7 vblanks late while the root disk was
+ * being read). A queued request takes at least three ring descriptors (header,
+ * one data segment, status; FLUSH and GET_ID never enter the queue), the ring
+ * has VBLK_QUEUE_MAX of them, so the guest cannot have more than
+ * VBLK_QUEUE_MAX / 3 in flight; one more slot covers the instant between the
+ * guest seeing a completion and the slot being popped.
+ */
+#define IDMA_QLEN ((VBLK_QUEUE_MAX / 3u) + 2u)
 
 struct vblk_idma_req {
 	uint16_t head;
@@ -1667,6 +1681,8 @@ struct vblk_idma_req {
 
 /* All under g_idmaq_lock. */
 static struct vblk_idma_req g_idmaq[IDMA_QLEN];
+_Static_assert(IDMA_QLEN * 3u > VBLK_QUEUE_MAX,
+               "the eMMC IDMAC queue must outnumber the guest's possible in-flight requests");
 static uint32_t g_idmaq_head, g_idmaq_count, g_idmaq_running;
 static uint32_t g_idma_sync_waiters;
 static volatile uint32_t g_idmaq_lock;

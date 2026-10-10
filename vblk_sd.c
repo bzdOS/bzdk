@@ -684,7 +684,25 @@ static inline uint64_t sd_ms_to_ticks(uint32_t ms)
  * queue that owns the lock, so a synchronous request drains the queue
  * before it touches the controller at all.
  * ------------------------------------------------------------------ */
-#define SD_IDMA_QLEN 16u
+/*
+ * The queue must be able to hold every request the guest can have in flight.
+ * A request that finds it full is not queued and not refused: it is served in
+ * the doorbell trap, after the whole queue has been drained there
+ * (vblk_sd_idma_drain_bounded()), with the guest's vCPU stuck in EL2 and its
+ * interrupts masked. With 16 slots a guest read of 1 MiB (about 17 requests of
+ * 60 KiB, all queued together) did that once per MiB, and the vCPU stood still
+ * for the 16 queued transfers, 50 ms and more, delaying everything bound to it:
+ * timer ticks, callouts, wakeups (a display flip event arrived 2..5 vblanks
+ * late, only while the SD card was busy; measured 2026-10-10, one synchronous
+ * serve per MiB in the counters, g_sdq_sync_waiters non-zero during the read).
+ *
+ * A queued request takes at least three ring descriptors (header, one data
+ * segment, status; FLUSH and GET_ID never enter the queue), and the ring has
+ * VBLK_SD_QUEUE_MAX of them, so the guest cannot have more than
+ * VBLK_SD_QUEUE_MAX / 3 in flight; one more slot covers the instant between
+ * the guest seeing a completion and the slot being popped.
+ */
+#define SD_IDMA_QLEN ((VBLK_SD_QUEUE_MAX / 3u) + 2u)
 #define SD_IDMA_MAX_DESC (VBLK_SD_MAX_CHAIN - 2u)
 
 struct sd_idma_req {
@@ -699,6 +717,8 @@ struct sd_idma_req {
 };
 
 static struct sd_idma_req g_sdq[SD_IDMA_QLEN];
+_Static_assert(SD_IDMA_QLEN * 3u > VBLK_SD_QUEUE_MAX,
+               "the SD IDMAC queue must outnumber the guest's possible in-flight requests");
 static uint32_t g_sdq_head, g_sdq_count, g_sdq_running, g_sdq_sync_waiters;
 static volatile uint32_t g_sdq_lock;
 static volatile uint32_t g_sdq_pending;
