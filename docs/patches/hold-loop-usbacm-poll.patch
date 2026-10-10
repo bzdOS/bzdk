@@ -1,0 +1,26 @@
+Hold-loop USB service for a held boot. NOT applied, NOT built, NOT tested on the board.
+
+Why: in a boot held by the entry-hold gate (safe mode arms it automatically), CPU1 stays parked in
+vcpu1_run(), and the MUSB gadget is serviced from CPU1's IRQ path, so the USB console never enumerates
+(host: error -71) for that whole boot; soak72 then refuses to start (board-off-usb). See HANDOFF.md,
+2026-09-30, "Open: no USB console in a boot that was held".
+
+Why it is not applied: usbacm.h warns that usbacm_poll() is the only code besides musb_init() that drives
+these registers and that CPU1's poll drives the same ones, so calling it from CPU0 needs a check that CPU1
+is really parked at that point. Apply against main_dbg.c at 5fd522f or later, build with `make hv-uimage`,
+test with a held boot (safe mode), and only then commit it into main_dbg.c.
+
+--- a/main_dbg.c	2026-10-05 20:52:04.677370911 +0300
++++ b/main_dbg.c	2026-10-10 04:21:28.851784495 +0300
+@@ -715,6 +715,11 @@
+ 			wdt_debug_kick();
+ 			if (!dbg_core_active)
+ 				dbgmon_service(&g_last_guest_frame);
++			/* Service the MUSB gadget while held: without this the USB
++			 * console never enumerates in a held boot (HANDOFF 2026-09-30,
++			 * host sees error -71) and soak72 refuses to start
++			 * (board-off-usb). */
++			usbacm_poll();
+ 			if (dbgtools_release_get())
+ 				break;
+ 		}
