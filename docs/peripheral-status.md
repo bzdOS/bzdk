@@ -12,7 +12,7 @@ Each "not done" entry says why, so the next person does not re-derive it.
 | Networking | virtio-net |
 | WiFi | BCM43430 SDIO, WPA2-PSK, real traffic. Scan, regulatory/channels, events, `kldunload` work; the interface is always `wlan0` (guest kernel #24). See the brcmfmac work |
 | Video decode, V4L2 | `freebsd-media` (bzdOS/freebsd-media): own V4L2 core + Cedrus MPEG-2/H.264 stateless decoders, FFmpeg `v4l2request` playback; decoded frames reach KMS without a CPU copy |
-| DE2 video plane | hypervisor scanout v3 video registers + guest `bzkms` overlay plane (NV12/NV21/YUYV/XRGB8888, dma-buf import); register-level verified, panel output not looked at (bsdOS branch `de2-plane`, not merged) |
+| DE2 video plane | hypervisor scanout v3 video registers + guest `bzkms` overlay plane (NV12/NV21/YUYV/XRGB8888, dma-buf import); register-level verified; owner saw playback on the panel (guest window, then full screen), 2026-10-10. Merged into bsdOS master |
 | Bluetooth | AP6212 (BCM43438A1) on uart1: new `bcmbt(4)` + `ng_h4(4)` + `bcmbtattach`, up at boot, inquiry/name/l2ping to a laptop. See `bsdOS/hal/bluetooth/README.md` (2026-09-26) |
 | GPU / DRM / KMS | Mali-400 via the lima port |
 | HDMI | driven by the hypervisor, guest gets a framebuffer |
