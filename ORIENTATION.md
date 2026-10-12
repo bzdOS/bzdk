@@ -122,8 +122,14 @@ the guest; the FreeBSD trees live on the host (`/opt/bzdos/freebsd-src`,
 `/opt/bzdos/freebsd-src-earlyboot-wt` — the latter is the dirty lineage the
 running guest kernel was built from). `nc -l` pattern for pushing files in.
 
-Never change the guest's MAC: it must stay `02:bd:05:00:00:01` or networking
-dies instantly (the guest relies on `VIRTIO_NET_F_MAC`).
+MAC addresses (since 2026-10-12; before that HV and guest both used
+`02:bd:05:00:00:01`): the HV's is derived from the A64 SID exactly like U-Boot's
+eth0 `ethaddr` (this board: `02:ba:fb:3b:f5:8c`, shared with U-Boot), the
+guest's is the same with `0x10` ORed into octet 0 (`12:ba:fb:3b:f5:8c`), handed
+over by `VIRTIO_NET_F_MAC`. dbgmon `mac` prints both. Host tools learn the HV's
+from the auth handshake (`~/.config/bzdk/board.mac`, `bzd_board.board_mac()`);
+do not hard-code it. The guest must not take the HV's MAC: vnet drops its
+frames with that source.
 
 ## Commit convention
 

@@ -12,7 +12,7 @@
  * AF_PACKET socket):
  *   - Every log line is emitted as ONE raw Ethernet frame:
  *       dst       = ff:ff:ff:ff:ff:ff (broadcast)
- *       src       = 02:bd:05:00:00:01 (our locally-administered "bzdOS" MAC)
+ *       src       = the HV MAC (per board, from the SoC SID: emac_hv_mac())
  *       ethertype = 0x88B5            (IEEE 802 local-experimental EtherType 1)
  *       payload   = ASCII text, zero-padded to the 46-byte minimum
  *   - Host->device: frames with ethertype 0x88B5 addressed to our MAC or to
@@ -81,7 +81,8 @@ int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len);
  * broadcast MAC, so the guest's SYN-ACK was seen by tcpdump and ignored by the
  * host's stack, and every connection hung retransmitting SYN (measured
  * 2026-07-30). Source MAC is still the EMAC's own, which is correct here: the
- * guest is deliberately assigned the same MAC (VNET_GUEST_MAC == OUR_MAC).
+ * guest used to be assigned the same MAC; since 2026-10-12 it has its own
+ * (emac_guest_mac()) and vnet uses emac_send_frame_from() with it.
  * emac_send_frame() itself is left byte-identical -- the debug console depends
  * on it, and this channel is the only way back in. */
 int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
@@ -89,7 +90,7 @@ int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
 
 /* emac_send_frame_to() with the guest's own Ethernet source address. A guest
  * that bridges another interface (WiFi AP + if_bridge) forwards frames whose
- * source is a client's MAC; rewriting it to OUR_MAC hid the client from the
+ * source is a client's MAC; rewriting it to the HV MAC hid the client from the
  * LAN, so DHCP replies and the switch's MAC learning never reached it
  * (measured 2026-10-12: a phone on the guest's AP sent DHCPDISCOVER that left
  * the board as 02:bd:05:00:00:01 and got no offer). */
@@ -145,5 +146,17 @@ int emac_rekick_active(void);
 void emac_nettest_quiet(uint32_t seconds);
 void emac_nettest_phydown(void);
 void emac_nettest_stats(uint32_t out[EMAC_NT_NSTATS]);
+
+/* MAC addresses (audit item 7, emac.c): the HV's own (EMAC_ADDR0, source of
+ * every HV frame) is derived from the A64 SID like U-Boot's eth0 ethaddr; the
+ * guest's (VIRTIO_NET_F_MAC) is the same with 0x10 ORed into octet 0.
+ * emac_mac_source(): 1 = SID, 2 = legacy 02:bd:05:00:00:01 fallback (SID 0).
+ * emac_rx_to_hv_dropped(): non-debug frames addressed to the HV MAC, which
+ * no longer reach the guest. */
+void emac_hv_mac(uint8_t out[6]);
+void emac_guest_mac(uint8_t out[6]);
+int emac_mac_is_hv(const uint8_t m[6]);
+uint32_t emac_mac_source(void);
+uint32_t emac_rx_to_hv_dropped(void);
 
 #endif /* BZDOS_EMAC_H */

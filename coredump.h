@@ -21,7 +21,7 @@
  * -------------------------------------------------------------------------
  * EtherType 0x88B7 (0x88B5 = console text, 0x88B6 = netcon; 0x88B7 is ours,
  * so coredump traffic never collides with the console). dst = broadcast,
- * src = our MAC (02:bd:05:00:00:01), via emac_send_frame().
+ * src = the HV MAC (emac_hv_mac(), SID-derived), via emac_send_frame().
  *
  * Each frame's Ethernet PAYLOAD is a 12-byte little-endian header + data:
  *

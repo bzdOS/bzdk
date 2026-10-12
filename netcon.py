@@ -43,11 +43,12 @@ import socket
 import struct
 import binascii
 
+import bzd_board
 import hvauth
 
 IFACE = "br0"
 NC_ETHERTYPE = 0x88B6
-BOARD_MAC = bytes.fromhex("02bd05000001")
+BOARD_MAC = bzd_board.LEGACY_BOARD_MAC   # per board now: bzd_board.board_mac()
 BCAST = b"\xff" * 6
 
 NC_MAGIC = 0x4E43
@@ -119,6 +120,8 @@ _channels = {}
 
 
 def _send_nc(sock, dst_mac, payload):
+    if dst_mac is None:
+        dst_mac = bzd_board.board_mac()
     """Host -> board netcon frame through hvauth (authenticated envelope on
     0x88B5 with the key file, else the legacy 0x88B6 frame). Wrapped afresh
     on every call, so a retransmit carries a new counter instead of being a
@@ -164,7 +167,7 @@ def _recv_one(sock, timeout):
         return h
 
 
-def send_blob(sock, blob, addr_hint=None, dst_mac=BOARD_MAC, verbose=True):
+def send_blob(sock, blob, addr_hint=None, dst_mac=None, verbose=True):
     """Reliably deliver `blob` to the board (host -> board), e.g. for
     hot-reload. Chunks it into <=CHUNK-byte DATA frames, stop-and-wait: send
     one, wait up to ACK_TIMEOUT for the matching ACK, retransmit on timeout
@@ -222,7 +225,7 @@ def send_blob(sock, blob, addr_hint=None, dst_mac=BOARD_MAC, verbose=True):
     return True
 
 
-def recv_blob(sock, timeout=RECV_IDLE_TIMEOUT, max_len=MAX_LEN, dst_mac=BOARD_MAC):
+def recv_blob(sock, timeout=RECV_IDLE_TIMEOUT, max_len=MAX_LEN, dst_mac=None):
     """Reliably collect a board -> host reply (the board side calling
     netcon_send()). ACKs every valid chunk as it lands (idempotent — a
     duplicate is just re-ACKed, matching the board's own idempotent

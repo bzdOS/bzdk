@@ -22,7 +22,7 @@
  *                   payload = the raw RSP bytes to deliver (NO trailing '\r';
  *                   zero-pad to the 46-byte minimum — the board's emac RX
  *                   stops at the first NUL, and RSP text never contains NUL).
- *   board -> host : dst=ff:ff:ff:ff:ff:ff  src=02:bd:05:00:00:01 etype=0x88B5
+ *   board -> host : dst=ff:ff:ff:ff:ff:ff  src=<HV MAC>         etype=0x88B5
  *                   payload = raw RSP bytes; host strips trailing NUL padding
  *                   (payload.split(b"\0",1)[0]) — RSP text has no embedded NUL.
  *
@@ -31,7 +31,8 @@
  *   #!/usr/bin/env python3
  *   import socket, struct, select
  *   IFACE="br0"; ETYPE=0x88B5
- *   BOARD=bytes.fromhex("02bd05000001"); BCAST=b"\xff"*6
+ *   BOARD=bytes.fromhex("02bafb3bf58c")  # dbgmon `mac`; per board
+ *   BCAST=b"\xff"*6
  *   raw=socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETYPE))
  *   raw.bind((IFACE, ETYPE)); SRC=raw.getsockname()[4]
  *   def to_board(data):

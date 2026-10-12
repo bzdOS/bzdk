@@ -33,6 +33,8 @@ import sys
 import threading
 import time
 
+import bzd_board
+
 ETYPE_CONSOLE = 0x88B5
 MAGIC = b"\x00BZK"
 T_HELLO, T_CHAL, T_DATA, T_NAK = 1, 2, 3, 4
@@ -40,7 +42,7 @@ CH_CONSOLE, CH_NETCON, CH_DBGTOOLS, CH_SNAPNET = 0, 1, 2, 3
 LEGACY_ETYPE = {CH_CONSOLE: 0x88B5, CH_NETCON: 0x88B6,
                 CH_DBGTOOLS: 0x88B7, CH_SNAPNET: 0x88B8}
 BCAST = b"\xff" * 6
-BOARD_MAC = bytes.fromhex("02bd05000001")
+BOARD_MAC = bzd_board.LEGACY_BOARD_MAC   # old images; see board_mac()
 MINPAY = 46
 TAG_LEN = 16
 DATA_HDR = 36
@@ -91,12 +93,14 @@ class Channel:
 
     _warned = set()
 
-    def __init__(self, iface="br0", key=None, board_mac=BOARD_MAC):
+    def __init__(self, iface="br0", key=None, board_mac=None):
         if isinstance(key, str):
             key = bytes.fromhex(key)
         self.key = load_key() if key is None else key
         self.iface = iface
-        self.board_mac = board_mac
+        # The HV's MAC: learned from the verified CHAL below (its Ethernet
+        # source), until then the last one recorded (bzd_board.board_mac()).
+        self.board_mac = board_mac or bzd_board.board_mac()
         self.require = os.environ.get("BZDK_DBG_AUTH") == "require"
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                   socket.htons(ETYPE_CONSOLE))
@@ -156,8 +160,16 @@ class Channel:
                     self.ks = _h(self.key, b"BZK1/sess", sb, lbl, nh)
                     self.ctr = 0
                     self.dst = f[6:12]
+                    self.board_mac = self.dst
+                    bzd_board.remember_board_mac(self.dst)
                     return True
             return False
+
+    def is_board(self, src):
+        """True if an Ethernet source address is the HV's (the one the
+        handshake proved, the recorded one, or the pre-2026-10-12 one)."""
+        src = bytes(src)
+        return src == self.board_mac or bzd_board.is_board_mac(src)
 
     def check_nak(self):
         """Drain pending control frames; True if the board NAKed our

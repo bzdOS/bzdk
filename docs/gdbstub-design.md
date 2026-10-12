@@ -74,7 +74,7 @@ own; GDB's own `$…#cc` framing *is* the framing:
 | direction     | dst               | src               | etype    | payload                               |
 |---------------|-------------------|-------------------|----------|---------------------------------------|
 | host → board  | `ff:ff:ff:ff:ff:ff`| host MAC          | `0x88B5` | raw RSP bytes, zero-padded to 46      |
-| board → host  | `ff:ff:ff:ff:ff:ff`| `02:bd:05:00:00:01`| `0x88B5` | raw RSP bytes, zero-padded to 46      |
+| board → host  | `ff:ff:ff:ff:ff:ff`| HV MAC (per board)| `0x88B5` | raw RSP bytes, zero-padded to 46      |
 
 Two facts about the EMAC console constrain the encoding, and RSP satisfies both:
 

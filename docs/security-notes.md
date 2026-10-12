@@ -127,6 +127,21 @@ debuggable. `BZDK_DBG_AUTH=require` turns the fallback off, and
 `gdb-bridge.py` now listens on 127.0.0.1 by default (it used to listen on
 0.0.0.0, which would have handed the authenticated channel to the LAN).
 
+### Addresses: the HV and the guest no longer share a MAC
+
+Until 2026-10-12 the HV and the guest both used `02:bd:05:00:00:01`, so a
+host could tell a guest frame from an HV frame only by ethertype. Now the
+HV's MAC is derived from the SoC SID (the same rule U-Boot uses for eth0's
+`ethaddr`) and the guest gets a different one (octet 0 | 0x10) through
+`VIRTIO_NET_F_MAC`; dbgmon `mac` prints both. vnet drops a guest frame whose
+source is the HV's MAC (like the HV ethertypes), and a non-debug frame sent
+to the HV's MAC no longer reaches the guest. Host tools take the HV's MAC
+from the source address of the handshake answer that carried a valid proof
+(`hvauth.Channel.handshake()`), record it in `~/.config/bzdk/board.mac` for
+listeners that start before any handshake, and accept the legacy address
+too so an older image stays debuggable (`bzd_board.board_mac()` /
+`is_board_mac()`; `$BZDK_BOARD_MAC` overrides).
+
 ### Replies: unicast instead of broadcast
 
 Everything the HV originates -- console text, netcon/dbgtools/snapnet

@@ -93,6 +93,10 @@ extern void emac_wd_test_mode(int on);
 extern void emac_nettest_quiet(uint32_t seconds);
 extern void emac_nettest_phydown(void);
 extern void emac_nettest_stats(uint32_t out[14]);
+extern void emac_hv_mac(uint8_t out[6]);
+extern void emac_guest_mac(uint8_t out[6]);
+extern uint32_t emac_mac_source(void);
+extern uint32_t emac_rx_to_hv_dropped(void);
 extern void vnet_emac_force_link_down(uint32_t polls) __attribute__((weak));
 
 /* Guest single-step toggle, implemented in el2_exc.c (linked into the same
@@ -1166,6 +1170,7 @@ static void cmd_help(void)
 	cputs("  phycycle           DISABLED (EL2 RSB races the guest's iichb1 — use guest-side phycut)\r\n");
 	cputs("  wdtest on|off      software 'PHY never trains' — exercises the give-up/escalation ladder\r\n");
 	cputs("  nettest [quiet <s>|vlink <s>|phydown]  link-watchdog/vnet link test levers (hex s)\r\n");
+	cputs("  mac                     HV and guest MAC addresses (SID-derived)\r\n");
 	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
 	cputs("  zstage             re-run the 2nd guest's copy-in from the landing window\r\n");
 	cputs("  zunhalt            re-arm CPU3 after a failed zboot (0xBAD1/0xBAD2), no reload\r\n");
@@ -1461,6 +1466,27 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cputs("phycycle: disabled -- EL2 must not touch the RSB while the "
 		      "guest owns it (measured wedge 2026-08-30). Use the guest-"
 		      "side phycut (I2CRDWR /dev/iic1) instead.\r\n");
+		return;
+	}
+	if (streq(cmd, "mac")) {
+		/* Audit item 7: one line, parsed by host tools. */
+		uint8_t m[6];
+		cputs("mac hv=");
+		emac_hv_mac(m);
+		for (int i = 0; i < 6; i++) {
+			if (i) cputs(":");
+			print_hex8(m[i]);
+		}
+		cputs(" guest=");
+		emac_guest_mac(m);
+		for (int i = 0; i < 6; i++) {
+			if (i) cputs(":");
+			print_hex8(m[i]);
+		}
+		cputs(emac_mac_source() == 1u ? " src=sid" : " src=legacy");
+		cputs(" to_hv_dropped=0x");
+		print_hex32(emac_rx_to_hv_dropped());
+		cputs("\r\n");
 		return;
 	}
 	if (streq(cmd, "nettest")) {

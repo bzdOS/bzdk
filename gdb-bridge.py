@@ -8,8 +8,8 @@ board's gdbstub.c consumes byte-for-byte. The payload is RAW RSP (GDB's own
 $...#cc framing IS the framing) so this process is a dumb, transparent byte
 pipe: GDB's acks/retransmits work end-to-end.
 
-Reuses hvdbg.py's AF_PACKET plumbing (ethertype 0x88B5, board MAC
-02:bd:05:00:00:01, broadcast dst, 46-byte zero-pad, RX split on first NUL).
+Reuses hvdbg.py's AF_PACKET plumbing (ethertype 0x88B5, the HV MAC that
+hvauth learns from the handshake, broadcast dst, 46-byte zero-pad, RX split on first NUL).
 
 Usage (run as root — AF_PACKET needs CAP_NET_RAW):
     sudo ./gdb-bridge.py                 # listen :1234, relay to board over br0
@@ -45,7 +45,6 @@ import time
 import hvauth
 
 ETYPE     = 0x88B5
-BOARD_MAC = bytes.fromhex("02bd05000001")
 BCAST     = b"\xff" * 6
 CHUNK     = 256          # keep each frame's payload under one Ethernet frame
 MINPAY    = 46           # Ethernet minimum payload; board pads/relies on this
@@ -84,7 +83,7 @@ class EmacLink:
                 break
             if len(f) < 14 or struct.unpack("!H", f[12:14])[0] != ETYPE:
                 continue
-            if f[6:12] != BOARD_MAC:
+            if not self.auth.is_board(f[6:12]):
                 continue
             out += f[14:].split(b"\x00", 1)[0]   # strip NUL padding
         return out

@@ -188,7 +188,8 @@ both directions between root and `agent`. If a flash still fails with
 2. `journalctl -t in.tftpd --since -10min`. No RRQs from 192.168.88.7 means
    the board is stuck in or before U-Boot. Watch netconsole: no `U-Boot`
    banner means it is before U-Boot (SPL/BROM) or the env failed to load.
-3. `tcpdump -eni br0 ether host 02:bd:05:00:00:01` to see whether the HV sends
+3. `tcpdump -eni br0 ether host $(cat ~/.config/bzdk/board.mac)` (the HV MAC,
+   SID-derived; `02:bd:05:00:00:01` on images before 2026-10-12) to see whether the HV sends
    anything at all.
 4. Since 2026-10-02 a missing USB host is **not** a reason to hang. If the
    board still parks waiting for USB, the card does not hold

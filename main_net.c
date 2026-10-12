@@ -7,7 +7,7 @@
  * raw-Ethernet heartbeat and echoes injected bytes. Sniff with:
  *     tcpdump -i <if> -e ether proto 0x88b5 -A
  * and inject commands with a raw AF_PACKET socket (dst = our MAC
- * 02:bd:05:00:00:01 or broadcast, ethertype 0x88B5, ASCII payload).
+ * -- SID-derived, emac_hv_mac() -- or broadcast, ethertype 0x88B5, ASCII payload).
  *
  * Deliberately shares NOTHING with musb.c: this is the analogue of main.c but
  * over Ethernet. Freestanding: only <stdint.h>, "emac.h", "wdt.h".

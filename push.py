@@ -5,7 +5,8 @@
 # кадрами, сверяет sum. Повтор при потере (канал лоссовый). Затем можно `c <addr>`.
 import os,sys,socket,struct,select,time
 IFACE="br0"; ETYPE=0x88B5
-BOARD=bytes.fromhex("02bd05000001"); BCAST=b"\xff"*6
+import bzd_board  # the HV MAC is per board: bzd_board.is_board_mac()
+BCAST=b"\xff"*6
 def usage(): print("usage: push.py <file> <hexaddr> [--call]"); sys.exit(2)
 if len(sys.argv)<3: usage()
 path=sys.argv[1]; addr=int(sys.argv[2],16); do_call="--call" in sys.argv
@@ -26,7 +27,7 @@ def drain(sec):
         r,_,_=select.select([s],[],[],0.2)
         if not r: continue
         f=s.recv(2048)
-        if len(f)<14 or struct.unpack("!H",f[12:14])[0]!=ETYPE or f[6:12]!=BOARD: continue
+        if len(f)<14 or struct.unpack("!H",f[12:14])[0]!=ETYPE or not bzd_board.is_board_mac(f[6:12]): continue
         pl=f[14:].split(b"\x00",1)[0]
         if pl: buf+=pl.decode("latin1","replace")
     return buf

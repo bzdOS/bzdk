@@ -53,6 +53,8 @@ low-SRAM breadcrumb block (0x00018xxx), not the DRAM hv-scratch block. Both
 values are preserved below, unrenamed in meaning, exactly as each tool used
 them — this module does not silently pick one.
 """
+import os
+
 
 # ── USB identity: U-Boot download gadget vs. the HV's own console gadget ───
 # The udev rule maps BOTH to the same stable /dev/ttyCHIMP symlink, so vid:pid
@@ -91,8 +93,75 @@ GUEST_ACM_TTY = "/dev/ttyACM0"
 # ── EMAC raw-Ethernet debug console (dbgmon / repl-cmd protocol) ───────────
 IFACE = "br0"
 ETYPE = 0x88B5
-BOARD_MAC = bytes.fromhex("02bd05000001")   # 02:bd:05:00:00:01
 BCAST = b"\xff" * 6
+
+# ── the hypervisor's Ethernet address ──────────────────────────────────────
+# The HV no longer has a fixed MAC. emac.c derives it from the A64 SID exactly
+# as U-Boot derives eth0's `ethaddr` (02:<sid0 low byte>:<crc32(sid[1..3])>),
+# so it is stable per board, and gives the guest a different one (first octet
+# | 0x10, U-Boot's eth1 rule) through VIRTIO_NET_F_MAC. This board:
+#   HV / U-Boot eth0  02:ba:fb:3b:f5:8c      guest vtnet0  12:ba:fb:3b:f5:8c
+# Until 2026-10-12 both were 02:bd:05:00:00:01; an image older than that, or a
+# board whose SID reads 0, still uses it (LEGACY_BOARD_MAC).
+#
+# Tools do not hard-code the new address: hvauth.Channel learns it from the
+# board's authenticated handshake answer (the CHAL that carries a valid proof)
+# and records it in BOARD_MAC_FILE, so listeners that start before any
+# handshake (console followers, coredump capture) know whom to listen to.
+# $BZDK_BOARD_MAC overrides everything.
+LEGACY_BOARD_MAC = bytes.fromhex("02bd05000001")   # 02:bd:05:00:00:01
+BOARD_MAC = LEGACY_BOARD_MAC     # kept for old imports; use board_mac()
+BOARD_MAC_FILE = os.path.expanduser("~/.config/bzdk/board.mac")
+_board_mac = None
+
+
+def _parse_mac(txt):
+    b = bytes.fromhex(txt.strip().replace(":", "").replace("-", ""))
+    if len(b) != 6:
+        raise ValueError(f"not a MAC: {txt!r}")
+    return b
+
+
+def board_mac():
+    """The HV's MAC as bytes: $BZDK_BOARD_MAC, else the last one a verified
+    handshake reported (BOARD_MAC_FILE), else LEGACY_BOARD_MAC. Reads the
+    file on the first call only (no import-time side effects)."""
+    global _board_mac
+    env = os.environ.get("BZDK_BOARD_MAC")
+    if env:
+        return _parse_mac(env)
+    if _board_mac is None:
+        try:
+            _board_mac = _parse_mac(open(BOARD_MAC_FILE).read())
+        except (OSError, ValueError):
+            _board_mac = LEGACY_BOARD_MAC
+    return _board_mac
+
+
+def remember_board_mac(mac):
+    """Record the HV MAC a verified handshake came from."""
+    global _board_mac
+    mac = bytes(mac)
+    if len(mac) != 6 or mac == board_mac():
+        _board_mac = mac if len(mac) == 6 else _board_mac
+        return
+    _board_mac = mac
+    try:
+        os.makedirs(os.path.dirname(BOARD_MAC_FILE), exist_ok=True)
+        tmp = BOARD_MAC_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(mac.hex(":") + "\n")
+        os.replace(tmp, BOARD_MAC_FILE)
+    except OSError:
+        pass
+
+
+def is_board_mac(src):
+    """True if an Ethernet source address is the hypervisor's. The legacy
+    address is accepted too, so a rollback to an older image stays
+    debuggable; nothing else uses it any more (the guest has its own MAC)."""
+    src = bytes(src)
+    return src == board_mac() or src == LEGACY_BOARD_MAC
 
 # ── host <-> board TFTP addressing (U-Boot's serverip/ipaddr) ──────────────
 BOARD_IP = "192.168.88.7"

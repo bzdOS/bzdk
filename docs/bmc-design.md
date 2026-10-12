@@ -12,8 +12,8 @@ run on the board.
 The Banana Pi M64 has **no UART**. The only out-of-band paths to a running (or
 wedged) board are:
 
-- **EMAC** raw-Ethernet debug console — ethertype `0x88B5`, board MAC
-  `02:bd:05:00:00:01`, serviced by `dbgmon.c` on the **CPU1 debug core**
+- **EMAC** raw-Ethernet debug console — ethertype `0x88B5`, HV MAC
+  (per board, SID-derived; `02:bd:05:00:00:01` before 2026-10-12), serviced by `dbgmon.c` on the **CPU1 debug core**
   (survives a guest wedge on CPU0 because CPU1 runs an independent poll loop —
   see `smp.c` `smp_secondary_main`).
 - **USB-OTG CDC-ACM** gadget — `usbacm.c`, also polled on CPU1, bridged to the
@@ -43,7 +43,7 @@ services:
 
 - **Wire:** a raw L2 Ethernet frame on `br0`, ethertype `0x88B5`, payload =
   the ASCII command line, `\r`-terminated, zero-padded to the 46-byte minimum.
-  Board replies are frames from `02:bd:05:00:00:01` with the same ethertype;
+  Board replies are frames from the HV MAC (`bzd_board.board_mac()`) with the same ethertype;
   the host reads until the `dbg> ` prompt re-appears (see `hvdbg.HV._drain`).
 - **USB-ACM path:** identical line protocol, just carried over the CDC-ACM
   bulk endpoints instead (`usbacm.c` feeds the same `console_*` hooks). No BMC

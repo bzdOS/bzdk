@@ -238,8 +238,11 @@ resulting bare `OSError: [Errno 5]` reads exactly like dead hardware.
 The guest is also a build host: it has `/usr/bin/cc` and free space, so a
 misbehaving base tool is usually faster to rebuild there than to debug. To copy
 files *in*, the **guest listens and the host connects** (`nc -l` on the guest) —
-inbound TCP to this host is firewalled. Never change the guest MAC: it must stay
-`02:bd:05:00:00:01` (the guest relies on `VIRTIO_NET_F_MAC`).
+inbound TCP to this host is firewalled. The guest's MAC is assigned by the HV
+(`VIRTIO_NET_F_MAC`) and differs from the HV's own: both are derived from the
+SoC SID (HV = U-Boot's eth0 `ethaddr`, guest = the same with octet 0 | 0x10;
+`02:ba:fb:3b:f5:8c` / `12:ba:fb:3b:f5:8c` on this board, `mac` in dbgmon).
+Until 2026-10-12 both were `02:bd:05:00:00:01`.
 
 ### Loading a build, and the resident supervisor
 

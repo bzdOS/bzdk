@@ -101,7 +101,7 @@ SRV_IP    = B.SRV_IP
 
 IFACE     = B.IFACE
 ETYPE     = B.ETYPE
-BOARD_MAC = B.BOARD_MAC
+BOARD_MAC = B.LEGACY_BOARD_MAC   # per board now: B.board_mac()
 BCAST     = B.BCAST
 
 # breadcrumb addresses (host physical, see dbgmon.c / el2_exc.c / gic_timer.c)
@@ -194,7 +194,7 @@ class NetCon:
                 continue
             if struct.unpack("!H", frame[12:14])[0] != ETYPE:
                 continue
-            if frame[6:12] != BOARD_MAC:
+            if not self.auth.is_board(frame[6:12]):
                 continue
             payload = frame[14:].split(b"\x00", 1)[0]
             if payload:

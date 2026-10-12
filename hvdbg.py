@@ -33,7 +33,7 @@ import hvauth
 
 IFACE     = B.IFACE
 ETYPE     = B.ETYPE
-BOARD_MAC = B.BOARD_MAC
+BOARD_MAC = B.LEGACY_BOARD_MAC   # the HV's MAC is per board now: B.board_mac()
 BCAST     = B.BCAST
 CSI       = re.compile(rb'\x1b\[[0-9;?]*[a-zA-Z]')
 
@@ -79,7 +79,7 @@ class HV:
             try:
                 f = self.sock.recv(2048)
                 if len(f) > 14 and struct.unpack("!H", f[12:14])[0] == ETYPE \
-                   and f[6:12] == BOARD_MAC:
+                   and self.auth.is_board(f[6:12]):
                     buf += f[14:].split(b"\x00")[0]
                     if early_prompt and early_prompt in buf:
                         break   # command complete — don't wait full timeout
@@ -611,7 +611,7 @@ class HV:
                     continue
                 if struct.unpack("!H", f[12:14])[0] != self.DBGRAW_ETHERTYPE:
                     continue
-                if f[6:12] != BOARD_MAC:
+                if not self.auth.is_board(f[6:12]):
                     continue
                 pl = f[14:14 + self.DBGRAW_REPLY_LEN]
                 if pl[0:4] != self.DBGRAW_MAGIC:

@@ -71,6 +71,12 @@
  * guest's ARP sender-HA now IS OUR_MAC, so peers address replies to a MAC
  * the hardware filter already passes — no promiscuous-mode dependency.
  *
+ * SUPERSEDED (2026-10-12, audit item 7): TX now keeps the guest's own dst
+ * and src (emac_send_frame_from()), the EMAC filter is off (RXALL +
+ * DIS_ADDR_FILTER, emac.c), and the guest no longer shares the HV's MAC: it
+ * gets emac_guest_mac() (SID-derived, octet 0 | 0x10) while the HV keeps
+ * emac_hv_mac() for itself. The guest may not transmit with the HV's MAC.
+ *
  * ============================================================================
  * CROSS-CORE CONCURRENCY — READ THIS BEFORE THIS EVER TOUCHES HARDWARE.
  * ============================================================================
@@ -562,11 +568,15 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 
 	int hv_type = vnet_tx_is_hv_ethertype(g_tx_stage + VNET_HDR_LEN,
 	                                       total - VNET_HDR_LEN);
+	/* Nor may it borrow the HV's source MAC (the guest has its own since
+	 * 2026-10-12; host tools identify the HV by this address). */
+	if (!hv_type && emac_mac_is_hv(g_tx_stage + VNET_HDR_LEN + 6))
+		hv_type = 1;
 	if (hv_type) {
 		/* HARD BLOCK: the guest must never be able to inject a frame that
 		 * masquerades as one of the HV's own protocols (0x88B5..0x88B8,
-		 * bare or VLAN-wrapped): with the guest's source MAC equal to the
-		 * HV's, host tools could not tell the two apart. Never reaches
+		 * bare or VLAN-wrapped), nor use the HV's source MAC: host tools
+		 * must be able to tell the two apart. Never reaches
 		 * emac_send_frame() / real hardware. Completion still pushed so the
 		 * guest's ring drains — indistinguishable from a real NIC quietly
 		 * dropping a frame. */
@@ -777,7 +787,7 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 	case VNET_R_VENDOR_ID:     return VNET_MMIO_VENDOR;
 	case VNET_R_DEVICE_FEATURES:
 		/* Word 1, bit 0 = VIRTIO_F_VERSION_1. Word 0, bit 5 = VIRTIO_NET_F_MAC
-		 * (see vnet_emac.h's VNET_GUEST_MAC comment for why) — no other
+		 * (the guest's MAC is emac_guest_mac(), see emac.h) — no other
 		 * MAC/CSUM/offload/MRG_RXBUF/STATUS bits offered, matching
 		 * vblk_emmc.c's minimal-feature-set precedent. */
 		if (d->dev_feat_sel == VNET_FEATWORD_HI)
@@ -807,7 +817,7 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 	}
 }
 
-/* Config-space byte-granular read for VNET_GUEST_MAC (see vnet_emac.h).
+/* Config-space byte-granular read of the guest MAC (emac_guest_mac()).
  * `byte_off` is relative to VNET_R_CONFIG; `sas` is the ESR_EL2.ISS access
  * size (0=byte,1=halfword,2/3=word). FreeBSD's if_vtnet reads a uint8_t[6]
  * config field with individual byte-width accesses, so — unlike every other
@@ -817,11 +827,12 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
  * register. */
 static uint32_t vnet_config_read(uint32_t byte_off, uint32_t sas)
 {
-	static const uint8_t mac[VNET_GUEST_MAC_LEN] = VNET_GUEST_MAC;
+	uint8_t mac[VNET_GUEST_MAC_LEN];
 	uint32_t nbytes = (sas == 0u) ? 1u : (sas == 1u) ? 2u : 4u;
 	uint32_t status = g_net.link_up ? VNET_S_LINK_UP : 0u;   /* le16 @6 */
 	uint32_t v = 0;
 
+	emac_guest_mac(mac);
 	for (uint32_t i = 0; i < nbytes; i++) {
 		uint32_t idx = byte_off + i;
 		uint8_t b = 0u;
@@ -1034,7 +1045,7 @@ int vnet_mmio_fault(struct el2_frame *frame)
 	uint32_t srt = (esr >> ESR_SRT_SHIFT) & ESR_SRT_MASK;
 	uint32_t sas = (esr >> ESR_SAS_SHIFT) & ESR_SAS_MASK;
 	/* Every STANDARD virtio-mmio register is a 32-bit word access — sas is
-	 * only actually consulted below for the config-space (VNET_GUEST_MAC)
+	 * only actually consulted below for the config-space (guest MAC)
 	 * read path, which FreeBSD accesses byte-at-a-time. */
 
 	uint32_t off = (uint32_t)(addr - g_net.base);

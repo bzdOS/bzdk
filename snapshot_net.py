@@ -59,6 +59,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import netcon  # noqa: E402  (see module docstring: reused unmodified)
 import hvauth  # noqa: E402
+import bzd_board  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # Constants — MUST mirror snapshot_net.h / snapshot.h exactly (same
@@ -299,7 +300,7 @@ def _cli_pull(args):
         # Board's netcon_recv() pre-declares this EXACT length (see
         # snapshot_net.c "FIXED-SIZE CONTROL MESSAGES") -- req_blob is
         # always exactly MISSING_CAP*4 bytes, sentinel-padded.
-        if not netcon.send_blob(nc_sock, req_blob, dst_mac=BOARD_MAC, verbose=False):
+        if not netcon.send_blob(nc_sock, req_blob, verbose=False):
             print("[snapnet] missing-list delivery failed (board not "
                   "responding over netcon) -- giving up on further rounds")
             break
@@ -361,7 +362,7 @@ def _cli_push(args):
         hdr = pack_hdr(seq, len(data), _crc32(data))
         # hvauth: authenticated envelope on 0x88B5 (key file), else the
         # legacy 0x88B8 frame -- see hvauth.py
-        bulk_auth.send(hvauth.CH_SNAPNET, hdr + data, dst=BOARD_MAC)
+        bulk_auth.send(hvauth.CH_SNAPNET, hdr + data, dst=bzd_board.board_mac())
 
     print("[snapnet] streaming bulk pass -- make sure snapshot_net_recv() "
           "is already running (or about to run) on the board")
@@ -372,7 +373,7 @@ def _cli_push(args):
 
     print(f"[snapnet] bulk pass done ({len(chunks)} chunks); delivering "
           f"manifest over netcon")
-    if not netcon.send_blob(nc_sock, manifest, dst_mac=BOARD_MAC, verbose=False):
+    if not netcon.send_blob(nc_sock, manifest, verbose=False):
         print("[snapnet] FAILED: manifest was never ACKed over netcon -- "
               "board not listening / link down")
         bulk_sock.close()
@@ -570,9 +571,9 @@ def _st_c_constant_drift():
         SETTLE_S / BULK_READ_TIMEOUT_S). There is no calibration between the
         two anywhere in the tree, so no assertion is possible — only a live
         run can say whether the two ends' patience actually overlaps.
-      - BOARD_MAC (imported from netcon.py) against emac.c's MAC. Not scraped;
-        emac.c is a large file with several MAC-shaped constants and picking
-        the right one by regex would be a guess.
+      - The board's MAC. It is per board (derived from the SoC SID at boot,
+        emac.c) and learned from the auth handshake (bzd_board.board_mac());
+        the selftests below use the legacy constant only as a sample address.
       - Nothing checks that the SIZE of a struct snapshot_hdr matches what
         this module assumes, because this module makes NO assumption: it
         treats chunk 0 as opaque bytes and never decodes the store header at

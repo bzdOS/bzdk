@@ -4,8 +4,8 @@
 bmc_client.py — host-side CLI for the bzdOS "software BMC" management plane.
 
 This is the clean, named front end to the BMC verbs implemented in bmc.c. It
-rides the EXACT SAME EMAC raw-Ethernet console (ethertype 0x88B5, board MAC
-02:bd:05:00:00:01) that hvdbg.py/dbgmon already use — it simply subclasses HV
+rides the EXACT SAME EMAC raw-Ethernet console (ethertype 0x88B5, the per-board
+HV MAC learned by hvauth) that hvdbg.py/dbgmon already use — it simply subclasses HV
 so all the low-level framing, draining and the reboot_clean() reset path come
 for free. Every subcommand sends a `bmc <verb> ...` line and renders the reply.
 

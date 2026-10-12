@@ -5,7 +5,8 @@
 #   repl-cmd.py "mi" 3 "mpN 400000" 12 "bc 0x50000000 24" 3
 import os,sys,socket,struct,select,time
 IFACE="br0"; ETYPE=0x88B5
-BOARD=bytes.fromhex("02bd05000001"); BCAST=b"\xff"*6
+import bzd_board  # the HV MAC is per board: bzd_board.is_board_mac()
+BCAST=b"\xff"*6
 s=socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETYPE))
 s.bind((IFACE,ETYPE)); SRC=s.getsockname()[4]
 def send(text):
@@ -19,7 +20,7 @@ def drain(sec):
         if not r: continue
         f=s.recv(2048)
         if len(f)<14 or struct.unpack("!H",f[12:14])[0]!=ETYPE: continue
-        if f[6:12]!=BOARD: continue
+        if not bzd_board.is_board_mac(f[6:12]): continue
         pl=f[14:].split(b"\x00",1)[0]
         if pl: buf+=pl.decode("latin1","replace")
     return buf

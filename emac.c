@@ -144,16 +144,16 @@ const char *const bzdos_emac_owner = "emac";
  * -- explaining why the hardware's default (address-filtered, RXALL=0)
  * behavior was never noticed before ROADMAP C1: every prior use of this
  * EMAC (debug protocol, netcon, snapshot-net) only ever needed frames
- * addressed to OUR_MAC, which the default filter already passes). RXALL
+ * addressed to the HV MAC, which the default filter already passes). RXALL
  * (bit0) disables destination-address filtering entirely -- needed so a
- * unicast reply addressed to the GUEST's own (not OUR_MAC) virtio MAC
+ * unicast reply addressed to the GUEST's own (not the HV MAC) virtio MAC
  * reaches the RX descriptor ring at all; see emac_init()'s own comment at
  * the RX_FRM_FLT write site for the live-hardware story (2026-07-23/24). */
 #define EMAC_RX_FRM_FLT      0x38
 #define  EMAC_FRM_FLT_RXALL      (1u << 0)
 /* RXALL alone still drops unicast to any MAC but ADDR0: measured 2026-10-12,
  * frames to 02:bd:05:00:00:42 and to an unknown MAC never reached vnet while
- * the same frames to OUR_MAC did. DIS_ADDR_FILTER turns the filter off. */
+ * the same frames to the HV MAC did. DIS_ADDR_FILTER turns the filter off. */
 #define  EMAC_FRM_FLT_DIS_ADDR   (1u << 31)
 #define EMAC_MII_CMD         0x48
 #define EMAC_MII_DATA        0x4c
@@ -203,8 +203,112 @@ const char *const bzdos_emac_owner = "emac";
 #define ETH_BUFSIZE     2048           /* per-descriptor buffer */
 #define ETH_RXSIZE      2044           /* sun8i_emac.c CFG_ETH_RXSIZE */
 
-/* Our locally-administered MAC and console EtherType. */
-static const uint8_t OUR_MAC[6] = { 0x02, 0xbd, 0x05, 0x00, 0x00, 0x01 };
+/* The HV's and the guest's MAC addresses (audit item 7). Until 2026-10-12
+ * both were the fixed 02:bd:05:00:00:01, on every board, so two boards on one
+ * segment collided and host tools could not tell the guest's frames from the
+ * HV's by source address. Now:
+ *
+ *   HV    = derived from the A64 SID exactly as U-Boot derives eth0's
+ *           `ethaddr` (board/sunxi/board.c setup_environment(): 02, SID word 0
+ *           low byte, then crc32 of SID words 1..3, never 00:00:00 in the low
+ *           three bytes). Stable per board, locally administered, and the same
+ *           address U-Boot uses on this NIC before the HV runs -- they never
+ *           run at once. An `ethaddr` set by hand in the U-Boot env is NOT
+ *           followed (the HV does not read the env).
+ *   guest = the HV MAC with 0x10 ORed into the first octet (U-Boot's rule for
+ *           eth1: (index << 4) | 0x02), handed over by VIRTIO_NET_F_MAC.
+ *
+ * A SID that reads 0 (no fuses, an emulator) falls back to the legacy
+ * 02:bd:05:00:00:01 for the HV (and 12:bd:05:00:00:01 for the guest).
+ * EMAC_ADDR0 = HV MAC. The guest's frames reach it through RXALL/
+ * DIS_ADDR_FILTER (below), not through an address register. */
+#define SUNXI_SID_BASE 0x01c14200u     /* SIDC 0x01c14000 + 0x200 (A64) */
+static uint8_t g_hv_mac[6];
+static uint8_t g_guest_mac[6];
+static volatile uint32_t g_mac_src;    /* 0 unset, 1 SID, 2 legacy fallback */
+static uint32_t g_rx_to_hv_dropped;    /* non-debug frames to the HV MAC */
+
+static uint32_t mac_crc32(const uint8_t *p, uint32_t n)
+{
+    uint32_t c = 0xffffffffu;
+    while (n--) {
+        c ^= *p++;
+        for (int k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+/* Idempotent; both cores may call it (CPU1 from emac_init(), CPU0 from the
+ * vnet config-space read) and compute the same bytes. */
+static void emac_macs_init(void)
+{
+    uint32_t sid[4];
+    uint32_t src = 1;
+
+    if (g_mac_src)
+        return;
+    for (int i = 0; i < 4; i++)
+        sid[i] = *(volatile uint32_t *)(uintptr_t)(SUNXI_SID_BASE + 4u * i);
+    if (sid[0] != 0) {
+        uint8_t b[12];
+        for (int i = 0; i < 12; i++)
+            b[i] = (uint8_t)(sid[1 + i / 4] >> (8 * (i % 4)));
+        uint32_t c = mac_crc32(b, sizeof(b));
+        if ((c & 0xffffffu) == 0)
+            c |= 0x800000u;
+        g_hv_mac[0] = 0x02;
+        g_hv_mac[1] = (uint8_t)sid[0];
+        g_hv_mac[2] = (uint8_t)(c >> 24);
+        g_hv_mac[3] = (uint8_t)(c >> 16);
+        g_hv_mac[4] = (uint8_t)(c >> 8);
+        g_hv_mac[5] = (uint8_t)c;
+    } else {
+        static const uint8_t legacy[6] = { 0x02, 0xbd, 0x05, 0x00, 0x00, 0x01 };
+        for (int i = 0; i < 6; i++)
+            g_hv_mac[i] = legacy[i];
+        src = 2;
+    }
+    for (int i = 0; i < 6; i++)
+        g_guest_mac[i] = g_hv_mac[i];
+    g_guest_mac[0] |= 0x10u;
+    __asm__ volatile("dmb ish" ::: "memory");
+    g_mac_src = src;
+}
+
+void emac_hv_mac(uint8_t out[6])
+{
+    emac_macs_init();
+    for (int i = 0; i < 6; i++)
+        out[i] = g_hv_mac[i];
+}
+
+void emac_guest_mac(uint8_t out[6])
+{
+    emac_macs_init();
+    for (int i = 0; i < 6; i++)
+        out[i] = g_guest_mac[i];
+}
+
+int emac_mac_is_hv(const uint8_t m[6])
+{
+    emac_macs_init();
+    for (int i = 0; i < 6; i++)
+        if (m[i] != g_hv_mac[i])
+            return 0;
+    return 1;
+}
+
+uint32_t emac_mac_source(void)
+{
+    emac_macs_init();
+    return g_mac_src;
+}
+
+uint32_t emac_rx_to_hv_dropped(void)
+{
+    return g_rx_to_hv_dropped;
+}
 #define ETHERTYPE_CONSOLE 0x88B5u
 /* Reliable-datagram (netcon) EtherType — a SECOND, independent channel from
  * the console. Frames on this EtherType are demuxed away from the console
@@ -1059,8 +1163,9 @@ static int phy_startup_ctx(int *duplex_full, int quick)
 /* ------------------------------------------------------------------ */
 static void write_hwaddr(void)
 {
-    uint32_t lo = OUR_MAC[0] | (OUR_MAC[1] << 8) | (OUR_MAC[2] << 16) | ((uint32_t)OUR_MAC[3] << 24);
-    uint32_t hi = OUR_MAC[4] | (OUR_MAC[5] << 8);
+    emac_macs_init();
+    uint32_t lo = g_hv_mac[0] | (g_hv_mac[1] << 8) | (g_hv_mac[2] << 16) | ((uint32_t)g_hv_mac[3] << 24);
+    uint32_t hi = g_hv_mac[4] | (g_hv_mac[5] << 8);
     wr(EMAC_ADDR0_HIGH, hi);
     wr(EMAC_ADDR0_LOW, lo);
 }
@@ -1384,13 +1489,13 @@ int emac_init(void)
      * despite ARP REQUESTS (broadcast) working fine and despite the
      * software-side (to_us||bcast) gate already being removed from
      * emac.c's RX demux for the vnet path. Direct experiment on real
-     * hardware (send a raw unicast test frame to a non-OUR_MAC
+     * hardware (send a raw unicast test frame to a non-HV-MAC
      * destination, watch vnet's rx_ethertype breadcrumb) proved the
      * default hardware filter (RXALL=0, i.e. only frames matching
-     * EMAC_ADDR0/OUR_MAC or broadcast reach the RX ring at all) was
+     * EMAC_ADDR0 (the HV MAC) or broadcast reach the RX ring at all) was
      * silently dropping it BEFORE any of our software ever saw it -- no
      * prior use of this EMAC (debug protocol, netcon, snapshot-net) ever
-     * needed a different destination than OUR_MAC, so this was never hit
+     * needed a different destination than the HV MAC, so this was never hit
      * before. Written here (config-before-enable, at init time) rather
      * than as a live runtime toggle -- toggling EMAC_RX_CTL0's RX_EN bit
      * on a RUNNING board to test this disables ALL reception including
@@ -1628,7 +1733,7 @@ static void wd_send_probe(void)
     p[2] = 1; p[3] = 0;                      /* function: reply */
     p[4] = (uint8_t)g_wd_probes; p[5] = (uint8_t)(g_wd_probes >> 8);
     g_wd_probes++;
-    (void)tx_frame_raw_src_ex(OUR_MAC, OUR_MAC, ETHERTYPE_LOOPBACK, p,
+    (void)tx_frame_raw_src_ex(g_hv_mac, g_hv_mac, ETHERTYPE_LOOPBACK, p,
                               (int)sizeof(p), 1);
 }
 
@@ -2064,7 +2169,7 @@ static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
 static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
                          const uint8_t *payload, int plen)
 {
-    return tx_frame_raw_src(dst, OUR_MAC, ethertype, payload, plen);
+    return tx_frame_raw_src(dst, g_hv_mac, ethertype, payload, plen);
 }
 
 /* Reply destination for everything the HV itself originates (console text,
@@ -2183,7 +2288,7 @@ static void hv_dispatch(uint8_t chan, const uint8_t *p, uint32_t n)
 
 /* Returns 1 if the frame was the HV's (dispatched, answered or dropped),
  * 0 if it should continue to the guest (vnet). Only called for the four HV
- * ethertypes, addressed to OUR_MAC or broadcast. */
+ * ethertypes, addressed to the HV MAC or broadcast. */
 static int hv_rx_frame(const uint8_t *buf, int length, uint16_t et)
 {
 #if defined(PROD_NO_DBG)
@@ -2268,7 +2373,7 @@ void emac_poll(void)
             uint16_t et = (uint16_t)((buf[12] << 8) | buf[13]);
             int to_us = 1, bcast = 1;
             for (int i = 0; i < 6; i++) {
-                if (buf[i] != OUR_MAC[i]) to_us = 0;
+                if (buf[i] != g_hv_mac[i]) to_us = 0;
                 if (buf[i] != 0xff)       bcast = 0;
             }
             /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
@@ -2277,6 +2382,12 @@ void emac_poll(void)
                          et == ETHERTYPE_SNAPNET || et == ETHERTYPE_DBGRAW);
             if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
                 /* consumed by the HV debug plane (see hv_rx_frame()) */
+            } else if (to_us) {
+                /* Addressed to the HV's own MAC but not a debug frame the
+                 * HV took (e.g. ARP/TFTP for U-Boot, which shares this MAC):
+                 * the guest has its own address since item 7, so none of
+                 * this is the guest's. */
+                g_rx_to_hv_dropped++;
             } else if (et != ETHERTYPE_CONSOLE &&
                        (!hv_et || HV_LEGACY_ETYPES_TO_GUEST)) {
 
@@ -2289,7 +2400,7 @@ void emac_poll(void)
                  * DELIBERATELY no (to_us || bcast) gate here (2026-07-23,
                  * found live via tcpdump while chasing why ping never got
                  * an ARP reply back to the guest): emac_send_frame()'s TX
-                 * path always sources frames from OUR_MAC (see its own
+                 * path always sources frames from the HV MAC (see its own
                  * "MAC IDENTITY NOTE"), but the guest's virtio-net driver's
                  * OWN protocol payloads (e.g. an ARP request's sender-HA
                  * field) correctly carry the guest's REAL virtio MAC. Peers

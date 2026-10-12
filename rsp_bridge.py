@@ -24,7 +24,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hvdbg import HV, BCAST, BOARD_MAC, ETYPE  # noqa: E402
+from hvdbg import HV, BCAST, ETYPE  # noqa: E402
 import hvauth  # noqa: E402
 
 PORT = 12345
@@ -78,7 +78,7 @@ def main():
             except OSError:
                 break
             if len(f) > 14 and struct.unpack("!H", f[12:14])[0] == ETYPE \
-               and f[6:12] == BOARD_MAC:
+               and hv.auth.is_board(f[6:12]):
                 payload = f[14:].split(b"\x00")[0]
                 if payload:
                     conn.sendall(payload)

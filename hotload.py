@@ -8,7 +8,8 @@ import os,sys,socket,struct,select,time
 sys.path.insert(0,"/opt/bzdos/microkernel")
 import netcon
 IFACE="br0"; C_ETYPE=0x88B5
-BOARD=bytes.fromhex("02bd05000001"); BCAST=b"\xff"*6
+import bzd_board  # the HV MAC is per board: bzd_board.is_board_mac()
+BCAST=b"\xff"*6
 if len(sys.argv)<3: print("usage: hotload.py <file> <hexaddr> [--call]"); sys.exit(2)
 path=sys.argv[1]; addr=int(sys.argv[2],16); do_call="--call" in sys.argv
 blob=open(path,"rb").read(); n=len(blob)
@@ -24,7 +25,7 @@ def cdrain(sec):
         r,_,_=select.select([cs],[],[],0.2)
         if not r: continue
         f=cs.recv(2048)
-        if len(f)<14 or struct.unpack("!H",f[12:14])[0]!=C_ETYPE or f[6:12]!=BOARD: continue
+        if len(f)<14 or struct.unpack("!H",f[12:14])[0]!=C_ETYPE or not bzd_board.is_board_mac(f[6:12]): continue
         pl=f[14:].split(b"\x00",1)[0]
         if pl: buf+=pl.decode("latin1","replace")
     return buf

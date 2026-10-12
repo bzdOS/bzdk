@@ -9,7 +9,7 @@ Wire format — MUST match coredump.h's header comment EXACTLY (that comment
 is the single source of truth; this parses it byte-for-byte, nothing here
 is guessed):
 
-  Ethernet: dst=broadcast, src=board MAC 02:bd:05:00:00:01, ethertype 0x88B7.
+  Ethernet: dst=broadcast, src=the board (HV) MAC, ethertype 0x88B7.
   Each frame's Ethernet PAYLOAD is a 12-byte little-endian header + data:
 
     off  size  field
@@ -59,7 +59,8 @@ import traceback
 
 IFACE = "br0"
 COREDUMP_ETHERTYPE = 0x88B7
-BOARD_MAC = bytes.fromhex("02bd05000001")
+import bzd_board  # noqa: E402
+BOARD_MAC = bzd_board.LEGACY_BOARD_MAC   # selftest sample only; the HV MAC is per board
 
 COREDUMP_MAGIC = 0x45524F43   # "CORE" (LE bytes C,O,R,E)
 FLAG_LAST = 0x1

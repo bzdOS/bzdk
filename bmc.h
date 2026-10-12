@@ -7,8 +7,8 @@
  * ---------------
  * The board has NO UART. The only out-of-band channels to a running (or
  * wedged) board are:
- *   - EMAC raw-Ethernet debug console (ethertype 0x88B5, board MAC
- *     02:bd:05:00:00:01) serviced by dbgmon.c on the CPU1 debug core, and
+ *   - EMAC raw-Ethernet debug console (ethertype 0x88B5, the HV MAC --
+ *     per board, from the SID: emac_hv_mac()) serviced by dbgmon.c on the CPU1 debug core, and
  *   - the USB-OTG CDC-ACM gadget (usbacm.c), also on CPU1.
  * Over time a pile of ad-hoc management capability accreted across dbgmon.c
  * (memory/register/breakpoint verbs), reboot.c (reboot_clean), wdt.c

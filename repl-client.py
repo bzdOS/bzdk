@@ -13,7 +13,8 @@ STAGE=0x48000000
 WDT_MODE="0x01c20cb8"
 IFACE="br0"
 ETYPE=0x88B5
-BOARD_MAC=bytes.fromhex("02bd05000001")
+import bzd_board  # the HV MAC is per board: bzd_board.board_mac()
+BOARD_MAC=bzd_board.board_mac()
 BCAST=b"\xff"*6
 LOG=open("/tmp/repl-client.log","wb")
 def clean(b): return L._CSI.sub(b'',b)
@@ -108,7 +109,7 @@ def drain(s, secs):
         if len(f)<14: continue
         et=struct.unpack("!H",f[12:14])[0]
         if et!=ETYPE: continue
-        if f[6:12]!=BOARD_MAC: continue
+        if not bzd_board.is_board_mac(f[6:12]): continue
         pl=f[14:].split(b"\x00",1)[0]
         if pl: out.append(pl.decode("latin1","replace"))
     return out

@@ -4,7 +4,7 @@
  *
  * Lets a real `gdb`/`lldb` attach to the running system (both our EL2 kernel
  * and the EL1 FreeBSD guest) over the same raw-Ethernet console channel the
- * dbgmon/REPL use (ethertype 0x88B5, board MAC 02:bd:05:00:00:01). A tiny
+ * dbgmon/REPL use (ethertype 0x88B5, the per-board HV MAC). A tiny
  * Python TCP<->raw-Ethernet bridge on the host turns `target remote :1234`
  * into 0x88B5 frames (see the spec at the bottom of gdbstub.c).
  *
