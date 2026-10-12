@@ -117,9 +117,16 @@ ssh -i /root/.ssh/chimp_ed25519 root@<guest_ip>      # once /etc/rc has run
 Addresses are not hard-coded anywhere: host tools read
 `~/.config/bzdk/board.conf` through `bzd_board.py` (guest_ip, board_ip,
 gateway, debug transport `l2`/`udp`); U-Boot's env holds the board's side
-(ipaddr/netmask/gatewayip/serverip, also the HV's UDP debug address), the
-guest's rc.conf its own. `tools/subnet/cutover.py` changes all three
-together. Details: `docs/network-and-boot.md`.
+(ipaddr/netmask/gatewayip/serverip, also the HV's UDP debug address, and
+`bzdk_net=dhcp|static`), the guest's rc.conf its own.
+`tools/subnet/cutover.py` changes all three together. With DHCP
+(`bzdk_net=dhcp`, guest `ifconfig_vtnet0="DHCP"`) board.conf says
+`board_ip = auto` / `guest_ip = auto`: `bzd_board.board_ip()` is what
+`bzd_udplink.py` verified by handshake (`~/.config/bzdk/board.ip`),
+`bzd_board.guest_ip()` asks the HV which address the guest uses
+(`~/.config/bzdk/guest.ip` as cache); U-Boot's static `ipaddr`
+(`uboot_ip`) is the HV's fallback. The only fixed address is the host's
+(`serverip`). Details: `docs/network-and-boot.md`.
 
 The guest is **also a build host** — but note the 2026-08-25 layout: `/` is
 mounted read-only *by design* (fstab `ro`), the build area is **`/opt`
@@ -143,6 +150,10 @@ carries the authenticated debug frames over UDP port 34997 too (`dbgip.c`),
 so the debug channel crosses a router; `bzd_udplink.py` (service
 `bzd-udplink`) bridges a host tap `bzd0` to it and `transport = udp` in
 board.conf points every tool at that tap. dbgmon `ip` shows the state.
+With `bzdk_net=dhcp` the HV's address is a DHCP lease taken with its own MAC
+(`dbgdhcp.c`; U-Boot's `ipaddr` after 10 s without one), announced to the
+host, which adopts it only after an authenticated handshake; `ip dhcp` /
+`ip static` switch live.
 
 Boot (since 2026-10-12): U-Boot loads HV, kernel and DTB from the eMMC ESP
 slots `bzdk/cur` / `bzdk/lkg` (three tries of cur, then lkg, then the old

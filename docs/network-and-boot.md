@@ -7,14 +7,18 @@ and it boots without the host's TFTP.
 
 | Where | What | Changed by |
 |---|---|---|
-| host `~/.config/bzdk/board.conf` | transport (`l2`/`udp`), wire iface, udplink tap, board/guest/host/gateway IPs, DNS, UDP port | `tools/subnet/cutover.py`, by hand |
-| U-Boot env (`uboot.env` on the ESP) | `ipaddr netmask gatewayip serverip` -- U-Boot's TFTP fallback and, exported by `bzdk_boot`, the HV's own address | `uboot_env.py`, `cutover.py` |
-| guest `/etc/rc.conf`, `/etc/resolv.conf` | `ifconfig_vtnet0`, `defaultrouter`, nameserver | `cutover.py` |
+| host `~/.config/bzdk/board.conf` | transport (`l2`/`udp`), wire iface, udplink tap, board/guest/host/gateway IPs (board/guest may be `auto`), U-Boot's static IP, DNS, UDP port | `tools/subnet/cutover.py`, by hand |
+| U-Boot env (`uboot.env` on the ESP) | `ipaddr netmask gatewayip serverip` -- U-Boot's TFTP fallback and, exported by `bzdk_boot`, the HV's own address; `bzdk_net=dhcp` makes the HV use DHCP instead (ipaddr etc. become its fallback) | `uboot_env.py`, `emmc_boot.py netmode`, `cutover.py` |
+| guest `/etc/rc.conf`, `/etc/resolv.conf` | `ifconfig_vtnet0` (static or `"DHCP"`), `defaultrouter`, nameserver | `cutover.py` |
+| host `~/.config/bzdk/board.ip`, `guest.ip` | learned addresses for `auto` (below) | `bzd_udplink.py`, `bzd_board.guest_ip()` |
 
 `bzd_board.py` reads board.conf (defaults = the 192.168.88.0/24 setup);
 every host tool takes the debug interface (`bzd_board.IFACE`), the guest
-address (`bzd_board.GUEST`, `guest_ssh_argv()`) and the board address from
-there. `tools/subnet/board.conf.example` documents the keys.
+address (`bzd_board.guest_ip()`, `GUEST`, `guest_ssh_argv()`), the board
+address (`board_ip()`) and U-Boot's own static address (`UBOOT_IP`: the
+U-Boot tools -- uboot_nc, uboot_setup, chimpd -- talk to U-Boot, which
+never uses DHCP) from there. `tools/subnet/board.conf.example` documents
+the keys.
 
 ## Debug channel over UDP/IPv4 (`dbgip.c`, `bzd_udplink.py`)
 
@@ -32,7 +36,7 @@ a boot, broadcast output (boot log, panic text) also goes to
 active (120 s), "to the peer" output goes to both.
 
 Config reaches the HV without a rebuild: `bzdk_boot` runs
-`env export -t 0x4a0f0000 gatewayip ipaddr netmask serverip`, `dbgip_init()`
+`env export -t 0x4a0f0000 gatewayip ipaddr netmask serverip bzdk_net`, `dbgip_init()`
 parses and zeroes it. No block (old bootcmd) = UDP off, L2 unchanged.
 dbgmon `ip` shows address, peer and counters; `ip set IP MASK GW HOST
 [PORT]` (hex) changes it until the next boot, `ip off` stops it.
@@ -46,6 +50,65 @@ and 192.0.2.0/24 (the board's unsolicited boot output).
 
 Watchdog reachability (wdt.c): authenticated UDP frames are dispatched
 through `hv_dispatch()`, which calls `note_rx_frame()` like the L2 path.
+
+## DHCP (`dbgdhcp.c`, `bzdk_net=dhcp`)
+
+U-Boot's `bzdk_net` (exported with the other four; absent or anything but
+`dhcp` = static, the behaviour above) puts the HV's address on DHCP:
+
+* **Client.** `dbgdhcp.c` is plain RFC 2131 (DISCOVER/OFFER/REQUEST/ACK,
+  RENEW at T1 unicast to the server, REBIND at T2 broadcast, back to INIT on
+  NAK or expiry; retransmissions 2, 4, .. 64 s with jitter), driven from
+  `dbgip_tick()` (CPU1's EMAC poll) with no blocking. Client identity is the
+  HV's MAC (`02:ba:fb:3b:f5:8c` here; chaddr and option 61), hostname
+  `bzdk`. It asks for mask, router, DNS, lease, T1, T2; the address, mask
+  and router replace U-Boot's. No ARP conflict probe, no DECLINE.
+* **The guest's DHCP is untouched.** emac.c now also offers broadcast IPv4
+  frames to `dbgip_rx()`, which takes a frame only if it is a BOOTP reply
+  (UDP 67 -> 68) whose chaddr is the HV's MAC. The guest's own exchange
+  (chaddr `12:..`), broadcast or unicast, goes on to vnet exactly as before;
+  so does every other broadcast.
+* **Fallback.** No lease 10 s (`DBGIP_FALLBACK_S`) after boot: U-Boot's
+  static `ipaddr/netmask/gatewayip` (src `env-fallback`); DHCP keeps going
+  and a lease replaces the address when it comes. Losing the lease goes
+  back to the fallback. `serverip` (the host) always comes from the env:
+  it is the one fixed address.
+* **Announce.** On every address change, and every 30 s while no UDP peer
+  is active, the HV sends `serverip`:34997 one inner 0x88B5 frame of
+  envelope type 5 (layout in `dbgip.h`: its address, mode, the guest's
+  address). It is not authenticated and nothing trusts it: with
+  `board_ip = auto`, `bzd_udplink.py` treats any datagram from an address
+  that is not the current board's as a candidate, sends a HELLO there, and
+  adopts the address only if the CHAL carries a valid proof of the shared
+  key (one try per candidate per 10 s). The verified address goes to
+  `~/.config/bzdk/board.ip`; a new lease is followed the same way. An
+  address change drops the HV's UDP peer (its next hop may be different);
+  sessions stay valid, the next DATA frame re-commits the peer.
+* **Guest address.** vnet TX hands every guest frame's first bytes to
+  `dbgip_guest_tx()`, which records the address the guest uses (sender of
+  its ARP frames, else IPv4 source, guest MAC as Ethernet source; never
+  0.0.0.0, 127/8, 169.254/16, multicast). With `guest_ip = auto`,
+  `bzd_board.guest_ip()` asks the HV once per process (dbgmon `mac`) and
+  caches the answer in `~/.config/bzdk/guest.ip`, used when the HV cannot
+  be asked. All ssh-using tools get it there.
+* **dbgmon.** `ip` prints the hex counters (now with `mode dhcp_state
+  dhcp_server lease_left dhcp_rx announce guest_ip`) and a second line for
+  people: `net mode=dhcp addr=192.0.2.23/24 gw=192.0.2.1 src=dhcp
+  host=192.168.88.2:34997 dhcp=bound lease=.. server=.. left=1700s/3600s
+  fallback=192.0.2.7 tx= offer= ack= nak= stale= lost= guest=192.0.2.50`.
+  `ip dhcp` starts DHCP live (the current address stays until a lease
+  arrives), `ip static` releases the lease and goes back to the static
+  address, `ip set` is static too. `mac` ends with `guest_ip=`.
+* **Setting it.** `emmc_boot.py netmode dhcp|static` writes `bzdk_net` and
+  the `bzdk_boot` that exports it (needed once: older `bzdk_boot` does not
+  export `bzdk_net`); `cutover.py` does the same for a whole move.
+
+Tested off the board: `test_dbgdhcp` (the real `dbgdhcp.c`, natively:
+full lease cycle, backoff, NAK, release, and guest replies with chaddr
+`12:..` -- broadcast, unicast, even with the HV's xid -- never taken),
+`bzd_udplink.py --selftest` (adoption only after a valid CHAL, wrong key
+refused, rate limit, explicit mode never learns; once over real loopback
+sockets). Not yet run on the board.
 
 ## Boot from the eMMC (`emmc_boot.py`, `hv_deploy.py`)
 
@@ -94,9 +157,15 @@ on slot cur with the tries cleared after 90 s.
     python3 tools/subnet/cutover.py verify
     python3 tools/subnet/cutover.py rollback <backup dir> [--console]
 
-`apply` backs up U-Boot env, guest rc.conf/resolv.conf, board.conf and the
-host's kernel netconsole script, writes all of them, and reboots the board
-cleanly; on the old segment the L2 channel (`BZDK_TRANSPORT=l2`) and the
-guest console still work, so the new config is checked before the cable
-moves. `rollback --console` works through the guest console on L2 when the
-board is back on the host's segment but unreachable by IP.
+`apply` backs up U-Boot env, guest rc.conf/resolv.conf, board.conf, the
+learned board.ip/guest.ip and the host's kernel netconsole script, writes
+all of them (target 10.0.0: `net = dhcp`, `board_ip = guest_ip = auto`,
+`uboot_ip = 192.0.2.7` as U-Boot's address and the HV's fallback), restarts
+`bzd-udplink.service`, and reboots the board cleanly; on the old segment
+the L2 channel (`BZDK_TRANSPORT=l2`) and the guest console still work, so
+the new config is checked before the cable moves -- and DHCP there hands
+out 192.168.88.x to the HV and the guest, which exercises the whole
+discovery path on the old segment. `rollback` restores all of it (env keys
+incl. `bzdk_net`/`bzdk_boot`, restarts the udplink too); `rollback
+--console` works through the guest console on L2 when the board is back on
+the host's segment but unreachable by IP.
