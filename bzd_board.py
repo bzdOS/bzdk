@@ -91,7 +91,9 @@ CHIMP_TTY = "/dev/ttyCHIMP"
 GUEST_ACM_TTY = "/dev/ttyACM0"
 
 # ── EMAC raw-Ethernet debug console (dbgmon / repl-cmd protocol) ───────────
-IFACE = "br0"
+# IFACE (the interface every raw-socket tool binds) comes from board.conf
+# below: the wire (`iface`, br0) for transport=l2, or the tap that
+# bzd_udplink.py bridges to the board's UDP debug port for transport=udp.
 ETYPE = 0x88B5
 BCAST = b"\xff" * 6
 
@@ -163,9 +165,109 @@ def is_board_mac(src):
     src = bytes(src)
     return src == board_mac() or src == LEGACY_BOARD_MAC
 
-# ── host <-> board TFTP addressing (U-Boot's serverip/ipaddr) ──────────────
-BOARD_IP = "192.168.88.7"
-SRV_IP = "192.168.88.2"
+# ── board network config: ~/.config/bzdk/board.conf ──────────────────────
+# The ONE host-side place for the board's addresses and the debug transport.
+# Plain `key = value` lines, `#` comments; missing keys fall back to the
+# defaults below (the 192.168.88.0/24 setup); $BZDK_BOARD_CONF names another
+# file, $BZDK_TRANSPORT overrides `transport`. The board's side of the same
+# facts lives in U-Boot's env (ipaddr/netmask/gatewayip/serverip, which the
+# HV also reads at boot -- dbgip.h) and the guest's /etc/rc.conf;
+# tools/subnet/cutover.py changes all three together.
+#
+#   transport  l2 | udp     raw Ethernet on `iface`, or UDP via `tap`
+#   iface      br0          host interface on the board's segment (l2)
+#   tap        bzd0         tap served by bzd_udplink.py (udp)
+#   board_ip   HV + U-Boot address          dbg_port  HV UDP debug port
+#   guest_ip   FreeBSD guest address        server_ip this host (TFTP, udplink)
+#   gateway / netmask / dns                 the board's subnet
+#
+# Values are read lazily on first use (module __getattr__), so importing
+# this module still opens nothing.
+BOARD_CONF_FILE = os.path.expanduser("~/.config/bzdk/board.conf")
+BOARD_CONF_DEFAULTS = {
+    "transport": "l2",
+    "iface": "br0",
+    "tap": "bzd0",
+    "board_ip": "192.168.88.7",
+    "dbg_port": "34997",
+    "guest_ip": "192.168.88.82",
+    "server_ip": "192.168.88.2",
+    "gateway": "192.168.88.1",
+    "netmask": "255.255.255.0",
+    "dns": "192.168.88.1",
+}
+_conf = None
+
+
+def parse_conf(text):
+    d = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        d[k.strip()] = v.strip()
+    return d
+
+
+def conf_path():
+    return os.environ.get("BZDK_BOARD_CONF") or BOARD_CONF_FILE
+
+
+def conf():
+    """board.conf merged over the defaults (dict of strings)."""
+    global _conf
+    if _conf is None:
+        c = dict(BOARD_CONF_DEFAULTS)
+        try:
+            c.update(parse_conf(open(conf_path()).read()))
+        except OSError:
+            pass
+        if os.environ.get("BZDK_TRANSPORT"):
+            c["transport"] = os.environ["BZDK_TRANSPORT"]
+        if c["transport"] not in ("l2", "udp"):
+            raise ValueError(f"{conf_path()}: transport must be l2 or udp")
+        _conf = c
+    return _conf
+
+
+def debug_iface():
+    """Interface the raw-socket debug tools bind for the configured transport."""
+    c = conf()
+    return c["tap"] if c["transport"] == "udp" else c["iface"]
+
+
+def guest_ssh_target():
+    return "root@" + conf()["guest_ip"]
+
+
+GUEST_SSH_KEY = "/root/.ssh/chimp_ed25519"
+
+
+def guest_ssh_argv(connect_timeout=10):
+    """ssh argv prefix for the guest (append the remote command)."""
+    return ["ssh", "-o", f"ConnectTimeout={connect_timeout}", "-o",
+            "BatchMode=yes", "-i", GUEST_SSH_KEY, guest_ssh_target()]
+
+
+_LAZY = {
+    "IFACE": debug_iface,
+    "WIRE_IFACE": lambda: conf()["iface"],
+    "TRANSPORT": lambda: conf()["transport"],
+    "BOARD_IP": lambda: conf()["board_ip"],      # U-Boot ipaddr == HV address
+    "SRV_IP": lambda: conf()["server_ip"],       # U-Boot serverip (this host)
+    "GUEST_IP": lambda: conf()["guest_ip"],
+    "GUEST": guest_ssh_target,
+    "DBG_PORT": lambda: int(conf()["dbg_port"]),
+    "GATEWAY": lambda: conf()["gateway"],
+    "NETMASK": lambda: conf()["netmask"],
+}
+
+
+def __getattr__(name):
+    if name in _LAZY:
+        return _LAZY[name]()
+    raise AttributeError(f"module 'bzd_board' has no attribute {name!r}")
 
 # ── guest root filesystem (kload.c's vfs.root.mountfrom kenv) ─────────────
 ROOT_MOUNTFROM = "ufs:/dev/vtbd0p3"

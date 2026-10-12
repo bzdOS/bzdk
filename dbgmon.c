@@ -24,7 +24,11 @@
 #include "vinput.h"
 #include "dbgauth.h"
 #include "hv_addrmap.h"
-#include "hv_addrmap.h"
+#include "dbgip.h"
+/* dbgip.o is linked into the dbg/dual images only. */
+extern void dbgip_stats(uint32_t out[DBGIP_ST_N]) __attribute__((weak));
+extern void dbgip_set(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t host,
+		      uint32_t port) __attribute__((weak));
 
 /* ── weak fallbacks for optional providers ──────────────────────────────────
  * dbgmon.c is linked into targets that do NOT link fbdump.o, sd_bio.o or the
@@ -1492,6 +1496,63 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cputs(emac_mac_source() == 1u ? " src=sid" : " src=legacy");
 		cputs(" to_hv_dropped=0x");
 		print_hex32(emac_rx_to_hv_dropped());
+		cputs("\r\n");
+		return;
+	}
+	if (streq(cmd, "ip")) {
+		/* UDP/IPv4 debug transport (dbgip.h). One line, parsed by
+		 * host tools (bzd_board.py). `ip set IP MASK GW HOST [PORT]`,
+		 * all hex, changes it until the next boot; `ip off` stops it. */
+		static const char *const names[DBGIP_ST_N] = {
+			"ip", "mask", "gw", "host", "port", "src", "peer",
+			"peer_port", "rx_udp", "rx_accept", "tx_udp", "arp_rx",
+			"arp_tx", "icmp", "drop", "nh_ok" };
+		uint32_t st[DBGIP_ST_N] = { 0 };
+		unsigned long a[5] = { 0, 0, 0, 0, 0 };
+
+		if (!dbgip_stats) {
+			err("no dbgip in this image");
+			return;
+		}
+		if (nt >= 2 && streq(tok[1], "off")) {
+			dbgip_set(0, 0, 0, 0, 0);
+		} else if (nt >= 2 && streq(tok[1], "set")) {
+			if (nt < 6 || !parse_hex(tok[2], &a[0]) ||
+			    !parse_hex(tok[3], &a[1]) || !parse_hex(tok[4], &a[2]) ||
+			    !parse_hex(tok[5], &a[3]) ||
+			    (nt >= 7 && !parse_hex(tok[6], &a[4]))) {
+				err("usage: ip set IP MASK GW HOST [PORT] (hex)");
+				return;
+			}
+			dbgip_set((uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2],
+				  (uint32_t)a[3], (uint32_t)a[4]);
+		}
+		dbgip_stats(st);
+		for (int i = 0; i < DBGIP_ST_N; i++) {
+			cputs(names[i]);
+			cputs("=");
+			print_hex32(st[i]);
+			cputs(i == DBGIP_ST_N - 1 ? "\r\n" : " ");
+		}
+		return;
+	}
+	if (streq(cmd, "bootslot")) {
+		/* U-Boot's eMMC slot record (hv_addrmap.h HVMAP_BOOTSLOT). */
+		volatile uint32_t *b = (volatile uint32_t *)HVMAP_BOOTSLOT;
+		unsigned long v;
+
+		if (nt >= 3 && streq(tok[1], "tries") && parse_hex(tok[2], &v)) {
+			b[1] = (uint32_t)v;
+			__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(&b[1]) : "memory");
+		}
+		cputs("bootslot magic=");
+		print_hex32(b[0]);
+		cputs(" tries=");
+		print_hex32(b[1]);
+		cputs(" slot=");
+		print_hex32(b[2]);
+		cputs(" healthy=");
+		print_hex32(b[3]);
 		cputs("\r\n");
 		return;
 	}

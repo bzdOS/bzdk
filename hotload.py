@@ -7,8 +7,9 @@
 import os,sys,socket,struct,select,time
 sys.path.insert(0,"/opt/bzdos/microkernel")
 import netcon
-IFACE="br0"; C_ETYPE=0x88B5
+C_ETYPE=0x88B5
 import bzd_board  # the HV MAC is per board: bzd_board.is_board_mac()
+IFACE = bzd_board.IFACE   # board.conf: wire or udplink tap
 BCAST=b"\xff"*6
 if len(sys.argv)<3: print("usage: hotload.py <file> <hexaddr> [--call]"); sys.exit(2)
 path=sys.argv[1]; addr=int(sys.argv[2],16); do_call="--call" in sys.argv

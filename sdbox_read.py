@@ -6,10 +6,12 @@ into reboot_clean() (sdbox.c): SD card LBA 64, read through the guest.
     python3 sdbox_read.py            # ssh into the guest, dd LBA 64, decode
     python3 sdbox_read.py file.bin   # decode a saved sector
 """
-import struct, subprocess, sys, time
+import os, struct, subprocess, sys, time
 
-SSH = ['ssh', '-o', 'ConnectTimeout=8', '-o', 'BatchMode=yes',
-       '-i', '/root/.ssh/chimp_ed25519', 'root@192.168.88.82']
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bzd_board  # noqa: E402  (guest address: ~/.config/bzdk/board.conf)
+
+SSH = bzd_board.guest_ssh_argv(8)
 REASON = {0: 'unknown', 1: 'bmc reset', 2: 'guest PSCI SYSTEM_OFF',
           3: 'guest PSCI SYSTEM_RESET', 4: 'EMAC-dark escalation', 5: 'repl reset',
           6: 'EMAC ladder gave up (auto-reboot off)', 7: 'unreachable: no EMAC/USB reach in window'}

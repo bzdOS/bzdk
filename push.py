@@ -4,8 +4,9 @@
 # (raw 0x88B5), без reset/U-Boot/YMODEM. Шлёт "rx <addr> <len>", стримит байты
 # кадрами, сверяет sum. Повтор при потере (канал лоссовый). Затем можно `c <addr>`.
 import os,sys,socket,struct,select,time
-IFACE="br0"; ETYPE=0x88B5
+ETYPE=0x88B5
 import bzd_board  # the HV MAC is per board: bzd_board.is_board_mac()
+IFACE = bzd_board.IFACE   # board.conf: wire or udplink tap
 BCAST=b"\xff"*6
 def usage(): print("usage: push.py <file> <hexaddr> [--call]"); sys.exit(2)
 if len(sys.argv)<3: usage()

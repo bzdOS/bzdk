@@ -17,11 +17,15 @@ to come back, because the environment is written from the guest.
 import contextlib
 import subprocess
 import sys
+import os
 import time
 
-ENV_TOOL = '/opt/bzdos/microkernel/uboot_env.py'
-SSH = ['ssh', '-o', 'ConnectTimeout=6', '-o', 'BatchMode=yes',
-       '-i', '/root/.ssh/chimp_ed25519', 'root@192.168.88.82']
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import bzd_board  # noqa: E402  (guest address: ~/.config/bzdk/board.conf)
+
+ENV_TOOL = os.path.join(HERE, 'uboot_env.py')
+SSH = bzd_board.guest_ssh_argv(6)
 GUEST_WAIT_S = 420      # an idle prompt resets itself after 120 s, then ~100 s to a guest
 
 

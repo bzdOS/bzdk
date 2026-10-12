@@ -111,8 +111,15 @@ refuse to build without it. `python3 hvauth.py` checks the handshake; dbgmon
 
 ```sh
 python3 guest_sh.py 'uname -a'          # console, works even with no network
-ssh -i /root/.ssh/chimp_ed25519 root@192.168.88.82   # once /etc/rc has run
+ssh -i /root/.ssh/chimp_ed25519 root@<guest_ip>      # once /etc/rc has run
 ```
+
+Addresses are not hard-coded anywhere: host tools read
+`~/.config/bzdk/board.conf` through `bzd_board.py` (guest_ip, board_ip,
+gateway, debug transport `l2`/`udp`); U-Boot's env holds the board's side
+(ipaddr/netmask/gatewayip/serverip, also the HV's UDP debug address), the
+guest's rc.conf its own. `tools/subnet/cutover.py` changes all three
+together. Details: `docs/network-and-boot.md`.
 
 The guest is **also a build host** — but note the 2026-08-25 layout: `/` is
 mounted read-only *by design* (fstab `ro`), the build area is **`/opt`
@@ -130,6 +137,17 @@ over by `VIRTIO_NET_F_MAC`. dbgmon `mac` prints both. Host tools learn the HV's
 from the auth handshake (`~/.config/bzdk/board.mac`, `bzd_board.board_mac()`);
 do not hard-code it. The guest must not take the HV's MAC: vnet drops its
 frames with that source.
+
+IP (since 2026-10-12): the HV answers ARP/ping on U-Boot's `ipaddr` and
+carries the authenticated debug frames over UDP port 34997 too (`dbgip.c`),
+so the debug channel crosses a router; `bzd_udplink.py` (service
+`bzd-udplink`) bridges a host tap `bzd0` to it and `transport = udp` in
+board.conf points every tool at that tap. dbgmon `ip` shows the state.
+
+Boot (since 2026-10-12): U-Boot loads HV, kernel and DTB from the eMMC ESP
+slots `bzdk/cur` / `bzdk/lkg` (three tries of cur, then lkg, then the old
+TFTP loop). Deploy with `hv_deploy.py deploy` + `hv_deploy.py reboot`, not by
+copying into /opt/bzdos/tftpboot (that is only the last fallback now).
 
 ## Commit convention
 

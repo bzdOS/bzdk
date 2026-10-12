@@ -29,8 +29,8 @@ sys.path.insert(0, '/opt/bzdos/microkernel')
 import bmc_client
 import board_ctl
 
-SSH = ['ssh', '-o', 'ConnectTimeout=8', '-o', 'BatchMode=yes',
-       '-i', '/root/.ssh/chimp_ed25519', 'root@192.168.88.82']
+import bzd_board
+SSH = bzd_board.guest_ssh_argv(8)
 UBOOT_DEADLINE_S = 40      # cold/warm start to U-Boot gadget is ~5 s
 HV_DEADLINE_S = 300
 GUEST_DEADLINE_S = 300

@@ -52,7 +52,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-GUEST = "192.168.88.82"
+import bzd_board  # noqa: E402  (board.conf)
+GUEST = bzd_board.GUEST_IP
 KEY = "/root/.ssh/chimp_ed25519"
 # ConnectTimeout 60, not 8: sshd in the guest does a reverse lookup of the
 # host that the LAN resolver never answers (10 s per try, measured

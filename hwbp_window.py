@@ -53,7 +53,7 @@ def main():
     ap.add_argument("--expect-pc", type=lambda x: int(x, 0), default=None,
                     help="the GUEST_BP_ADDR this build was compiled with; "
                          "a hit record is only trusted if it matches")
-    ap.add_argument("--iface", default="br0")
+    ap.add_argument("--iface", default=None)
     a = ap.parse_args()
 
     hv = hvdbg.HV()

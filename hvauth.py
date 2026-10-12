@@ -93,7 +93,8 @@ class Channel:
 
     _warned = set()
 
-    def __init__(self, iface="br0", key=None, board_mac=None):
+    def __init__(self, iface=None, key=None, board_mac=None):
+        iface = iface or bzd_board.IFACE
         if isinstance(key, str):
             key = bytes.fromhex(key)
         self.key = load_key() if key is None else key
@@ -258,7 +259,7 @@ def selftest():
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="debug-channel auth check")
-    ap.add_argument("--iface", default="br0")
+    ap.add_argument("--iface", default=None)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:

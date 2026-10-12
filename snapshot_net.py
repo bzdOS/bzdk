@@ -66,7 +66,7 @@ import bzd_board  # noqa: E402
 # "hardcode + cross-reference comment" convention coredump.py-equivalent
 # constants already use elsewhere in this tree for DRAM_HI/STAGE2_DRAM_BASE).
 # ------------------------------------------------------------------ #
-IFACE = "br0"
+IFACE = bzd_board.IFACE   # board.conf (bzd_board.py)
 SNAPNET_ETHERTYPE = 0x88B8
 BOARD_MAC = netcon.BOARD_MAC
 

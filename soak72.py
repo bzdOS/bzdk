@@ -1109,7 +1109,7 @@ def main(argv=None):
                     help="disk: the single-disk v1-gate load; mixed: SD verify "
                          "plus CPU bursts (DVFS), eMMC read-verify, net pull "
                          "and lima renders on the 4-vCPU guest")
-    ap.add_argument("--net-host", default="192.168.88.2",
+    ap.add_argument("--net-host", default=L.bzd_board.SRV_IP,
                     help="(mixed) host address the guest pulls the blob from")
     ap.add_argument("--tftp-root", default="/opt/bzdos/tftpboot")
     ap.add_argument("--net-mb", type=int, default=4,
@@ -1137,7 +1137,7 @@ def main(argv=None):
                     help="default soak72[-mixed]-state.json by profile")
     ap.add_argument("--events", default=None)
     ap.add_argument("--logdir", default=DEFAULT_LOGDIR)
-    ap.add_argument("--iface", default="br0")
+    ap.add_argument("--iface", default=None)
     ap.add_argument("--restart", action="store_true",
                     help="zero the counters and start a fresh run (the ONLY "
                          "way to lose accumulated hours)")

@@ -32,6 +32,7 @@ import contextlib, io, sys, time, struct, argparse, traceback
 
 # Reuse the whole EMAC transport + reset machinery from hvdbg.py.
 from hvdbg import HV
+import bzd_board
 
 BMC_HEALTH_BASE = 0x50006000
 BMC_HEALTH_MAGIC = 0x424D4331  # "BMC1"
@@ -563,7 +564,7 @@ def main(argv):
     if argv and argv[0] == "selftest":
         return _cli_selftest(argv[1:])
     ap = argparse.ArgumentParser(description="bzdOS software-BMC client")
-    ap.add_argument("--iface", default="br0")
+    ap.add_argument("--iface", default=bzd_board.IFACE)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     h = sub.add_parser("health", help="structured status record")

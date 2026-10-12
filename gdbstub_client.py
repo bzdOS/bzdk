@@ -131,7 +131,7 @@ class GdbStubClient:
     host-tooling plumbing only, never exercised by `make test`/`./ci.sh`.
     """
 
-    def __init__(self, iface="br0", key=None, arm=True):
+    def __init__(self, iface=None, key=None, arm=True):
         """`iface`: raw-Ethernet interface the board is reachable on (same
         default as gdb-bridge.py/hvdbg.py, br0). `key`: optional DBG_AUTH hex
         key, passed straight through to EmacLink (see gdb-bridge.py's module

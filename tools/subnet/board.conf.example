@@ -1,0 +1,12 @@
+# ~/.config/bzdk/board.conf -- the board's addresses and the debug transport,
+# read by bzd_board.py (every host tool). See bzd_board.py for the keys.
+transport = l2
+iface     = br0
+tap       = bzd0
+board_ip  = 192.168.88.7
+dbg_port  = 34997
+guest_ip  = 192.168.88.82
+server_ip = 192.168.88.2
+gateway   = 192.168.88.1
+netmask   = 255.255.255.0
+dns       = 192.168.88.1

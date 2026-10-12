@@ -11,9 +11,10 @@ import loady_over_acm as L
 ELF="/opt/bzdos/microkernel/microkernel-repl.elf"
 STAGE=0x48000000
 WDT_MODE="0x01c20cb8"
-IFACE="br0"
+IFACE=None  # set from bzd_board below
 ETYPE=0x88B5
 import bzd_board  # the HV MAC is per board: bzd_board.board_mac()
+IFACE = bzd_board.IFACE   # board.conf: wire or udplink tap
 BOARD_MAC=bzd_board.board_mac()
 BCAST=b"\xff"*6
 LOG=open("/tmp/repl-client.log","wb")

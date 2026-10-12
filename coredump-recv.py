@@ -57,7 +57,7 @@ import socket
 import struct
 import traceback
 
-IFACE = "br0"
+IFACE = bzd_board.IFACE   # board.conf (bzd_board.py)
 COREDUMP_ETHERTYPE = 0x88B7
 import bzd_board  # noqa: E402
 BOARD_MAC = bzd_board.LEGACY_BOARD_MAC   # selftest sample only; the HV MAC is per board

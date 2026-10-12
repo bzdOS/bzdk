@@ -56,6 +56,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import bmc_client                      # noqa: E402
+import bzd_board                       # noqa: E402
 import boot_ledger                     # noqa: E402
 
 
@@ -76,12 +77,12 @@ def _load_hyphenated(name, filename):
     return mod
 
 
-def _bmc(iface="br0"):
+def _bmc(iface=None):
     return bmc_client.BMC(iface=iface)
 
 
 # ── status ───────────────────────────────────────────────────────────────
-def collect_status(iface="br0"):
+def collect_status(iface=None):
     """Everything cheap and EMAC-only, as a plain dict (also feeds `serve`).
 
     Never raises: a dashboard polling a board that is mid-reboot must render
@@ -1180,7 +1181,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="bzdctl.py",
         description="bzdOS Chimp board lifecycle: power, boot, console, crash")
-    ap.add_argument("--iface", default="br0", help="EMAC debug interface")
+    ap.add_argument("--iface", default=bzd_board.IFACE,
+                    help="debug interface (board.conf: br0 for l2, the udplink tap for udp)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="one-screen board state (EMAC only)")

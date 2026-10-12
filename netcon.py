@@ -46,7 +46,7 @@ import binascii
 import bzd_board
 import hvauth
 
-IFACE = "br0"
+IFACE = bzd_board.IFACE   # board.conf (bzd_board.py)
 NC_ETHERTYPE = 0x88B6
 BOARD_MAC = bzd_board.LEGACY_BOARD_MAC   # per board now: bzd_board.board_mac()
 BCAST = b"\xff" * 6

@@ -4,8 +4,9 @@
 # ответы. Аргументы: пары "cmd" wait_sec ... Пример:
 #   repl-cmd.py "mi" 3 "mpN 400000" 12 "bc 0x50000000 24" 3
 import os,sys,socket,struct,select,time
-IFACE="br0"; ETYPE=0x88B5
+ETYPE=0x88B5
 import bzd_board  # the HV MAC is per board: bzd_board.is_board_mac()
+IFACE = bzd_board.IFACE   # board.conf: wire or udplink tap
 BCAST=b"\xff"*6
 s=socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETYPE))
 s.bind((IFACE,ETYPE)); SRC=s.getsockname()[4]

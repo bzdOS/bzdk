@@ -93,6 +93,22 @@ static void bootcnt_boot(uint32_t warm)
 	}
 }
 
+/* U-Boot's eMMC slot record (hv_addrmap.h HVMAP_BOOTSLOT): this boot
+ * proved healthy. Booted from `cur`: zero the tries, so the next reset boots
+ * `cur` again. Booted from `lkg` (cur failed 3 times): keep the tries, so
+ * the board stays on lkg until a deploy resets them. */
+static void bootslot_healthy(void)
+{
+	volatile uint32_t *b = (volatile uint32_t *)HVMAP_BOOTSLOT;
+
+	if (b[0] != HVMAP_BOOTSLOT_MAGIC)
+		return;
+	if (b[2] == 1u)
+		b[1] = 0;
+	b[3] = 1u;
+	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(b) : "memory");
+}
+
 void dbgtools_tick(void)
 {
 	uint64_t freq;
@@ -105,6 +121,7 @@ void dbgtools_tick(void)
 	if (bootcnt_now() - bootcnt_t0 < (uint64_t)BOOTCNT_HEALTHY_S * freq)
 		return;
 	bc_wr32(BOOTCNT_OFF_COUNT, 0);
+	bootslot_healthy();
 	if (bc_rd32(BOOTCNT_OFF_SAFE)) {
 		/* safe mode was released and the guest has stayed up: disarm the
 		 * hold it armed, so the next warm reset boots straight through */

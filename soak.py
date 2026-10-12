@@ -507,7 +507,7 @@ def dwell(n, args, report):
 GUEST_SSH = [
     "ssh", "-i", "/root/.ssh/chimp_ed25519",
     "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", "root@192.168.88.82",
+    "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", B.GUEST,
 ]
 
 

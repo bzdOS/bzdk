@@ -435,6 +435,18 @@ __attribute__((weak)) void dbgtools_rx_frame(const uint8_t *payload, uint16_t le
     (void)payload; (void)len;   /* no dbgtools linked in: drop silently */
 }
 
+/* dbgip.c: the same debug frames over UDP/IPv4 (dbgip.h). Weak and
+ * undefined (NULL) in builds that do not link dbgip.o: the checks below
+ * then skip it and nothing changes. */
+#include "dbgip.h"
+extern void dbgip_init(void) __attribute__((weak));
+extern int  dbgip_rx(const uint8_t *f, uint32_t len) __attribute__((weak));
+extern void dbgip_tick(void) __attribute__((weak));
+extern int  dbgip_peer_active(uint8_t inner[6]) __attribute__((weak));
+extern int  dbgip_tx_route(const uint8_t dst[6], uint16_t ethertype,
+                           uint32_t inner_len, uint8_t hdr[DBGIP_HDR_LEN])
+    __attribute__((weak));
+
 /* ------------------------------------------------------------------ */
 /* Scratch DRAM layout for DMA (rings + buffers). 0x50100000 onward is    */
 /* clear of the image (0x42000000..0x42800000), of musb.c's breadcrumb    */
@@ -1601,6 +1613,9 @@ int emac_init(void)
     __asm__ volatile("dsb sy" ::: "memory");
     bc(1, BC_STAGE_ENABLED);
 
+    if (dbgip_init)
+        dbgip_init();           /* UDP transport config from U-Boot's env */
+
     /* Callers still get the same "no link yet" signal as before; EMAC itself
      * is now always armed regardless. */
     return linked ? 0 : -1;
@@ -2359,38 +2374,63 @@ int emac_tx_space(void)
     return tx_slot_free(g_tx_slot + TX_HV_RESERVE);
 }
 
-static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
-                                uint16_t ethertype, const uint8_t *payload,
-                                int plen, int probe)
+/* `outer` != NULL: the frame goes out wrapped in that Eth/IPv4/UDP header
+ * (dbgip.c), the Ethernet frame built here becoming its UDP payload. */
+static int tx_frame_build(const uint8_t dst[6], const uint8_t src[6],
+                          uint16_t ethertype, const uint8_t *payload,
+                          int plen, int probe, const uint8_t *outer)
 {
     uint8_t *buf;
     int total, i;
+    int o = outer ? (int)DBGIP_HDR_LEN : 0;
     int slot = emac_tx_begin(0, &buf);
 
     if (slot < 0)
         return 0;
 
-    if (plen > (ETH_BUFSIZE - 14 - 4))
-        plen = ETH_BUFSIZE - 14 - 4;
+    if (plen > (ETH_BUFSIZE - 14 - 4 - o))
+        plen = ETH_BUFSIZE - 14 - 4 - o;
 
+    if (outer)
+        nc_copy(buf, outer, (uint32_t)o);
     {
         uint8_t eh[14];
         for (i = 0; i < 6; i++) eh[i] = dst[i];        /* dst */
         for (i = 0; i < 6; i++) eh[6 + i] = src[i];    /* src */
         eh[12] = (uint8_t)(ethertype >> 8);
         eh[13] = (uint8_t)(ethertype & 0xff);
-        nc_copy(buf, eh, 14);
+        nc_copy(buf + o, eh, 14);
     }
     /* The buffer is Non-cacheable: word-wide copy, not one access per byte. */
-    nc_copy(buf + 14, payload, (uint32_t)plen);
+    nc_copy(buf + o + 14, payload, (uint32_t)plen);
 
-    total = 14 + plen;
+    total = o + 14 + plen;
     if (total < 60) {                 /* pad to the 60-byte min (pre-CRC) */
         nc_zero(buf + total, (uint32_t)(60 - total));
         total = 60;
     }
     emac_tx_end_ex(slot, (uint32_t)total, 1, probe);
     return 1;
+}
+
+static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
+                                uint16_t ethertype, const uint8_t *payload,
+                                int plen, int probe)
+{
+    uint8_t oh[DBGIP_HDR_LEN];
+    int mode = DBGIP_TX_L2, r;
+
+    /* HV-originated debug frames may have to cross a router (dbgip.h). */
+    if (dbgip_tx_route && emac_mac_is_hv(src) && plen >= 0)
+        mode = dbgip_tx_route(dst, ethertype, (uint32_t)(14 + plen), oh);
+    if (mode == DBGIP_TX_DROP)
+        return 0;
+    if (mode == DBGIP_TX_UDP)
+        return tx_frame_build(dst, src, ethertype, payload, plen, probe, oh);
+    r = tx_frame_build(dst, src, ethertype, payload, plen, probe, 0);
+    if (mode == DBGIP_TX_BOTH)
+        (void)tx_frame_build(dst, src, ethertype, payload, plen, probe, oh);
+    return r;
 }
 
 static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
@@ -2413,9 +2453,48 @@ static const uint8_t *reply_dst(void)
     return peer ? peer : BCAST_MAC;
 }
 
+/* Last host that spoke authenticated L2 debug frames, and when. With both
+ * transports in use at once (a host tool on the wire, another through the
+ * UDP link), output meant for "the peer" goes to both -- the same
+ * everyone-sees-everything the wire alone gives several tools on one host. */
+#define L2_PEER_ACTIVE_S 120u
+static uint8_t  g_l2_peer[6];
+static volatile uint64_t g_l2_peer_t;
+
+static void note_l2_peer(const uint8_t *src)
+{
+    for (int i = 0; i < 6; i++)
+        g_l2_peer[i] = src[i];
+    g_l2_peer_t = timer_now();
+}
+
+static int l2_peer_active(void)
+{
+    uint64_t t = g_l2_peer_t;
+    return t && timer_now() - t < (uint64_t)L2_PEER_ACTIVE_S * timer_freq();
+}
+
+static int tx_reply(uint16_t ethertype, const uint8_t *payload, int plen)
+{
+    const uint8_t *dst = reply_dst();
+    uint8_t ui[6];
+    int r = tx_frame_raw(dst, ethertype, payload, plen), same = 1;
+
+    if (!dbgip_peer_active || dst == BCAST_MAC || !dbgip_peer_active(ui))
+        return r;
+    for (int i = 0; i < 6; i++)
+        if (dst[i] != ui[i])
+            same = 0;
+    if (!same)
+        (void)tx_frame_raw(ui, ethertype, payload, plen);       /* UDP copy */
+    else if (l2_peer_active())
+        (void)tx_frame_raw(g_l2_peer, ethertype, payload, plen); /* L2 copy */
+    return r;
+}
+
 static void tx_frame(const uint8_t *payload, int plen)
 {
-    (void)tx_frame_raw(reply_dst(), ETHERTYPE_CONSOLE, payload, plen);
+    (void)tx_reply(ETHERTYPE_CONSOLE, payload, plen);
 }
 
 void emac_flush(void)
@@ -2432,7 +2511,7 @@ void emac_flush(void)
  * Returns 1 if queued, 0 if dropped. */
 int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len)
 {
-    return tx_frame_raw(reply_dst(), ethertype, payload, (int)len);
+    return tx_reply(ethertype, payload, (int)len);
 }
 
 int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
@@ -2529,6 +2608,7 @@ static int hv_rx_frame(const uint8_t *buf, int length, uint16_t et)
         uint32_t n;
         int r = dbgauth_rx(buf, (uint32_t)length, &chan, &inner, &n);
         if (r == DBGAUTH_ACCEPT) {
+            note_l2_peer(buf + 6);
             hv_dispatch(chan, inner, n);
             return 1;
         }
@@ -2549,9 +2629,42 @@ static int hv_rx_frame(const uint8_t *buf, int length, uint16_t et)
     else if (et == ETHERTYPE_DBGRAW)
         chan = DBGAUTH_CHAN_DBGTOOLS;
     dbgauth_set_peer(buf + 6);
+    note_l2_peer(buf + 6);
     hv_dispatch(chan, buf + 14, (uint32_t)(length - 14));
     return 1;
 #endif
+#endif
+}
+
+/* An inner debug frame that arrived over UDP (dbgip.c). Only the
+ * authenticated envelope is taken this way: legacy unauthenticated frames
+ * never cross the router. Returns 2 = accepted and dispatched, 1 =
+ * consumed by dbgauth (handshake, NAK, rejected), 0 = not ours. */
+int emac_dbg_rx_inner(const uint8_t *buf, uint32_t length)
+{
+#if defined(PROD_NO_DBG) || !defined(DBG_AUTH)
+    (void)buf; (void)length;
+    return 0;
+#else
+    uint8_t chan = DBGAUTH_CHAN_CONSOLE;
+    const uint8_t *inner;
+    uint32_t n;
+    int r;
+
+    if (length < 14 || ((buf[12] << 8) | buf[13]) != ETHERTYPE_CONSOLE)
+        return 0;
+    if (!emac_mac_is_hv(buf)) {
+        for (int i = 0; i < 6; i++)
+            if (buf[i] != 0xff)
+                return 0;
+    }
+    dbgauth_entropy(((uint64_t)length << 32) ^ (uint32_t)buf[length - 1]);
+    r = dbgauth_rx(buf, length, &chan, &inner, &n);
+    if (r == DBGAUTH_ACCEPT) {
+        hv_dispatch(chan, inner, n);
+        return 2;
+    }
+    return r == DBGAUTH_CONSUMED ? 1 : 0;
 #endif
 }
 
@@ -2632,7 +2745,10 @@ static int emac_rx_drain(int from_irq)
                 bc(29, ++g_rx_irq_hv);
             /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
             dbgauth_entropy(((uint64_t)status << 32) ^ (uint32_t)length);
-            if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
+            if ((et == 0x0806u || (et == 0x0800u && to_us)) && dbgip_rx &&
+                dbgip_rx(buf, (uint32_t)(length - 4))) {
+                /* ARP/ICMP/UDP for the HV's own IPv4 address (dbgip.c) */
+            } else if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
                 /* consumed by the HV debug plane (see hv_rx_frame()) */
             } else if (to_us) {
                 /* Addressed to the HV's own MAC but not a debug frame the
@@ -2717,6 +2833,8 @@ void emac_poll(void)
     vnet_emac_link_update(g_link_up);
 
     emac_nettest_filter_expire();
+    if (dbgip_tick)
+        dbgip_tick();
     (void)emac_rx_drain(0);
     vnet_emac_tx_resume();         /* fallback if no TX_INT came */
 }

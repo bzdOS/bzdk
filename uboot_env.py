@@ -32,11 +32,15 @@ mount_msdosfs failed with EIO. See VBLK_BOOT_GUARD_LBA in vblk_emmc.h.
 """
 import argparse
 import binascii
+import os
 import subprocess
 import sys
 
-GUEST = 'root@192.168.88.82'
-KEY = '/root/.ssh/chimp_ed25519'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bzd_board  # noqa: E402  (guest address: ~/.config/bzdk/board.conf)
+
+GUEST = bzd_board.GUEST
+KEY = bzd_board.GUEST_SSH_KEY
 ESP_DEV = '/dev/vtbd0p2'
 MNT = '/tmp/esp'
 ENV_PATH = MNT + '/uboot.env'

@@ -43,6 +43,7 @@ import sys
 import time
 
 import hvauth
+import bzd_board
 
 ETYPE     = 0x88B5
 BCAST     = b"\xff" * 6
@@ -52,7 +53,8 @@ MINPAY    = 46           # Ethernet minimum payload; board pads/relies on this
 class EmacLink:
     """Raw-Ethernet 0x88B5 link to the board, mirroring hvdbg.py."""
 
-    def __init__(self, iface, key=None):
+    def __init__(self, iface=None, key=None):
+        iface = iface or bzd_board.IFACE
         """`key`: optional hex string overriding the key file."""
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                   socket.htons(ETYPE))
@@ -97,7 +99,8 @@ class EmacLink:
 
 def main():
     ap = argparse.ArgumentParser(description="TCP<->EMAC bridge for the bzdOS GDB stub")
-    ap.add_argument("--iface", default="br0", help="raw-Ethernet interface (default br0)")
+    ap.add_argument("--iface", default=bzd_board.IFACE,
+                    help="debug interface (default from ~/.config/bzdk/board.conf)")
     ap.add_argument("--port", type=int, default=1234, help="TCP port for gdb (default 1234)")
     ap.add_argument("--arm", action="store_true",
                     help="send the dbgmon `gdb` hand-off line before relaying "

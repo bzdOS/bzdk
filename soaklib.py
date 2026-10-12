@@ -53,8 +53,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-GUEST_IP = "192.168.88.82"
-GATEWAY = "192.168.88.1"
+import bzd_board                      # noqa: E402  (board.conf)
+GUEST_IP = bzd_board.GUEST_IP
+GATEWAY = bzd_board.GATEWAY
 ROOT_DEV = "/dev/vtbd0p3"
 HIGH_TEMP_C = 85.0
 
@@ -450,7 +451,7 @@ class Board:
 
     kind = "real"
 
-    def __init__(self, iface="br0", log=None):
+    def __init__(self, iface=None, log=None):
         self.iface = iface
         self.log = log
         self._ssh_ok_last = None
@@ -1435,7 +1436,7 @@ class FakeBoard:
         return True, 120.0, "LOADED & VERIFIED on cycle #1", False
 
 
-def make_board(dry_run, scenario, clock, log, iface="br0"):
+def make_board(dry_run, scenario, clock, log, iface=None):
     """The ONE place a board object is constructed. A dry run can never end up
     with a real Board, whatever else goes wrong — and it also latches the
     DRY_RUN flag that keeps simulated outcomes out of the real ledger."""

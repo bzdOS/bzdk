@@ -31,7 +31,9 @@ T=/opt/bzdos/tftpboot
 W=$(mktemp -d /var/tmp/uimg-chainload.XXXXXX)
 LOG=/var/tmp/uimg-chainload-$TAG.log
 NC=/var/tmp/uimg-chainload-$TAG.nc
-KEY=/root/.ssh/chimp_ed25519; GUEST=root@192.168.88.82
+KEY=/root/.ssh/chimp_ed25519
+# addresses from ~/.config/bzdk/board.conf (bzd_board.py)
+eval "$(python3 -c 'import sys; sys.path.insert(0, "/opt/bzdos/microkernel"); import bzd_board as b; print(f"GUEST={b.GUEST} BOARD_IP={b.BOARD_IP} WIRE={b.WIRE_IFACE}")')"
 log() { echo "$(date +%T) $*" | tee -a "$LOG"; }
 : > "$LOG"
 
@@ -58,9 +60,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-timeout 900 tcpdump -l -ni br0 -A 'udp port 6666' > "$NC" 2>/dev/null &
+timeout 900 tcpdump -l -ni "$WIRE" -A 'udp port 6666' > "$NC" 2>/dev/null &
 if [ -n "$NOUSB" ]; then
-    ( timeout 300 tcpdump -ni br0 -c1 'src host 192.168.88.7 and udp dst port 69' >/dev/null 2>&1
+    ( timeout 300 tcpdump -ni "$WIRE" -c1 "src host $BOARD_IP and udp dst port 69" >/dev/null 2>&1
       echo 0 > /sys/bus/usb/devices/usb2/authorized_default
       echo "$(date +%T) stock loader at TFTP: usb2 authorized_default=0" >> "$LOG" ) &
 fi

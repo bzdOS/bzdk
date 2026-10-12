@@ -1,0 +1,13 @@
+[Unit]
+Description=bzdk HV debug channel over UDP (tap bzd0 <-> board dbg_port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /opt/bzdos/microkernel/bzd_udplink.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

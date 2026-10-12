@@ -52,8 +52,9 @@ import sys, time, os
 sys.path.insert(0, "/opt/bzdos/microkernel")
 import loady_over_acm as L
 
-BOARD_IP = "192.168.88.7"
-SRV_IP   = "192.168.88.2"
+import bzd_board  # noqa: E402  (board.conf)
+BOARD_IP = bzd_board.BOARD_IP
+SRV_IP   = bzd_board.SRV_IP
 
 # CORRECTED 2026-08-23: tftp + bootm on a proper uImage, NOT tftp + bootelf on
 # the raw ELF (see the module docstring for why). `setenv autostart no/yes`

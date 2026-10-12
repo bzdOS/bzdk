@@ -39,7 +39,8 @@ CSI       = re.compile(rb'\x1b\[[0-9;?]*[a-zA-Z]')
 
 class HV:
     """Connection to the running hypervisor debug monitor over EMAC."""
-    def __init__(self, iface=IFACE, timeout=3, key=None):
+    def __init__(self, iface=None, timeout=3, key=None):
+        iface = iface or B.IFACE      # board.conf: wire (l2) or udplink tap
         """`key`: optional hex string overriding the key file (see the
         module docstring and hvauth.py)."""
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,

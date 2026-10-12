@@ -188,6 +188,22 @@
 #define HVMAP_DBGTOOLS_SIZE         0x40UL            /* generous, room to grow */
 #define HVMAP_DBGTOOLS_END          (HVMAP_DBGTOOLS_BASE + HVMAP_DBGTOOLS_SIZE)
 
+/* ---- 0x50021100 eMMC boot-slot record (U-Boot bootcmd <-> HV) ----------
+ * Written by U-Boot's bootcmd with mw.l before it loads a slot from the ESP
+ * (docs/emmc-boot.md), read and cleared by the HV. Lives in this reserved
+ * page because the guest cannot write it and a warm (watchdog) reset keeps
+ * it; a cold boot leaves garbage, which the magic check discards.
+ *   [0] magic HVMAP_BOOTSLOT_MAGIC ("BZAB")
+ *   [1] tries -- boots since the last healthy boot from `cur`; U-Boot boots
+ *       `cur` while tries <= 3, else `lkg`
+ *   [2] slot U-Boot booted: 1 cur, 2 lkg, 3 TFTP
+ *   [3] HV: 1 once this boot was healthy (dbgtools_tick, 90 s up, guest
+ *       not held); a healthy boot from `cur` also zeroes [1]. U-Boot zeroes
+ *       it before every boot. */
+#define HVMAP_BOOTSLOT              0x50021100UL
+#define HVMAP_BOOTSLOT_MAGIC        0x42415a42UL   /* "BZAB" */
+#define HVMAP_BOOTSLOT_SIZE         0x10UL
+
 /* ---- 0x50022000 watchdog EPISODE record ("WDEP", emac.c) --------------
  * Written ONLY by emac.c's link-watchdog / link_recheck / emac_poll paths,
  * NEVER by emac_init() — so the record survives the recovery reboot and
