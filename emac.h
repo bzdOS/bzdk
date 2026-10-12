@@ -44,6 +44,19 @@ int emac_init(void);
  * musb_poll()). Cheap and non-blocking. */
 void emac_poll(void);
 
+/* EMAC RX interrupt service (SPI 82, CPU1 only, from gic_timer_irq()):
+ * drains guest frames between ticks. See emac.c. */
+#define EMAC_IRQ_SPI    82u
+#define EMAC_IRQ_INTID  (32u + EMAC_IRQ_SPI)     /* 114 */
+void emac_rx_irq(void);
+
+/* RX/TX performance counters for dbgmon `netstat`: [0] rx frames [1] rx irqs
+ * [2] rx irq frames [3] irq drains deferred to the tick [4] max batch
+ * [5] rx ring-full events [6] rx fifo overflows [7] tx frames [8] tx drops
+ * [9] rx ring size [10] tx ring size */
+#define EMAC_PERF_NSTATS 11
+void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS]);
+
 /* Current, LIVE link state — refreshed periodically inside emac_poll() (not
  * a one-shot latch from emac_init()). A brief autoneg re-negotiation blip is
  * debounced and will NOT flip this to 0; only a link that stays down across

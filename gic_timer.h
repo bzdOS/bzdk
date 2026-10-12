@@ -111,6 +111,13 @@ void gic_timer_cpuif_init(void);
  * unmasking IRQs on CPU1. */
 void musb_irq_arm_cpu1(void);
 
+/* Same for the EMAC RX interrupt (EMAC_IRQ_INTID, emac.h; audit item 9):
+ * target CPU1, enable, and let gic_timer_irq() call emac_rx_irq(). Call once
+ * from vcpu1_run() beside musb_irq_arm_cpu1(). emac_irq_stats(): [0] armed
+ * [1] budget throttles [2] wrong-core arrivals. */
+void emac_irq_arm_cpu1(void);
+void emac_irq_stats(uint32_t out[3]);
+
 #ifdef HV_HDMI
 /* Target the real TCON1 vblank SPI (HDMI_TCON1_IRQ_INTID, hdmi.h) at CPU1's
  * GIC CPU interface alone, enable it at the distributor, AND turn on the

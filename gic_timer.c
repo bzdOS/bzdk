@@ -1153,6 +1153,40 @@ musb_irq_arm_cpu1(void)
 	    (1u << GICD_BIT(MUSB_IRQ_INTID));
 }
 
+/* ------------------------------------------------------------------ *
+ * EMAC_IRQ_INTID (114, SPI 82, the EMAC "macirq" -- emac.h), audit item 9:
+ * RX by interrupt instead of only the 10 ms tick. Same treatment as
+ * MUSB_IRQ_INTID above: EL2-owned (the guest's ethernet@1c30000 node is
+ * status="disabled"), targeted at CPU1 alone, never handed to
+ * vgic_inject_hw(), a per-tick budget against a stuck level line, and the
+ * tick re-asserts enable + target because the guest's GIC driver resets the
+ * distributor during its own attach. The EMAC side (INT_EN = RX | RX_BUF_UA)
+ * is set at emac_init(); nothing raises the line at the GIC until this runs.
+ * ------------------------------------------------------------------ */
+#define EMAC_IRQ_BUDGET_PER_TICK 64u
+static volatile uint32_t g_emac_irq_armed;
+static uint32_t g_emac_irqs_tick;       /* CPU1 only: serviced this tick      */
+static uint32_t g_emac_throttles;       /* budget ran out, masked till tick   */
+static uint32_t g_emac_wrong_core;      /* arrived on another core, masked    */
+
+void
+emac_irq_arm_cpu1(void)
+{
+	GICD_IPRIORITYR_BYTE(EMAC_IRQ_INTID) = (uint8_t)TIMER_PRIORITY;
+	GICD_ITARGETSR_BYTE(EMAC_IRQ_INTID) = (1u << 1);
+	g_emac_irq_armed = 1u;
+	GICD_ISENABLER(GICD_WORD(EMAC_IRQ_INTID)) =
+	    (1u << GICD_BIT(EMAC_IRQ_INTID));
+}
+
+void
+emac_irq_stats(uint32_t out[3])
+{
+	out[0] = g_emac_irq_armed;
+	out[1] = g_emac_throttles;
+	out[2] = g_emac_wrong_core;
+}
+
 #ifdef HV_HDMI
 /* ------------------------------------------------------------------ *
  * HDMI_TCON1_IRQ_INTID (119, SPI 87, TCON1/"lcd-controller@1c0d000" — hdmi.h)
@@ -1353,6 +1387,32 @@ gic_timer_irq(struct el2_frame *frame)
 	 * re-asserts the targeting (see the tick block), so this self-corrects;
 	 * the counter exists so "it is landing on the wrong core" is visible
 	 * instead of being a silent performance leak on the guest's vCPU0. */
+	if (intid == EMAC_IRQ_INTID) {
+		if (smp_cpu_id() != SMP_DEBUG_CPU || !dbg_vcpu1) {
+			/* Wrong core: the guest's GIC init retargeted it. The line
+			 * is level and only CPU1 may touch the RX ring, so mask it
+			 * rather than let it re-fire here; CPU1's tick re-targets
+			 * and re-enables it. */
+			GICD_ICENABLER(GICD_WORD(EMAC_IRQ_INTID)) =
+			    (1u << GICD_BIT(EMAC_IRQ_INTID));
+			g_emac_wrong_core++;
+			GICC_EOIR = iar;
+			GICC_DIR = iar;
+			return;
+		}
+		emac_rx_irq();            /* clears INT_STA, then drains */
+		GICC_EOIR = iar;
+		GICC_DIR = iar;
+		if (++g_emac_irqs_tick >= EMAC_IRQ_BUDGET_PER_TICK) {
+			/* Past the budget the tick's own emac_poll() drains the
+			 * ring; the 256-descriptor ring holds 30 ms of full-size
+			 * frames, three ticks. */
+			GICD_ICENABLER(GICD_WORD(EMAC_IRQ_INTID)) =
+			    (1u << GICD_BIT(EMAC_IRQ_INTID));
+			g_emac_throttles++;
+		}
+		return;
+	}
 	if (intid == MUSB_IRQ_INTID && smp_cpu_id() != SMP_DEBUG_CPU) {
 		gt->musb_wrong_core++;
 		GICC_EOIR = iar;
@@ -1724,6 +1784,16 @@ gic_timer_irq(struct el2_frame *frame)
 		 * comment and vgicd.c's SAS-decode note on the same hazard). */
 		if (GICD_ITARGETSR_BYTE(MUSB_IRQ_INTID) != (1u << 1))
 			GICD_ITARGETSR_BYTE(MUSB_IRQ_INTID) = (1u << 1);
+
+		/* EMAC RX interrupt: new budget, then the same drift-correcting
+		 * re-target + unconditional re-enable as MUSB just above. */
+		g_emac_irqs_tick = 0;
+		if (g_emac_irq_armed) {
+			if (GICD_ITARGETSR_BYTE(EMAC_IRQ_INTID) != (1u << 1))
+				GICD_ITARGETSR_BYTE(EMAC_IRQ_INTID) = (1u << 1);
+			GICD_ISENABLER(GICD_WORD(EMAC_IRQ_INTID)) =
+			    (1u << GICD_BIT(EMAC_IRQ_INTID));
+		}
 
 #ifdef HV_HDMI
 		/* Refresh the TCON1 vblank storm budget and un-mask the line if the

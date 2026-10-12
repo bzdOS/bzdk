@@ -121,6 +121,13 @@ const char *const bzdos_emac_owner = "emac";
 #define  EMAC_CTL1_BURST_LEN_SHIFT 24
 #define EMAC_INT_STA         0x08
 #define EMAC_INT_EN          0x0c
+/* EMAC_INT_STA / EMAC_INT_EN bits (Linux dwmac-sun8i.c). INT_STA is
+ * write-1-to-clear; the line (SPI 82) is level and stays up while any
+ * enabled status bit is set. */
+#define  EMAC_INT_RX             (1u << 8)    /* a frame was received        */
+#define  EMAC_INT_RX_BUF_UA      (1u << 9)    /* RX ring full: DMA suspended */
+#define  EMAC_INT_RX_OVERFLOW    (1u << 12)   /* RX FIFO overflowed          */
+#define  EMAC_INT_STA_MASK       0x3fffu
 #define EMAC_TX_CTL0         0x10
 #define  EMAC_TX_CTL0_TX_EN      (1u << 31)
 #define EMAC_TX_CTL1         0x14
@@ -198,8 +205,14 @@ const char *const bzdos_emac_owner = "emac";
  *
  * Linux's sun8i-emac uses 256. 64 is 8x the buffering for 132 KiB of the 1 MiB
  * non-cacheable scratch window, which was 96% unused. The ring is a linked list
- * (each descriptor carries `next`), so depth is purely a memory question. */
-#define N_RX_DESC       64
+ * (each descriptor carries `next`), so depth is purely a memory question.
+ *
+ * 256 since 2026-10-12 (audit item 9). Measured at 64: RX could never take more
+ * than 64 frames per 10 ms poll, so TCP into the guest topped out at ~67 Mbit/s
+ * and a burst of 128 small frames lost exactly 64. RX is now also drained from
+ * the EMAC's own interrupt (emac_rx_irq()), and a full ring is counted
+ * (RX_BUF_UA / RX_OVERFLOW, bc[24]/[25], dbgmon `netstat`). */
+#define N_RX_DESC       256
 #define ETH_BUFSIZE     2048           /* per-descriptor buffer */
 #define ETH_RXSIZE      2044           /* sun8i_emac.c CFG_ETH_RXSIZE */
 
@@ -362,6 +375,7 @@ __attribute__((weak)) void snapshot_net_rx_frame(const uint8_t *payload, uint16_
  * netcon's — i.e. every ethertype this file's own RX dispatch does not
  * already claim. */
 extern void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len);
+extern void vnet_emac_rx_flush(void);
 __attribute__((weak)) void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 {
     (void)frame; (void)len;   /* no vnet_emac linked in: drop silently */
@@ -373,6 +387,12 @@ extern void vnet_emac_link_update(int emac_link_up);
 __attribute__((weak)) void vnet_emac_link_update(int emac_link_up)
 {
     (void)emac_link_up;
+}
+
+/* vnet_emac.c: raise one guest interrupt for everything one RX drain
+ * delivered; weak no-op without vnet. */
+__attribute__((weak)) void vnet_emac_rx_flush(void)
+{
 }
 
 /* dbgtools.c provides the real implementation (dbg/gdb builds only); same
@@ -404,10 +424,11 @@ __attribute__((weak)) void dbgtools_rx_frame(const uint8_t *payload, uint16_t le
  * would have run straight into the old TX_BUF_BASE at +0x1000. Each region gets
  * room to grow again, and the asserts below make a future overlap a build
  * failure rather than a DMA engine quietly writing over a neighbour. */
-#define TX_DESC_BASE    (SCRATCH_BASE + 0x00000UL)   /* 8 * 64   =   512 B */
-#define RX_DESC_BASE    (SCRATCH_BASE + 0x01000UL)   /* 64 * 64  =  4 KiB  */
-#define TX_BUF_BASE     (SCRATCH_BASE + 0x02000UL)   /* 8 * 2048 = 16 KiB  */
-#define RX_BUF_BASE     (SCRATCH_BASE + 0x08000UL)   /* 64 * 2048 = 128 KiB */
+/* Re-laid out again for N_RX_DESC 256 (and room for 64 TX descriptors). */
+#define TX_DESC_BASE    (SCRATCH_BASE + 0x00000UL)   /* <=64 * 64   =   4 KiB */
+#define RX_DESC_BASE    (SCRATCH_BASE + 0x01000UL)   /* 256 * 64    =  16 KiB */
+#define TX_BUF_BASE     (SCRATCH_BASE + 0x08000UL)   /* <=64 * 2048 = 128 KiB */
+#define RX_BUF_BASE     (SCRATCH_BASE + 0x28000UL)   /* 256 * 2048  = 512 KiB */
 #define SCRATCH_END     (RX_BUF_BASE + (unsigned long)N_RX_DESC * ETH_BUFSIZE)
 
 _Static_assert(TX_DESC_BASE + (unsigned long)N_TX_DESC * DESC_STRIDE <= RX_DESC_BASE,
@@ -512,6 +533,14 @@ static inline void udelay_spin(uint32_t n)
  *                     Nonzero here means the far end would not negotiate the
  *                     restricted advertisement -- read [20] and the switch.
  *  [19] first_rx     latches to 1 the FIRST time a frame is ever accepted
+ *  [23] rx_irqs      EMAC RX interrupts serviced (emac_rx_irq(), CPU1)
+ *  [24] rx_buf_ua    RX ring-full events (INT_STA RX_BUF_UA: the DMA had no
+ *                     free descriptor, frames were lost in hardware)
+ *  [25] rx_overflow  RX FIFO overflow events (INT_STA RX_OVERFLOW)
+ *  [26] wd_test_mode / [27] wd_test_skips (emac_wd_test_mode())
+ *  [28] rx_irq_frames frames drained from the interrupt rather than the tick
+ *  [29] rx_irq_deferred IRQ drains that stopped at an HV debug frame
+ *  [30] rx_max_batch most descriptors drained in one pass
  *  [32] tx_lock_contended  sticky 1 if the cross-core TX lock (added for
  *                     vnet_emac.c, EMAC_TX_LOCK_PA) was ever seen already
  *                     held by tx_frame_raw()'s bounded acquire — expected
@@ -1503,6 +1532,12 @@ int emac_init(void)
      * (recovered via the USB-ACM break-glass, see project memory) before
      * this fix was written correctly here. */
     wr(EMAC_RX_FRM_FLT, EMAC_FRM_FLT_RXALL | EMAC_FRM_FLT_DIS_ADDR);
+    /* RX interrupt sources (audit item 9): a received frame and a full ring.
+     * Inert until something enables SPI 82 at the GIC distributor -- only
+     * emac_irq_arm_cpu1() (gic_timer.c, dbg build with vcpu1) does; every
+     * other image keeps polling exactly as before. */
+    wr(EMAC_INT_STA, EMAC_INT_STA_MASK);
+    wr(EMAC_INT_EN, EMAC_INT_RX | EMAC_INT_RX_BUF_UA);
     setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
     setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
     __asm__ volatile("dsb sy" ::: "memory");
@@ -2329,27 +2364,45 @@ static int hv_rx_frame(const uint8_t *buf, int length, uint16_t et)
 }
 
 /* ------------------------------------------------------------------ */
-/* RX — drain the ring into the getc byte buffer                        */
+/* RX — drain the ring into the getc byte buffer / the guest             */
 /* ------------------------------------------------------------------ */
-void emac_poll(void)
+/* RX-side performance counters (audit item 9), exported by bc() and by    */
+/* emac_perf_stats() (dbgmon `netstat`).                                   */
+static uint32_t g_rx_irqs;         /* bc[23] EMAC RX interrupts serviced    */
+static uint32_t g_rx_buf_ua;       /* bc[24] RX ring-full (DMA suspended)   */
+static uint32_t g_rx_overflow;     /* bc[25] RX FIFO overflow events        */
+static uint32_t g_rx_irq_frames;   /* bc[28] frames drained from the IRQ    */
+static uint32_t g_rx_irq_deferred; /* bc[29] IRQ drains that stopped at an HV
+                                    * debug frame and left it to the tick  */
+static uint32_t g_rx_max_batch;    /* bc[30] most frames drained at once    */
+
+/* Read and clear (write-1) the EMAC interrupt status; count the RX loss
+ * events. Called by both drain paths before they walk the ring, so a frame
+ * that lands after the clear raises the (level) line again. */
+static void emac_int_latch(void)
 {
-    bc(1, BC_STAGE_LOOP);
-    bc(8, rd(EMAC_INT_STA));
+    uint32_t st = rd(EMAC_INT_STA) & EMAC_INT_STA_MASK;
 
-    /* Episode-record heartbeat: proves (after a recovery reboot) whether
-     * polling kept running through a dark episode, and roughly how long.
-     * One DRAM write per 256 polls — negligible. */
-    if ((++g_wdep_poll_cnt & 0xffu) == 0)
-        wdep_write(12, g_wdep_poll_cnt >> 8);
+    if (!st)
+        return;
+    wr(EMAC_INT_STA, st);
+    bc(8, st);
+    if (st & EMAC_INT_RX_BUF_UA)
+        bc(24, ++g_rx_buf_ua);
+    if (st & EMAC_INT_RX_OVERFLOW)
+        bc(25, ++g_rx_overflow);
+}
 
-    /* Throttled live link check: MDIO transactions are relatively slow
-     * (tens of us each), so we don't want one on every single poll — but we
-     * do want emac_link_up() to reflect reality within a fraction of a
-     * second, not just at emac_init() time. */
-    if ((++g_poll_calls & (LINK_CHECK_INTERVAL - 1u)) == 0 &&
-        !emac_rekick_active())
-        link_recheck();
-    vnet_emac_link_update(g_link_up);
+/* Walk the RX ring. `from_irq`: called from emac_rx_irq() rather than the
+ * tick's emac_poll(). The IRQ path takes only frames the HV does not act on
+ * (guest traffic, frames to the HV MAC that are just counted) and stops at
+ * the first HV debug-plane frame, leaving it -- and everything behind it --
+ * for the tick, so the debug channel (console bytes, netcon, snapnet,
+ * dbgtools) is serviced exactly where and when it always was. Returns the
+ * number of descriptors consumed. */
+static int emac_rx_drain(int from_irq)
+{
+    int done = 0;
 
     for (int guard = 0; guard < N_RX_DESC; guard++) {
         volatile struct emac_desc *d = rx_desc(g_rx_slot);
@@ -2376,10 +2429,14 @@ void emac_poll(void)
                 if (buf[i] != g_hv_mac[i]) to_us = 0;
                 if (buf[i] != 0xff)       bcast = 0;
             }
-            /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
-            dbgauth_entropy(((uint64_t)status << 32) ^ (uint32_t)length);
             int hv_et = (et == ETHERTYPE_CONSOLE || et == ETHERTYPE_NETCON ||
                          et == ETHERTYPE_SNAPNET || et == ETHERTYPE_DBGRAW);
+            if (from_irq && hv_et && (to_us || bcast)) {
+                bc(29, ++g_rx_irq_deferred);
+                break;                /* the tick's emac_poll() takes it */
+            }
+            /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
+            dbgauth_entropy(((uint64_t)status << 32) ^ (uint32_t)length);
             if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
                 /* consumed by the HV debug plane (see hv_rx_frame()) */
             } else if (to_us) {
@@ -2431,10 +2488,70 @@ void emac_poll(void)
 
         if (++g_rx_slot >= N_RX_DESC)
             g_rx_slot = 0;
+        done++;
     }
 
-    /* Keep RX DMA pumping in case it stalled at the ring tail. */
+    if ((uint32_t)done > g_rx_max_batch)
+        bc(30, g_rx_max_batch = (uint32_t)done);
+    /* Keep RX DMA pumping in case it stalled at the ring tail (RX_BUF_UA
+     * suspends it until this is written). */
     setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_START);
+    /* One guest interrupt for the whole batch (vnet_emac.c). */
+    vnet_emac_rx_flush();
+    return done;
+}
+
+void emac_poll(void)
+{
+    bc(1, BC_STAGE_LOOP);
+    emac_int_latch();
+
+    /* Episode-record heartbeat: proves (after a recovery reboot) whether
+     * polling kept running through a dark episode, and roughly how long.
+     * One DRAM write per 256 polls — negligible. */
+    if ((++g_wdep_poll_cnt & 0xffu) == 0)
+        wdep_write(12, g_wdep_poll_cnt >> 8);
+
+    /* Throttled live link check: MDIO transactions are relatively slow
+     * (tens of us each), so we don't want one on every single poll — but we
+     * do want emac_link_up() to reflect reality within a fraction of a
+     * second, not just at emac_init() time. */
+    if ((++g_poll_calls & (LINK_CHECK_INTERVAL - 1u)) == 0 &&
+        !emac_rekick_active())
+        link_recheck();
+    vnet_emac_link_update(g_link_up);
+
+    (void)emac_rx_drain(0);
+}
+
+/* EMAC interrupt (SPI 82), serviced on CPU1 by gic_timer_irq() between two
+ * ticks: guest frames reach the guest within microseconds instead of waiting
+ * up to 10 ms for the next emac_poll(). Same core as emac_poll(), never
+ * nested with it (both run with EL2 IRQs masked), so the ring needs no lock.
+ * Clears the interrupt status first, so the level line drops once the ring
+ * is drained and rises again for the next frame. */
+void emac_rx_irq(void)
+{
+    emac_int_latch();
+    bc(23, ++g_rx_irqs);
+    uint32_t n = (uint32_t)emac_rx_drain(1);
+    g_rx_irq_frames += n;
+    bc(28, g_rx_irq_frames);
+}
+
+void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS])
+{
+    out[0] = g_rx_count;
+    out[1] = g_rx_irqs;
+    out[2] = g_rx_irq_frames;
+    out[3] = g_rx_irq_deferred;
+    out[4] = g_rx_max_batch;
+    out[5] = g_rx_buf_ua;
+    out[6] = g_rx_overflow;
+    out[7] = g_tx_count;
+    out[8] = g_tx_drops;
+    out[9] = N_RX_DESC;
+    out[10] = N_TX_DESC;
 }
 
 int emac_getc(void)

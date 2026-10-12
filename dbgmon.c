@@ -98,6 +98,10 @@ extern void emac_guest_mac(uint8_t out[6]);
 extern uint32_t emac_mac_source(void);
 extern uint32_t emac_rx_to_hv_dropped(void);
 extern void vnet_emac_force_link_down(uint32_t polls) __attribute__((weak));
+/* `netstat` (audit items 9-12): EMAC ring/IRQ counters; the IRQ ones live in
+ * gic_timer.c, weak so a target without it still links. */
+extern void emac_perf_stats(uint32_t out[11]);
+extern void emac_irq_stats(uint32_t out[3]) __attribute__((weak));
 
 /* Guest single-step toggle, implemented in el2_exc.c (linked into the same
  * debugger build). Returns the new enabled state (1=on, 0=off). Passing the
@@ -1170,6 +1174,7 @@ static void cmd_help(void)
 	cputs("  phycycle           DISABLED (EL2 RSB races the guest's iichb1 — use guest-side phycut)\r\n");
 	cputs("  wdtest on|off      software 'PHY never trains' — exercises the give-up/escalation ladder\r\n");
 	cputs("  nettest [quiet <s>|vlink <s>|phydown]  link-watchdog/vnet link test levers (hex s)\r\n");
+	cputs("  netstat                 EMAC RX/TX ring + interrupt counters (hex)\r\n");
 	cputs("  mac                     HV and guest MAC addresses (SID-derived)\r\n");
 	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
 	cputs("  zstage             re-run the 2nd guest's copy-in from the landing window\r\n");
@@ -1487,6 +1492,23 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cputs(" to_hv_dropped=0x");
 		print_hex32(emac_rx_to_hv_dropped());
 		cputs("\r\n");
+		return;
+	}
+	if (streq(cmd, "netstat")) {
+		static const char *const names[14] = {
+			"rx", "rx_irqs", "rx_irq_frames", "irq_deferred", "max_batch",
+			"rx_ring_full", "rx_fifo_ovf", "tx", "tx_drops", "rx_ring",
+			"tx_ring", "irq_armed", "irq_throttles", "irq_wrong_core" };
+		uint32_t st[14] = { 0 };
+		emac_perf_stats(st);
+		if (emac_irq_stats)
+			emac_irq_stats(&st[11]);
+		for (int i = 0; i < 14; i++) {
+			cputs(names[i]);
+			cputs("=");
+			print_hex32(st[i]);
+			cputs(i == 13 ? "\r\n" : " ");
+		}
 		return;
 	}
 	if (streq(cmd, "nettest")) {

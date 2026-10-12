@@ -272,6 +272,11 @@ void vcpu1_run(void)
 	 * TIMER_INTID). */
 	musb_irq_arm_cpu1();
 
+	/* EMAC RX interrupt (audit item 9): guest frames are drained when they
+	 * arrive instead of on the next 10 ms tick. Same contract as the MUSB
+	 * arm above. */
+	emac_irq_arm_cpu1();
+
 #ifdef HV_HDMI
 	/* The HDMI/TCON1 vblank SPI, same treatment and for the same reason as
 	 * MUSB immediately above: the duty is event-shaped, not period-shaped.

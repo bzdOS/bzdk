@@ -356,7 +356,8 @@ int vnet_mmio_fault(struct el2_frame *frame);
  * byte) and `len` is its total length (>=14, <=ETH_RXSIZE, already CRC/
  * length/error-checked by emac_poll() before this is called). Prepends the
  * legacy 10-byte virtio_net_hdr, scatters into the guest's next available RX
- * descriptor chain (queue 0) if one exists, and injects VNET_INTID; drops
+ * descriptor chain (queue 0) if one exists (the interrupt is raised once per
+ * drain by vnet_emac_rx_flush()); drops
  * (with a breadcrumb count) if the guest has posted no RX buffer, or if the
  * device is not yet DRIVER_OK. Never blocks. NOT reentrant against itself
  * (only ever called from the single EMAC-polling core) but IS reentrant
@@ -364,6 +365,10 @@ int vnet_mmio_fault(struct el2_frame *frame);
  * the cross-core concurrency comment block in vnet_emac.c before relying on
  * this in a build that matters. */
 void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len);
+
+/* Called by emac.c after each RX drain: one VRING interrupt for every frame
+ * vnet_emac_rx_frame() queued since the last call (audit item 12). */
+void vnet_emac_rx_flush(void);
 
 /* Link-status hook, called from emac_poll() (CPU1) on every poll with the
  * EMAC's current debounced link state. Publishes a change into config.status,

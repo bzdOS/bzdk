@@ -38,7 +38,10 @@
  *          otherwise prepends the legacy 10-byte virtio_net_hdr (all-zero:
  *          no offloads negotiated) and scatters header+frame across the
  *          guest's descriptor chain; pushes the used-ring entry with the
- *          total byte count; injects VNET_INTID.
+ *          total byte count. emac.c calls vnet_emac_rx_flush() at the end of
+ *          each drain, which injects VNET_INTID once for the whole batch.
+ *          Since 2026-10-12 the drain runs from the EMAC RX interrupt on CPU1
+ *          as well as from the 10 ms tick (audit item 9).
  *
  * MAC IDENTITY NOTE: emac_send_frame(ethertype, payload, len) — the ONLY
  * transmit primitive this task's brief permits calling — always builds its
@@ -222,6 +225,7 @@ static uint32_t g_tx_linkdown;        /* [22] guest TX dropped, link down */
 static uint32_t g_rx_reset_busy;      /* [23] RX dropped, queue being reset */
 static uint32_t g_link_changes;       /* [24] link changes published */
 static volatile uint32_t g_force_down_polls;  /* nettest vlink: polls left */
+static uint32_t g_rx_irq_pending;     /* CPU1: frames queued since the last flush */
 
 /* Per-queue locks (see the QUEUE STATE vs DEVICE RESET note at the top).
  * Plain BSS words: HV memory is Normal cacheable and the cores run with
@@ -732,7 +736,16 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 	vq_push_used(vq, head, written);
 	vq_unlock(VNET_QUEUE_RX);
 	vnet_bc(4, ++g_rx_queued);
+	g_rx_irq_pending = 1u;        /* one interrupt per drain: vnet_emac_rx_flush() */
+}
 
+/* End of one EMAC RX drain (emac.c, CPU1): if anything was queued, set the
+ * VRING cause and raise the guest interrupt once for the whole batch. */
+void vnet_emac_rx_flush(void)
+{
+	if (!g_rx_irq_pending)
+		return;
+	g_rx_irq_pending = 0u;
 	int_status_or((volatile uint32_t *)&g_net.int_status, VNET_INT_VRING);
 	vnet_inject_irq();
 }
