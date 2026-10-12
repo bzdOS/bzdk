@@ -80,7 +80,13 @@ U-Boot's `bzdk_net` (exported with the other four; absent or anything but
   `board_ip = auto`, `bzd_udplink.py` treats any datagram from an address
   that is not the current board's as a candidate, sends a HELLO there, and
   adopts the address only if the CHAL carries a valid proof of the shared
-  key (one try per candidate per 10 s). The verified address goes to
+  key (one try per candidate per 10 s). Behind the MikroTik the announce
+  never arrives (it forwards from 192.0.2.0/24 to the host's LAN only
+  replies to connections the host opened, and source-NATs the host), so
+  `board_ip = auto` also sweeps the board's subnet with HELLOs (last
+  known address first) until one answers with a valid proof, and again
+  when frames go up and nothing comes back; the CHAL is a reply and
+  passes. The verified address goes to
   `~/.config/bzdk/board.ip`; a new lease is followed the same way. An
   address change drops the HV's UDP peer (its next hop may be different);
   sessions stay valid, the next DATA frame re-commits the peer.
@@ -108,7 +114,24 @@ full lease cycle, backoff, NAK, release, and guest replies with chaddr
 `12:..` -- broadcast, unicast, even with the HV's xid -- never taken),
 `bzd_udplink.py --selftest` (adoption only after a valid CHAL, wrong key
 refused, rate limit, explicit mode never learns; once over real loopback
-sockets). Not yet run on the board.
+sockets).
+
+On the board, 2026-10-12, in 192.0.2.0/24 behind the MikroTik: the HV took
+a lease (192.0.2.121, 24 h), the guest got its own by dhclient, the host
+found the HV by the sweep within seconds and the guest through the HV;
+hvauth, hvdbg, triage, hv_deploy and guest ssh work, the guest reaches the
+internet and resolves names. After a warm reboot both came back with the
+two addresses swapped (HV .122, guest .121), and the host followed both
+without help. Give the two MACs static leases on the router if stable
+addresses matter.
+
+Not understood yet: the first boot in DHCP mode, still on the old segment
+(192.168.88.0/24) right after `cutover.py apply`, sent no DHCP request at
+all, fell back to 192.0.2.7, kept ARPing for 192.0.2.1 and answered ping,
+but answered no debug frame (neither L2 nor UDP) and the guest never came
+on the wire. Moving the cable to 192.0.2.0/24 brought the board back
+through a reset whose cause was not captured. A live `ip dhcp` on the
+same segment worked earlier the same day.
 
 ## Boot from the eMMC (`emmc_boot.py`, `hv_deploy.py`)
 

@@ -151,8 +151,9 @@ so the debug channel crosses a router; `bzd_udplink.py` (service
 `bzd-udplink`) bridges a host tap `bzd0` to it and `transport = udp` in
 board.conf points every tool at that tap. dbgmon `ip` shows the state.
 With `bzdk_net=dhcp` the HV's address is a DHCP lease taken with its own MAC
-(`dbgdhcp.c`; U-Boot's `ipaddr` after 10 s without one), announced to the
-host, which adopts it only after an authenticated handshake; `ip dhcp` /
+(`dbgdhcp.c`; U-Boot's `ipaddr` after 10 s without one), found by the host
+(announce, or a HELLO sweep of the subnet when a router drops the announce)
+and adopted only after an authenticated handshake; `ip dhcp` /
 `ip static` switch live.
 
 Boot (since 2026-10-12): U-Boot loads HV, kernel and DTB from the eMMC ESP
