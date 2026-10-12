@@ -63,6 +63,7 @@
  * same, already-handled outcome.
  */
 #include <stdint.h>
+#include "nc_copy.h"
 #include "emac.h"
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
 #include "dbgauth.h"   /* authenticated envelope for every HV debug channel
@@ -2166,15 +2167,20 @@ static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
 
     buf = (uint8_t *)(uintptr_t)d->buf_addr;
 
-    for (i = 0; i < 6; i++) buf[i] = dst[i];           /* dst */
-    for (i = 0; i < 6; i++) buf[6 + i] = src[i];       /* src */
-    buf[12] = (uint8_t)(ethertype >> 8);
-    buf[13] = (uint8_t)(ethertype & 0xff);
-    for (i = 0; i < plen; i++) buf[14 + i] = payload[i];
+    {
+        uint8_t eh[14];
+        for (i = 0; i < 6; i++) eh[i] = dst[i];        /* dst */
+        for (i = 0; i < 6; i++) eh[6 + i] = src[i];    /* src */
+        eh[12] = (uint8_t)(ethertype >> 8);
+        eh[13] = (uint8_t)(ethertype & 0xff);
+        nc_copy(buf, eh, 14);
+    }
+    /* The buffer is Non-cacheable: word-wide copy, not one access per byte. */
+    nc_copy(buf + 14, payload, (uint32_t)plen);
 
     total = 14 + plen;
     if (total < 60) {                 /* pad to the 60-byte min (pre-CRC) */
-        for (i = total; i < 60; i++) buf[i] = 0;
+        nc_zero(buf + total, (uint32_t)(60 - total));
         total = 60;
     }
 

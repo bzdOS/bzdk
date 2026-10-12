@@ -141,6 +141,7 @@
 #include "guest_mem.h"   /* guest_gpa_ok(): guest RAM minus every HV-owned window */
 #include "emac.h"           /* emac_send_frame() */
 #include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO, ...) on QueueNotify */
+#include "nc_copy.h"        /* word-wide copies to/from Non-cacheable memory */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -196,15 +197,46 @@
  * (debug console, netcon, dbgtools, snapnet), plus tagged frames too short to
  * show their inner ethertype.
  * ------------------------------------------------------------------ */
+/*   [27] EL2 time spent delivering RX frames (CNTPCT ticks, 24 MHz, low 32)
+ *   [28] EL2 time spent in TX kicks (same unit)
+ *   [29] TX kicks (QueueNotify on the transmitq)
+ *   [30] RX frames dropped for not fitting the guest's buffer (were
+ *        truncated before 2026-10-12)
+ *   [31] TX frames dropped for exceeding the largest Ethernet frame
+ *
+ * Since 2026-10-12 (audit item 10) a counter update is a plain store into
+ * g_bcv[]; vnet_bc_publish() copies the whole table to the window from the
+ * CPU1 tick (vnet_emac_link_update(), every emac_poll()). The window lags by
+ * at most one tick, and the per-frame path no longer pays a cache clean plus
+ * a full-system barrier for each counter it bumps. */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
-#define VNET_BC_LAST   26u           /* highest slot used above */
+#define VNET_BC_LAST   31u           /* highest slot used above */
+#define VNET_BC_SLOTS  32u
+
+static uint32_t g_bcv[VNET_BC_SLOTS];
 
 static inline void vnet_bc(uint32_t idx, uint32_t v)
 {
-	volatile uint32_t *p = (volatile uint32_t *)(VNET_BC_BASE + idx * 4u);
-	*p = v;
-	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(p) : "memory");
+	g_bcv[idx] = v;
+}
+
+static void vnet_bc_publish(void)
+{
+	volatile uint32_t *w = (volatile uint32_t *)VNET_BC_BASE;
+	for (uint32_t i = 1; i < VNET_BC_SLOTS; i++)
+		w[i] = g_bcv[i];
+	w[0] = VNET_BC_MAGIC;
+	for (uint32_t off = 0; off < VNET_BC_SLOTS * 4u; off += 64u)
+		__asm__ volatile("dc civac, %0" :: "r"(VNET_BC_BASE + off) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static inline uint64_t vnet_now(void)
+{
+	uint64_t t;
+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+	return t;
 }
 
 /* ------------------------------------------------------------------ *
@@ -226,6 +258,10 @@ static uint32_t g_rx_reset_busy;      /* [23] RX dropped, queue being reset */
 static uint32_t g_link_changes;       /* [24] link changes published */
 static volatile uint32_t g_force_down_polls;  /* nettest vlink: polls left */
 static uint32_t g_rx_irq_pending;     /* CPU1: frames queued since the last flush */
+static uint32_t g_rx_too_big;         /* [30] RX frame larger than the guest buffer */
+static uint32_t g_tx_too_big;         /* [31] TX frame larger than Ethernet allows */
+static uint32_t g_tx_kicks;           /* [29] */
+static uint64_t g_rx_time, g_tx_time; /* [27]/[28] CNTPCT ticks in EL2 */
 
 /* Per-queue locks (see the QUEUE STATE vs DEVICE RESET note at the top).
  * Plain BSS words: HV memory is Normal cacheable and the cores run with
@@ -300,7 +336,6 @@ static void int_status_clear(volatile uint32_t *p, uint32_t bits)
  * (one per direction) avoid even the theoretical cross-core aliasing a
  * single shared buffer would risk if that assumption ever changed. */
 static uint8_t g_tx_stage[VNET_STAGE_BUF_SIZE];
-static uint8_t g_rx_stage[VNET_STAGE_BUF_SIZE];
 
 /* ------------------------------------------------------------------ *
  * Guest-memory helpers — BYTE-FOR-BYTE the same pattern as vblk_emmc.c's
@@ -338,11 +373,8 @@ static int gmem_read(uint64_t gpa, void *dst, uint32_t len)
 			((uint8_t *)dst)[i] = 0;
 		return 0;
 	}
-	const volatile uint8_t *s = (const volatile uint8_t *)(uintptr_t)gpa;
-	uint8_t *d = (uint8_t *)dst;
 	gmem_cmo(gpa, len);                  /* refetch from PoC, never stale */
-	for (uint32_t i = 0; i < len; i++)
-		d[i] = s[i];
+	nc_copy(dst, (const void *)(uintptr_t)gpa, len);
 	return 1;
 }
 
@@ -352,10 +384,11 @@ static void gmem_write(uint64_t gpa, const void *src, uint32_t len)
 		vnet_bc(15, ++g_gmem_oob);      /* not guest RAM: drop the write */
 		return;
 	}
-	volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)gpa;
-	const uint8_t *s = (const uint8_t *)src;
-	for (uint32_t i = 0; i < len; i++)
-		d[i] = s[i];
+	/* Clean+invalidate BEFORE the store too: a line the guest dirtied in
+	 * its own cache would otherwise be written back over our data by the
+	 * clean below. After: drop anything speculatively refetched meanwhile. */
+	gmem_cmo(gpa, len);
+	nc_copy((void *)(uintptr_t)gpa, src, len);
 	gmem_cmo(gpa, len);                  /* publish to PoC for every observer */
 }
 
@@ -486,29 +519,43 @@ static uint32_t vnet_gather(struct vnet_desc *chain, uint32_t n,
 	return total;
 }
 
-/* Scatter `src_len` bytes of `src` across a (write-only, RX-direction)
- * descriptor chain, in order. Returns bytes actually written (may be less
- * than src_len if the guest's posted buffers are too small — counted as a
- * truncation, never a correctness bug: we simply stop, the guest's device
- * driver sees a short completion). */
-static uint32_t vnet_scatter(struct vnet_desc *chain, uint32_t n,
+/* Bytes the guest can take in a (write-only, RX-direction) descriptor
+ * chain. */
+static uint32_t vnet_chain_room(const struct vnet_desc *chain, uint32_t n)
+{
+	uint64_t room = 0;            /* guest-chosen lengths: no 32-bit wrap */
+	for (uint32_t i = 0; i < n; i++)
+		room += chain[i].len;
+	return room > 0xffffffffull ? 0xffffffffu : (uint32_t)room;
+}
+
+/* Scatter the virtio-net header and then the frame straight from the EMAC
+ * DMA buffer across the chain, in order -- no staging copy (audit item 10).
+ * The caller has checked that the chain is big enough. Returns bytes
+ * written. */
+static uint32_t vnet_scatter2(const struct vnet_desc *chain, uint32_t n,
+                              const uint8_t *hdr, uint32_t hdr_len,
                               const uint8_t *src, uint32_t src_len)
 {
 	uint32_t written = 0;
 	uint32_t ci = 0, coff = 0;
+	const uint8_t *p = hdr;
+	uint32_t left = hdr_len;
 
-	while (written < src_len && ci < n) {
-		uint32_t avail = chain[ci].len - coff;
-		if (avail == 0) { ci++; coff = 0; continue; }
-		uint32_t take = src_len - written;
-		if (take > avail) take = avail;
-		gmem_write(chain[ci].addr + coff, src + written, take);
-		written += take;
-		coff += take;
-		if (coff >= chain[ci].len) { ci++; coff = 0; }
+	for (int part = 0; part < 2; part++) {
+		while (left && ci < n) {
+			uint32_t avail = chain[ci].len - coff;
+			if (avail == 0) { ci++; coff = 0; continue; }
+			uint32_t take = left < avail ? left : avail;
+			gmem_write(chain[ci].addr + coff, p, take);
+			p += take;
+			left -= take;
+			written += take;
+			coff += take;
+		}
+		p = src;
+		left = src_len;
 	}
-	if (written < src_len)
-		vnet_bc(14, ++g_rx_truncated);
 	return written;
 }
 
@@ -556,6 +603,14 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 	for (uint32_t i = 0; i < n; i++)
 		if (chain[i].flags & VNET_VRING_DESC_F_WRITE)
 			vnet_bc(17, ++g_bad_desc_flags);
+
+	/* Larger than any Ethernet frame (1514 + one VLAN tag): drop it whole
+	 * rather than send a truncated, corrupt frame (audit item 13). */
+	if (vnet_chain_room(chain, n) > VNET_HDR_LEN + VNET_ETH_MAX_FRAME + 4u) {
+		vnet_bc(31, ++g_tx_too_big);
+		vq_push_used(vq, head, 0);
+		return;
+	}
 
 	uint32_t total = vnet_gather(chain, n, g_tx_stage, VNET_STAGE_BUF_SIZE);
 
@@ -651,12 +706,16 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 
 		/* Held across the whole drain: a reset/QueueReady write from
 		 * another vCPU waits until this ring walk is finished. */
+		uint64_t t0 = vnet_now();
 		vq_lock(VNET_QUEUE_TX);
 		while (vq_pop_avail(vq, &head)) {
 			vnet_tx_one(d, head);
 			served = 1;
 		}
 		vq_unlock(VNET_QUEUE_TX);
+		g_tx_time += vnet_now() - t0;
+		vnet_bc(28, (uint32_t)g_tx_time);
+		vnet_bc(29, ++g_tx_kicks);
 		if (served) {
 			int_status_or((volatile uint32_t *)&d->int_status, VNET_INT_VRING);
 			vnet_inject_irq();
@@ -671,7 +730,7 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
  * ethertype is not already claimed by the console (0x88B5) or netcon
  * (0x88B6).
  * ------------------------------------------------------------------ */
-void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
+static void vnet_rx_one(const uint8_t *frame, uint16_t len)
 {
 	struct vnet_vq *vq = &g_net.vq[VNET_QUEUE_RX];
 	uint16_t head;
@@ -705,16 +764,11 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 		vnet_bc(12, ethertype);
 	}
 
-	/* Assemble header (all-zero: no offloads negotiated) + frame into the
-	 * staging buffer, then scatter across the guest's descriptor chain. */
+	/* Header: all-zero (no offloads negotiated) except num_buffers. */
 	struct vnet_hdr hdr;
 	hdr.flags = 0; hdr.gso_type = 0; hdr.hdr_len = 0;
 	hdr.gso_size = 0; hdr.csum_start = 0; hdr.csum_offset = 0;
 	hdr.num_buffers = 1;          /* spec: 1 without MRG_RXBUF (was stack garbage) */
-	for (uint32_t i = 0; i < VNET_HDR_LEN; i++)
-		g_rx_stage[i] = ((const uint8_t *)&hdr)[i];
-	for (uint32_t i = 0; i < len; i++)
-		g_rx_stage[VNET_HDR_LEN + i] = frame[i];
 
 	struct vnet_desc chain[VNET_MAX_CHAIN];
 	uint32_t n = vq_collect_chain(vq, head, chain, VNET_MAX_CHAIN);
@@ -731,12 +785,31 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 		if (!(chain[i].flags & VNET_VRING_DESC_F_WRITE))
 			vnet_bc(17, ++g_bad_desc_flags);
 
-	uint32_t written = vnet_scatter(chain, n, g_rx_stage,
-	                                 VNET_HDR_LEN + (uint32_t)len);
+	/* A frame that does not fit is dropped, not cut short: a truncated
+	 * frame is a different, corrupt frame (audit item 13). The buffer goes
+	 * back with length 0, which if_vtnet counts as an input error. */
+	if (vnet_chain_room(chain, n) < VNET_HDR_LEN + (uint32_t)len) {
+		vnet_bc(30, ++g_rx_too_big);
+		vq_push_used(vq, head, 0);
+		vq_unlock(VNET_QUEUE_RX);
+		g_rx_irq_pending = 1u;
+		return;
+	}
+
+	uint32_t written = vnet_scatter2(chain, n, (const uint8_t *)&hdr,
+	                                 VNET_HDR_LEN, frame, (uint32_t)len);
 	vq_push_used(vq, head, written);
 	vq_unlock(VNET_QUEUE_RX);
 	vnet_bc(4, ++g_rx_queued);
 	g_rx_irq_pending = 1u;        /* one interrupt per drain: vnet_emac_rx_flush() */
+}
+
+void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
+{
+	uint64_t t0 = vnet_now();
+	vnet_rx_one(frame, len);
+	g_rx_time += vnet_now() - t0;
+	vnet_bc(27, (uint32_t)g_rx_time);
 }
 
 /* End of one EMAC RX drain (emac.c, CPU1): if anything was queued, set the
@@ -763,6 +836,7 @@ void vnet_emac_link_update(int emac_link_up)
 {
 	uint32_t up = emac_link_up ? 1u : 0u;
 
+	vnet_bc_publish();             /* once per emac_poll(): counters -> window */
 	if (g_force_down_polls) {
 		g_force_down_polls--;
 		up = 0u;
@@ -799,14 +873,14 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 	case VNET_R_DEVICE_ID:     return VNET_DEVICE_ID;         /* 1: virtio-net */
 	case VNET_R_VENDOR_ID:     return VNET_MMIO_VENDOR;
 	case VNET_R_DEVICE_FEATURES:
-		/* Word 1, bit 0 = VIRTIO_F_VERSION_1. Word 0, bit 5 = VIRTIO_NET_F_MAC
-		 * (the guest's MAC is emac_guest_mac(), see emac.h) — no other
-		 * MAC/CSUM/offload/MRG_RXBUF/STATUS bits offered, matching
+		/* Word 1, bit 0 = VIRTIO_F_VERSION_1. Word 0: VIRTIO_NET_F_MAC (the
+		 * guest's MAC is emac_guest_mac(), see emac.h), _STATUS (link) and
+		 * _MTU (1500). No CSUM/offload/MRG_RXBUF bits, matching
 		 * vblk_emmc.c's minimal-feature-set precedent. */
 		if (d->dev_feat_sel == VNET_FEATWORD_HI)
 			return VNET_F_VERSION_1_BIT;
 		if (d->dev_feat_sel == VNET_FEATWORD_LO)
-			return VNET_F_MAC_BIT | VNET_F_STATUS_BIT;
+			return VNET_F_MAC_BIT | VNET_F_STATUS_BIT | VNET_F_MTU_BIT;
 		return 0u;
 	case VNET_R_QUEUE_NUM_MAX:
 		/* D5(a): a nonexistent queue_sel must read back 0 (spec: QueueNumMax
@@ -855,6 +929,10 @@ static uint32_t vnet_config_read(uint32_t byte_off, uint32_t sas)
 			b = (uint8_t)status;
 		else if (idx == VNET_CFG_STATUS_OFF + 1u)
 			b = (uint8_t)(status >> 8);
+		else if (idx == VNET_CFG_MTU_OFF)
+			b = (uint8_t)VNET_MTU;
+		else if (idx == VNET_CFG_MTU_OFF + 1u)
+			b = (uint8_t)(VNET_MTU >> 8);
 		v |= (uint32_t)b << (8u * i);
 	}
 	return v;
@@ -1106,8 +1184,8 @@ void vnet_init(void)
 	/* Every slot, not just the ready bits: the window is not cleared by
 	 * anything else, and a counter that has never fired must read 0, not
 	 * whatever the DRAM held. */
-	for (uint32_t i = 1; i <= VNET_BC_LAST; i++)
-		vnet_bc(i, 0);
+	for (uint32_t i = 0; i < VNET_BC_SLOTS; i++)
+		g_bcv[i] = 0;
 	vnet_bc(25, g_net.link_up);
-	vnet_bc(0, VNET_BC_MAGIC);
+	vnet_bc_publish();
 }

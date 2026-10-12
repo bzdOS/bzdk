@@ -173,9 +173,17 @@
  * handing frames to a dead wire. */
 #define VNET_F_STATUS_BIT         (1u << 16)
 #define VNET_S_LINK_UP            0x1u
-/* struct virtio_net_config: mac[6] @0, le16 status @6. */
+/* VIRTIO_NET_F_MTU (bit 3): config.mtu tells the driver the largest MTU the
+ * device supports. The EMAC path carries 1514-byte frames (plus one VLAN
+ * tag), so 1500; if_vtnet then refuses `ifconfig vtnet0 mtu 9000` instead of
+ * building frames this device can only drop (audit item 13). */
+#define VNET_F_MTU_BIT            (1u << 3)
+#define VNET_MTU                  1500u
+/* struct virtio_net_config: mac[6] @0, le16 status @6,
+ * le16 max_virtqueue_pairs @8 (no MQ: reads 0), le16 mtu @10. */
 #define VNET_CFG_STATUS_OFF       6u
-#define VNET_CFG_LEN              8u
+#define VNET_CFG_MTU_OFF          10u
+#define VNET_CFG_LEN              12u
 #define VNET_F_VERSION_1_BIT      0x1u
 
 /* Device-specific config space (struct virtio_net_config): the 6-byte `mac`
