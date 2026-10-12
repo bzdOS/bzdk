@@ -207,6 +207,8 @@
  *   [32] TX drains stopped because the EMAC ring was full (frame left on
  *        the avail ring for CPU1 to send, see vnet_tx_drain())
  *   [33] TX drains CPU1 continued (vnet_emac_tx_resume())
+ *   [34] interrupts not raised because the driver suppressed them
+ *        (EVENT_IDX used_event / VRING_AVAIL_F_NO_INTERRUPT, audit item 12)
  *
  * Since 2026-10-12 (audit item 10) a counter update is a plain store into
  * g_bcv[]; vnet_bc_publish() copies the whole table to the window from the
@@ -215,7 +217,7 @@
  * a full-system barrier for each counter it bumps. */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
-#define VNET_BC_LAST   33u           /* highest slot used above */
+#define VNET_BC_LAST   34u           /* highest slot used above */
 #define VNET_BC_SLOTS  40u
 
 static uint32_t g_bcv[VNET_BC_SLOTS];
@@ -468,18 +470,54 @@ static int vq_peek_avail(struct vnet_vq *vq, uint16_t *head)
 
 static uint16_t vq_push_used(struct vnet_vq *vq, uint16_t head, uint32_t used_len)
 {
+	/* Re-read rather than trust a shadow: a snapshot restore rewrites
+	 * guest RAM, rings included, under a running device. */
 	uint16_t used_idx = gmem_ld16(vq->used + 2u);
 	uint16_t slot = (uint16_t)(used_idx % vq->num);
 	uint64_t e = vq->used + 4u + (uint64_t)slot * 8u;   /* &ring[slot] */
-	uint32_t id = head;
+	uint32_t ent[2] = { head, used_len };
 	uint16_t new_idx = (uint16_t)(used_idx + 1u);
 
-	gmem_write(e + 0u, &id, 4u);
-	gmem_write(e + 4u, &used_len, 4u);
+	gmem_write(e, ent, 8u);                             /* id + len at once */
 	__asm__ volatile("dsb sy" ::: "memory");            /* entry before idx */
 	gmem_st16(vq->used + 2u, new_idx);
 	__asm__ volatile("dsb sy" ::: "memory");
+	vq->used_idx = new_idx;
 	return new_idx;
+}
+
+/* Interrupt suppression (audit item 12). Does the driver want an interrupt
+ * for the used entries pushed since the last decision? With EVENT_IDX:
+ * did used->idx pass used_event (virtio 1.x 2.7.10, vring_need_event());
+ * without: is VRING_AVAIL_F_NO_INTERRUPT clear. Caller holds the queue
+ * lock, so the rings cannot be torn down under it. */
+static int vq_want_irq(const struct vnet_dev *d, struct vnet_vq *vq)
+{
+	uint16_t now = vq->used_idx, old = vq->signalled_used;
+
+	vq->signalled_used = now;
+	if (now == old)
+		return 0;                          /* nothing new */
+	if (d->driver_features & VNET_F_EVENT_IDX_BIT) {
+		uint16_t ev = gmem_ld16(vq->avail + 4u + 2u * (uint64_t)vq->num);
+		return (uint16_t)(now - ev - 1u) < (uint16_t)(now - old);
+	}
+	return !(gmem_ld16(vq->avail) & VNET_VRING_AVAIL_F_NO_INTERRUPT);
+}
+
+/* Kick suppression: tell the driver whether to notify us when it adds to
+ * this queue. With EVENT_IDX avail_event says "after entry N": N =
+ * last_avail asks for a kick on the next new entry, last_avail + 0x8000 is
+ * never reached. Without it, VRING_USED_F_NO_NOTIFY. */
+static void vq_set_notify(const struct vnet_dev *d, struct vnet_vq *vq, int on)
+{
+	if (d->driver_features & VNET_F_EVENT_IDX_BIT) {
+		uint16_t ev = on ? vq->last_avail : (uint16_t)(vq->last_avail + 0x8000u);
+		gmem_st16(vq->used + 4u + 8u * (uint64_t)vq->num, ev);
+	} else {
+		gmem_st16(vq->used, on ? 0u : VNET_VRING_USED_F_NO_NOTIFY);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 /* Collect one descriptor chain starting at `head` into `chain[]` (bounded by
@@ -599,6 +637,7 @@ static void vnet_inject_irq(void)
 static volatile uint32_t g_tx_resume;  /* TX drain left work for CPU1 */
 static uint32_t g_tx_retries;          /* [32] drains stopped on a full ring */
 static uint32_t g_tx_resumes;          /* [33] drains CPU1 continued */
+static uint32_t g_irq_suppressed;      /* [34] used entries pushed, driver asked for no IRQ */
 
 static int vnet_tx_one(struct vnet_dev *d, uint16_t head)
 {
@@ -732,6 +771,40 @@ static uint32_t vnet_tx_drain(struct vnet_dev *d, uint32_t budget)
 	return done;
 }
 
+/* Drain, then set kick suppression to match: work left for CPU1 (full EMAC
+ * ring or budget spent) -> no kicks, they could only find the ring full
+ * again; caught up -> kick on the next frame. Re-check after re-enabling:
+ * a frame the driver queued between our last look and that store saw the
+ * old setting and did not kick (virtio 1.x 2.7.10 "re-check"). Caller holds
+ * the TX queue lock. */
+static uint32_t vnet_tx_drain_notify(struct vnet_dev *d)
+{
+	struct vnet_vq *vq = &d->vq[VNET_QUEUE_TX];
+	uint32_t done = 0;
+
+	for (int pass = 0; pass < 2; pass++) {
+		done += vnet_tx_drain(d, VNET_TX_BUDGET);
+		if (g_tx_resume) {
+			vq_set_notify(d, vq, 0);
+			break;
+		}
+		vq_set_notify(d, vq, 1);
+		if (gmem_ld16(vq->avail + 2u) == vq->last_avail)
+			break;
+		if (pass == 1)
+			g_tx_resume = 1u;            /* still racing: CPU1 picks it up */
+	}
+	return done;
+}
+
+static int vnet_tx_want_irq(struct vnet_dev *d)
+{
+	int want = vq_want_irq(d, &d->vq[VNET_QUEUE_TX]);
+	if (!want)
+		vnet_bc(34, ++g_irq_suppressed);
+	return want;
+}
+
 static void vnet_tx_irq(struct vnet_dev *d)
 {
 	int_status_or((volatile uint32_t *)&d->int_status, VNET_INT_VRING);
@@ -750,15 +823,18 @@ void vnet_emac_tx_resume(void)
 	if (!vq_trylock(VNET_QUEUE_TX))
 		return;
 	uint32_t done = 0;
-	if (d->vq[VNET_QUEUE_TX].ready && (d->status & VNET_S_DRIVER_OK))
-		done = vnet_tx_drain(d, VNET_TX_BUDGET);
-	else
+	int irq = 0;
+	if (d->vq[VNET_QUEUE_TX].ready && (d->status & VNET_S_DRIVER_OK)) {
+		done = vnet_tx_drain_notify(d);
+		irq = done && vnet_tx_want_irq(d);
+	} else {
 		g_tx_resume = 0u;
-	vq_unlock(VNET_QUEUE_TX);
-	if (done) {
-		vnet_bc(33, ++g_tx_resumes);
-		vnet_tx_irq(d);
 	}
+	vq_unlock(VNET_QUEUE_TX);
+	if (done)
+		vnet_bc(33, ++g_tx_resumes);
+	if (irq)
+		vnet_tx_irq(d);
 }
 
 /* QueueNotify handler: drain up to VNET_TX_BUDGET chains from the notified
@@ -780,12 +856,17 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 		 * another vCPU waits until this ring walk is finished. */
 		uint64_t t0 = vnet_now();
 		vq_lock(VNET_QUEUE_TX);
-		uint32_t done = vnet_tx_drain(d, VNET_TX_BUDGET);
+		uint32_t done = 0;
+		int irq = 0;
+		if (d->vq[VNET_QUEUE_TX].ready) {
+			done = vnet_tx_drain_notify(d);
+			irq = done && vnet_tx_want_irq(d);
+		}
 		vq_unlock(VNET_QUEUE_TX);
 		g_tx_time += vnet_now() - t0;
 		vnet_bc(28, (uint32_t)g_tx_time);
 		vnet_bc(29, ++g_tx_kicks);
-		if (done)
+		if (irq)
 			vnet_tx_irq(d);
 	}
 	/* qidx == VNET_QUEUE_RX: nothing to do here — see comment above. */
@@ -883,9 +964,28 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
  * VRING cause and raise the guest interrupt once for the whole batch. */
 void vnet_emac_rx_flush(void)
 {
+	struct vnet_vq *vq = &g_net.vq[VNET_QUEUE_RX];
+	int want = 1;
+
 	if (!g_rx_irq_pending)
 		return;
 	g_rx_irq_pending = 0u;
+	/* Under the RX lock: the rings must not be reset under us. A reset in
+	 * progress just gets the interrupt (harmless). */
+	if (vq_trylock(VNET_QUEUE_RX)) {
+		if (vq->ready && (g_net.status & VNET_S_DRIVER_OK)) {
+			want = vq_want_irq(&g_net, vq);
+			/* RX never needs the driver's "buffers added" kick: frames
+			 * pull buffers off the ring as they arrive. Each such kick
+			 * was a guest trap for nothing. */
+			vq_set_notify(&g_net, vq, 0);
+		}
+		vq_unlock(VNET_QUEUE_RX);
+	}
+	if (!want) {
+		vnet_bc(34, ++g_irq_suppressed);
+		return;
+	}
 	int_status_or((volatile uint32_t *)&g_net.int_status, VNET_INT_VRING);
 	vnet_inject_irq();
 }
@@ -947,7 +1047,8 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 		if (d->dev_feat_sel == VNET_FEATWORD_HI)
 			return VNET_F_VERSION_1_BIT;
 		if (d->dev_feat_sel == VNET_FEATWORD_LO)
-			return VNET_F_MAC_BIT | VNET_F_STATUS_BIT | VNET_F_MTU_BIT;
+			return VNET_F_MAC_BIT | VNET_F_STATUS_BIT | VNET_F_MTU_BIT |
+			       VNET_F_EVENT_IDX_BIT;
 		return 0u;
 	case VNET_R_QUEUE_NUM_MAX:
 		/* D5(a): a nonexistent queue_sel must read back 0 (spec: QueueNumMax
@@ -1112,6 +1213,8 @@ static void vnet_reg_write_locked(struct vnet_dev *d, uint32_t off, uint32_t val
 				vq->ready = 0u;
 			} else if (val & 1u) {
 				vq->last_avail = 0;      /* fresh negotiation */
+				vq->used_idx = 0;
+				vq->signalled_used = 0;
 				/* Barrier BEFORE the ready store, not after: publish the
 				 * whole vq struct (desc/avail/used/num, all written just
 				 * above/before this) so CPU1 cannot observe ready==1 while
@@ -1144,6 +1247,7 @@ static void vnet_reg_write_locked(struct vnet_dev *d, uint32_t off, uint32_t val
 			for (uint32_t q = 0; q < VNET_NUM_QUEUES; q++) {
 				struct vnet_vq *vq = &d->vq[q];
 				vq->ready = 0; vq->num = 0; vq->last_avail = 0;
+				vq->used_idx = 0; vq->signalled_used = 0;
 				vq->desc = vq->avail = vq->used = 0;
 			}
 			d->driver_features = 0;   /* renegotiated after a reset */

@@ -185,6 +185,14 @@
 #define VNET_CFG_MTU_OFF          10u
 #define VNET_CFG_LEN              12u
 #define VNET_F_VERSION_1_BIT      0x1u
+/* VIRTIO_RING_F_EVENT_IDX (bit 29, word 0), audit item 12: the driver says
+ * after which used entry it wants an interrupt (used_event, after the avail
+ * ring) and the device says after which avail entry it wants a kick
+ * (avail_event, after the used ring). Without it the drivers' hints are the
+ * ring flags below, which are honoured too. */
+#define VNET_F_EVENT_IDX_BIT      (1u << 29)
+#define VNET_VRING_AVAIL_F_NO_INTERRUPT 0x1u
+#define VNET_VRING_USED_F_NO_NOTIFY     0x1u
 
 /* Device-specific config space (struct virtio_net_config): the 6-byte `mac`
  * field at offset 0 and the 16-bit `status` at 6 (VIRTIO_NET_F_STATUS); no
@@ -321,6 +329,8 @@ struct vnet_vq {
 	uint64_t avail;          /* guest PA of avail ring (driver area)        */
 	uint64_t used;           /* guest PA of used ring (device area)         */
 	uint16_t last_avail;     /* next avail->ring[] index not yet consumed   */
+	uint16_t used_idx;       /* used->idx as of our last push               */
+	uint16_t signalled_used; /* used->idx at the last interrupt decision     */
 };
 
 struct vnet_dev {
