@@ -62,6 +62,7 @@ DBG_ETYPES = range(0x88B5, 0x88BA)
 INNER_MAX = 1472          # one datagram, no fragmentation at a 1500 MTU
 VERIFY_EVERY_S = 10.0     # one HELLO per candidate address per this long
 VERIFY_WAIT_S = 3.0       # how long a HELLO's CHAL is waited for
+SWEEP_EVERY_S = 60.0     # auto: re-sweep the subnet this often until found
 
 
 def open_tap(name):
@@ -92,6 +93,7 @@ class Link:
         self.remember = remember or (lambda ip: None)
         self.log = log or (lambda m: None)
         self.now = now
+        self.verified = False        # board_ip proved by a handshake
         self.pending = {}            # candidate ip -> (nonce, deadline)
         self.last_try = {}           # candidate ip -> time of last HELLO
         self.n = dict(up=0, down=0, too_big=0, foreign=0, no_board=0,
@@ -116,7 +118,8 @@ class Link:
 
     def from_udp(self, d, src):
         ip = src[0]
-        if ip == self.board_ip:
+        if ip == self.board_ip and not (ip in self.pending and
+                                        not self.verified):
             if len(d) >= 14:
                 self.tap_write(d)
                 self.n["down"] += 1
@@ -153,11 +156,46 @@ class Link:
         except OSError as e:
             self.log(f"send to {ip}: {e}")
 
+    def sweep(self, candidates):
+        """Ask every candidate with a HELLO; the one whose CHAL carries a
+        valid proof is adopted by from_udp(). Announces cannot replace
+        this: a router that only lets replies through from the board's
+        subnet (stateful firewall, NAT) drops them, while the CHAL to our
+        own HELLO is a reply and passes."""
+        t = self.now()
+        self.n["sweeps"] = self.n.get("sweeps", 0) + 1
+        for ip in candidates:
+            nh = secrets.token_bytes(16)
+            self.pending[ip] = (nh, t + VERIFY_WAIT_S)
+            self.last_try[ip] = t
+            try:
+                self.sendto(hvauth.hello_frame(self.src_mac, nh),
+                            (ip, self.port))
+                self.n["verify_sent"] += 1
+            except OSError as e:
+                self.log(f"send to {ip}: {e}")
+
     def adopt(self, ip):
         old, self.board_ip = self.board_ip, ip
+        self.verified = True
         self.n["adopted"] += 1
         self.remember(ip)
         self.log(f"board address {old} -> {ip} (handshake verified)")
+
+
+def sweep_candidates(c, first=None):
+    """The last known address first, then every host of the board's subnet
+    (board.conf gateway/netmask), at most a /22."""
+    import ipaddress
+    out = [first] if first else []
+    try:
+        net = ipaddress.ip_network(f"{c['gateway']}/{c['netmask']}",
+                                   strict=False)
+    except (KeyError, ValueError):
+        return out
+    if net.num_addresses > 1024:
+        return out
+    return out + [str(h) for h in net.hosts() if str(h) != first]
 
 
 def _selftest():
@@ -315,8 +353,21 @@ def main():
           flush=True)
 
     t_stat = time.time()
+    t_sweep, down_seen, up_seen = 0.0, 0, 0
     while True:
-        r, _, _ = select.select([fd, us], [], [], 60)
+        # board_ip = auto: find the board by asking, not by waiting for its
+        # announce (see Link.sweep). Sweep until a handshake proved an
+        # address, and again when frames go up and nothing comes back.
+        if auto and time.time() - t_sweep > SWEEP_EVERY_S:
+            if link.verified and link.n["up"] > up_seen and \
+                    link.n["down"] == down_seen:
+                link.verified = False
+                link.log(f"{link.board_ip} stopped answering: sweeping")
+            up_seen, down_seen = link.n["up"], link.n["down"]
+            if not link.verified:
+                t_sweep = time.time()
+                link.sweep(sweep_candidates(c, link.board_ip))
+        r, _, _ = select.select([fd, us], [], [], 5)
         if fd in r:
             link.from_tap(os.read(fd, 65536))
         if us in r:
