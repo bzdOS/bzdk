@@ -1644,8 +1644,9 @@ void emac_wd_test_mode(int on)
 /* caller (netcon, vnet_emac.c, in the send-frame case) decides whether/   */
 /* how to retry; this function itself never blocks unboundedly.           */
 /* ------------------------------------------------------------------ */
-static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
-                         const uint8_t *payload, int plen)
+static int tx_frame_raw_src(const uint8_t dst[6], const uint8_t src[6],
+                             uint16_t ethertype, const uint8_t *payload,
+                             int plen)
 {
     volatile struct emac_desc *d;
     uint8_t *buf;
@@ -1695,7 +1696,7 @@ static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
     buf = (uint8_t *)(uintptr_t)d->buf_addr;
 
     for (i = 0; i < 6; i++) buf[i] = dst[i];           /* dst */
-    for (i = 0; i < 6; i++) buf[6 + i] = OUR_MAC[i];   /* src */
+    for (i = 0; i < 6; i++) buf[6 + i] = src[i];       /* src */
     buf[12] = (uint8_t)(ethertype >> 8);
     buf[13] = (uint8_t)(ethertype & 0xff);
     for (i = 0; i < plen; i++) buf[14 + i] = payload[i];
@@ -1721,6 +1722,12 @@ static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
     bc(6, ++g_tx_count);
     emac_tx_unlock();
     return 1;
+}
+
+static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
+                         const uint8_t *payload, int plen)
+{
+    return tx_frame_raw_src(dst, OUR_MAC, ethertype, payload, plen);
 }
 
 /* Console TX kept byte-identical in behavior: broadcast dst, ETHERTYPE_CONSOLE. */
@@ -1750,6 +1757,13 @@ int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
                        const uint8_t *payload, uint16_t len)
 {
     return tx_frame_raw(dst, ethertype, payload, (int)len);
+}
+
+int emac_send_frame_from(const uint8_t dst[6], const uint8_t src[6],
+                         uint16_t ethertype, const uint8_t *payload,
+                         uint16_t len)
+{
+    return tx_frame_raw_src(dst, src, ethertype, payload, (int)len);
 }
 
 void emac_putc(int c)

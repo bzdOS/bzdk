@@ -484,7 +484,11 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 		 * MAC is the first 6 bytes of the guest's Ethernet header, which sits
 		 * immediately after the virtio_net_hdr in the staging buffer. */
 		const uint8_t *dst = g_tx_stage + VNET_HDR_LEN;
-		int ok = emac_send_frame_to(dst, ethertype, payload, (uint16_t)plen);
+		/* Keep the guest's source MAC too: a bridged frame carries its
+		 * client's address (emac.h, emac_send_frame_from()). */
+		const uint8_t *src = g_tx_stage + VNET_HDR_LEN + 6;
+		int ok = emac_send_frame_from(dst, src, ethertype, payload,
+		                              (uint16_t)plen);
 		if (ok)
 			vnet_bc(6, ++g_tx_sent);
 		else

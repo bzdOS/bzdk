@@ -87,6 +87,16 @@ int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len);
 int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
                        const uint8_t *payload, uint16_t len);
 
+/* emac_send_frame_to() with the guest's own Ethernet source address. A guest
+ * that bridges another interface (WiFi AP + if_bridge) forwards frames whose
+ * source is a client's MAC; rewriting it to OUR_MAC hid the client from the
+ * LAN, so DHCP replies and the switch's MAC learning never reached it
+ * (measured 2026-10-12: a phone on the guest's AP sent DHCPDISCOVER that left
+ * the board as 02:bd:05:00:00:01 and got no offer). */
+int emac_send_frame_from(const uint8_t dst[6], const uint8_t src[6],
+                         uint16_t ethertype, const uint8_t *payload,
+                         uint16_t len);
+
 /* CPU1 debug-loop link watchdog: call every loop iteration (cheap — rate-
  * limited internally to one real check per ~8 s). If EMAC has NEVER accepted
  * a single RX frame, re-runs the bounded PHY bring-up + rings/DMA/MAC enable
