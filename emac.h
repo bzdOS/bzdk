@@ -124,4 +124,26 @@ int emac_link_watchdog(void);
  * cpu3). See HANDOFF.md §1. */
 void emac_wd_test_mode(int on);
 
+/* 1 while the link watchdog's PHY re-kick state machine is running (it
+ * owns the PHY then; emac_poll() skips its own link_recheck()). */
+int emac_rekick_active(void);
+
+/* dbgmon `nettest` (audit item 4/5 test levers, CPU1 only):
+ *  - emac_nettest_quiet(s): for s seconds the link watchdog ignores every
+ *    received frame and every non-probe TX completion -- a quiet wire as
+ *    the watchdog sees it, without silencing the LAN. 0 cancels.
+ *  - emac_nettest_phydown(): power the PHY down (BMCR bit 11) on the next
+ *    watchdog call: a REAL link loss that only the watchdog's re-kick (BMCR
+ *    reset) recovers. The debug channel is down until it does (~20 s).
+ *  - emac_nettest_stats(): [0] link up [1] re-kick state [2] re-kicks
+ *    [3] link-down events [4] probes sent [5] TX completions seen
+ *    [6] TX-stuck verdicts [7] last verdict bits (0 link bad, 1 tx stuck,
+ *    2 rx ok, 3 tx ok, 4 deaf, 5 probe sent) [8] s since last RX
+ *    [9] s since last TX completion [10] quiet s left [11] deaf give-ups
+ *    [12] attempts [13] TX drops. */
+#define EMAC_NT_NSTATS 14
+void emac_nettest_quiet(uint32_t seconds);
+void emac_nettest_phydown(void);
+void emac_nettest_stats(uint32_t out[EMAC_NT_NSTATS]);
+
 #endif /* BZDOS_EMAC_H */

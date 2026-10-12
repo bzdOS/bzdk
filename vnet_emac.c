@@ -101,23 +101,29 @@
  * the single choke point all TX paths funnel through, so CPU0's vnet TX and
  * CPU1's console TX can no longer hand out the same g_tx_slot. See emac.c's
  * header (tx_frame_raw / EMAC_TX_LOCK_PA) and bc[32] tx_lock_contended.
- * Residual gap (review D7): emac_link_watchdog() re-runs rings_init() + the DMA
- * enables WITHOUT the TX lock, guarded only by g_rx_count==0 — which does not
- * preclude a concurrent guest TX. That corner still wants closing.
+ * (Review D7, closed 2026-10-12: the link watchdog's never-had-traffic
+ * rings_init() now runs under the TX lock too.)
  *
- * A second, narrower hazard: vnet_dev.int_status is read-modify-written from
- * BOTH cores (CPU0 clears acked bits on VNET_R_INTERRUPT_ACK writes, sets
- * VNET_INT_VRING on TX completions; CPU1 sets the SAME single bit on RX
- * completions). Because there is only one cause bit in this device, a lost
- * update between the two OR-writes converges to the same final value either
- * way — benign by construction, NOT by real synchronization. Per-queue ring
- * state (vq[RX] vs vq[TX] and their desc/avail/used/last_avail) is safe in
- * STEADY STATE because each queue's ring is only ever walked by one core
- * (CPU1 for RX/queue 0, CPU0 for TX/queue 1) — but the ONE-TIME negotiation
- * window (CPU0 writing QueueDesc/QueueDriver/QueueDevice/QueueReady for
- * queue 0 while CPU1 could, in principle, already be polling) has no barrier
- * protecting it beyond the single dsb added to the QueueReady write path
- * below. Narrow, not proven safe, flagged rather than solved.
+ * QUEUE STATE vs DEVICE RESET (audit item 6, fixed 2026-10-12): the guest
+ * may write Status=0 (reset) or reprogram/disable a queue from ANY vCPU while
+ * CPU1 sits inside vnet_emac_rx_frame() scattering a frame into the RX ring
+ * it just popped. The old code cleared vq->ready/desc/avail/used underneath
+ * it, so RX could write a frame and a used entry into buffers the guest had
+ * already freed. Each queue now has its own lock (vq_lock[], ldaxr/stlxr like
+ * the EMAC TX lock): RX holds queue 0's for the whole pop->scatter->push, the
+ * TX kick holds queue 1's, and every register write that changes a queue
+ * (QueueNum/Desc/Driver/Device/Ready) or resets the device (Status=0) takes
+ * the lock(s) first -- i.e. a reset WAITS for an in-flight RX/TX to finish,
+ * and RX re-checks DRIVER_OK/ready under the lock, so it never touches a
+ * queue that is being reset. RX never spins on its lock: if a reset holds it,
+ * the frame is dropped and counted ([23]), which is what a NIC mid-reset does.
+ * Both critical sections are bounded loops (no waits on external events), so
+ * the reset side may spin until it gets the lock.
+ *
+ * vnet_dev.int_status is set from CPU1 (RX, link change) and from the
+ * kicking vCPU (TX), and cleared from whichever vCPU acks: with two cause
+ * bits (VRING, CONFIG) a lost read-modify-write is no longer benign, so both
+ * directions are atomic (int_status_or/int_status_clear).
  *
  * Freestanding: <stdint.h> only.
  */
@@ -169,6 +175,12 @@
  *        wholly guest RAM, or its index is outside the ring
  *   [20] QueueReady refused: desc/avail/used ring not wholly guest RAM
  *   [21] of [7], frames whose HV ethertype sat inside a VLAN tag
+ *   [22] guest TX frames dropped because the link is down (the guest also
+ *        sees VIRTIO_NET_S_LINK_UP clear and should stop sending)
+ *   [23] RX frames dropped because a reset/queue reprogram held the RX lock
+ *   [24] link changes published to the guest (config-change interrupts)
+ *   [25] link state currently published in config.status (1 = up)
+ *   [26] config generation
  *
  * [7] counts every guest frame dropped on TX because its ethertype, bare or
  * behind one or two 802.1Q/802.1ad tags, is one of the HV's own 0x88B5..0x88B8
@@ -177,7 +189,7 @@
  * ------------------------------------------------------------------ */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
-#define VNET_BC_LAST   21u           /* highest slot used above */
+#define VNET_BC_LAST   26u           /* highest slot used above */
 
 static inline void vnet_bc(uint32_t idx, uint32_t v)
 {
@@ -200,6 +212,76 @@ static uint32_t g_kick_not_ready;     /* (e) TX kick before DRIVER_OK, NOT enfor
 static uint32_t g_bad_chain;          /* chain with a non-guest-RAM buffer / bad index */
 static uint32_t g_bad_ring;           /* QueueReady with a non-guest-RAM ring, refused */
 static uint32_t g_tx_blocked_vlan;    /* HV ethertype hidden behind a VLAN tag */
+static uint32_t g_tx_linkdown;        /* [22] guest TX dropped, link down */
+static uint32_t g_rx_reset_busy;      /* [23] RX dropped, queue being reset */
+static uint32_t g_link_changes;       /* [24] link changes published */
+static volatile uint32_t g_force_down_polls;  /* nettest vlink: polls left */
+
+/* Per-queue locks (see the QUEUE STATE vs DEVICE RESET note at the top).
+ * Plain BSS words: HV memory is Normal cacheable and the cores run with
+ * SMPEN, so ldaxr/stlxr are coherent across them (same as smp.c g_online).
+ * One cache line each so the RX and TX sides never false-share. */
+static volatile uint32_t g_vq_lock[VNET_NUM_QUEUES][16] __attribute__((aligned(64)));
+
+static int vq_trylock(uint32_t q)
+{
+	volatile uint32_t *p = &g_vq_lock[q][0];
+	uint32_t prev, status, one = 1u;
+	__asm__ volatile(
+		"	ldaxr	%w0, [%3]\n"
+		"	cbnz	%w0, 1f\n"
+		"	stlxr	%w1, %w2, [%3]\n"
+		"	b	2f\n"
+		"1:	clrex\n"
+		"	mov	%w1, #1\n"
+		"2:\n"
+		: "=&r"(prev), "=&r"(status)
+		: "r"(one), "r"(p)
+		: "memory");
+	return prev == 0u && status == 0u;
+}
+
+/* Waits for the holder: every critical section under these locks is a
+ * bounded walk of a guest ring (plus, for TX, emac.c's bounded send), so
+ * this cannot wait forever. */
+static void vq_lock(uint32_t q)
+{
+	while (!vq_trylock(q))
+		__asm__ volatile("yield" ::: "memory");
+}
+
+static void vq_unlock(uint32_t q)
+{
+	__asm__ volatile("dmb ish" ::: "memory");
+	g_vq_lock[q][0] = 0u;
+	__asm__ volatile("dsb ish\n\tsev" ::: "memory");
+}
+
+static void int_status_or(volatile uint32_t *p, uint32_t bits)
+{
+	uint32_t v, st;
+	__asm__ volatile(
+		"1:	ldaxr	%w0, [%2]\n"
+		"	orr	%w0, %w0, %w3\n"
+		"	stlxr	%w1, %w0, [%2]\n"
+		"	cbnz	%w1, 1b\n"
+		: "=&r"(v), "=&r"(st)
+		: "r"(p), "r"(bits)
+		: "memory");
+}
+
+static void int_status_clear(volatile uint32_t *p, uint32_t bits)
+{
+	uint32_t v, st;
+	__asm__ volatile(
+		"1:	ldaxr	%w0, [%2]\n"
+		"	bic	%w0, %w0, %w3\n"
+		"	stlxr	%w1, %w0, [%2]\n"
+		"	cbnz	%w1, 1b\n"
+		: "=&r"(v), "=&r"(st)
+		: "r"(p), "r"(bits)
+		: "memory");
+}
 
 /* HV-local staging buffer for one frame at a time. Only ever touched from
  * ONE core per call (vnet_kick on CPU0, vnet_emac_rx_frame on CPU1), but
@@ -491,6 +573,13 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 		vnet_bc(7, ++g_tx_blocked);
 		if (hv_type > 1)
 			vnet_bc(21, ++g_tx_blocked_vlan);
+	} else if (!g_net.link_up) {
+		/* Link down (config.status says so too, and the guest was sent a
+		 * config-change interrupt): nothing can leave. Count it here rather
+		 * than let it vanish into emac.c's generic drop counter. virtio-net
+		 * has no per-frame TX error status, so the completion below is the
+		 * most a device can say; the honest signal is the link state. */
+		vnet_bc(22, ++g_tx_linkdown);
 	} else {
 		const uint8_t *payload = g_tx_stage + VNET_HDR_LEN + VNET_ETH_HDR_LEN;
 		uint32_t plen = total - VNET_HDR_LEN - VNET_ETH_HDR_LEN;
@@ -546,12 +635,16 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 		if (!(d->status & VNET_S_DRIVER_OK))
 			vnet_bc(18, ++g_kick_not_ready);
 
+		/* Held across the whole drain: a reset/QueueReady write from
+		 * another vCPU waits until this ring walk is finished. */
+		vq_lock(VNET_QUEUE_TX);
 		while (vq_pop_avail(vq, &head)) {
 			vnet_tx_one(d, head);
 			served = 1;
 		}
+		vq_unlock(VNET_QUEUE_TX);
 		if (served) {
-			d->int_status |= VNET_INT_VRING;
+			int_status_or((volatile uint32_t *)&d->int_status, VNET_INT_VRING);
 			vnet_inject_irq();
 		}
 	}
@@ -569,15 +662,26 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 	struct vnet_vq *vq = &g_net.vq[VNET_QUEUE_RX];
 	uint16_t head;
 
-	if (!(g_net.status & VNET_S_DRIVER_OK)) {
-		vnet_bc(5, ++g_rx_dropped);          /* driver not attached yet */
-		return;
-	}
 	if (len < VNET_ETH_HDR_LEN || (uint32_t)len > VNET_STAGE_BUF_SIZE - VNET_HDR_LEN) {
 		vnet_bc(5, ++g_rx_dropped);          /* malformed / oversize */
 		return;
 	}
+	/* Never wait here: a reset or queue reprogram holding the lock means
+	 * the ring is going away -- drop the frame, as a NIC mid-reset would. */
+	if (!vq_trylock(VNET_QUEUE_RX)) {
+		vnet_bc(23, ++g_rx_reset_busy);
+		return;
+	}
+	/* DRIVER_OK and the queue registers are re-read UNDER the lock: a reset
+	 * that completed just before we took it is seen here, and one that
+	 * starts after waits for vq_unlock() below. */
+	if (!(g_net.status & VNET_S_DRIVER_OK)) {
+		vq_unlock(VNET_QUEUE_RX);
+		vnet_bc(5, ++g_rx_dropped);          /* driver not attached yet */
+		return;
+	}
 	if (!vq_pop_avail(vq, &head)) {
+		vq_unlock(VNET_QUEUE_RX);
 		vnet_bc(5, ++g_rx_dropped);          /* guest posted no RX buffer */
 		return;
 	}
@@ -592,6 +696,7 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 	struct vnet_hdr hdr;
 	hdr.flags = 0; hdr.gso_type = 0; hdr.hdr_len = 0;
 	hdr.gso_size = 0; hdr.csum_start = 0; hdr.csum_offset = 0;
+	hdr.num_buffers = 1;          /* spec: 1 without MRG_RXBUF (was stack garbage) */
 	for (uint32_t i = 0; i < VNET_HDR_LEN; i++)
 		g_rx_stage[i] = ((const uint8_t *)&hdr)[i];
 	for (uint32_t i = 0; i < len; i++)
@@ -601,6 +706,7 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 	uint32_t n = vq_collect_chain(vq, head, chain, VNET_MAX_CHAIN);
 	if (n == 0) {
 		vq_push_used(vq, head, 0);
+		vq_unlock(VNET_QUEUE_RX);
 		return;
 	}
 
@@ -614,11 +720,49 @@ void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len)
 	uint32_t written = vnet_scatter(chain, n, g_rx_stage,
 	                                 VNET_HDR_LEN + (uint32_t)len);
 	vq_push_used(vq, head, written);
+	vq_unlock(VNET_QUEUE_RX);
 	vnet_bc(4, ++g_rx_queued);
 
-	g_net.int_status |= VNET_INT_VRING;      /* see cross-core note: benign
-	                                          * single-bit OR from CPU1 */
+	int_status_or((volatile uint32_t *)&g_net.int_status, VNET_INT_VRING);
 	vnet_inject_irq();
+}
+
+/* ------------------------------------------------------------------ *
+ * Link status (VIRTIO_NET_F_STATUS). Runs on CPU1 from emac_poll(); the
+ * only writer of g_net.link_up / config_gen after vnet_init().
+ * ------------------------------------------------------------------ */
+void vnet_emac_force_link_down(uint32_t polls)
+{
+	g_force_down_polls = polls;
+}
+
+void vnet_emac_link_update(int emac_link_up)
+{
+	uint32_t up = emac_link_up ? 1u : 0u;
+
+	if (g_force_down_polls) {
+		g_force_down_polls--;
+		up = 0u;
+	}
+	if (up == g_net.link_up)
+		return;
+
+	/* Status first, then the generation: a driver that read the old
+	 * generation before our status store sees a different one after it
+	 * and re-reads (virtio 1.x 4.2.2.2 ConfigGeneration). */
+	g_net.link_up = up;
+	__asm__ volatile("dmb ish" ::: "memory");
+	g_net.config_gen++;
+	__asm__ volatile("dsb ish" ::: "memory");
+	vnet_bc(24, ++g_link_changes);
+	vnet_bc(25, up);
+	vnet_bc(26, g_net.config_gen);
+
+	if ((g_net.status & VNET_S_DRIVER_OK) &&
+	    (g_net.driver_features & VNET_F_STATUS_BIT)) {
+		int_status_or((volatile uint32_t *)&g_net.int_status, VNET_INT_CONFIG);
+		vnet_inject_irq();
+	}
 }
 
 /* ------------------------------------------------------------------ *
@@ -639,7 +783,7 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 		if (d->dev_feat_sel == VNET_FEATWORD_HI)
 			return VNET_F_VERSION_1_BIT;
 		if (d->dev_feat_sel == VNET_FEATWORD_LO)
-			return VNET_F_MAC_BIT;
+			return VNET_F_MAC_BIT | VNET_F_STATUS_BIT;
 		return 0u;
 	case VNET_R_QUEUE_NUM_MAX:
 		/* D5(a): a nonexistent queue_sel must read back 0 (spec: QueueNumMax
@@ -675,17 +819,60 @@ static uint32_t vnet_config_read(uint32_t byte_off, uint32_t sas)
 {
 	static const uint8_t mac[VNET_GUEST_MAC_LEN] = VNET_GUEST_MAC;
 	uint32_t nbytes = (sas == 0u) ? 1u : (sas == 1u) ? 2u : 4u;
+	uint32_t status = g_net.link_up ? VNET_S_LINK_UP : 0u;   /* le16 @6 */
 	uint32_t v = 0;
 
 	for (uint32_t i = 0; i < nbytes; i++) {
 		uint32_t idx = byte_off + i;
-		uint8_t b = (idx < VNET_GUEST_MAC_LEN) ? mac[idx] : 0u;
+		uint8_t b = 0u;
+		if (idx < VNET_GUEST_MAC_LEN)
+			b = mac[idx];
+		else if (idx == VNET_CFG_STATUS_OFF)
+			b = (uint8_t)status;
+		else if (idx == VNET_CFG_STATUS_OFF + 1u)
+			b = (uint8_t)(status >> 8);
 		v |= (uint32_t)b << (8u * i);
 	}
 	return v;
 }
 
+static void vnet_reg_write_locked(struct vnet_dev *d, uint32_t off, uint32_t val);
+
+/* Which queue locks a register write needs (bit q = lock queue q): every
+ * write that changes a queue's ring registers or readiness takes that
+ * queue's lock, a reset (Status=0) takes both. Everything else -- notably
+ * QueueNotify (vnet_kick locks TX itself) and InterruptACK -- takes none. */
+static uint32_t vnet_write_locks(const struct vnet_dev *d, uint32_t off, uint32_t val)
+{
+	switch (off) {
+	case VNET_R_QUEUE_NUM:
+	case VNET_R_QUEUE_DESC_LOW:   case VNET_R_QUEUE_DESC_HIGH:
+	case VNET_R_QUEUE_DRIVER_LOW: case VNET_R_QUEUE_DRIVER_HIGH:
+	case VNET_R_QUEUE_DEVICE_LOW: case VNET_R_QUEUE_DEVICE_HIGH:
+	case VNET_R_QUEUE_READY:
+		return d->queue_sel < VNET_NUM_QUEUES ? (1u << d->queue_sel) : 0u;
+	case VNET_R_STATUS:
+		return val == 0u ? ((1u << VNET_NUM_QUEUES) - 1u) : 0u;
+	default:
+		return 0u;
+	}
+}
+
 static void vnet_reg_write(struct vnet_dev *d, uint32_t off, uint32_t val)
+{
+	uint32_t locks = vnet_write_locks(d, off, val);
+
+	/* Fixed order (RX then TX) so two resets on two vCPUs cannot deadlock. */
+	for (uint32_t q = 0; q < VNET_NUM_QUEUES; q++)
+		if (locks & (1u << q))
+			vq_lock(q);
+	vnet_reg_write_locked(d, off, val);
+	for (uint32_t q = VNET_NUM_QUEUES; q-- > 0; )
+		if (locks & (1u << q))
+			vq_unlock(q);
+}
+
+static void vnet_reg_write_locked(struct vnet_dev *d, uint32_t off, uint32_t val)
 {
 	switch (off) {
 	case VNET_R_DEVICE_FEATURES_SEL: d->dev_feat_sel = val; break;
@@ -775,18 +962,26 @@ static void vnet_reg_write(struct vnet_dev *d, uint32_t off, uint32_t val)
 		vnet_kick(d, val);
 		break;
 	case VNET_R_INTERRUPT_ACK:
-		d->int_status &= ~val;
+		int_status_clear((volatile uint32_t *)&d->int_status, val);
 		break;
 	case VNET_R_STATUS:
-		d->status = val;
 		if (val == 0u) {
-			/* Driver reset: clear queue state (device stays registered). */
+			/* Driver reset, with BOTH queue locks held (vnet_reg_write):
+			 * any RX scatter or TX drain in flight has finished, and none
+			 * can start until the queues below read not-ready. Status
+			 * goes to 0 first so RX's DRIVER_OK re-check fails too. */
+			d->status = 0u;
+			__asm__ volatile("dmb ish" ::: "memory");
 			for (uint32_t q = 0; q < VNET_NUM_QUEUES; q++) {
 				struct vnet_vq *vq = &d->vq[q];
 				vq->ready = 0; vq->num = 0; vq->last_avail = 0;
 				vq->desc = vq->avail = vq->used = 0;
 			}
-			d->int_status = 0;
+			d->driver_features = 0;   /* renegotiated after a reset */
+			int_status_clear((volatile uint32_t *)&d->int_status, ~0u);
+			__asm__ volatile("dsb ish" ::: "memory");
+		} else {
+			d->status = val;
 		}
 		break;
 	default:
@@ -852,7 +1047,7 @@ int vnet_mmio_fault(struct el2_frame *frame)
 		if (off == VNET_R_QUEUE_NOTIFY)
 			flightrec_log(FLTR_K_VIRTIO, off, val);
 	} else {
-		uint32_t val = (off >= VNET_R_CONFIG && off < VNET_R_CONFIG + VNET_GUEST_MAC_LEN)
+		uint32_t val = (off >= VNET_R_CONFIG && off < VNET_R_CONFIG + VNET_CFG_LEN)
 		             ? vnet_config_read(off - VNET_R_CONFIG, sas)
 		             : vnet_reg_read(&g_net, off);
 		if (srt != SRT_XZR)
@@ -877,11 +1072,18 @@ void vnet_init(void)
 
 	g_gmem_oob = g_bad_queue_num = g_bad_desc_flags = g_kick_not_ready = 0;
 	g_bad_chain = g_bad_ring = g_tx_blocked_vlan = 0;
+	g_tx_linkdown = g_rx_reset_busy = g_link_changes = 0;
+	g_force_down_polls = 0;
+	g_vq_lock[0][0] = g_vq_lock[1][0] = 0u;
+	/* Start from the EMAC's current state; vnet_emac_link_update() (every
+	 * emac_poll) publishes each change after this. */
+	g_net.link_up = emac_link_up() ? 1u : 0u;
 
 	/* Every slot, not just the ready bits: the window is not cleared by
 	 * anything else, and a counter that has never fired must read 0, not
 	 * whatever the DRAM held. */
 	for (uint32_t i = 1; i <= VNET_BC_LAST; i++)
 		vnet_bc(i, 0);
+	vnet_bc(25, g_net.link_up);
 	vnet_bc(0, VNET_BC_MAGIC);
 }

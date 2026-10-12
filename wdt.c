@@ -67,6 +67,10 @@ static uint64_t wdt_last_progress;   /* CNTPCT at the last observed progress   *
  *
  * So every pet now also requires that the board was reachable within
  * WDT_UNREACH_S: an EMAC frame received (emac.c calls wdt_note_reachable()),
+ * an EMAC frame SENT -- a TX descriptor the DMA gave back while the PHY
+ * reports a correct link (emac.c note_tx_done(); the guest's own traffic
+ * counts, and on a silent wire the link watchdog sends a small loopback probe
+ * about once a minute, so a quiet but working wire is not "unreachable") --
  * or the USB host still clocking the bus -- the MUSB frame number advances
  * with every SOF only while a host holds the port enabled; a wedged gadget
  * that the host gave up on stops it. Past that, nobody pets, the 16 s WDOG

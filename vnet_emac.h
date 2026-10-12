@@ -38,8 +38,8 @@
  *
  * ============================================================================
  * TRANSPORT: virtio-mmio, MODERN (spec v2 / VIRTIO 1.x), NOT legacy.
- * VIRTIO_F_VERSION_1 and VIRTIO_NET_F_MAC are offered — no CSUM/offload
- * features, no VIRTIO_NET_F_MRG_RXBUF, no VIRTIO_NET_F_STATUS. This means:
+ * VIRTIO_F_VERSION_1, VIRTIO_NET_F_MAC and VIRTIO_NET_F_STATUS are offered —
+ * no CSUM/offload features, no VIRTIO_NET_F_MRG_RXBUF. This means:
  *   - every virtio_net_hdr on the wire always carries the trailing
  *     num_buffers field (VIRTIO 1.0 §5.1.6.1 — a MODERN device always
  *     includes it, MRG_RXBUF negotiation doesn't change that; see
@@ -158,22 +158,33 @@
 
 /* InterruptStatus bits. */
 #define VNET_INT_VRING            0x1u    /* used ring advanced (either queue) */
+#define VNET_INT_CONFIG           0x2u    /* config space changed (link status) */
 
 /* Feature bit 32 = VIRTIO_F_VERSION_1 lives in feature word 1, bit 0.
  * VIRTIO_NET_F_MAC (bit 5) lives in feature word 0 — offered so the guest
  * uses a HYPERVISOR-ASSIGNED MAC (VNET_GUEST_MAC below, == emac.c's OUR_MAC)
  * instead of picking its own random one. See the config-space comment below
  * for why this matters (2026-07-24: fixes unicast RX never reaching the
- * guest). No other feature bit is offered — no CSUM/MRG_RXBUF/STATUS/
- * offloads, matching vblk_emmc.c's minimal-feature-set precedent. */
+ * guest). VIRTIO_NET_F_STATUS (below) is the only other one — no CSUM/
+ * MRG_RXBUF/offloads, matching vblk_emmc.c's minimal-feature-set precedent. */
 #define VNET_FEATWORD_LO          0u
 #define VNET_FEATWORD_HI          1u
 #define VNET_F_MAC_BIT            (1u << 5)
+/* VIRTIO_NET_F_STATUS (bit 16): config.status carries VIRTIO_NET_S_LINK_UP,
+ * mirroring the EMAC's PHY link (emac_link_up()). A change bumps
+ * ConfigGeneration and raises VNET_INT_CONFIG, so if_vtnet(4) re-reads it and
+ * reports the link to the stack (ifconfig "status: no carrier"), and stops
+ * handing frames to a dead wire. */
+#define VNET_F_STATUS_BIT         (1u << 16)
+#define VNET_S_LINK_UP            0x1u
+/* struct virtio_net_config: mac[6] @0, le16 status @6. */
+#define VNET_CFG_STATUS_OFF       6u
+#define VNET_CFG_LEN              8u
 #define VNET_F_VERSION_1_BIT      0x1u
 
-/* Device-specific config space (struct virtio_net_config): just the 6-byte
- * `mac` field at offset 0, nothing else (no VIRTIO_NET_F_STATUS/MQ/etc, so
- * the guest never reads past offset 5). MUST equal emac.c's OUR_MAC.
+/* Device-specific config space (struct virtio_net_config): the 6-byte `mac`
+ * field at offset 0 and the 16-bit `status` at 6 (VIRTIO_NET_F_STATUS); no
+ * MQ/MTU fields. The MAC MUST equal emac.c's OUR_MAC.
  *
  * WHY: emac_send_frame() (see the "MAC IDENTITY NOTE" below) always sources
  * TX frames from OUR_MAC — the guest's own virtio-net MAC never appears on
@@ -324,6 +335,7 @@ struct vnet_dev {
 	uint32_t status;
 	uint32_t int_status;
 	uint32_t config_gen;
+	uint32_t link_up;        /* config.status LINK_UP as last published     */
 	struct vnet_vq vq[VNET_NUM_QUEUES];
 };
 
@@ -363,5 +375,17 @@ int vnet_mmio_fault(struct el2_frame *frame);
  * the cross-core concurrency comment block in vnet_emac.c before relying on
  * this in a build that matters. */
 void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len);
+
+/* Link-status hook, called from emac_poll() (CPU1) on every poll with the
+ * EMAC's current debounced link state. Publishes a change into config.status,
+ * bumps ConfigGeneration and raises the config-change interrupt. Cheap when
+ * nothing changed (one compare). */
+void vnet_emac_link_update(int emac_link_up);
+
+/* Test lever (dbgmon `nettest vlink`): report the link DOWN to the guest for
+ * `polls` emac_poll() calls (~10 ms each) whatever the PHY says, then follow
+ * the PHY again. Only the guest's view changes; the HV's own traffic keeps
+ * flowing, so the debug channel stays up during the test. */
+void vnet_emac_force_link_down(uint32_t polls);
 
 #endif /* BZDOS_VNET_EMAC_H */

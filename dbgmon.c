@@ -88,6 +88,12 @@ extern void console_flush(void);
  * wdtest command, so the reference only needs to RESOLVE at link time in
  * the builds that can reach it — same pattern as console_flush above). */
 extern void emac_wd_test_mode(int on);
+/* `nettest` levers (emac.h / vnet_emac.h). The vnet one is weak: not every
+ * target that links dbgmon.o links vnet_emac.o. */
+extern void emac_nettest_quiet(uint32_t seconds);
+extern void emac_nettest_phydown(void);
+extern void emac_nettest_stats(uint32_t out[14]);
+extern void vnet_emac_force_link_down(uint32_t polls) __attribute__((weak));
 
 /* Guest single-step toggle, implemented in el2_exc.c (linked into the same
  * debugger build). Returns the new enabled state (1=on, 0=off). Passing the
@@ -1159,6 +1165,7 @@ static void cmd_help(void)
 	cputs("  release            release a currently-held pause-before-guest-entry\r\n");
 	cputs("  phycycle           DISABLED (EL2 RSB races the guest's iichb1 — use guest-side phycut)\r\n");
 	cputs("  wdtest on|off      software 'PHY never trains' — exercises the give-up/escalation ladder\r\n");
+	cputs("  nettest [quiet <s>|vlink <s>|phydown]  link-watchdog/vnet link test levers (hex s)\r\n");
 	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
 	cputs("  zstage             re-run the 2nd guest's copy-in from the landing window\r\n");
 	cputs("  zunhalt            re-arm CPU3 after a failed zboot (0xBAD1/0xBAD2), no reload\r\n");
@@ -1454,6 +1461,49 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cputs("phycycle: disabled -- EL2 must not touch the RSB while the "
 		      "guest owns it (measured wedge 2026-08-30). Use the guest-"
 		      "side phycut (I2CRDWR /dev/iic1) instead.\r\n");
+		return;
+	}
+	if (streq(cmd, "nettest")) {
+		/* Audit item 4/5 test levers -- see emac.h. Numbers are hex. */
+		unsigned long v = 0;
+		if (nt >= 3 && streq(tok[1], "quiet") && parse_hex(tok[2], &v)) {
+			emac_nettest_quiet((uint32_t)v);
+			cputs("nettest: quiet wire (watchdog view) for 0x");
+			print_hex32((uint32_t)v);
+			cputs(" s\r\n");
+			return;
+		}
+		if (nt >= 3 && streq(tok[1], "vlink") && parse_hex(tok[2], &v)) {
+			if (!vnet_emac_force_link_down) {
+				err("no vnet in this image");
+				return;
+			}
+			/* emac_poll() runs once per 10 ms tick. */
+			vnet_emac_force_link_down((uint32_t)v * 100u);
+			cputs("nettest: guest sees link DOWN for 0x");
+			print_hex32((uint32_t)v);
+			cputs(" s\r\n");
+			return;
+		}
+		if (nt >= 2 && streq(tok[1], "phydown")) {
+			emac_nettest_phydown();
+			cputs("nettest: PHY power-down requested -- channel dark until the watchdog re-kicks\r\n");
+			return;
+		}
+		{
+			static const char *const names[14] = {
+				"link", "rk_state", "rekicks", "down_ev", "probes",
+				"txdone", "txstuck", "verdict", "rx_age", "txdone_age",
+				"quiet_left", "deaf", "attempts", "tx_drops" };
+			uint32_t st[14];
+			emac_nettest_stats(st);
+			for (int i = 0; i < 14; i++) {
+				cputs(names[i]);
+				cputs("=");
+				print_hex32(st[i]);
+				cputs(i == 13 ? "\r\n" : " ");
+			}
+		}
 		return;
 	}
 	if (streq(cmd, "wdtest")) {

@@ -263,6 +263,14 @@ __attribute__((weak)) void vnet_emac_rx_frame(const uint8_t *frame, uint16_t len
     (void)frame; (void)len;   /* no vnet_emac linked in: drop silently */
 }
 
+/* vnet_emac.c's link-status hook (VIRTIO_NET_F_STATUS), called every
+ * emac_poll() with the debounced link state; weak no-op without vnet. */
+extern void vnet_emac_link_update(int emac_link_up);
+__attribute__((weak)) void vnet_emac_link_update(int emac_link_up)
+{
+    (void)emac_link_up;
+}
+
 /* dbgtools.c provides the real implementation (dbg/gdb builds only); same
  * weak-fallback pattern as netcon_rx_frame above so any build without
  * dbgtools.o (repl/fbsd/zephyr/hdmi/net/stage0) links cleanly. Same
@@ -530,6 +538,20 @@ static uint32_t g_link_down_events;   /* up->down transition count */
 static uint32_t g_tx_drops;           /* frames dropped by tx_frame() */
 static uint32_t g_first_rx_latched;   /* one-shot: has ANY frame ever arrived */
 
+/* TX health (audit item 4): a frame handed to the TX DMA whose descriptor
+ * the DMA later gives back (OWN clear) went out of the MAC. With the PHY
+ * reporting a correct link at the same time, that is evidence the board's
+ * Ethernet path works even when nobody is sending to us. Every TX path
+ * (console, HV replies, the guest's vnet frames, the watchdog's own probe)
+ * goes through tx_frame_raw_src(), so they all count. The masks and slot
+ * stamps are written only under the TX lock. */
+static uint32_t g_tx_pending_mask;          /* slots handed to DMA, unreaped */
+static uint32_t g_tx_probe_mask;            /* ... of which watchdog probes */
+static uint64_t g_tx_slot_ticks[N_TX_DESC]; /* when each slot was queued */
+static volatile uint64_t g_last_txdone_ticks;    /* newest observed completion */
+static volatile uint64_t g_last_probedone_ticks; /* newest completed probe */
+static uint32_t g_txdone_count;
+
 /* Watchdog-ladder TEST MODE (emac_wd_test_mode()/dbgmon `wdtest`): while on,
  * phy_startup() fails instantly without touching MDIO and the link
  * watchdog's healthy short-circuit is bypassed, so the full
@@ -634,6 +656,31 @@ static inline void note_rx_frame(void)
         g_first_rx_latched = 1;
         bc(19, 1);
     }
+}
+
+/* A TX descriptor came back from the DMA (caller holds the TX lock). With
+ * the link up, the board can still reach the wire: that feeds wdt.c's
+ * reachability gate exactly like a received frame, provided the RX side
+ * has not been deaf for longer than the dark-reboot horizon -- a board
+ * whose RX path died while TX still completes must not keep itself alive
+ * on TX alone (emac_link_watchdog()'s "deaf" rule reboots it). */
+static int emac_rx_deaf(uint64_t now);
+static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
+                                uint16_t ethertype, const uint8_t *payload,
+                                int plen, int probe);
+static void note_tx_done(int slot, uint64_t now)
+{
+    uint32_t bit = 1u << slot;
+
+    g_tx_pending_mask &= ~bit;
+    g_last_txdone_ticks = now;
+    g_txdone_count++;
+    if (g_tx_probe_mask & bit) {
+        g_tx_probe_mask &= ~bit;
+        g_last_probedone_ticks = now;
+    }
+    if (g_link_up && !emac_rx_deaf(now))
+        wdt_note_reachable();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1020,8 +1067,10 @@ static void write_hwaddr(void)
 
 /* Boot-context wrapper: the full LINK_WAIT budget + forced fallback are the
  * RIGHT thing at emac_init() time (nothing else on the board is being
- * starved, and the console must get every chance to train). Only the
- * watchdog re-kick uses phy_startup_ctx(quick=1). */
+ * starved, and the console must get every chance to train). The runtime
+ * re-kick no longer calls phy_startup_ctx() at all (not even quick=1): it is
+ * the tick-stepped state machine in emac_link_watchdog(), so it never holds
+ * the CPU1 tick for seconds. */
 static int phy_startup(int *duplex_full)
 {
     return phy_startup_ctx(duplex_full, 0);
@@ -1177,6 +1226,8 @@ static void rings_init(void)
     wr(EMAC_TX_DMA_DESC, (uint32_t)TX_DESC_BASE);
     g_rx_slot = 0;
     g_tx_slot = 0;
+    g_tx_pending_mask = 0;
+    g_tx_probe_mask = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1458,6 +1509,269 @@ static int phy_rail_ensure(void)
 }
 
 
+/* ------------------------------------------------------------------ */
+/* Watchdog health model (audit item 4, 2026-10-12).                     */
+/*                                                                      */
+/* The old test was "link up AND a frame RECEIVED in the last 60 s": a   */
+/* quiet wire -- nobody talking to a board that is up as a router/AP --  */
+/* read as dark, and every 8 s the watchdog soft-reset the PHY (BMCR     */
+/* RESET: a real link drop) and then sat for up to ~10 s inside the CPU1 */
+/* tick waiting for retrain, stalling vCPU1 and all board I/O.           */
+/*                                                                      */
+/* Now:                                                                 */
+/*  - LINK BAD  = debounced link down (link_recheck), or PHYSR shows no  */
+/*    resolved link / a speed-duplex the MAC is not programmed for.      */
+/*  - TX STUCK  = a frame handed to the TX DMA has not been given back   */
+/*    within LINK_WD_TX_STUCK_S.                                         */
+/*  - PATH PROVEN = a frame received, OR a TX completed, within          */
+/*    LINK_WD_RX_STALE_S. TX includes the guest's frames. When neither   */
+/*    happened the watchdog transmits one probe (IEEE 802.3 loopback     */
+/*    0x9000, to our own MAC: the switch drops it), so a quiet wire      */
+/*    proves itself with one small frame a minute.                       */
+/* Only LINK BAD or TX STUCK re-kick the PHY. A link that is up with a   */
+/* working TX is never reset, however quiet.                            */
+/*                                                                      */
+/* Re-kick is a state machine stepped once per call (= once per CPU1     */
+/* tick): reset, settle, advertise, wait for link, resolve -- each step  */
+/* a few MDIO transactions, no multi-second wait inside the tick.        */
+/*                                                                      */
+/* Dark-board recovery is kept: the escalation ladder (attempts, then     */
+/* LINK_WD_DARK_REBOOT_S of continuous trouble -> give-up -> reboot) runs */
+/* on LINK BAD / TX STUCK as before, and a link that is up with TX still  */
+/* completing but has RECEIVED NOTHING for LINK_WD_DARK_REBOOT_S is       */
+/* "deaf" (RX path wedged) and gives up too -- the PHY is not reset for  */
+/* it, the board is rebooted. TX completions stop feeding wdt.c's        */
+/* reachability gate once deaf, so that gate still fires on its own.     */
+/* ------------------------------------------------------------------ */
+#define LINK_WD_TX_STUCK_S       4u   /* queued TX not returned => stuck  */
+#define ETHERTYPE_LOOPBACK       0x9000u  /* IEEE 802.3 CTP (loopback)    */
+
+/* Re-kick state machine. */
+enum { RK_IDLE = 0, RK_RESET_WAIT, RK_SETTLE, RK_LINK_WAIT, RK_ANEG_WAIT };
+#define RK_RESET_TIMEOUT_MS   1000u
+#define RK_SETTLE_MS          200u
+#define RK_LINK_TIMEOUT_MS    10000u   /* healthy retrain is 2-4 s */
+#define RK_ANEG_TIMEOUT_MS    3000u
+static uint32_t g_rk_state;
+static uint64_t g_rk_t0;
+
+/* Test levers (dbgmon `nettest`). */
+static volatile uint64_t g_nt_quiet_until;  /* fake "no RX, no non-probe TX" */
+static volatile uint32_t g_nt_phydown;      /* request a real PHY power-down */
+static uint32_t g_wd_probes, g_wd_txstuck, g_wd_deaf;
+static uint32_t g_wd_last_verdict;          /* see emac_nettest_stats() */
+
+int emac_rekick_active(void)
+{
+    return g_rk_state != RK_IDLE;
+}
+
+static uint64_t ms_ticks(uint64_t freq, uint32_t ms)
+{
+    return freq / 1000u * ms;
+}
+
+static int nt_quiet(uint64_t now)
+{
+    return now < g_nt_quiet_until;
+}
+
+/* "Deaf": nothing received for LINK_WD_DARK_REBOOT_S (since emac_init()
+ * if nothing ever was). */
+static int emac_rx_deaf(uint64_t now)
+{
+    uint64_t freq = timer_freq() ? timer_freq() : 24000000ull;
+    uint64_t base = g_rx_count ? g_last_rx_ticks : g_emac_up_ticks;
+    return now > base && (now - base) >= freq * (uint64_t)LINK_WD_DARK_REBOOT_S;
+}
+
+static int emac_tx_recent(uint64_t freq, uint64_t now)
+{
+    uint64_t stale = freq * (uint64_t)LINK_WD_RX_STALE_S;
+    uint64_t t = nt_quiet(now) ? g_last_probedone_ticks : g_last_txdone_ticks;
+    return t != 0 && (t >= now || now - t < stale);
+}
+
+/* Reap TX descriptors the DMA has given back; return 1 if one is overdue.
+ * CPU1, bounded TX-lock acquire (a busy lock just means "check next time"). */
+static int tx_reap(uint64_t freq, uint64_t now)
+{
+    int stuck = 0;
+
+    if (!emac_tx_lock_acquire_bounded())
+        return 0;
+    for (int i = 0; i < N_TX_DESC; i++) {
+        if (!(g_tx_pending_mask & (1u << i)))
+            continue;
+        volatile struct emac_desc *d = tx_desc(i);
+        cache_inval((uintptr_t)d, sizeof(*d));
+        if (!(d->status & EMAC_DESC_OWN_DMA))
+            note_tx_done(i, now);
+        else if (now > g_tx_slot_ticks[i] &&
+                 now - g_tx_slot_ticks[i] > freq * (uint64_t)LINK_WD_TX_STUCK_S)
+            stuck = 1;
+    }
+    if (stuck)
+        setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
+    emac_tx_unlock();
+    return stuck;
+}
+
+/* One small frame to our own MAC, to find out whether TX still works on a
+ * wire nobody is talking on. CTP "reply" with skipCount 0: any station that
+ * did see it would just drop it; a switch filters it (destination == the
+ * port it learnt the source on). */
+static void wd_send_probe(void)
+{
+    uint8_t p[6];
+    p[0] = 0; p[1] = 0;                      /* skipCount */
+    p[2] = 1; p[3] = 0;                      /* function: reply */
+    p[4] = (uint8_t)g_wd_probes; p[5] = (uint8_t)(g_wd_probes >> 8);
+    g_wd_probes++;
+    (void)tx_frame_raw_src_ex(OUR_MAC, OUR_MAC, ETHERTYPE_LOOPBACK, p,
+                              (int)sizeof(p), 1);
+}
+
+static void rk_finish(int linked, int duplex_full)
+{
+    g_rk_state = RK_IDLE;
+    wdep_write(7, (uint32_t)(linked ? 1 : 0));
+    bc(4, linked ? 1 : 0);
+    if (linked) {
+        bc(5, g_speed);
+        adjust_link(duplex_full);
+        g_link_down_streak = 0;
+        g_link_up = 1;
+        bc(14, ++g_link_up_events);
+        g_wd_attempts = 0;     /* episode over: full budget for the next one */
+    }
+    if (g_rx_count == 0) {
+        /* Never-had-traffic boot: re-arm rings/DMA/MAC as the old re-kick
+         * did. Under the TX lock, so a guest TX on another core cannot be
+         * mid-descriptor while the ring is rewritten. */
+        if (emac_tx_lock_acquire_bounded()) {
+            rings_init();
+            setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
+                                  EMAC_RX_CTL1_RX_RUNT_FRM);
+            setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
+            setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
+            setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
+            __asm__ volatile("dsb sy" ::: "memory");
+            emac_tx_unlock();
+        }
+    }
+}
+
+/* Start a re-kick: PHY rail, ID check, BMCR reset. Returns 0 if it failed
+ * outright (counted as a failed attempt; the ladder retries next period). */
+static int rk_start(uint64_t now)
+{
+    int id1, id2;
+
+    wdep_write(6, ++g_wdep_rekicks);
+    if (g_wd_test_mode) {                 /* software "PHY never trains" */
+        g_wd_test_skips++;
+        bc(27, g_wd_test_skips);
+        wdep_write(7, 0);
+        return 0;
+    }
+    /* PHY reads as absent (last BMSR sample 0xffff): its rail is off, see
+     * phy_rail_ensure(). Restore it before retraining. */
+    if ((wdep_read(4) & 0xffffu) == 0xffffu)
+        phy_rail_ensure();
+
+    id1 = mdio_read(PHY_ADDR, MII_PHYID1);
+    id2 = mdio_read(PHY_ADDR, MII_PHYID2);
+    if (id1 < 0 || id2 < 0 || ((id1 & 0xffff) == 0xffff && (id2 & 0xffff) == 0xffff) ||
+        (id1 == 0 && id2 == 0)) {
+        wdep_write(7, 0);                 /* not answering: failed attempt */
+        return 0;
+    }
+    bc(9, ((uint32_t)(id1 & 0xffff) << 16) | (uint32_t)(id2 & 0xffff));
+    if (g_link_up) {
+        g_link_up = 0;
+        bc(4, 0);
+        bc(13, ++g_link_down_events);
+    }
+    mdio_write(PHY_ADDR, MII_BMCR, BMCR_RESET);
+    g_rk_t0 = now;
+    g_rk_state = RK_RESET_WAIT;
+    return 1;
+}
+
+/* One step of a running re-kick; a handful of MDIO transactions at most. */
+static void rk_step(uint64_t freq, uint64_t now)
+{
+    switch (g_rk_state) {
+    case RK_RESET_WAIT: {
+        int v = mdio_read(PHY_ADDR, MII_BMCR);
+        if (v == 0xffff || (v >= 0 && !(v & BMCR_RESET)) ||
+            now - g_rk_t0 > ms_ticks(freq, RK_RESET_TIMEOUT_MS)) {
+            g_rk_t0 = now;
+            g_rk_state = RK_SETTLE;
+        }
+        break;
+    }
+    case RK_SETTLE:
+        if (now - g_rk_t0 < ms_ticks(freq, RK_SETTLE_MS))
+            break;
+#if EMAC_FORCE_LINK
+        {
+            uint16_t bmcr = 0;
+            if (EMAC_FORCE_FULL_DUPLEX) bmcr |= BMCR_DUPLEX_FULL;
+            if (EMAC_FORCE_SPEED == 1000) bmcr |= BMCR_SPEED_MSB;
+            else if (EMAC_FORCE_SPEED == 100) bmcr |= BMCR_SPEED_LSB;
+            mdio_write(PHY_ADDR, MII_BMCR, bmcr);
+        }
+#else
+        /* Same programming as phy_startup_ctx(): restricted advertisement
+         * (no gigabit, full duplex only) BEFORE restarting negotiation. */
+        mdio_write(PHY_ADDR, MII_ANAR, EMAC_AN_ADVERT);
+        mdio_write(PHY_ADDR, MII_GBCR, 0);
+        mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
+#endif
+        bc(10, (uint32_t)(mdio_read(PHY_ADDR, MII_BMCR) & 0xffff));
+        g_rk_t0 = now;
+        g_rk_state = RK_LINK_WAIT;
+        break;
+    case RK_LINK_WAIT: {
+        int bmsr;
+        (void)mdio_read(PHY_ADDR, MII_BMSR);           /* latched-low */
+        bmsr = mdio_read(PHY_ADDR, MII_BMSR);
+        bc(11, (uint32_t)(bmsr & 0xffff));
+        if (bmsr >= 0 && bmsr != 0xffff && (bmsr & BMSR_LSTATUS)) {
+            g_rk_t0 = now;
+            g_rk_state = RK_ANEG_WAIT;
+        } else if (now - g_rk_t0 > ms_ticks(freq, RK_LINK_TIMEOUT_MS)) {
+            rk_finish(0, 1);
+        }
+        break;
+    }
+    case RK_ANEG_WAIT: {
+        int bmsr = mdio_read(PHY_ADDR, MII_BMSR);
+        if ((bmsr >= 0 && (bmsr & BMSR_ANEGDONE)) || EMAC_FORCE_LINK ||
+            now - g_rk_t0 > ms_ticks(freq, RK_ANEG_TIMEOUT_MS)) {
+            int duplex_full;
+#if EMAC_FORCE_LINK
+            g_speed = EMAC_FORCE_SPEED;
+            duplex_full = EMAC_FORCE_FULL_DUPLEX;
+#else
+            int physr = mdio_read(PHY_ADDR, RTL_PHYSR);
+            uint32_t sp = ((uint32_t)physr >> PHYSR_SPEED_SHIFT) & PHYSR_SPEED_MASK;
+            bc(12, (uint32_t)(physr & 0xffff));
+            g_speed = (sp == 2) ? 1000u : (sp == 1) ? 100u : 10u;
+            duplex_full = (physr & PHYSR_DUPLEX) ? 1 : 0;
+#endif
+            rk_finish(1, duplex_full);
+        }
+        break;
+    }
+    default:
+        g_rk_state = RK_IDLE;
+        break;
+    }
+}
+
 int emac_link_watchdog(void)
 {
     uint64_t freq = timer_freq();
@@ -1468,13 +1782,26 @@ int emac_link_watchdog(void)
         freq = 24000000ull;
     period_ticks = freq * (uint64_t)LINK_WD_CHECK_PERIOD_S;
 
+    /* A running re-kick advances one step per call (= per CPU1 tick). */
+    if (g_rk_state != RK_IDLE) {
+        rk_step(freq, now);
+        return 0;
+    }
+
+    /* nettest phydown: a REAL link loss for the recovery test -- PHY power
+     * down (BMCR bit 11). Only the re-kick's BMCR reset brings it back, so
+     * this exercises detection, re-kick and the guest's link-down/up. */
+    if (g_nt_phydown) {
+        g_nt_phydown = 0;
+        mdio_write(PHY_ADDR, MII_BMCR, 0x0800u);
+    }
+
     if (g_wd_gave_up) {
-        /* Not terminal after all (changed 2026-08-27): a board that went
-          * dark on one bad boot used to stay watchdog-dead for the rest of
-          * that boot even after the link recovered. Re-arm the moment real
-          * health (link up AND recent traffic) is observed, so the NEXT
-          * episode gets a fresh budget. */
-        if (g_link_up && emac_rx_recent(freq, now)) {
+        /* Not terminal after all (changed 2026-08-27): re-arm the moment
+         * real health is observed, so the NEXT episode gets a fresh
+         * budget. */
+        if (g_link_up && (emac_rx_recent(freq, now) || emac_tx_recent(freq, now))
+            && !emac_rx_deaf(now)) {
             g_wd_gave_up = 0;
             g_wd_attempts = 0;
             bc(1, BC_STAGE_LOOP);
@@ -1489,75 +1816,74 @@ int emac_link_watchdog(void)
     g_wd_last_check_ticks = now;
 
     wdep_boot();
-    {
-        /* healthy->sick transition counter for the episode record */
-        static uint32_t prev_healthy;
-        uint32_t healthy = (emac_rx_recent(freq, now) && g_link_up
-                            && !g_wd_test_mode && !phy_physr_no_link());
-        if (prev_healthy && !healthy)
-            wdep_write(8, ++g_wdep_sickx);
-        prev_healthy = healthy;
+
+    int tx_stuck = tx_reap(freq, now);
+    if (tx_stuck)
+        g_wd_txstuck++;
+    int link_bad = !g_link_up || g_wd_test_mode || phy_physr_no_link();
+    int rx_ok = emac_rx_recent(freq, now) && !nt_quiet(now);
+    int tx_ok = emac_tx_recent(freq, now);
+    int deaf = !link_bad && emac_rx_deaf(now);
+    int healthy = !link_bad && !tx_stuck && (rx_ok || tx_ok) && !deaf;
+
+    /* verdict for nettest: bit0 link_bad, bit1 tx_stuck, bit2 rx_ok,
+     * bit3 tx_ok, bit4 deaf, bit5 probe sent */
+    g_wd_last_verdict = (uint32_t)link_bad | ((uint32_t)tx_stuck << 1) |
+                        ((uint32_t)rx_ok << 2) | ((uint32_t)tx_ok << 3) |
+                        ((uint32_t)deaf << 4);
+
+    if (!link_bad && !tx_stuck && !rx_ok && !tx_ok) {
+        /* Quiet wire, link up: prove TX instead of resetting anything. A
+         * probe that never comes back shows up as TX STUCK next period. */
+        wd_send_probe();
+        g_wd_last_verdict |= 1u << 5;
     }
 
-    if (emac_rx_recent(freq, now) && g_link_up && !g_wd_test_mode
-        && !phy_physr_no_link()) {
-        g_dark_since = 0;               /* healthy: no dark episode running */
-        return 0;   /* healthy: recent RX traffic + link up. The old test was
-                     * "at least one frame has EVER arrived" (g_rx_count != 0),
-                     * which went permanently blind to a link that DROPPED
-                     * after boot traffic (measured 2026-08-27: a WDOG-reset
-                     * boot sat EMAC-dark with the watchdog satisfied forever).
-                     * Re-kicking with the link down is as safe as the
-                     * original zero-RX case: no RX can be in flight over a
-                     * down link, and tx_frame_raw() drops TX on link-down
-                     * before it ever touches the rings. */
+    {
+        /* healthy->sick transition counter for the episode record */
+        static uint32_t prev_healthy = 1;
+        int sick = link_bad || tx_stuck || deaf;
+        if (prev_healthy && sick)
+            wdep_write(8, ++g_wdep_sickx);
+        prev_healthy = !sick;
+    }
+
+    if (healthy || (!link_bad && !tx_stuck && !deaf)) {
+        /* Healthy, or link up with a probe in flight: nothing to fix. */
+        if (healthy)
+            g_dark_since = 0;
+        g_wd_attempts = 0;
+        return 0;
+    }
+
+    if (g_dark_since == 0)
+        g_dark_since = now;
+
+    if (deaf) {
+        /* Link up and TX fine, but nothing received for hours: the RX side
+         * is wedged, and a PHY reset is not what fixes that. Give up and
+         * let the caller reboot (owner's rule: hours, not minutes). */
+        g_wd_deaf++;
+        g_wd_gave_up = 1;
+        bc(1, BC_STAGE_WD_GAVEUP);
+        wdep_write(3, ++g_wdep_giveups);
+        return 1;
     }
 
     g_wd_attempts++;
     bc(18, g_wd_attempts);
     wdep_write(2, g_wd_attempts);
     if (g_wd_attempts > LINK_WD_MAX_ATTEMPTS) {
-        /* Do NOT escalate while no frame has EVER arrived and we are still
-         * close to boot.
-         *
-         * emac_rx_recent() reports 0 when g_rx_count == 0 -- "never had any
-         * traffic" is indistinguishable here from "the wire went dark". With
-         * a check every 8 s and a 6-attempt budget that means a board which
-         * has simply not been spoken to yet gives up ~48 s after emac_init(),
-         * the caller sets wdt_debug_hold, and the 16 s HW watchdog reboots
-         * it: dark at ~64 s, every time.
-         *
-         * The guest cannot prevent that. It needs two to three minutes to
-         * reach the point where vtnet0 passes a packet -- four times the
-         * budget -- so a board nobody is polling reboots before its guest can
-         * ever produce the traffic that would prove the link. It then does it
-         * again, forever, and never finishes booting.
-         *
-         * That is not theoretical: measured 2026-09-23. The board stayed up
-         * all day only because chimpd polls it every 10 s; within 65 s of the
-         * last poller exiting it rebooted itself, and again after the next
-         * boot. 48 + 16 is exactly the 65 s observed.
-         *
-         * A link that has never carried a frame is UNPROVEN, not proven-dead,
-         * and rebooting cannot make traffic appear. Keep re-kicking the PHY
-         * (harmless, and it is the useful half of this watchdog) but withhold
-         * the reboot until the guest has had time to come up. Once any frame
-         * has ever arrived, g_rx_count is non-zero and the recency test from
-         * 2026-08-27 takes over unchanged -- a link that drops AFTER traffic
-         * still escalates immediately, which is what that change was for. */
         /* THE OWNER'S RULE (2026-09-25): a dark EMAC is rebooted after
-         * HOURS, not after a minute. Keep re-kicking the PHY every check
-         * period for as long as it takes -- a re-kick is cheap and it is
-         * what fixes the known cause (the PHY rail, phy_rail_ensure()) --
-         * and only when the link has been continuously dark for
-         * LINK_WD_DARK_REBOOT_S does the ladder give up and let smp.c
-         * reboot the board. A never-had-a-frame boot is the same case:
-         * it gets the same hours, not a 300 s grace. */
-        if (g_dark_since == 0)
-            g_dark_since = now;
+         * HOURS, not after a minute. Keep re-kicking every check period
+         * for as long as it takes, and only when the link has been
+         * continuously bad for LINK_WD_DARK_REBOOT_S does the ladder give
+         * up and let the caller reboot the board. A never-had-a-frame boot
+         * is the same case (see git history for the 2026-09-23 boot loop
+         * the old 48 s budget caused). */
         if (now - g_dark_since < freq * (uint64_t)LINK_WD_DARK_REBOOT_S) {
             g_wd_attempts = 0;           /* fresh budget, keep re-kicking */
-            wdep_write(16, (uint32_t)((now - g_dark_since) / freq));  /* dark seconds so far */
+            wdep_write(16, (uint32_t)((now - g_dark_since) / freq));
             return 0;
         }
         g_wd_gave_up = 1;
@@ -1566,60 +1892,43 @@ int emac_link_watchdog(void)
         return 1;           /* one-shot: tell the caller to consider escalating */
     }
 
-    /* PHY reads as absent (last BMSR sample 0xffff): its rail is off, see
-     * phy_rail_ensure(). Restore it BEFORE retraining; an unpowered PHY
-     * cannot answer phy_startup_ctx() and the re-kick budget would just
-     * burn down to give-up. The RTL8211E needs its power-on delay before
-     * MDIO answers; the QUICK bring-up's own polling covers that. */
-    if ((wdep_read(4) & 0xffffu) == 0xffffu)
-        phy_rail_ensure();
-
-    /* Bounded re-kick: re-run PHY bring-up; re-arm the rings and RX/TX/MAC
-     * enables ONLY in the never-had-traffic case (g_rx_count==0).
-     *
-     * [FOUND LIVE 2026-08-30, phycut DC1SW-cut experiment] The unconditional
-     * rings_init() here violated its own safety contract ever since the sick
-     * test was widened (2026-08-27) to include "link currently down": a boot
-     * that HAD traffic (g_rx_count>0) and then lost the link now reaches
-     * this code, and rings_init() tears the descriptor rings out from under
-     * CPU0's concurrent vnet TX path (the TX lock protects tx_frame_raw vs
-     * tx_frame_raw, NOT vs rings_init). Measured result of one such re-kick
-     * storm: the RX ring died for the REST of that boot (console deaf), while
-     * link_recheck kept reporting link up once the PHY retrained on its own —
-     * so the watchdog's healthy test (g_rx_count!=0 [a LIFETIME counter] &&
-     * g_link_up) never went sick again: no further re-kicks, no give-up, no
-     * escalation. The channel was dead forever with the watchdog content.
-     * With the recency fix (emac_rx_recent + phy_physr_no_link cross-check),
-     * a link that drops after boot traffic now correctly goes sick.
-     * When traffic has flowed, the rings/DMA/MAC were armed by emac_init()
-     * and NOTHING in this path tore them down — a dark window does not
-     * disarm them — so the only thing a re-kick may do there is retrain the
-     * PHY (phy_startup) and reprogram speed/duplex (adjust_link). */
-    {
-        int duplex_full = 1;
-        /* QUICK context — see phy_startup_ctx()/LINK_WAIT_PASSES_QUICK: the
-         * tick owns all board I/O, so the re-kick must finish in seconds,
-         * not minutes. */
-        wdep_write(6, ++g_wdep_rekicks);
-        int linked = phy_startup_ctx(&duplex_full, 1);
-        wdep_write(7, (uint32_t)(linked ? 1 : 0));
-        bc(4, linked ? 1 : 0);
-        if (linked) {
-            bc(5, g_speed);
-            adjust_link(duplex_full);
-            g_wd_attempts = 0;   /* episode over: full budget for the next one */
-        }
-        if (g_rx_count == 0) {
-            rings_init();
-            setbits(EMAC_RX_CTL1, EMAC_RX_CTL1_RX_DMA_EN | EMAC_RX_CTL1_RX_ERR_FRM |
-                                  EMAC_RX_CTL1_RX_RUNT_FRM);
-            setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_EN);
-            setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
-            setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
-            __asm__ volatile("dsb sy" ::: "memory");
-        }
-    }
+    /* Re-kick the PHY: link bad or TX stuck. Never touches the rings while
+     * traffic has flowed (see rk_finish() for the never-had-traffic case and
+     * the 2026-08-30 note in git history on why). */
+    (void)rk_start(now);
     return 0;
+}
+
+/* dbgmon `nettest` levers and readout (emac.h). */
+void emac_nettest_quiet(uint32_t seconds)
+{
+    uint64_t freq = timer_freq() ? timer_freq() : 24000000ull;
+    g_nt_quiet_until = seconds ? timer_now() + freq * (uint64_t)seconds : 0;
+}
+
+void emac_nettest_phydown(void)
+{
+    g_nt_phydown = 1;
+}
+
+void emac_nettest_stats(uint32_t out[EMAC_NT_NSTATS])
+{
+    uint64_t freq = timer_freq() ? timer_freq() : 24000000ull;
+    uint64_t now = timer_now();
+    out[0] = (uint32_t)g_link_up;
+    out[1] = g_rk_state;
+    out[2] = g_wdep_rekicks;
+    out[3] = g_link_down_events;
+    out[4] = g_wd_probes;
+    out[5] = g_txdone_count;
+    out[6] = g_wd_txstuck;
+    out[7] = g_wd_last_verdict;
+    out[8] = g_rx_count ? (uint32_t)((now - g_last_rx_ticks) / freq) : 0xffffffffu;
+    out[9] = g_last_txdone_ticks ? (uint32_t)((now - g_last_txdone_ticks) / freq) : 0xffffffffu;
+    out[10] = g_nt_quiet_until > now ? (uint32_t)((g_nt_quiet_until - now) / freq) : 0;
+    out[11] = g_wd_deaf;
+    out[12] = g_wd_attempts;
+    out[13] = g_tx_drops;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1647,9 +1956,20 @@ void emac_wd_test_mode(int on)
 /* caller (netcon, vnet_emac.c, in the send-frame case) decides whether/   */
 /* how to retry; this function itself never blocks unboundedly.           */
 /* ------------------------------------------------------------------ */
+static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
+                                uint16_t ethertype, const uint8_t *payload,
+                                int plen, int probe);
+
 static int tx_frame_raw_src(const uint8_t dst[6], const uint8_t src[6],
                              uint16_t ethertype, const uint8_t *payload,
                              int plen)
+{
+    return tx_frame_raw_src_ex(dst, src, ethertype, payload, plen, 0);
+}
+
+static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
+                                uint16_t ethertype, const uint8_t *payload,
+                                int plen, int probe)
 {
     volatile struct emac_desc *d;
     uint8_t *buf;
@@ -1696,6 +2016,14 @@ static int tx_frame_raw_src(const uint8_t dst[6], const uint8_t src[6],
         return 0;
     }
 
+    {
+        /* The slot is free again: if it carried a frame, the DMA sent it. */
+        uint64_t now = timer_now();
+        if (g_tx_pending_mask & (1u << g_tx_slot))
+            note_tx_done(g_tx_slot, now);
+        g_tx_slot_ticks[g_tx_slot] = now;
+    }
+
     buf = (uint8_t *)(uintptr_t)d->buf_addr;
 
     for (i = 0; i < 6; i++) buf[i] = dst[i];           /* dst */
@@ -1716,6 +2044,12 @@ static int tx_frame_raw_src(const uint8_t dst[6], const uint8_t src[6],
                   EMAC_DESC_FIRST_DESC | EMAC_DESC_LAST_DESC;
     d->status = EMAC_DESC_OWN_DMA;
     cache_clean((uintptr_t)d, sizeof(*d));
+
+    g_tx_pending_mask |= 1u << g_tx_slot;
+    if (probe)
+        g_tx_probe_mask |= 1u << g_tx_slot;
+    else
+        g_tx_probe_mask &= ~(1u << g_tx_slot);
 
     /* Kick the TX DMA. */
     setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
@@ -1907,8 +2241,10 @@ void emac_poll(void)
      * (tens of us each), so we don't want one on every single poll — but we
      * do want emac_link_up() to reflect reality within a fraction of a
      * second, not just at emac_init() time. */
-    if ((++g_poll_calls & (LINK_CHECK_INTERVAL - 1u)) == 0)
+    if ((++g_poll_calls & (LINK_CHECK_INTERVAL - 1u)) == 0 &&
+        !emac_rekick_active())
         link_recheck();
+    vnet_emac_link_update(g_link_up);
 
     for (int guard = 0; guard < N_RX_DESC; guard++) {
         volatile struct emac_desc *d = rx_desc(g_rx_slot);
