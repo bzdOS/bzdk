@@ -11,8 +11,10 @@ ${mmc_bootdev}:2, the guest's vtbd0p2) in two slots:
 bootcmd runs `bzdk_boot` first, then the old TFTP loop (`boothv`, routed
 through gatewayip when serverip is off-link), then arms the watchdog:
 
-  1. `env export -t` ipaddr/netmask/gatewayip/serverip to 0x4a0f0000 --
-     the HV's UDP debug transport reads its address there (dbgip.h);
+  1. `env export -t` ipaddr/netmask/gatewayip/serverip/bzdk_net to
+     0x4a0f0000 -- the HV's UDP debug transport reads its address there
+     (dbgip.h); bzdk_net=dhcp makes it take a DHCP lease instead, with
+     ipaddr etc. as the fallback (`netmode` below sets it);
   2. the slot record at 0x50021100 (hv_addrmap.h HVMAP_BOOTSLOT, survives a
      watchdog reset, cleared by a cold boot's garbage check): tries += 1;
   3. tries <= 3: boot `cur`; otherwise, or when `cur` does not load or its
@@ -59,7 +61,8 @@ VARS = {
         "echo [bzdk] booting slot ${bzdk_slot} && "
         "setenv autostart yes && bootm 0x48000000; setenv autostart yes"),
     "bzdk_boot": (
-        f"env export -t {NETCFG_PA:#x} gatewayip ipaddr netmask serverip; "
+        f"env export -t {NETCFG_PA:#x} gatewayip ipaddr netmask serverip "
+        "bzdk_net; "
         f"if itest.l *{SLOT_PA:#x} != {SLOT_MAGIC:#x}; then "
         f"mw.l {SLOT_PA:#x} {SLOT_MAGIC:#x}; mw.l {SLOT_PA + 4:#x} 0; fi; "
         f"setexpr.l bzdk_n *{SLOT_PA + 4:#x} + 1; mw.l {SLOT_PA + 4:#x} ${{bzdk_n}}; "
@@ -131,6 +134,10 @@ def main():
     i.add_argument("--netmask", required=True)
     i.add_argument("--gatewayip", required=True)
     u = sub.add_parser("uninstall", help="bootcmd back to the TFTP loop only")
+    n = sub.add_parser("netmode", help="HV address from DHCP or U-Boot's "
+                       "static ipaddr (bzdk_net; also refreshes bzdk_boot "
+                       "so that it exports bzdk_net)")
+    n.add_argument("mode", choices=("dhcp", "static"))
     a = ap.parse_args()
 
     if a.cmd == "vars":
@@ -152,6 +159,9 @@ def main():
         sys.stdout.write(env_tool("set", *sets))
     elif a.cmd == "uninstall":
         sys.stdout.write(env_tool("set", f"bootcmd={OLD_BOOTCMD}"))
+    elif a.cmd == "netmode":
+        sys.stdout.write(env_tool("set", f"bzdk_net={a.mode}",
+                                  f"bzdk_boot={VARS['bzdk_boot']}"))
 
 
 if __name__ == "__main__":

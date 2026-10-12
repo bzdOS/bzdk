@@ -106,7 +106,7 @@ def main():
         os.write(fd, (line + '\n').encode())
         return rd(fd, secs, stop).decode('latin1', 'replace')
 
-    out = cmd(f"setenv autostart no ; setenv netretry no ; setenv ipaddr {B.BOARD_IP} ; "
+    out = cmd(f"setenv autostart no ; setenv netretry no ; setenv ipaddr {B.UBOOT_IP} ; "
               f"setenv serverip {B.SRV_IP}", 2)
     out = cmd(f"tftpboot 0x4a000000 {CAND}", 40, b"Bytes transferred")
     if 'Bytes transferred' not in out:

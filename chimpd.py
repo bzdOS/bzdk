@@ -96,7 +96,7 @@ ZADDR       = 0x4E000000
 ZADDR_LIMIT = 0x02000000          # == zstage.h ZSTAGE_LOW_SIZE (32 MiB)
 ZGUEST_NAME = "zguest.elf"        # filename U-Boot fetches, inside TFTP_ROOT
 ZGUEST_ELF  = None                # path to stage; None = no second guest
-BOARD_IP  = B.BOARD_IP
+BOARD_IP  = B.UBOOT_IP          # U-Boot's static ipaddr
 SRV_IP    = B.SRV_IP
 
 IFACE     = B.IFACE

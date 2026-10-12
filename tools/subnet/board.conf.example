@@ -1,9 +1,14 @@
 # ~/.config/bzdk/board.conf -- the board's addresses and the debug transport,
 # read by bzd_board.py (every host tool). See bzd_board.py for the keys.
+# board_ip / guest_ip may be `auto` (board on DHCP: learned at run time,
+# ~/.config/bzdk/board.ip and guest.ip); uboot_ip is then U-Boot's static
+# ipaddr. `net` (static|dhcp) is the board-side mode cutover.py sets.
 transport = l2
+net       = static
 iface     = br0
 tap       = bzd0
 board_ip  = 192.168.88.7
+uboot_ip  =
 dbg_port  = 34997
 guest_ip  = 192.168.88.82
 server_ip = 192.168.88.2

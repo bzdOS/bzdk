@@ -53,7 +53,7 @@ sys.path.insert(0, "/opt/bzdos/microkernel")
 import loady_over_acm as L
 
 import bzd_board  # noqa: E402  (board.conf)
-BOARD_IP = bzd_board.BOARD_IP
+BOARD_IP = bzd_board.UBOOT_IP     # U-Boot's own static ipaddr
 SRV_IP   = bzd_board.SRV_IP
 
 # CORRECTED 2026-08-23: tftp + bootm on a proper uImage, NOT tftp + bootelf on

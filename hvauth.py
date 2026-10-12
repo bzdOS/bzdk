@@ -38,6 +38,7 @@ import bzd_board
 ETYPE_CONSOLE = 0x88B5
 MAGIC = b"\x00BZK"
 T_HELLO, T_CHAL, T_DATA, T_NAK = 1, 2, 3, 4
+T_ANNOUNCE = 5            # HV -> host, unauthenticated hint (dbgip.h)
 CH_CONSOLE, CH_NETCON, CH_DBGTOOLS, CH_SNAPNET = 0, 1, 2, 3
 LEGACY_ETYPE = {CH_CONSOLE: 0x88B5, CH_NETCON: 0x88B6,
                 CH_DBGTOOLS: 0x88B7, CH_SNAPNET: 0x88B8}
@@ -88,6 +89,41 @@ class AuthError(Exception):
     pass
 
 
+def hello_frame(src_mac, nh):
+    """A whole HELLO Ethernet frame (broadcast) carrying nonce `nh`."""
+    return (BCAST + bytes(src_mac) + struct.pack("!H", ETYPE_CONSOLE) +
+            _pad(MAGIC + bytes([T_HELLO, 0]) + nh))
+
+
+def check_chal(key, frame, nh):
+    """Verify a CHAL Ethernet frame answering HELLO(nh). Returns (sess, sb)
+    when it is a CHAL for nh with a valid proof, None when it is not a CHAL
+    for nh; raises AuthError when it is one but the proof is wrong."""
+    p = frame[14:]
+    if (len(frame) < 14 or len(p) < 58 or p[:4] != MAGIC or
+            p[4] != T_CHAL or p[26:42] != nh):
+        return None
+    sess = struct.unpack(">I", p[6:10])[0]
+    sb = p[10:26]
+    proof = _h(key, b"BZK1/chal", sb, struct.pack(">I", sess), nh)[:16]
+    if not hmac.compare_digest(proof, p[42:58]):
+        raise AuthError("board answered the handshake with a wrong proof:"
+                        f" its key differs from {key_file()}")
+    return sess, sb
+
+
+def parse_announce(frame):
+    """dbgip.h ANNOUNCE (unauthenticated: a hint, never proof) -> dict."""
+    p = frame[14:]
+    if len(p) < 30 or p[:4] != MAGIC or p[4] != T_ANNOUNCE:
+        return None
+    ip = lambda b: socket.inet_ntoa(bytes(b))  # noqa: E731
+    return {"ip": ip(p[6:10]), "mask": ip(p[10:14]), "gw": ip(p[14:18]),
+            "src": p[18], "mode": "dhcp" if p[19] == 1 else "static",
+            "guest_ip": ip(p[20:24]), "guest_mac": p[24:30].hex(":"),
+            "mac": frame[6:12].hex(":")}
+
+
 class Channel:
     """One debug session to the board. Thread-safe."""
 
@@ -134,10 +170,8 @@ class Channel:
         """HELLO -> CHAL. True on a verified session."""
         with self._lock:
             nh = secrets.token_bytes(16)
-            hello = _pad(MAGIC + bytes([T_HELLO, 0]) + nh)
             for _ in range(tries):
-                self.sock.send(BCAST + self.src_mac +
-                               struct.pack("!H", ETYPE_CONSOLE) + hello)
+                self.sock.send(hello_frame(self.src_mac, nh))
                 t_end = time.time() + wait
                 while time.time() < t_end:
                     self.sock.settimeout(max(0.005, t_end - time.time()))
@@ -145,18 +179,11 @@ class Channel:
                         f = self.sock.recv(2048)
                     except (socket.timeout, OSError):
                         break
-                    p = f[14:]
-                    if (len(p) < 58 or p[:4] != MAGIC or p[4] != T_CHAL or
-                            p[26:42] != nh):
+                    r = check_chal(self.key, f, nh)
+                    if r is None:
                         continue
-                    sess = struct.unpack(">I", p[6:10])[0]
-                    sb = p[10:26]
+                    sess, sb = r
                     lbl = struct.pack(">I", sess)
-                    proof = _h(self.key, b"BZK1/chal", sb, lbl, nh)[:16]
-                    if not hmac.compare_digest(proof, p[42:58]):
-                        raise AuthError(
-                            "board answered the handshake with a wrong proof:"
-                            f" its key differs from {key_file()}")
                     self.sess = sess
                     self.ks = _h(self.key, b"BZK1/sess", sb, lbl, nh)
                     self.ctr = 0

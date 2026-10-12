@@ -37,7 +37,7 @@ PROMPT = b"=> "
 
 class NC:
     def __init__(self, log=None):
-        self.board = (bzd_board.BOARD_IP, PORT)
+        self.board = (bzd_board.UBOOT_IP, PORT)   # U-Boot: static ipaddr
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.s.bind(("", PORT))

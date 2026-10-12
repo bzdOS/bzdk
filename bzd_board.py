@@ -170,15 +170,18 @@ def is_board_mac(src):
 # Plain `key = value` lines, `#` comments; missing keys fall back to the
 # defaults below (the 192.168.88.0/24 setup); $BZDK_BOARD_CONF names another
 # file, $BZDK_TRANSPORT overrides `transport`. The board's side of the same
-# facts lives in U-Boot's env (ipaddr/netmask/gatewayip/serverip, which the
-# HV also reads at boot -- dbgip.h) and the guest's /etc/rc.conf;
+# facts lives in U-Boot's env (ipaddr/netmask/gatewayip/serverip/bzdk_net,
+# which the HV also reads at boot -- dbgip.h) and the guest's /etc/rc.conf;
 # tools/subnet/cutover.py changes all three together.
 #
 #   transport  l2 | udp     raw Ethernet on `iface`, or UDP via `tap`
 #   iface      br0          host interface on the board's segment (l2)
 #   tap        bzd0         tap served by bzd_udplink.py (udp)
-#   board_ip   HV + U-Boot address          dbg_port  HV UDP debug port
-#   guest_ip   FreeBSD guest address        server_ip this host (TFTP, udplink)
+#   board_ip   HV address, or `auto` (DHCP: learned, see board_ip())
+#   uboot_ip   U-Boot's static ipaddr, also the HV's DHCP fallback
+#              (empty = board_ip)          dbg_port  HV UDP debug port
+#   guest_ip   FreeBSD guest address, or `auto` (asked from the HV, guest_ip())
+#   server_ip  this host (TFTP, udplink)   net  static | dhcp (board side)
 #   gateway / netmask / dns                 the board's subnet
 #
 # Values are read lazily on first use (module __getattr__), so importing
@@ -189,6 +192,8 @@ BOARD_CONF_DEFAULTS = {
     "iface": "br0",
     "tap": "bzd0",
     "board_ip": "192.168.88.7",
+    "uboot_ip": "",
+    "net": "static",
     "dbg_port": "34997",
     "guest_ip": "192.168.88.82",
     "server_ip": "192.168.88.2",
@@ -237,8 +242,126 @@ def debug_iface():
     return c["tap"] if c["transport"] == "udp" else c["iface"]
 
 
+# ── learned addresses (board_ip / guest_ip = auto, DHCP on the board) ─────
+# The HV takes its address by DHCP (dbgip.h) and announces it to server_ip;
+# bzd_udplink.py adopts it only after an authenticated handshake to it and
+# records it in BOARD_IP_FILE. The guest's address is what the HV saw it use
+# (dbgmon `mac` ... guest_ip=); guest_ip() asks the HV once per process and
+# caches the answer in GUEST_IP_FILE, used when the HV cannot be asked.
+# $BZDK_BOARD_IP / $BZDK_GUEST_IP override both.
+BOARD_IP_FILE = os.path.expanduser("~/.config/bzdk/board.ip")
+GUEST_IP_FILE = os.path.expanduser("~/.config/bzdk/guest.ip")
+_guest_ip = None
+
+
+def _valid_ip(txt):
+    parts = txt.strip().split(".")
+    try:
+        return (len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+                and txt.strip() != "0.0.0.0")
+    except ValueError:
+        return False
+
+
+def _read_ip(path):
+    try:
+        t = open(path).read().strip()
+    except OSError:
+        return None
+    return t if _valid_ip(t) else None
+
+
+def _write_ip(path, ip):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(ip + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def uboot_ip():
+    """U-Boot's own (static) ipaddr: also the HV's address in static mode
+    and its fallback in DHCP mode."""
+    c = conf()
+    if c.get("uboot_ip"):
+        return c["uboot_ip"]
+    if c["board_ip"] != "auto":
+        return c["board_ip"]
+    return BOARD_CONF_DEFAULTS["board_ip"]
+
+
+def learned_board_ip():
+    return _read_ip(BOARD_IP_FILE)
+
+
+def remember_board_ip(ip):
+    if _valid_ip(ip) and ip != learned_board_ip():
+        _write_ip(BOARD_IP_FILE, ip)
+
+
+def board_ip():
+    """The HV's IPv4 address: board.conf's, or with `auto` the one
+    bzd_udplink.py verified last (BOARD_IP_FILE), else uboot_ip()."""
+    c = conf()
+    if c["board_ip"] != "auto":
+        return c["board_ip"]
+    return (os.environ.get("BZDK_BOARD_IP") or learned_board_ip()
+            or uboot_ip())
+
+
+def parse_guest_ip(reply):
+    """guest_ip=a.b.c.d (dbgmon `mac`) or guest=a.b.c.d (dbgmon `ip`)
+    from a dbgmon reply; None if absent or 0.0.0.0."""
+    import re
+    m = re.search(r"guest(?:_ip)?=(\d+\.\d+\.\d+\.\d+)", reply or "")
+    return m.group(1) if m and _valid_ip(m.group(1)) else None
+
+
+def ask_hv_guest_ip(timeout=3):
+    """The guest address the HV has seen (dbgmon `mac`), or None."""
+    try:
+        import hvdbg
+        hv = hvdbg.HV(timeout=timeout)
+        try:
+            for _ in range(2):
+                ip = parse_guest_ip(hv.cmd("mac"))
+                if ip:
+                    return ip
+        finally:
+            hv.close()
+    except Exception:            # no board, no key, no permission: cache
+        return None
+    return None
+
+
+def guest_ip():
+    """The guest's IPv4 address: board.conf's, or with `auto` the HV's
+    answer (cached in GUEST_IP_FILE), else the cached one."""
+    global _guest_ip
+    c = conf()
+    if c["guest_ip"] != "auto":
+        return c["guest_ip"]
+    if os.environ.get("BZDK_GUEST_IP"):
+        return os.environ["BZDK_GUEST_IP"]
+    if _guest_ip is None:
+        ip = ask_hv_guest_ip()
+        if ip:
+            if ip != _read_ip(GUEST_IP_FILE):
+                _write_ip(GUEST_IP_FILE, ip)
+        else:
+            ip = _read_ip(GUEST_IP_FILE)
+        if not ip:
+            raise RuntimeError("guest_ip = auto: the HV has not seen the "
+                               f"guest's address and {GUEST_IP_FILE} is empty")
+        _guest_ip = ip
+    return _guest_ip
+
+
 def guest_ssh_target():
-    return "root@" + conf()["guest_ip"]
+    return "root@" + guest_ip()
 
 
 GUEST_SSH_KEY = "/root/.ssh/chimp_ed25519"
@@ -254,9 +377,10 @@ _LAZY = {
     "IFACE": debug_iface,
     "WIRE_IFACE": lambda: conf()["iface"],
     "TRANSPORT": lambda: conf()["transport"],
-    "BOARD_IP": lambda: conf()["board_ip"],      # U-Boot ipaddr == HV address
+    "BOARD_IP": board_ip,                        # the HV's address (learned with auto)
+    "UBOOT_IP": uboot_ip,                        # U-Boot's static ipaddr
     "SRV_IP": lambda: conf()["server_ip"],       # U-Boot serverip (this host)
-    "GUEST_IP": lambda: conf()["guest_ip"],
+    "GUEST_IP": guest_ip,
     "GUEST": guest_ssh_target,
     "DBG_PORT": lambda: int(conf()["dbg_port"]),
     "GATEWAY": lambda: conf()["gateway"],

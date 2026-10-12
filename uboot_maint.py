@@ -25,7 +25,6 @@ sys.path.insert(0, HERE)
 import bzd_board  # noqa: E402  (guest address: ~/.config/bzdk/board.conf)
 
 ENV_TOOL = os.path.join(HERE, 'uboot_env.py')
-SSH = bzd_board.guest_ssh_argv(6)
 GUEST_WAIT_S = 420      # an idle prompt resets itself after 120 s, then ~100 s to a guest
 
 
@@ -52,7 +51,7 @@ def set_bootdelay(v):
 def wait_guest(limit_s=GUEST_WAIT_S):
     t0 = time.time()
     while time.time() - t0 < limit_s:
-        r = subprocess.run(SSH + ['true'], capture_output=True, timeout=20,
+        r = subprocess.run(bzd_board.guest_ssh_argv(6) + ['true'], capture_output=True, timeout=20,
                            stdin=subprocess.DEVNULL)
         if r.returncode == 0:
             return True

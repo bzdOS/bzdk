@@ -39,7 +39,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bzd_board  # noqa: E402  (guest address: ~/.config/bzdk/board.conf)
 
-GUEST = bzd_board.GUEST
 KEY = bzd_board.GUEST_SSH_KEY
 ESP_DEV = '/dev/vtbd0p2'
 MNT = '/tmp/esp'
@@ -49,7 +48,7 @@ ENV_SIZE = 65536
 
 def ssh(cmd, binary=False, check=True):
     argv = ['ssh', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes',
-            '-i', KEY, GUEST, cmd]
+            '-i', KEY, bzd_board.guest_ssh_target(), cmd]
     # stdin=DEVNULL: under `timeout` (or any non-foreground process group) an
     # ssh left reading the caller's stdin is stopped by SIGTTIN and the read
     # comes back empty -- which is what made sdbox_read.py fail 2026-09-26.

@@ -110,7 +110,7 @@ def main():
         os.write(fd, (c + '\n').encode())
         return rd(secs, stop)
 
-    cmd(f"setenv autostart no ; setenv netretry no ; setenv ipaddr {B.BOARD_IP} ; "
+    cmd(f"setenv autostart no ; setenv netretry no ; setenv ipaddr {B.UBOOT_IP} ; "
         f"setenv serverip {B.SRV_IP}", 2)
     for name, addr, n in ((a.current, READ, cur_n), (a.fit, LOAD, new_n)):
         o = cmd(f"tftpboot 0x{addr:x} {name}", 40, b"Bytes transferred")
