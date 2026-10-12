@@ -1163,6 +1163,12 @@ musb_irq_arm_cpu1(void)
  * distributor during its own attach. The EMAC side (INT_EN = RX | RX_BUF_UA)
  * is set at emac_init(); nothing raises the line at the GIC until this runs.
  * ------------------------------------------------------------------ */
+/* 64 per 10 ms tick. Measured 2026-10-12 against 256: TCP at wire speed into
+ * the guest wants ~10 k IRQs/s, so 64 throttles on most ticks and the rest
+ * is drained by the tick -- which batches frames and costs the guest ~10%
+ * less CPU (fewer virtio interrupts) at the same 94 Mbit/s. 256 only helps
+ * a burst of ~1000 minimum-size frames, and then the guest's own 128 RX
+ * buffers become the limit. */
 #define EMAC_IRQ_BUDGET_PER_TICK 64u
 static volatile uint32_t g_emac_irq_armed;
 static uint32_t g_emac_irqs_tick;       /* CPU1 only: serviced this tick      */
