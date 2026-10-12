@@ -53,8 +53,9 @@ void emac_rx_irq(void);
 /* RX/TX performance counters for dbgmon `netstat`: [0] rx frames [1] rx irqs
  * [2] rx irq frames [3] irq drains deferred to the tick [4] max batch
  * [5] rx ring-full events [6] rx fifo overflows [7] tx frames [8] tx drops
- * [9] rx ring size [10] tx ring size */
-#define EMAC_PERF_NSTATS 11
+ * [9] rx ring size [10] tx ring size [11] guest TX found the ring full
+ * [12] TX_INT interrupts seen */
+#define EMAC_PERF_NSTATS 13
 void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS]);
 
 /* Current, LIVE link state — refreshed periodically inside emac_poll() (not
@@ -85,6 +86,19 @@ int emac_getc(void);
  * decides whether to retry). Intended for netcon.c (ethertype 0x88B6) but
  * usable for any ethertype that isn't 0x88B5 (the console owns that one). */
 int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len);
+
+/* Zero-copy TX for vnet (audit item 11): emac_tx_begin() reserves the next
+ * descriptor and returns its index (TX lock held) with *buf pointing at its
+ * DMA buffer (Non-cacheable, ETH_BUFSIZE bytes; write the whole Ethernet
+ * frame there), or EMAC_TX_BUSY / EMAC_TX_DROP (lock not held).
+ * emac_tx_end() sends `len` bytes (>= 60, <= 2044) or, send == 0, gives the
+ * slot back. guest = 1 never waits and leaves a few descriptors to the HV.
+ * emac_tx_space(): would a guest emac_tx_begin() find room now. */
+#define EMAC_TX_BUSY  (-1)
+#define EMAC_TX_DROP  (-2)
+int emac_tx_begin(int guest, uint8_t **buf);
+void emac_tx_end(int slot, uint32_t len, int send);
+int emac_tx_space(void);
 
 /* As emac_send_frame(), but to a caller-supplied Ethernet destination instead
  * of broadcast. Needed by the bridged virtio-net TX path: emac_send_frame()

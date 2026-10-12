@@ -100,7 +100,7 @@ extern uint32_t emac_rx_to_hv_dropped(void);
 extern void vnet_emac_force_link_down(uint32_t polls) __attribute__((weak));
 /* `netstat` (audit items 9-12): EMAC ring/IRQ counters; the IRQ ones live in
  * gic_timer.c, weak so a target without it still links. */
-extern void emac_perf_stats(uint32_t out[11]);
+extern void emac_perf_stats(uint32_t out[13]);
 extern void emac_irq_stats(uint32_t out[3]) __attribute__((weak));
 
 /* Guest single-step toggle, implemented in el2_exc.c (linked into the same
@@ -1495,19 +1495,20 @@ static void exec_line(char *line, struct el2_frame *frame)
 		return;
 	}
 	if (streq(cmd, "netstat")) {
-		static const char *const names[14] = {
-			"rx", "rx_irqs", "rx_irq_frames", "irq_deferred", "max_batch",
+		static const char *const names[16] = {
+			"rx", "irqs", "rx_irq_frames", "irq_deferred", "max_batch",
 			"rx_ring_full", "rx_fifo_ovf", "tx", "tx_drops", "rx_ring",
-			"tx_ring", "irq_armed", "irq_throttles", "irq_wrong_core" };
-		uint32_t st[14] = { 0 };
+			"tx_ring", "tx_ring_busy", "tx_ints", "irq_armed",
+			"irq_throttles", "irq_wrong_core" };
+		uint32_t st[16] = { 0 };
 		emac_perf_stats(st);
 		if (emac_irq_stats)
-			emac_irq_stats(&st[11]);
-		for (int i = 0; i < 14; i++) {
+			emac_irq_stats(&st[13]);
+		for (int i = 0; i < 16; i++) {
 			cputs(names[i]);
 			cputs("=");
 			print_hex32(st[i]);
-			cputs(i == 13 ? "\r\n" : " ");
+			cputs(i == 15 ? "\r\n" : " ");
 		}
 		return;
 	}

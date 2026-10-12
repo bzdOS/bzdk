@@ -125,6 +125,7 @@ const char *const bzdos_emac_owner = "emac";
 /* EMAC_INT_STA / EMAC_INT_EN bits (Linux dwmac-sun8i.c). INT_STA is
  * write-1-to-clear; the line (SPI 82) is level and stays up while any
  * enabled status bit is set. */
+#define  EMAC_INT_TX             (1u << 0)    /* a TX_INT_CTL frame was sent */
 #define  EMAC_INT_RX             (1u << 8)    /* a frame was received        */
 #define  EMAC_INT_RX_BUF_UA      (1u << 9)    /* RX ring full: DMA suspended */
 #define  EMAC_INT_RX_OVERFLOW    (1u << 12)   /* RX FIFO overflowed          */
@@ -194,7 +195,21 @@ const char *const bzdos_emac_owner = "emac";
 /* ------------------------------------------------------------------ */
 #define PHY_ADDR        1              /* .config CONFIG_PHY_ADDR=1; DTS
                                         * ext_rgmii_phy reg = <1> (RTL8211E) */
-#define N_TX_DESC       8
+/* TX ring depth. WAS 8: a guest TX burst found the ring full after eight
+ * frames and CPU0 then spun inside the guest's MMIO trap, holding the TX
+ * lock, until the wire freed a descriptor -- measured 2026-10-12: ~113 us of
+ * EL2 per frame, 12-13 s of every 15 s of a bulk guest->host TCP transfer.
+ * 64 descriptors (128 KiB of buffers) hold ~7.7 ms of full-size frames at
+ * 100 Mbit/s; the guest's frames now never wait in EL2 (emac_tx_begin()). */
+#define N_TX_DESC       64
+/* Descriptors the guest may never take: console/netcon/dbgtools frames
+ * always find a free slot even while a guest burst fills the ring. */
+#define TX_HV_RESERVE   4
+/* TX descriptor control: raise TX_INT when this frame has been sent.
+ * Set only while the ring is nearly full, so CPU1 hears about free slots
+ * when the guest is waiting for them (emac_tx_end()). */
+#define EMAC_DESC_TX_INT_CTL   (1u << 31)
+#define TX_IRQ_WHEN_FREE_BELOW 8
 /* RX ring depth. WAS 8, which is 8 frames = ~12 KiB of buffering: at the
  * ~170 KB/s this link actually achieves inbound, that is about 70 ms of slack
  * before the DMA has nowhere to put a frame. Anything that keeps CPU1 out of
@@ -396,6 +411,12 @@ __attribute__((weak)) void vnet_emac_rx_flush(void)
 {
 }
 
+/* vnet_emac.c: continue a guest TX drain that stopped on a full ring or
+ * its per-kick budget (CPU1; weak no-op without vnet). */
+__attribute__((weak)) void vnet_emac_tx_resume(void)
+{
+}
+
 /* dbgtools.c provides the real implementation (dbg/gdb builds only); same
  * weak-fallback pattern as netcon_rx_frame above so any build without
  * dbgtools.o (repl/fbsd/zephyr/hdmi/net/stage0) links cleanly. Same
@@ -588,7 +609,10 @@ static inline void bc(int i, uint32_t v)
 /* of every other lane's documented window.                                 */
 /* ------------------------------------------------------------------ */
 #define EMAC_TX_LOCK_PA        0x50000180UL
-#define EMAC_TX_LOCK_CONTEND_BC 32   /* bc() index: contended-acquire count  */
+/* bc() index of the sticky "contended" flag. WAS 32, which is the lock word
+ * itself (BC_BASE + 32*4 == EMAC_TX_LOCK_PA): a failed bounded acquire
+ * stored 1 into the lock and left it held for good. */
+#define EMAC_TX_LOCK_CONTEND_BC 33
 
 static inline volatile uint32_t *emac_tx_lock_word(void)
 {
@@ -670,6 +694,8 @@ static int      g_link_down_streak;   /* consecutive "not up" reads while up,
 static uint32_t g_link_up_events;     /* down->up transition count */
 static uint32_t g_link_down_events;   /* up->down transition count */
 static uint32_t g_tx_drops;           /* frames dropped by tx_frame() */
+static uint32_t g_tx_busy;            /* guest TX found the ring full */
+static void emac_tx_end_ex(int slot, uint32_t len, int send, int probe);
 static uint32_t g_first_rx_latched;   /* one-shot: has ANY frame ever arrived */
 
 /* TX health (audit item 4): a frame handed to the TX DMA whose descriptor
@@ -679,8 +705,9 @@ static uint32_t g_first_rx_latched;   /* one-shot: has ANY frame ever arrived */
  * (console, HV replies, the guest's vnet frames, the watchdog's own probe)
  * goes through tx_frame_raw_src(), so they all count. The masks and slot
  * stamps are written only under the TX lock. */
-static uint32_t g_tx_pending_mask;          /* slots handed to DMA, unreaped */
-static uint32_t g_tx_probe_mask;            /* ... of which watchdog probes */
+static uint64_t g_tx_pending_mask;          /* slots handed to DMA, unreaped */
+static uint64_t g_tx_probe_mask;            /* ... of which watchdog probes */
+_Static_assert(N_TX_DESC <= 64, "TX slot masks are 64-bit");
 static uint64_t g_tx_slot_ticks[N_TX_DESC]; /* when each slot was queued */
 static volatile uint64_t g_last_txdone_ticks;    /* newest observed completion */
 static volatile uint64_t g_last_probedone_ticks; /* newest completed probe */
@@ -804,7 +831,7 @@ static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
                                 int plen, int probe);
 static void note_tx_done(int slot, uint64_t now)
 {
-    uint32_t bit = 1u << slot;
+    uint64_t bit = 1ull << slot;
 
     g_tx_pending_mask &= ~bit;
     g_last_txdone_ticks = now;
@@ -1533,12 +1560,14 @@ int emac_init(void)
      * (recovered via the USB-ACM break-glass, see project memory) before
      * this fix was written correctly here. */
     wr(EMAC_RX_FRM_FLT, EMAC_FRM_FLT_RXALL | EMAC_FRM_FLT_DIS_ADDR);
-    /* RX interrupt sources (audit item 9): a received frame and a full ring.
+    /* Interrupt sources (audit items 9, 11): a received frame, a full RX
+     * ring, and a sent frame whose descriptor asked for it (TX_INT_CTL, set
+     * only while the TX ring is nearly full -- see emac_tx_end()).
      * Inert until something enables SPI 82 at the GIC distributor -- only
      * emac_irq_arm_cpu1() (gic_timer.c, dbg build with vcpu1) does; every
      * other image keeps polling exactly as before. */
     wr(EMAC_INT_STA, EMAC_INT_STA_MASK);
-    wr(EMAC_INT_EN, EMAC_INT_RX | EMAC_INT_RX_BUF_UA);
+    wr(EMAC_INT_EN, EMAC_INT_RX | EMAC_INT_RX_BUF_UA | EMAC_INT_TX);
     setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
     setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
     __asm__ volatile("dsb sy" ::: "memory");
@@ -1742,7 +1771,7 @@ static int tx_reap(uint64_t freq, uint64_t now)
     if (!emac_tx_lock_acquire_bounded())
         return 0;
     for (int i = 0; i < N_TX_DESC; i++) {
-        if (!(g_tx_pending_mask & (1u << i)))
+        if (!(g_tx_pending_mask & (1ull << i)))
             continue;
         volatile struct emac_desc *d = tx_desc(i);
         cache_inval((uintptr_t)d, sizeof(*d));
@@ -2108,17 +2137,33 @@ static int tx_frame_raw_src(const uint8_t dst[6], const uint8_t src[6],
     return tx_frame_raw_src_ex(dst, src, ethertype, payload, plen, 0);
 }
 
-static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
-                                uint16_t ethertype, const uint8_t *payload,
-                                int plen, int probe)
+/* Free (not DMA-owned) TX descriptor at ring index i? */
+static int tx_slot_free(int i)
+{
+    volatile struct emac_desc *d = tx_desc(i % N_TX_DESC);
+    cache_inval((uintptr_t)d, sizeof(*d));
+    return !(d->status & EMAC_DESC_OWN_DMA);
+}
+
+/* Take the next TX descriptor. On success (>= 0) the TX lock is HELD and
+ * *buf is the slot's DMA buffer; finish with emac_tx_end(). Otherwise the
+ * lock is not held: EMAC_TX_BUSY (no free descriptor -- the guest retries
+ * when emac_tx_space() says so) or EMAC_TX_DROP (link down, lock not
+ * obtained, a descriptor wedged).
+ *
+ * guest = 1: never waits. The DMA completes descriptors in ring order, so
+ * the slot TX_HV_RESERVE ahead being free means every slot up to it is,
+ * and the guest leaves those last few to the HV's own frames.
+ * guest = 0: the HV's console/netcon/... frames wait a bounded time for a
+ * descriptor, as tx_frame_raw() always did. */
+int emac_tx_begin(int guest, uint8_t **buf)
 {
     volatile struct emac_desc *d;
-    uint8_t *buf;
-    int total, i, to;
+    int to;
 
     if (!emac_tx_lock_acquire_bounded()) {
         bc(15, ++g_tx_drops);
-        return 0;
+        return EMAC_TX_DROP;
     }
 
     if (!g_link_up) {
@@ -2127,45 +2172,118 @@ static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
          * instead of just a gap in the log. */
         bc(15, ++g_tx_drops);
         emac_tx_unlock();
-        return 0;
+        return EMAC_TX_DROP;
     }
-
-    if (plen > (ETH_BUFSIZE - 14 - 4))
-        plen = ETH_BUFSIZE - 14 - 4;
 
     d = tx_desc(g_tx_slot);
-
-    /* Make sure this descriptor is free (OWN clear) — bounded wait. Nudge
-     * TX DMA periodically in case it stalled rather than being legitimately
-     * busy with a prior frame still in flight. */
-    cache_inval((uintptr_t)d, sizeof(*d));
-    to = 200000;
-    while (--to > 0 && (d->status & EMAC_DESC_OWN_DMA)) {
-        if ((to & 0x3fffu) == 0)
-            setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
+    if (guest) {
+        if (!tx_slot_free(g_tx_slot + TX_HV_RESERVE)) {
+            g_tx_busy++;
+            emac_tx_unlock();
+            return EMAC_TX_BUSY;
+        }
+    } else {
+        /* Make sure this descriptor is free (OWN clear) — bounded wait.
+         * Nudge TX DMA periodically in case it stalled rather than being
+         * legitimately busy with a prior frame still in flight. */
         cache_inval((uintptr_t)d, sizeof(*d));
-    }
-    if (to <= 0) {
-        /* Previous TX still in flight after the bounded wait: drop this
-         * frame, count it, but STILL advance g_tx_slot so a single wedged
-         * descriptor doesn't retry the same slot forever and wedge the
-         * whole channel — the next call gets a fresh descriptor to try. */
-        bc(15, ++g_tx_drops);
-        if (++g_tx_slot >= N_TX_DESC)
-            g_tx_slot = 0;
-        emac_tx_unlock();
-        return 0;
+        to = 200000;
+        while (--to > 0 && (d->status & EMAC_DESC_OWN_DMA)) {
+            if ((to & 0x3fffu) == 0)
+                setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
+            cache_inval((uintptr_t)d, sizeof(*d));
+        }
+        if (to <= 0) {
+            /* Previous TX still in flight after the bounded wait: drop this
+             * frame, count it, but STILL advance g_tx_slot so a single
+             * wedged descriptor doesn't retry the same slot forever and
+             * wedge the whole channel — the next call gets a fresh
+             * descriptor to try. */
+            bc(15, ++g_tx_drops);
+            if (++g_tx_slot >= N_TX_DESC)
+                g_tx_slot = 0;
+            emac_tx_unlock();
+            return EMAC_TX_DROP;
+        }
     }
 
     {
         /* The slot is free again: if it carried a frame, the DMA sent it. */
         uint64_t now = timer_now();
-        if (g_tx_pending_mask & (1u << g_tx_slot))
+        if (g_tx_pending_mask & (1ull << g_tx_slot))
             note_tx_done(g_tx_slot, now);
         g_tx_slot_ticks[g_tx_slot] = now;
     }
 
-    buf = (uint8_t *)(uintptr_t)d->buf_addr;
+    *buf = (uint8_t *)(uintptr_t)d->buf_addr;
+    return g_tx_slot;
+}
+
+/* Finish emac_tx_begin(): hand `len` bytes (a whole Ethernet frame, at most
+ * ETH_BUFSIZE - 4, padded by the caller to 60) to the DMA, or with
+ * send == 0 give the slot back untouched. Releases the TX lock. */
+void emac_tx_end(int slot, uint32_t len, int send)
+{
+    emac_tx_end_ex(slot, len, send, 0);
+}
+
+static void emac_tx_end_ex(int slot, uint32_t len, int send, int probe)
+{
+    volatile struct emac_desc *d = tx_desc(slot);
+    uint32_t ctl;
+
+    if (!send) {
+        emac_tx_unlock();
+        return;
+    }
+    cache_clean((uintptr_t)d->buf_addr, len);
+
+    ctl = len | EMAC_DESC_CHAIN_SECOND | EMAC_DESC_FIRST_DESC |
+          EMAC_DESC_LAST_DESC;
+    /* Nearly full: ask for TX_INT when this one is out, so a guest that
+     * found no room (EMAC_TX_BUSY) is resumed from CPU1 as soon as there
+     * is some, instead of on the next 10 ms tick. */
+    if (!tx_slot_free(slot + 1 + TX_IRQ_WHEN_FREE_BELOW))
+        ctl |= EMAC_DESC_TX_INT_CTL;
+    d->ctl_size = ctl;
+    d->status = EMAC_DESC_OWN_DMA;
+    cache_clean((uintptr_t)d, sizeof(*d));
+
+    g_tx_pending_mask |= 1ull << slot;
+    if (probe)
+        g_tx_probe_mask |= 1ull << slot;
+    else
+        g_tx_probe_mask &= ~(1ull << slot);
+
+    /* Kick the TX DMA. */
+    setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
+
+    if (++g_tx_slot >= N_TX_DESC)
+        g_tx_slot = 0;
+    bc(6, ++g_tx_count);
+    emac_tx_unlock();
+}
+
+/* Room for a guest frame right now (lock-free peek, may be stale by the
+ * time the caller acts -- emac_tx_begin() decides). */
+int emac_tx_space(void)
+{
+    return tx_slot_free(g_tx_slot + TX_HV_RESERVE);
+}
+
+static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
+                                uint16_t ethertype, const uint8_t *payload,
+                                int plen, int probe)
+{
+    uint8_t *buf;
+    int total, i;
+    int slot = emac_tx_begin(0, &buf);
+
+    if (slot < 0)
+        return 0;
+
+    if (plen > (ETH_BUFSIZE - 14 - 4))
+        plen = ETH_BUFSIZE - 14 - 4;
 
     {
         uint8_t eh[14];
@@ -2183,27 +2301,7 @@ static int tx_frame_raw_src_ex(const uint8_t dst[6], const uint8_t src[6],
         nc_zero(buf + total, (uint32_t)(60 - total));
         total = 60;
     }
-
-    cache_clean((uintptr_t)buf, (uint32_t)total);
-
-    d->ctl_size = (uint32_t)total | EMAC_DESC_CHAIN_SECOND |
-                  EMAC_DESC_FIRST_DESC | EMAC_DESC_LAST_DESC;
-    d->status = EMAC_DESC_OWN_DMA;
-    cache_clean((uintptr_t)d, sizeof(*d));
-
-    g_tx_pending_mask |= 1u << g_tx_slot;
-    if (probe)
-        g_tx_probe_mask |= 1u << g_tx_slot;
-    else
-        g_tx_probe_mask &= ~(1u << g_tx_slot);
-
-    /* Kick the TX DMA. */
-    setbits(EMAC_TX_CTL1, EMAC_TX_CTL1_TX_DMA_START);
-
-    if (++g_tx_slot >= N_TX_DESC)
-        g_tx_slot = 0;
-    bc(6, ++g_tx_count);
-    emac_tx_unlock();
+    emac_tx_end_ex(slot, (uint32_t)total, 1, probe);
     return 1;
 }
 
@@ -2381,6 +2479,7 @@ static uint32_t g_rx_irq_frames;   /* bc[28] frames drained from the IRQ    */
 static uint32_t g_rx_irq_deferred; /* bc[29] IRQ drains that stopped at an HV
                                     * debug frame and left it to the tick  */
 static uint32_t g_rx_max_batch;    /* bc[30] most frames drained at once    */
+static uint32_t g_tx_ints;         /* TX_INT seen (TX_INT_CTL frames sent)  */
 
 /* Read and clear (write-1) the EMAC interrupt status; count the RX loss
  * events. Called by both drain paths before they walk the ring, so a frame
@@ -2397,6 +2496,8 @@ static void emac_int_latch(void)
         bc(24, ++g_rx_buf_ua);
     if (st & EMAC_INT_RX_OVERFLOW)
         bc(25, ++g_rx_overflow);
+    if (st & EMAC_INT_TX)
+        g_tx_ints++;
 }
 
 /* Walk the RX ring. `from_irq`: called from emac_rx_irq() rather than the
@@ -2528,6 +2629,7 @@ void emac_poll(void)
     vnet_emac_link_update(g_link_up);
 
     (void)emac_rx_drain(0);
+    vnet_emac_tx_resume();         /* fallback if no TX_INT came */
 }
 
 /* EMAC interrupt (SPI 82), serviced on CPU1 by gic_timer_irq() between two
@@ -2543,6 +2645,7 @@ void emac_rx_irq(void)
     uint32_t n = (uint32_t)emac_rx_drain(1);
     g_rx_irq_frames += n;
     bc(28, g_rx_irq_frames);
+    vnet_emac_tx_resume();         /* TX_INT: descriptors came back */
 }
 
 void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS])
@@ -2558,6 +2661,8 @@ void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS])
     out[8] = g_tx_drops;
     out[9] = N_RX_DESC;
     out[10] = N_TX_DESC;
+    out[11] = g_tx_busy;
+    out[12] = g_tx_ints;
 }
 
 int emac_getc(void)

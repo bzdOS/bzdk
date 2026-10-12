@@ -11,22 +11,23 @@
  * FLOW:
  *   TX (guest -> wire):
  *     guest writes QueueNotify(1)  ->  vnet_mmio_fault() -> vnet_kick(1)
- *       -> for each available descriptor chain on the transmitq:
- *            gather the WHOLE chain (virtio_net_hdr + Ethernet frame,
- *            regardless of how the guest split it across descriptors) into
- *            a linear HV-local staging buffer;
- *            read the ethertype out of the reassembled Ethernet frame;
- *            if the ethertype is one of the HV's own 0x88B5..0x88B8, bare
- *              or behind one/two VLAN tags (vnet_tx_is_hv_ethertype()): DROP. Never
- *              calls emac_send_frame(); the guest cannot spoof the debug
- *              channel. Completion is still pushed (len=0) so the guest's
- *              ring drains normally — from the driver's perspective this is
- *              indistinguishable from a real NIC silently dropping a frame,
- *              which is normal Ethernet behavior, not an error.
- *            else: emac_send_frame(ethertype, payload, payload_len) — see
- *              the "MAC identity" note below for what actually goes out on
- *              the wire.
- *       -> set InterruptStatus.VRING, inject VNET_INTID.
+ *       -> vnet_tx_drain(): for up to VNET_TX_BUDGET available chains:
+ *            reserve the next EMAC TX descriptor (emac_tx_begin(), never
+ *              waits; a full ring leaves the chain on the avail ring and
+ *              CPU1 continues the drain, vnet_emac_tx_resume());
+ *            gather the chain minus its virtio_net_hdr straight into that
+ *              descriptor's DMA buffer;
+ *            check the copy: one of the HV's own ethertypes 0x88B5..0x88B8,
+ *              bare or behind one/two VLAN tags (vnet_tx_is_hv_ethertype()),
+ *              or the HV's source MAC -> the slot goes back unsent; the
+ *              guest cannot spoof the debug channel. Completion is still
+ *              pushed (len=0) so the guest's ring drains normally — from the
+ *              driver's perspective this is indistinguishable from a real
+ *              NIC silently dropping a frame;
+ *            else emac_tx_end() hands it to the DMA, dst/src as the guest
+ *              built them;
+ *            push the used entry (the frame has been copied out).
+ *       -> set InterruptStatus.VRING, inject VNET_INTID once.
  *
  *   RX (wire -> guest):
  *     emac.c's emac_poll() RX demux calls vnet_emac_rx_frame(frame, len) for
@@ -203,6 +204,9 @@
  *   [30] RX frames dropped for not fitting the guest's buffer (were
  *        truncated before 2026-10-12)
  *   [31] TX frames dropped for exceeding the largest Ethernet frame
+ *   [32] TX drains stopped because the EMAC ring was full (frame left on
+ *        the avail ring for CPU1 to send, see vnet_tx_drain())
+ *   [33] TX drains CPU1 continued (vnet_emac_tx_resume())
  *
  * Since 2026-10-12 (audit item 10) a counter update is a plain store into
  * g_bcv[]; vnet_bc_publish() copies the whole table to the window from the
@@ -211,8 +215,8 @@
  * a full-system barrier for each counter it bumps. */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
-#define VNET_BC_LAST   31u           /* highest slot used above */
-#define VNET_BC_SLOTS  32u
+#define VNET_BC_LAST   33u           /* highest slot used above */
+#define VNET_BC_SLOTS  40u
 
 static uint32_t g_bcv[VNET_BC_SLOTS];
 
@@ -335,7 +339,6 @@ static void int_status_clear(volatile uint32_t *p, uint32_t bits)
  * cannot: neither call site is reentrant with itself). Two SEPARATE buffers
  * (one per direction) avoid even the theoretical cross-core aliasing a
  * single shared buffer would risk if that assumption ever changed. */
-static uint8_t g_tx_stage[VNET_STAGE_BUF_SIZE];
 
 /* ------------------------------------------------------------------ *
  * Guest-memory helpers — BYTE-FOR-BYTE the same pattern as vblk_emmc.c's
@@ -449,6 +452,20 @@ static int vq_pop_avail(struct vnet_vq *vq, uint16_t *head)
 	return 1;
 }
 
+/* Like vq_pop_avail() but leaves the entry on the ring: the caller bumps
+ * vq->last_avail itself once the chain is really consumed (TX may have to
+ * leave it there for a full EMAC ring, see vnet_tx_drain()). */
+static int vq_peek_avail(struct vnet_vq *vq, uint16_t *head)
+{
+	if (!vq->ready || vq->num == 0 || !vq_rings_ok(vq))
+		return 0;
+	uint16_t avail_idx = gmem_ld16(vq->avail + 2u);
+	if (vq->last_avail == avail_idx)
+		return 0;
+	*head = gmem_ld16(vq->avail + 4u + (uint64_t)(vq->last_avail % vq->num) * 2u);
+	return 1;
+}
+
 static uint16_t vq_push_used(struct vnet_vq *vq, uint16_t head, uint32_t used_len)
 {
 	uint16_t used_idx = gmem_ld16(vq->used + 2u);
@@ -499,25 +516,6 @@ static uint32_t vq_collect_chain(struct vnet_vq *vq, uint16_t head,
 	return n;
 }
 
-/* Gather up to dst_cap bytes out of a (read-only, TX-direction) descriptor
- * chain into a linear HV-local buffer, in order, regardless of how the
- * guest split header vs data across descriptors (robust to either the
- * "header in its own descriptor" or "header+data combined" layout — we
- * never assumed VIRTIO_NET_F_ANY_LAYOUT either way). */
-static uint32_t vnet_gather(struct vnet_desc *chain, uint32_t n,
-                             uint8_t *dst, uint32_t dst_cap)
-{
-	uint32_t total = 0;
-	for (uint32_t i = 0; i < n && total < dst_cap; i++) {
-		uint32_t take = chain[i].len;
-		if (total + take > dst_cap)
-			take = dst_cap - total;
-		if (take)
-			gmem_read(chain[i].addr, dst + total, take);
-		total += take;
-	}
-	return total;
-}
 
 /* Bytes the guest can take in a (write-only, RX-direction) descriptor
  * chain. */
@@ -581,125 +579,199 @@ static void vnet_inject_irq(void)
 
 /* ------------------------------------------------------------------ *
  * TX: one descriptor chain off the transmitq (queue 1).
+ *
+ * Since 2026-10-12 (audit item 11) the frame is gathered straight from the
+ * guest's chain into the EMAC descriptor's DMA buffer (emac_tx_begin()),
+ * checked THERE -- in HV-owned memory, so a guest vCPU rewriting its buffer
+ * after the check cannot change what is sent -- and handed to the DMA. If
+ * the EMAC ring has no room the chain is left on the avail ring, not
+ * dropped and not waited for: the drain stops, g_tx_resume asks CPU1 to
+ * continue it (emac_rx_irq() on TX_INT, or the next tick), and the guest
+ * vCPU returns to the guest at once.
  * ------------------------------------------------------------------ */
-static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
+#define VNET_TX_DONE   1     /* chain consumed (sent or dropped)       */
+#define VNET_TX_RETRY  0     /* no EMAC descriptor: leave it on the ring */
+
+/* Frames one drain may move before it hands the rest to CPU1: a guest
+ * burst never holds a vCPU in EL2 for more than ~VNET_TX_BUDGET * 10 us. */
+#define VNET_TX_BUDGET 32u
+
+static volatile uint32_t g_tx_resume;  /* TX drain left work for CPU1 */
+static uint32_t g_tx_retries;          /* [32] drains stopped on a full ring */
+static uint32_t g_tx_resumes;          /* [33] drains CPU1 continued */
+
+static int vnet_tx_one(struct vnet_dev *d, uint16_t head)
 {
 	struct vnet_vq *vq = &d->vq[VNET_QUEUE_TX];
 	struct vnet_desc chain[VNET_MAX_CHAIN];
 	uint32_t n = vq_collect_chain(vq, head, chain, VNET_MAX_CHAIN);
 
-	if (n == 0) {
-		vq_push_used(vq, head, 0);
-		return;
-	}
+	if (n == 0)
+		return VNET_TX_DONE;          /* malformed: completed with length 0 */
 
 	/* D5(d), DIAGNOSTIC ONLY (same "count, don't enforce" caution as
 	 * vblk_emmc.c's identical fix): every transmitq descriptor is guest-
 	 * supplied, device-READ data (the device writes nothing back except the
 	 * zero-length completion) — none should carry VNET_VRING_DESC_F_WRITE.
-	 * Not enforced: no hardware access in this task to confirm if_vtnet never
-	 * does otherwise on some code path, and a wrong hard-reject here would
-	 * break the guest's already-working TX path outright. */
+	 * Not enforced: a wrong hard-reject here would break the guest's
+	 * already-working TX path outright. */
 	for (uint32_t i = 0; i < n; i++)
 		if (chain[i].flags & VNET_VRING_DESC_F_WRITE)
 			vnet_bc(17, ++g_bad_desc_flags);
 
+	uint32_t room = vnet_chain_room(chain, n);
 	/* Larger than any Ethernet frame (1514 + one VLAN tag): drop it whole
 	 * rather than send a truncated, corrupt frame (audit item 13). */
-	if (vnet_chain_room(chain, n) > VNET_HDR_LEN + VNET_ETH_MAX_FRAME + 4u) {
+	if (room > VNET_HDR_LEN + VNET_ETH_MAX_FRAME + 4u) {
 		vnet_bc(31, ++g_tx_too_big);
-		vq_push_used(vq, head, 0);
-		return;
+		return VNET_TX_DONE;
+	}
+	/* Need the virtio header plus an Ethernet header to have an ethertype
+	 * to mux on. Anything shorter is malformed — drop cleanly. */
+	if (room < VNET_HDR_LEN + VNET_ETH_HDR_LEN)
+		return VNET_TX_DONE;
+	uint32_t len = room - VNET_HDR_LEN;
+
+	if (!g_net.link_up) {
+		/* Link down (config.status says so too, and the guest was sent a
+		 * config-change interrupt): nothing can leave. virtio-net has no
+		 * per-frame TX error status, so the completion is the most a
+		 * device can say; the honest signal is the link state. */
+		vnet_bc(22, ++g_tx_linkdown);
+		return VNET_TX_DONE;
 	}
 
-	uint32_t total = vnet_gather(chain, n, g_tx_stage, VNET_STAGE_BUF_SIZE);
-
-	/* Need at least the legacy header + a minimal Ethernet header to have an
-	 * ethertype to mux on. Anything shorter is malformed — drop cleanly. */
-	if (total < VNET_HDR_LEN + VNET_ETH_HDR_LEN) {
-		vq_push_used(vq, head, 0);
-		return;
+	uint8_t *buf;
+	int slot = emac_tx_begin(1, &buf);
+	if (slot == EMAC_TX_BUSY)
+		return VNET_TX_RETRY;
+	if (slot < 0) {
+		vnet_bc(8, ++g_tx_dropped);       /* lock / link / wedged descriptor */
+		return VNET_TX_DONE;
 	}
 
-	uint16_t ethertype = (uint16_t)((g_tx_stage[VNET_HDR_LEN + 12] << 8) |
-	                                  g_tx_stage[VNET_HDR_LEN + 13]);
+	/* Gather, skipping the 12-byte virtio_net_hdr (no offloads were
+	 * negotiated, so it carries nothing), however the guest split it. */
+	uint32_t skip = VNET_HDR_LEN, off = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t l = chain[i].len;
+		uint64_t a = chain[i].addr;
+		if (skip) {
+			uint32_t k = l < skip ? l : skip;
+			skip -= k; l -= k; a += k;
+		}
+		if (l) {
+			gmem_read(a, buf + off, l);
+			off += l;
+		}
+	}
+	if (len < VNET_ETH_MIN_FRAME) {
+		nc_zero(buf + len, VNET_ETH_MIN_FRAME - len);
+		len = VNET_ETH_MIN_FRAME;
+	}
+
+	/* Checks on the copy (up to two VLAN tags: 22 bytes). */
+	uint8_t eh[24];
+	uint32_t ehl = len < sizeof(eh) ? len : (uint32_t)sizeof(eh);
+	nc_copy(eh, buf, ehl);
+	uint16_t ethertype = (uint16_t)((eh[12] << 8) | eh[13]);
 	vnet_bc(11, ethertype);
 
-	int hv_type = vnet_tx_is_hv_ethertype(g_tx_stage + VNET_HDR_LEN,
-	                                       total - VNET_HDR_LEN);
+	int hv_type = vnet_tx_is_hv_ethertype(eh, ehl);
 	/* Nor may it borrow the HV's source MAC (the guest has its own since
 	 * 2026-10-12; host tools identify the HV by this address). */
-	if (!hv_type && emac_mac_is_hv(g_tx_stage + VNET_HDR_LEN + 6))
+	if (!hv_type && emac_mac_is_hv(eh + 6))
 		hv_type = 1;
 	if (hv_type) {
 		/* HARD BLOCK: the guest must never be able to inject a frame that
 		 * masquerades as one of the HV's own protocols (0x88B5..0x88B8,
 		 * bare or VLAN-wrapped), nor use the HV's source MAC: host tools
-		 * must be able to tell the two apart. Never reaches
-		 * emac_send_frame() / real hardware. Completion still pushed so the
-		 * guest's ring drains — indistinguishable from a real NIC quietly
-		 * dropping a frame. */
+		 * must be able to tell the two apart. The slot goes back unsent;
+		 * the completion still drains the guest's ring — indistinguishable
+		 * from a real NIC quietly dropping a frame. */
+		emac_tx_end(slot, 0, 0);
 		vnet_bc(7, ++g_tx_blocked);
 		if (hv_type > 1)
 			vnet_bc(21, ++g_tx_blocked_vlan);
-	} else if (!g_net.link_up) {
-		/* Link down (config.status says so too, and the guest was sent a
-		 * config-change interrupt): nothing can leave. Count it here rather
-		 * than let it vanish into emac.c's generic drop counter. virtio-net
-		 * has no per-frame TX error status, so the completion below is the
-		 * most a device can say; the honest signal is the link state. */
-		vnet_bc(22, ++g_tx_linkdown);
-	} else {
-		const uint8_t *payload = g_tx_stage + VNET_HDR_LEN + VNET_ETH_HDR_LEN;
-		uint32_t plen = total - VNET_HDR_LEN - VNET_ETH_HDR_LEN;
-		/* Preserve the guest's own Ethernet destination instead of
-		 * broadcasting (the "MAC IDENTITY NOTE" above described the old
-		 * behaviour). ARP tolerated broadcast because a peer learns the
-		 * sender's hardware address from the ARP payload's sender-HA field,
-		 * not the frame header -- but TCP does not: Linux drops a unicast-IP
-		 * packet delivered to the broadcast MAC, so the guest's SYN-ACK
-		 * showed up in tcpdump and was ignored by the host's stack, leaving
-		 * the host retransmitting SYN until it gave up (measured live
-		 * 2026-07-30, with `ip neigh` stuck FAILED for the guest). The dst
-		 * MAC is the first 6 bytes of the guest's Ethernet header, which sits
-		 * immediately after the virtio_net_hdr in the staging buffer. */
-		const uint8_t *dst = g_tx_stage + VNET_HDR_LEN;
-		/* Keep the guest's source MAC too: a bridged frame carries its
-		 * client's address (emac.h, emac_send_frame_from()). */
-		const uint8_t *src = g_tx_stage + VNET_HDR_LEN + 6;
-		int ok = emac_send_frame_from(dst, src, ethertype, payload,
-		                              (uint16_t)plen);
-		if (ok)
-			vnet_bc(6, ++g_tx_sent);
-		else
-			vnet_bc(8, ++g_tx_dropped);      /* link down / TX ring busy */
+		return VNET_TX_DONE;
 	}
 
-	/* virtio-net TX completions carry no meaningful "bytes written" (the
-	 * device writes nothing back on the transmitq) — 0 is correct per spec,
-	 * matching every other real virtio-net device. */
-	vq_push_used(vq, head, 0);
+	/* The guest's own dst and src go out as they are (see the "MAC
+	 * IDENTITY NOTE" history at the top of this file). */
+	emac_tx_end(slot, len, 1);
+	vnet_bc(6, ++g_tx_sent);
+	return VNET_TX_DONE;
 }
 
-/* QueueNotify handler: drain every available request on the notified queue,
- * then raise one IRQ if anything was served. Queue 0 (RX) is driven by
- * vnet_emac_rx_frame() instead — a guest NOTIFY on queue 0 just means "I
- * posted more RX buffers", which requires no immediate action here (the
- * next inbound frame will find them via vq_pop_avail), so it is a no-op
- * that still counts as "served" for symmetry/diagnostics only if you choose
- * to extend it; today it simply returns. */
+/* Move up to `budget` chains from the transmitq to the EMAC. Caller holds
+ * the TX queue lock. Completions are pushed as each chain is consumed (the
+ * frame has been copied out, so the guest may reuse its buffer -- this is
+ * a copying device). Returns the number of chains completed; sets
+ * g_tx_resume if work is left (full EMAC ring or budget spent). */
+static uint32_t vnet_tx_drain(struct vnet_dev *d, uint32_t budget)
+{
+	struct vnet_vq *vq = &d->vq[VNET_QUEUE_TX];
+	uint16_t head;
+	uint32_t done = 0;
+
+	g_tx_resume = 0u;
+	while (vq_peek_avail(vq, &head)) {
+		if (done == budget) {
+			g_tx_resume = 1u;
+			break;
+		}
+		if (vnet_tx_one(d, head) == VNET_TX_RETRY) {
+			vnet_bc(32, ++g_tx_retries);
+			g_tx_resume = 1u;
+			break;
+		}
+		vq->last_avail++;
+		vq_push_used(vq, head, 0);   /* TX completions carry no length */
+		done++;
+	}
+	return done;
+}
+
+static void vnet_tx_irq(struct vnet_dev *d)
+{
+	int_status_or((volatile uint32_t *)&d->int_status, VNET_INT_VRING);
+	vnet_inject_irq();
+}
+
+/* CPU1 (emac_rx_irq() after TX_INT, and every emac_poll()): continue a
+ * drain the guest's own kick could not finish. Never waits for the queue
+ * lock -- whoever holds it is draining or resetting the queue already. */
+void vnet_emac_tx_resume(void)
+{
+	struct vnet_dev *d = &g_net;
+
+	if (!g_tx_resume || !emac_tx_space())
+		return;
+	if (!vq_trylock(VNET_QUEUE_TX))
+		return;
+	uint32_t done = 0;
+	if (d->vq[VNET_QUEUE_TX].ready && (d->status & VNET_S_DRIVER_OK))
+		done = vnet_tx_drain(d, VNET_TX_BUDGET);
+	else
+		g_tx_resume = 0u;
+	vq_unlock(VNET_QUEUE_TX);
+	if (done) {
+		vnet_bc(33, ++g_tx_resumes);
+		vnet_tx_irq(d);
+	}
+}
+
+/* QueueNotify handler: drain up to VNET_TX_BUDGET chains from the notified
+ * transmitq, then raise one IRQ if anything was served. Queue 0 (RX) is
+ * driven by vnet_emac_rx_frame() instead — a guest NOTIFY on queue 0 just
+ * means "I posted more RX buffers", which requires no immediate action here
+ * (the next inbound frame will find them via vq_pop_avail). */
 static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 {
 	if (qidx == VNET_QUEUE_TX) {
-		struct vnet_vq *vq = &d->vq[VNET_QUEUE_TX];
-		uint16_t head;
-		int served = 0;
-
 		/* D5(e), DIAGNOSTIC ONLY (see vblk_kick()'s identical rationale in
-		 * vblk_emmc.c — not enforced, no hardware access in this task to
-		 * confirm it never fires for a working driver). vnet_emac_rx_frame()
-		 * already hard-gates on DRIVER_OK for the RX direction (existing,
-		 * unchanged, proven-safe code, predating this fix) — this counts the
+		 * vblk_emmc.c — not enforced). vnet_emac_rx_frame() already
+		 * hard-gates on DRIVER_OK for the RX direction — this counts the
 		 * TX-side equivalent instead of also hard-gating it. */
 		if (!(d->status & VNET_S_DRIVER_OK))
 			vnet_bc(18, ++g_kick_not_ready);
@@ -708,18 +780,13 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 		 * another vCPU waits until this ring walk is finished. */
 		uint64_t t0 = vnet_now();
 		vq_lock(VNET_QUEUE_TX);
-		while (vq_pop_avail(vq, &head)) {
-			vnet_tx_one(d, head);
-			served = 1;
-		}
+		uint32_t done = vnet_tx_drain(d, VNET_TX_BUDGET);
 		vq_unlock(VNET_QUEUE_TX);
 		g_tx_time += vnet_now() - t0;
 		vnet_bc(28, (uint32_t)g_tx_time);
 		vnet_bc(29, ++g_tx_kicks);
-		if (served) {
-			int_status_or((volatile uint32_t *)&d->int_status, VNET_INT_VRING);
-			vnet_inject_irq();
-		}
+		if (done)
+			vnet_tx_irq(d);
 	}
 	/* qidx == VNET_QUEUE_RX: nothing to do here — see comment above. */
 }
