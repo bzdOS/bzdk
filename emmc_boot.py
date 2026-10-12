@@ -35,6 +35,7 @@ sys.path.insert(0, HERE)
 
 SLOT_PA = 0x50021100          # == hv_addrmap.h HVMAP_BOOTSLOT
 SLOT_MAGIC = 0x42415a42       # "BZAB"
+ENV_FILE_PA = 0x4f000000   # scratch for the RAM-only test env file
 NETCFG_PA = 0x4a0f0000        # == dbgip.h DBGIP_CFG_PA
 MAX_TRIES = 3
 
@@ -82,12 +83,25 @@ def nc_script(boot=True, slot=None):
              "fatls mmc ${mmc_bootdev}:2 bzdk/cur",
              "fatls mmc ${mmc_bootdev}:2 bzdk/lkg",
              f"md.l {SLOT_PA:#x} 4"]
-    for k, v in VARS.items():
-        lines.append(f"setenv {k} '{v}'")
+    # Netconsole drops characters from long input lines (a 400-byte setenv
+    # arrived without its head and left the prompt in an open quote), so the
+    # long variables come from a file on the ESP: write `env_file()` to
+    # bzdk/test.env first (through the guest), then import it here.
+    lines += [f"fatload mmc ${{mmc_bootdev}}:2 {ENV_FILE_PA:#x} bzdk/test.env",
+              f"env import -t {ENV_FILE_PA:#x} ${{filesize}}"]
     if slot:
         lines.append(f"mw.l {SLOT_PA + 4:#x} {0 if slot == 'cur' else MAX_TRIES}")
     if boot:
         lines.append("!run bzdk_boot")
+    return "\n".join(lines) + "\n"
+
+
+def env_file(netmask="255.255.255.0", gatewayip=None):
+    """Text for `env import -t`: the boot variables for a RAM-only test."""
+    lines = [f"{k}={v}" for k, v in VARS.items() if k != "bootcmd"]
+    lines.append(f"netmask={netmask}")
+    if gatewayip:
+        lines.append(f"gatewayip={gatewayip}")
     return "\n".join(lines) + "\n"
 
 
@@ -108,6 +122,9 @@ def main():
     s.add_argument("--no-boot", action="store_true")
     s.add_argument("--slot", choices=("cur", "lkg"),
                    help="preset the tries so this slot is the one booted")
+    e = sub.add_parser("env-file", help="bzdk/test.env for the RAM-only test")
+    e.add_argument("--netmask", default="255.255.255.0")
+    e.add_argument("--gatewayip")
     i = sub.add_parser("install", help="write the variables + new bootcmd "
                        "into uboot.env (backs it up first)")
     i.add_argument("--backup", required=True, help="file for the old env")
@@ -122,6 +139,8 @@ def main():
         print(f"bootcmd={NEW_BOOTCMD}")
     elif a.cmd == "nc-script":
         sys.stdout.write(nc_script(not a.no_boot, a.slot))
+    elif a.cmd == "env-file":
+        sys.stdout.write(env_file(a.netmask, a.gatewayip))
     elif a.cmd == "install":
         env_tool("backup", a.backup)
         cur = env_tool("get", "bootcmd").strip().splitlines()[-1]

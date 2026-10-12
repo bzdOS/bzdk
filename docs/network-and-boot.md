@@ -78,8 +78,13 @@ through a fresh read-only mount. U-Boot's binary is never touched.
 
 Testing a boot path without touching the saved env: `uboot_maint.py open`
 (bootdelay 3), then `uboot_nc.py run <script>` catches the prompt over
-netconsole (UDP 6666) and runs `emmc_boot.py nc-script` (setenv in RAM,
-`run bzdk_boot`).
+netconsole (UDP 6666) and runs `emmc_boot.py nc-script`. Netconsole loses
+characters from long input lines, so the variables are not typed: put
+`emmc_boot.py env-file` on the ESP as `bzdk/test.env` first (through the
+guest), and the script `env import`s it in RAM and runs `bzdk_boot`; preset
+the tries with `--slot lkg` to test the fallback. Verified 2026-10-12: cur
+boot, lkg fallback after 3 tries, then three reboots from the saved env, all
+on slot cur with the tries cleared after 90 s.
 
 ## Moving the board to another subnet
 
