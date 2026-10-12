@@ -153,6 +153,10 @@ const char *const bzdos_emac_owner = "emac";
  * the RX_FRM_FLT write site for the live-hardware story (2026-07-23/24). */
 #define EMAC_RX_FRM_FLT      0x38
 #define  EMAC_FRM_FLT_RXALL      (1u << 0)
+/* RXALL alone still drops unicast to any MAC but ADDR0: measured 2026-10-12,
+ * frames to 02:bd:05:00:00:42 and to an unknown MAC never reached vnet while
+ * the same frames to OUR_MAC did. DIS_ADDR_FILTER turns the filter off. */
+#define  EMAC_FRM_FLT_DIS_ADDR   (1u << 31)
 #define EMAC_MII_CMD         0x48
 #define EMAC_MII_DATA        0x4c
 #define EMAC_ADDR0_HIGH      0x50
@@ -1343,7 +1347,7 @@ int emac_init(void)
      * the debug protocol itself, self-inflicting an "EMAC dark" episode
      * (recovered via the USB-ACM break-glass, see project memory) before
      * this fix was written correctly here. */
-    wr(EMAC_RX_FRM_FLT, EMAC_FRM_FLT_RXALL);
+    wr(EMAC_RX_FRM_FLT, EMAC_FRM_FLT_RXALL | EMAC_FRM_FLT_DIS_ADDR);
     setbits(EMAC_RX_CTL0, EMAC_RX_CTL0_RX_EN);
     setbits(EMAC_TX_CTL0, EMAC_TX_CTL0_TX_EN);
     __asm__ volatile("dsb sy" ::: "memory");
@@ -2012,7 +2016,11 @@ void emac_poll(void)
                  * This also matches what a future in-guest packet sniffer
                  * (promiscuous-style capture) needs: frames not addressed
                  * to the guest's own MAC must still reach it to be seen. */
-                vnet_emac_rx_frame(buf, (uint16_t)length);
+                /* The descriptor length includes the 4-byte FCS (RX_CTL0
+                 * has no STRIP_FCS): a 64-byte frame reached the guest as
+                 * 68, and a bridged 1514-byte frame would leave its WiFi
+                 * side as 1518. Hand vnet the frame without it. */
+                vnet_emac_rx_frame(buf, (uint16_t)(length - 4));
                 note_rx_frame();
             }
         }
