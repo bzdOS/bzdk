@@ -164,10 +164,18 @@ const char *const bzdos_emac_owner = "emac";
  * frames to 02:bd:05:00:00:42 and to an unknown MAC never reached vnet while
  * the same frames to the HV MAC did. DIS_ADDR_FILTER turns the filter off. */
 #define  EMAC_FRM_FLT_DIS_ADDR   (1u << 31)
+/* Pass every multicast frame (Linux dwmac-sun8i EMAC_FRM_FLT_MULTICAST). */
+#define  EMAC_FRM_FLT_ALLMULTI   (1u << 16)
 #define EMAC_MII_CMD         0x48
 #define EMAC_MII_DATA        0x4c
 #define EMAC_ADDR0_HIGH      0x50
 #define EMAC_ADDR0_LOW       0x54
+/* Address filter slots 0..7 (ADDR0 = the HV's MAC). HIGH bit 31 enables a
+ * slot >= 1 as a destination match (Linux sun8i_dwmac_set_umac_addr()). */
+#define EMAC_ADDR_HIGH(n)    (0x50u + (uint32_t)(n) * 8u)
+#define EMAC_ADDR_LOW(n)     (0x54u + (uint32_t)(n) * 8u)
+#define  EMAC_ADDR_EN            (1u << 31)
+#define EMAC_N_ADDR          8
 
 /* Descriptor status/ctl bits (sun8i_emac.c lines 120-125). */
 #define EMAC_DESC_OWN_DMA      (1u << 31)
@@ -1218,6 +1226,22 @@ static int phy_startup_ctx(int *duplex_full, int quick)
 /* ------------------------------------------------------------------ */
 /* MAC address + link programming                                       */
 /* ------------------------------------------------------------------ */
+/* Program address slot n (1..7): a destination MAC the filter passes, or
+ * disabled with m == NULL. Registers only; the filter mode is
+ * EMAC_RX_FRM_FLT (emac_rx_filter_apply()). */
+static void emac_set_addr(int n, const uint8_t *m)
+{
+    if (n < 1 || n >= EMAC_N_ADDR)
+        return;
+    if (!m) {
+        wr(EMAC_ADDR_HIGH(n), 0);
+        wr(EMAC_ADDR_LOW(n), 0);
+        return;
+    }
+    wr(EMAC_ADDR_LOW(n), m[0] | (m[1] << 8) | (m[2] << 16) | ((uint32_t)m[3] << 24));
+    wr(EMAC_ADDR_HIGH(n), m[4] | (m[5] << 8) | EMAC_ADDR_EN);
+}
+
 static void write_hwaddr(void)
 {
     emac_macs_init();
@@ -1225,6 +1249,10 @@ static void write_hwaddr(void)
     uint32_t hi = g_hv_mac[4] | (g_hv_mac[5] << 8);
     wr(EMAC_ADDR0_HIGH, hi);
     wr(EMAC_ADDR0_LOW, lo);
+    /* ADDR1 = the guest's MAC, for the hardware filter (audit item 8). */
+    emac_set_addr(1, g_guest_mac);
+    for (int n = 2; n < EMAC_N_ADDR; n++)
+        emac_set_addr(n, 0);
 }
 
 /* Boot-context wrapper: the full LINK_WAIT budget + forced fallback are the
@@ -2081,6 +2109,66 @@ void emac_nettest_phydown(void)
     g_nt_phydown = 1;
 }
 
+/* Receive filter (audit item 8), driven by vnet's control queue. See
+ * emac.h. Writes RX_FRM_FLT and the address slots only -- never RX_EN,
+ * which would take the debug channel down with it. ADDR0 (the HV) and
+ * broadcast pass in every mode. */
+static volatile uint32_t g_rx_filter_mode = 2u;  /* 0 filter, 1 +allmulti, 2 promisc */
+static volatile uint64_t g_nt_filt_until;
+static uint32_t g_nt_filt_saved;
+
+void emac_rx_filter(int promisc, int allmulti, const uint8_t mac[6],
+                    const uint8_t (*uc)[6], uint32_t nuc)
+{
+    uint32_t flt, mode;
+
+    if (promisc || nuc > (uint32_t)(EMAC_N_ADDR - 2)) {
+        flt = EMAC_FRM_FLT_RXALL | EMAC_FRM_FLT_DIS_ADDR;
+        mode = 2u;
+    } else {
+        /* Slots before the mode: a frame for the guest is never refused
+         * because the filter went on before its address did. */
+        emac_set_addr(1, mac);
+        for (uint32_t i = 0; i < (uint32_t)(EMAC_N_ADDR - 2); i++)
+            emac_set_addr(2 + (int)i, i < nuc ? uc[i] : 0);
+        flt = allmulti ? EMAC_FRM_FLT_ALLMULTI : 0u;
+        mode = allmulti ? 1u : 0u;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (g_nt_filt_until)
+        g_nt_filt_saved = flt;           /* a nettest window restores this */
+    else
+        wr(EMAC_RX_FRM_FLT, flt);
+    g_rx_filter_mode = mode;
+}
+
+uint32_t emac_rx_filter_mode(void)
+{
+    return g_rx_filter_mode;
+}
+
+/* nettest filt: put `val` into EMAC_RX_FRM_FLT for `seconds`, then restore
+ * what was there (emac_poll()). Lets a filter mode be tried on the live
+ * board without risking the debug channel for longer than that. */
+void emac_nettest_filter(uint32_t val, uint32_t seconds)
+{
+    uint64_t freq = timer_freq() ? timer_freq() : 24000000ull;
+    if (!g_nt_filt_until)
+        g_nt_filt_saved = rd(EMAC_RX_FRM_FLT);
+    if (seconds > 60u)
+        seconds = 60u;
+    g_nt_filt_until = timer_now() + freq * (uint64_t)seconds;
+    wr(EMAC_RX_FRM_FLT, val);
+}
+
+static void emac_nettest_filter_expire(void)
+{
+    if (g_nt_filt_until && timer_now() >= g_nt_filt_until) {
+        wr(EMAC_RX_FRM_FLT, g_nt_filt_saved);
+        g_nt_filt_until = 0;
+    }
+}
+
 void emac_nettest_stats(uint32_t out[EMAC_NT_NSTATS])
 {
     uint64_t freq = timer_freq() ? timer_freq() : 24000000ull;
@@ -2628,6 +2716,7 @@ void emac_poll(void)
         link_recheck();
     vnet_emac_link_update(g_link_up);
 
+    emac_nettest_filter_expire();
     (void)emac_rx_drain(0);
     vnet_emac_tx_resume();         /* fallback if no TX_INT came */
 }
@@ -2663,6 +2752,7 @@ void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS])
     out[10] = N_TX_DESC;
     out[11] = g_tx_busy;
     out[12] = g_tx_ints;
+    out[13] = g_rx_filter_mode;
 }
 
 int emac_getc(void)

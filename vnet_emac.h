@@ -192,6 +192,26 @@
  * ring flags below, which are honoured too. */
 #define VNET_F_EVENT_IDX_BIT      (1u << 29)
 #define VNET_VRING_AVAIL_F_NO_INTERRUPT 0x1u
+/* Receive filtering (audit item 8): a control queue (CTRL_VQ, bit 17) that
+ * carries promiscuous/all-multicast switches (CTRL_RX, bit 18), the MAC
+ * filter table and the driver's own address (CTRL_MAC_ADDR, bit 23). The
+ * EMAC filters in hardware accordingly (emac_rx_filter()); until the driver
+ * says otherwise, and after every reset, the device is promiscuous, as it
+ * always was. */
+#define VNET_F_CTRL_VQ_BIT        (1u << 17)
+#define VNET_F_CTRL_RX_BIT        (1u << 18)
+#define VNET_F_CTRL_MAC_ADDR_BIT  (1u << 23)
+#define VNET_CTRL_RX              0u
+#define  VNET_CTRL_RX_PROMISC      0u
+#define  VNET_CTRL_RX_ALLMULTI     1u
+#define VNET_CTRL_MAC             1u
+#define  VNET_CTRL_MAC_TABLE_SET   0u
+#define  VNET_CTRL_MAC_ADDR_SET    1u
+#define VNET_CTRL_OK              0u
+#define VNET_CTRL_ERR             1u
+/* Largest control command we read: MAC_TABLE_SET with if_vtnet's 128
+ * unicast + 128 multicast entries is 2 + 2 * (4 + 128 * 6) = 1546 bytes. */
+#define VNET_CTRL_BUF             1600u
 #define VNET_VRING_USED_F_NO_NOTIFY     0x1u
 
 /* Device-specific config space (struct virtio_net_config): the 6-byte `mac`
@@ -212,7 +232,8 @@
  * 1 = transmitq (TX, driver->device). Unlike vblk's single request queue. */
 #define VNET_QUEUE_RX             0u
 #define VNET_QUEUE_TX             1u
-#define VNET_NUM_QUEUES           2u
+#define VNET_QUEUE_CTRL           2u      /* control queue (VIRTIO_NET_F_CTRL_VQ) */
+#define VNET_NUM_QUEUES           3u
 #define VNET_QUEUE_MAX            256u    /* advertised QueueNumMax, per queue  */
 #define VNET_MAX_CHAIN            32u     /* descriptors walked per request     */
 

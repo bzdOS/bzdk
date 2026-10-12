@@ -209,6 +209,9 @@
  *   [33] TX drains CPU1 continued (vnet_emac_tx_resume())
  *   [34] interrupts not raised because the driver suppressed them
  *        (EVENT_IDX used_event / VRING_AVAIL_F_NO_INTERRUPT, audit item 12)
+ *   [35] control-queue commands  [36] of which refused (ack ERR)
+ *   [37] EMAC receive filter in force (emac_rx_filter_mode(): 0 hardware
+ *        filter, 1 + all-multicast, 2 promiscuous)
  *
  * Since 2026-10-12 (audit item 10) a counter update is a plain store into
  * g_bcv[]; vnet_bc_publish() copies the whole table to the window from the
@@ -217,7 +220,7 @@
  * a full-system barrier for each counter it bumps. */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
-#define VNET_BC_LAST   34u           /* highest slot used above */
+#define VNET_BC_LAST   37u           /* highest slot used above */
 #define VNET_BC_SLOTS  40u
 
 static uint32_t g_bcv[VNET_BC_SLOTS];
@@ -837,6 +840,170 @@ void vnet_emac_tx_resume(void)
 		vnet_tx_irq(d);
 }
 
+/* ------------------------------------------------------------------ *
+ * Control queue: receive filtering (audit item 8).
+ *
+ * The EMAC used to run with its address filter off (RXALL +
+ * DIS_ADDR_FILTER) for good, so every unicast frame on the segment went
+ * through the HV and into the guest. With CTRL_RX the driver says what it
+ * wants and the EMAC filters in hardware (emac_rx_filter()): ADDR1 = the
+ * guest's MAC, ADDR2..7 = extra unicast addresses from MAC_TABLE_SET (more
+ * than six -> promiscuous), multicast all-or-nothing (hardware verified
+ * 2026-10-12: FRM_FLT bit 16 passes every multicast frame, 0 none),
+ * broadcast always. PROMISC (bridge0 sets it on vtnet0, so the WiFi AP
+ * bridge keeps working, and tcpdump without -p) switches back to
+ * RXALL | DIS_ADDR_FILTER. Only RX_FRM_FLT and the address registers are
+ * written, never RX_EN. The HV's own MAC (ADDR0) and broadcast pass in
+ * every mode, so the debug channel does not depend on any of this.
+ * ------------------------------------------------------------------ */
+static struct {
+	uint8_t promisc, allmulti, nmc_any;
+	uint32_t nuc;                        /* > 6: too many -> promiscuous */
+	uint8_t mac[6];                      /* the driver's address */
+	uint8_t uc[6][6];
+} g_rxf;
+static uint8_t g_ctrl_buf[VNET_CTRL_BUF];
+static uint32_t g_ctrl_cmds, g_ctrl_errs;   /* [35] / [36] */
+
+static void vnet_rxf_apply(void)
+{
+	emac_rx_filter(g_rxf.promisc, g_rxf.allmulti || g_rxf.nmc_any,
+	               g_rxf.mac, (const uint8_t (*)[6])g_rxf.uc, g_rxf.nuc);
+	vnet_bc(37, emac_rx_filter_mode());
+}
+
+/* Device reset / init: promiscuous, the guest's assigned MAC, no table. */
+static void vnet_rxf_reset(void)
+{
+	g_rxf.promisc = 1u;
+	g_rxf.allmulti = 0u;
+	g_rxf.nmc_any = 0u;
+	g_rxf.nuc = 0u;
+	emac_guest_mac(g_rxf.mac);
+	vnet_rxf_apply();
+}
+
+static uint32_t rd_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+	       ((uint32_t)p[3] << 24);
+}
+
+static uint8_t vnet_ctrl_cmd(const uint8_t *b, uint32_t n)
+{
+	if (n < 2u)
+		return VNET_CTRL_ERR;
+	uint8_t cls = b[0], cmd = b[1];
+	const uint8_t *p = b + 2;
+	uint32_t len = n - 2u;
+
+	if (cls == VNET_CTRL_RX &&
+	    (cmd == VNET_CTRL_RX_PROMISC || cmd == VNET_CTRL_RX_ALLMULTI)) {
+		if (len < 1u)
+			return VNET_CTRL_ERR;
+		if (cmd == VNET_CTRL_RX_PROMISC)
+			g_rxf.promisc = p[0] ? 1u : 0u;
+		else
+			g_rxf.allmulti = p[0] ? 1u : 0u;
+		vnet_rxf_apply();
+		return VNET_CTRL_OK;
+	}
+	if (cls == VNET_CTRL_MAC && cmd == VNET_CTRL_MAC_TABLE_SET) {
+		/* le32 entries + entries * mac[6], unicast table then multicast. */
+		if (len < 4u)
+			return VNET_CTRL_ERR;
+		uint32_t nuc = rd_le32(p);
+		if (nuc > 1024u || len < 4u + nuc * 6u + 4u)
+			return VNET_CTRL_ERR;
+		uint32_t nmc = rd_le32(p + 4u + nuc * 6u);
+		if (nmc > 1024u || len < 8u + (nuc + nmc) * 6u)
+			return VNET_CTRL_ERR;
+		g_rxf.nuc = nuc;
+		for (uint32_t i = 0; i < nuc && i < 6u; i++)
+			for (uint32_t k = 0; k < 6u; k++)
+				g_rxf.uc[i][k] = p[4u + i * 6u + k];
+		g_rxf.nmc_any = nmc ? 1u : 0u;
+		vnet_rxf_apply();
+		return VNET_CTRL_OK;
+	}
+	if (cls == VNET_CTRL_MAC && cmd == VNET_CTRL_MAC_ADDR_SET) {
+		if (len < 6u)
+			return VNET_CTRL_ERR;
+		/* Not a group address, not all-zero, and never the HV's own: the
+		 * HV MAC is the debug channel's identity (TX refuses it too). */
+		if ((p[0] & 1u) || !(p[0] | p[1] | p[2] | p[3] | p[4] | p[5]) ||
+		    emac_mac_is_hv(p))
+			return VNET_CTRL_ERR;
+		for (uint32_t k = 0; k < 6u; k++)
+			g_rxf.mac[k] = p[k];
+		vnet_rxf_apply();
+		return VNET_CTRL_OK;
+	}
+	return VNET_CTRL_ERR;                /* VLAN, ANNOUNCE, MQ: not offered */
+}
+
+/* One control command: device-readable descriptors carry class, command
+ * and data; the first device-writable one gets the 1-byte ack. */
+static uint32_t vnet_ctrl_one(struct vnet_vq *vq, uint16_t head)
+{
+	struct vnet_desc chain[VNET_MAX_CHAIN];
+	uint32_t n = vq_collect_chain(vq, head, chain, VNET_MAX_CHAIN);
+	uint32_t got = 0, i;
+	int too_big = 0;
+
+	if (n == 0)
+		return 0;
+	for (i = 0; i < n && !(chain[i].flags & VNET_VRING_DESC_F_WRITE); i++) {
+		if (chain[i].len > VNET_CTRL_BUF - got) {
+			too_big = 1;
+			break;
+		}
+		if (chain[i].len)
+			gmem_read(chain[i].addr, g_ctrl_buf + got, chain[i].len);
+		got += chain[i].len;
+	}
+	while (i < n && !(chain[i].flags & VNET_VRING_DESC_F_WRITE))
+		i++;
+	if (i == n || chain[i].len < 1u)
+		return 0;                        /* nowhere to put the ack */
+
+	uint8_t ack = too_big ? VNET_CTRL_ERR : vnet_ctrl_cmd(g_ctrl_buf, got);
+	vnet_bc(35, ++g_ctrl_cmds);
+	if (ack != VNET_CTRL_OK)
+		vnet_bc(36, ++g_ctrl_errs);
+	gmem_write(chain[i].addr, &ack, 1u);
+	return 1u;
+}
+
+static void vnet_ctrl_kick(struct vnet_dev *d)
+{
+	struct vnet_vq *vq = &d->vq[VNET_QUEUE_CTRL];
+	uint16_t head;
+	int irq = 0;
+
+	vq_lock(VNET_QUEUE_CTRL);
+	if (vq->ready && (d->driver_features & VNET_F_CTRL_VQ_BIT)) {
+		/* Ask for a kick on the next command, then look again for one
+		 * queued before that store was visible. With EVENT_IDX this is
+		 * mandatory: avail_event stays where we leave it, and a stale one
+		 * means the driver never kicks again (found live: if_vtnet hung
+		 * in virtqueue_poll() on its second command). */
+		for (int pass = 0; pass < 4; pass++) {   /* bounded: guest-driven */
+			while (vq_pop_avail(vq, &head))
+				vq_push_used(vq, head, vnet_ctrl_one(vq, head));
+			vq_set_notify(d, vq, 1);
+			if (gmem_ld16(vq->avail + 2u) == vq->last_avail)
+				break;
+		}
+		irq = vq_want_irq(d, vq);
+	}
+	vq_unlock(VNET_QUEUE_CTRL);
+	if (irq) {
+		int_status_or((volatile uint32_t *)&d->int_status, VNET_INT_VRING);
+		vnet_inject_irq();
+	}
+}
+
 /* QueueNotify handler: drain up to VNET_TX_BUDGET chains from the notified
  * transmitq, then raise one IRQ if anything was served. Queue 0 (RX) is
  * driven by vnet_emac_rx_frame() instead — a guest NOTIFY on queue 0 just
@@ -869,6 +1036,8 @@ static void vnet_kick(struct vnet_dev *d, uint32_t qidx)
 		if (irq)
 			vnet_tx_irq(d);
 	}
+	if (qidx == VNET_QUEUE_CTRL)
+		vnet_ctrl_kick(d);
 	/* qidx == VNET_QUEUE_RX: nothing to do here — see comment above. */
 }
 
@@ -1048,7 +1217,8 @@ static uint32_t vnet_reg_read(struct vnet_dev *d, uint32_t off)
 			return VNET_F_VERSION_1_BIT;
 		if (d->dev_feat_sel == VNET_FEATWORD_LO)
 			return VNET_F_MAC_BIT | VNET_F_STATUS_BIT | VNET_F_MTU_BIT |
-			       VNET_F_EVENT_IDX_BIT;
+			       VNET_F_EVENT_IDX_BIT | VNET_F_CTRL_VQ_BIT |
+			       VNET_F_CTRL_RX_BIT | VNET_F_CTRL_MAC_ADDR_BIT;
 		return 0u;
 	case VNET_R_QUEUE_NUM_MAX:
 		/* D5(a): a nonexistent queue_sel must read back 0 (spec: QueueNumMax
@@ -1238,7 +1408,7 @@ static void vnet_reg_write_locked(struct vnet_dev *d, uint32_t off, uint32_t val
 		break;
 	case VNET_R_STATUS:
 		if (val == 0u) {
-			/* Driver reset, with BOTH queue locks held (vnet_reg_write):
+			/* Driver reset, with ALL queue locks held (vnet_reg_write):
 			 * any RX scatter or TX drain in flight has finished, and none
 			 * can start until the queues below read not-ready. Status
 			 * goes to 0 first so RX's DRIVER_OK re-check fails too. */
@@ -1251,6 +1421,7 @@ static void vnet_reg_write_locked(struct vnet_dev *d, uint32_t off, uint32_t val
 				vq->desc = vq->avail = vq->used = 0;
 			}
 			d->driver_features = 0;   /* renegotiated after a reset */
+			vnet_rxf_reset();         /* back to promiscuous */
 			int_status_clear((volatile uint32_t *)&d->int_status, ~0u);
 			__asm__ volatile("dsb ish" ::: "memory");
 		} else {
@@ -1347,7 +1518,9 @@ void vnet_init(void)
 	g_bad_chain = g_bad_ring = g_tx_blocked_vlan = 0;
 	g_tx_linkdown = g_rx_reset_busy = g_link_changes = 0;
 	g_force_down_polls = 0;
-	g_vq_lock[0][0] = g_vq_lock[1][0] = 0u;
+	for (uint32_t q = 0; q < VNET_NUM_QUEUES; q++)
+		g_vq_lock[q][0] = 0u;
+	vnet_rxf_reset();
 	/* Start from the EMAC's current state; vnet_emac_link_update() (every
 	 * emac_poll) publishes each change after this. */
 	g_net.link_up = emac_link_up() ? 1u : 0u;

@@ -92,6 +92,7 @@ extern void emac_wd_test_mode(int on);
  * target that links dbgmon.o links vnet_emac.o. */
 extern void emac_nettest_quiet(uint32_t seconds);
 extern void emac_nettest_phydown(void);
+extern void emac_nettest_filter(uint32_t val, uint32_t seconds);
 extern void emac_nettest_stats(uint32_t out[14]);
 extern void emac_hv_mac(uint8_t out[6]);
 extern void emac_guest_mac(uint8_t out[6]);
@@ -100,7 +101,7 @@ extern uint32_t emac_rx_to_hv_dropped(void);
 extern void vnet_emac_force_link_down(uint32_t polls) __attribute__((weak));
 /* `netstat` (audit items 9-12): EMAC ring/IRQ counters; the IRQ ones live in
  * gic_timer.c, weak so a target without it still links. */
-extern void emac_perf_stats(uint32_t out[13]);
+extern void emac_perf_stats(uint32_t out[14]);
 extern void emac_irq_stats(uint32_t out[3]) __attribute__((weak));
 
 /* Guest single-step toggle, implemented in el2_exc.c (linked into the same
@@ -1173,7 +1174,7 @@ static void cmd_help(void)
 	cputs("  release            release a currently-held pause-before-guest-entry\r\n");
 	cputs("  phycycle           DISABLED (EL2 RSB races the guest's iichb1 — use guest-side phycut)\r\n");
 	cputs("  wdtest on|off      software 'PHY never trains' — exercises the give-up/escalation ladder\r\n");
-	cputs("  nettest [quiet <s>|vlink <s>|phydown]  link-watchdog/vnet link test levers (hex s)\r\n");
+	cputs("  nettest [quiet <s>|vlink <s>|phydown|filt <v> <s>]  link-watchdog/vnet/filter test levers (hex)\r\n");
 	cputs("  netstat                 EMAC RX/TX ring + interrupt counters (hex)\r\n");
 	cputs("  mac                     HV and guest MAC addresses (SID-derived)\r\n");
 	cputs("  zboot              start the 2nd guest on CPU3 (dual build; stage its ELF first)\r\n");
@@ -1495,20 +1496,20 @@ static void exec_line(char *line, struct el2_frame *frame)
 		return;
 	}
 	if (streq(cmd, "netstat")) {
-		static const char *const names[16] = {
+		static const char *const names[17] = {
 			"rx", "irqs", "rx_irq_frames", "irq_deferred", "max_batch",
 			"rx_ring_full", "rx_fifo_ovf", "tx", "tx_drops", "rx_ring",
-			"tx_ring", "tx_ring_busy", "tx_ints", "irq_armed",
-			"irq_throttles", "irq_wrong_core" };
-		uint32_t st[16] = { 0 };
+			"tx_ring", "tx_ring_busy", "tx_ints", "rx_filter",
+			"irq_armed", "irq_throttles", "irq_wrong_core" };
+		uint32_t st[17] = { 0 };
 		emac_perf_stats(st);
 		if (emac_irq_stats)
-			emac_irq_stats(&st[13]);
-		for (int i = 0; i < 16; i++) {
+			emac_irq_stats(&st[14]);
+		for (int i = 0; i < 17; i++) {
 			cputs(names[i]);
 			cputs("=");
 			print_hex32(st[i]);
-			cputs(i == 15 ? "\r\n" : " ");
+			cputs(i == 16 ? "\r\n" : " ");
 		}
 		return;
 	}
@@ -1533,6 +1534,18 @@ static void exec_line(char *line, struct el2_frame *frame)
 			print_hex32((uint32_t)v);
 			cputs(" s\r\n");
 			return;
+		}
+		if (nt >= 4 && streq(tok[1], "filt")) {
+			unsigned long secs = 0;
+			if (parse_hex(tok[2], &v) && parse_hex(tok[3], &secs)) {
+				emac_nettest_filter((uint32_t)v, (uint32_t)secs);
+				cputs("nettest: RX_FRM_FLT=0x");
+				print_hex32((uint32_t)v);
+				cputs(" for 0x");
+				print_hex32((uint32_t)secs);
+				cputs(" s\r\n");
+				return;
+			}
 		}
 		if (nt >= 2 && streq(tok[1], "phydown")) {
 			emac_nettest_phydown();

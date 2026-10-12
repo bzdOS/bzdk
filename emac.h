@@ -54,8 +54,8 @@ void emac_rx_irq(void);
  * [2] rx irq frames [3] irq drains deferred to the tick [4] max batch
  * [5] rx ring-full events [6] rx fifo overflows [7] tx frames [8] tx drops
  * [9] rx ring size [10] tx ring size [11] guest TX found the ring full
- * [12] TX_INT interrupts seen */
-#define EMAC_PERF_NSTATS 13
+ * [12] TX_INT interrupts seen [13] receive filter mode (emac_rx_filter_mode()) */
+#define EMAC_PERF_NSTATS 14
 void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS]);
 
 /* Current, LIVE link state — refreshed periodically inside emac_poll() (not
@@ -173,6 +173,17 @@ int emac_rekick_active(void);
 void emac_nettest_quiet(uint32_t seconds);
 void emac_nettest_phydown(void);
 void emac_nettest_stats(uint32_t out[EMAC_NT_NSTATS]);
+void emac_nettest_filter(uint32_t val, uint32_t seconds);
+
+/* Hardware receive filter for the guest (audit item 8, vnet control queue):
+ * promisc (or more than 6 extra unicast addresses) -> filter off, every
+ * frame; else pass the HV's MAC, `mac` (the guest's), the `nuc` addresses
+ * in uc[], broadcast, and every multicast frame if `allmulti`.
+ * emac_rx_filter_mode(): 0 filtering, 1 filtering + all multicast,
+ * 2 promiscuous (the boot default). */
+void emac_rx_filter(int promisc, int allmulti, const uint8_t mac[6],
+                    const uint8_t (*uc)[6], uint32_t nuc);
+uint32_t emac_rx_filter_mode(void);
 
 /* MAC addresses (audit item 7, emac.c): the HV's own (EMAC_ADDR0, source of
  * every HV frame) is derived from the A64 SID like U-Boot's eth0 ethaddr; the
