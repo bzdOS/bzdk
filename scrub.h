@@ -23,7 +23,7 @@
 #include <stdint.h>
 
 #define SCRUB_CHUNK        4096u
-#define SCRUB_MAX_BYTES    0x40000u                /* 256 KiB golden copy */
+#define SCRUB_MAX_BYTES    0x50000u                /* 320 KiB golden copy */
 #define SCRUB_CHUNKS_MAX   (SCRUB_MAX_BYTES / SCRUB_CHUNK)
 #define SCRUB_TABLE_MAGIC  0x42435243u             /* "CRCB" */
 

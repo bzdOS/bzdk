@@ -2745,9 +2745,12 @@ static int emac_rx_drain(int from_irq)
                 bc(29, ++g_rx_irq_hv);
             /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
             dbgauth_entropy(((uint64_t)status << 32) ^ (uint32_t)length);
-            if ((et == 0x0806u || (et == 0x0800u && to_us)) && dbgip_rx &&
-                dbgip_rx(buf, (uint32_t)(length - 4))) {
-                /* ARP/ICMP/UDP for the HV's own IPv4 address (dbgip.c) */
+            /* Broadcast IPv4 too: a DHCP server may broadcast the HV's
+             * OFFER/ACK. dbgip_rx() takes only replies naming the HV's MAC
+             * (chaddr); every other broadcast goes on to the guest. */
+            if ((et == 0x0806u || (et == 0x0800u && (to_us || bcast))) &&
+                dbgip_rx && dbgip_rx(buf, (uint32_t)(length - 4))) {
+                /* ARP/ICMP/UDP/DHCP for the HV's own IPv4 address (dbgip.c) */
             } else if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
                 /* consumed by the HV debug plane (see hv_rx_frame()) */
             } else if (to_us) {

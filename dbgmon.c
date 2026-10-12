@@ -29,6 +29,9 @@
 extern void dbgip_stats(uint32_t out[DBGIP_ST_N]) __attribute__((weak));
 extern void dbgip_set(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t host,
 		      uint32_t port) __attribute__((weak));
+extern void dbgip_mode(uint32_t mode) __attribute__((weak));
+extern void dbgip_format(char *buf, uint32_t n) __attribute__((weak));
+extern uint32_t dbgip_guest_ip(void) __attribute__((weak));
 
 /* ── weak fallbacks for optional providers ──────────────────────────────────
  * dbgmon.c is linked into targets that do NOT link fbdump.o, sd_bio.o or the
@@ -1496,17 +1499,36 @@ static void exec_line(char *line, struct el2_frame *frame)
 		cputs(emac_mac_source() == 1u ? " src=sid" : " src=legacy");
 		cputs(" to_hv_dropped=0x");
 		print_hex32(emac_rx_to_hv_dropped());
+		if (dbgip_guest_ip) {
+			/* the guest's IPv4 as seen in its TX (dbgip.h) */
+			uint32_t g = dbgip_guest_ip();
+			cputs(" guest_ip=");
+			for (int i = 3; i >= 0; i--) {
+				char d[4];
+				uint32_t v = (g >> (8 * i)) & 0xffu, n = 0;
+				if (v >= 100u) d[n++] = (char)('0' + v / 100u);
+				if (v >= 10u)  d[n++] = (char)('0' + v / 10u % 10u);
+				d[n++] = (char)('0' + v % 10u);
+				d[n] = 0;
+				cputs(d);
+				if (i) cputs(".");
+			}
+		}
 		cputs("\r\n");
 		return;
 	}
 	if (streq(cmd, "ip")) {
-		/* UDP/IPv4 debug transport (dbgip.h). One line, parsed by
-		 * host tools (bzd_board.py). `ip set IP MASK GW HOST [PORT]`,
-		 * all hex, changes it until the next boot; `ip off` stops it. */
+		/* UDP/IPv4 debug transport (dbgip.h). Line 1 (hex counters)
+		 * and line 2 ("net mode=..", dotted) are parsed by host tools
+		 * (bzd_board.py reads guest=). `ip set IP MASK GW HOST [PORT]`,
+		 * all hex, changes it until the next boot (static mode);
+		 * `ip off` stops it; `ip dhcp` / `ip static` switch the mode. */
 		static const char *const names[DBGIP_ST_N] = {
 			"ip", "mask", "gw", "host", "port", "src", "peer",
 			"peer_port", "rx_udp", "rx_accept", "tx_udp", "arp_rx",
-			"arp_tx", "icmp", "drop", "nh_ok" };
+			"arp_tx", "icmp", "drop", "nh_ok", "mode", "dhcp_state",
+			"dhcp_server", "lease_left", "dhcp_rx", "announce",
+			"guest_ip" };
 		uint32_t st[DBGIP_ST_N] = { 0 };
 		unsigned long a[5] = { 0, 0, 0, 0, 0 };
 
@@ -1516,6 +1538,14 @@ static void exec_line(char *line, struct el2_frame *frame)
 		}
 		if (nt >= 2 && streq(tok[1], "off")) {
 			dbgip_set(0, 0, 0, 0, 0);
+		} else if (nt >= 2 && (streq(tok[1], "dhcp") ||
+				       streq(tok[1], "static"))) {
+			if (!dbgip_mode) {
+				err("no dhcp in this image");
+				return;
+			}
+			dbgip_mode(streq(tok[1], "dhcp") ? DBGIP_MODE_DHCP :
+				   DBGIP_MODE_STATIC);
 		} else if (nt >= 2 && streq(tok[1], "set")) {
 			if (nt < 6 || !parse_hex(tok[2], &a[0]) ||
 			    !parse_hex(tok[3], &a[1]) || !parse_hex(tok[4], &a[2]) ||
@@ -1533,6 +1563,13 @@ static void exec_line(char *line, struct el2_frame *frame)
 			cputs("=");
 			print_hex32(st[i]);
 			cputs(i == DBGIP_ST_N - 1 ? "\r\n" : " ");
+		}
+		if (dbgip_format) {
+			/* second line, dotted and decimal, for people */
+			static char line[320];
+			dbgip_format(line, sizeof(line));
+			cputs(line);
+			cputs("\r\n");
 		}
 		return;
 	}

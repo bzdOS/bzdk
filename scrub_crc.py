@@ -16,7 +16,7 @@ import sys
 import zlib
 
 CHUNK = 4096
-MAX_BYTES = 0x40000
+MAX_BYTES = 0x50000          # == scrub.h SCRUB_MAX_BYTES
 MAGIC = 0x42435243
 NM = 'aarch64-linux-gnu-nm'
 

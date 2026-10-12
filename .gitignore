@@ -82,3 +82,4 @@ test_vzram_pool
 test_guest_mem
 dbg_auth_key.h
 test_dbgauth
+test_dbgdhcp

@@ -9,6 +9,7 @@
  */
 #include <stdint.h>
 #include "dbgip.h"
+#include "dbgdhcp.h"
 #include "emac.h"
 
 /* emac.c: hand one inner debug Ethernet frame to the debug plane.
@@ -49,6 +50,17 @@ static uint32_t g_nh_tries;
 static volatile uint32_t g_st[DBGIP_ST_N];
 static uint16_t g_ipid;
 static uint8_t  g_buf[1514];      /* ARP/ICMP replies (RX context only) */
+
+/* Address mode (dbgip.h "DHCP"). The static values from U-Boot's env (or
+ * the last `ip set`) are kept as the fallback for DHCP mode. */
+static volatile uint32_t g_mode;               /* DBGIP_MODE_*            */
+static uint32_t g_fb_ip, g_fb_mask, g_fb_gw;   /* static / fallback       */
+static uint64_t g_fb_at;                       /* CNTPCT: fallback due    */
+static struct dhcpc g_dh;
+static uint8_t  g_gmac[6];                     /* the guest's MAC         */
+static volatile uint32_t g_guest_ip;           /* last seen in guest TX   */
+static uint64_t g_ann_next;                    /* CNTPCT: next announce   */
+static uint8_t  g_tbuf[128];                   /* announce (tick context) */
 
 static inline uint64_t now_ticks(void)
 {
@@ -138,27 +150,103 @@ static void nh_reset(void)
 	g_st[DBGIP_ST_NH_OK] = 0;
 }
 
-void dbgip_set(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t host,
-	       uint32_t port)
+/* The address itself (mode and fallback untouched). Every change drops
+ * the UDP peer: its next hop may be another router now. An unchanged
+ * address (a renewed lease) changes nothing. */
+static void addr_set(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t src)
 {
+	mask = mask ? mask : 0xffffff00u;
+	if (ip == g_ip && mask == g_mask && gw == g_gw) {
+		g_src = src;
+		g_st[DBGIP_ST_SRC] = src;
+		return;
+	}
 	emac_hv_mac(g_mac);
 	g_ip = 0;                 /* off while the fields change */
 	__asm__ volatile("dmb ish" ::: "memory");
 	g_peer_valid = 0;
-	g_mask = mask ? mask : 0xffffff00u;
+	g_mask = mask;
 	g_gw = gw;
-	g_host = host;
-	g_port = (port && port < 65536u) ? port : DBGIP_PORT;
 	__asm__ volatile("dmb ish" ::: "memory");
 	g_ip = ip;
 	nh_reset();
+	g_ann_next = 0;           /* announce the new address at once */
 	g_st[DBGIP_ST_IP] = g_ip;
 	g_st[DBGIP_ST_MASK] = g_mask;
 	g_st[DBGIP_ST_GW] = g_gw;
+	g_src = ip ? src : 0u;
+	g_st[DBGIP_ST_SRC] = g_src;
+}
+
+static void host_set(uint32_t host, uint32_t port)
+{
+	g_host = host;
+	g_port = (port && port < 65536u) ? port : DBGIP_PORT;
 	g_st[DBGIP_ST_HOST] = g_host;
 	g_st[DBGIP_ST_PORT] = g_port;
-	g_src = ip ? 2u : 0u;
-	g_st[DBGIP_ST_SRC] = g_src;
+	nh_reset();
+}
+
+static uint64_t now_ms(void)
+{
+	uint64_t f = freq_hz();
+	return f ? now_ticks() / (f / 1000u ? f / 1000u : 1u) : 0;
+}
+
+void dbgip_set(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t host,
+	       uint32_t port)
+{
+	/* dbgmon `ip set`/`ip off`: static, and the new fallback */
+	if (g_mode == DBGIP_MODE_DHCP)
+		dhcpc_stop(&g_dh, 1);
+	g_mode = DBGIP_MODE_STATIC;
+	g_fb_ip = ip;
+	g_fb_mask = mask;
+	g_fb_gw = gw;
+	g_fb_at = 0;
+	g_st[DBGIP_ST_MODE] = g_mode;
+	addr_set(0, 0, 0, 0);     /* forces nh/peer reset even if unchanged */
+	host_set(host, port);
+	addr_set(ip, mask, gw, 2u);
+}
+
+/* dbgmon `ip dhcp` / `ip static`. DHCP keeps whatever address is in use
+ * until a lease arrives; static goes back to the fallback address. */
+void dbgip_mode(uint32_t mode)
+{
+	emac_hv_mac(g_mac);
+	if (mode == DBGIP_MODE_DHCP) {
+		g_mode = DBGIP_MODE_DHCP;
+		g_fb_at = now_ticks();    /* no waiting: fallback applies now */
+		dhcpc_start(&g_dh, g_mac, (uint32_t)now_ticks(), now_ms());
+	} else {
+		if (g_mode == DBGIP_MODE_DHCP)
+			dhcpc_stop(&g_dh, 1);
+		g_mode = DBGIP_MODE_STATIC;
+		addr_set(g_fb_ip, g_fb_mask, g_fb_gw, g_fb_ip ? 1u : 0u);
+	}
+	g_st[DBGIP_ST_MODE] = g_mode;
+}
+
+/* dbgdhcp.h hooks. */
+int dhcpc_xmit(const uint8_t dst[6], const uint8_t *ipv4, uint32_t len)
+{
+	return emac_send_frame_to(dst, ET_IPV4, ipv4, (uint16_t)len);
+}
+
+void dhcpc_bound(const struct dhcpc_lease *l)
+{
+	if (g_mode != DBGIP_MODE_DHCP)
+		return;
+	addr_set(l->ip, l->mask, l->router, 3u);
+}
+
+void dhcpc_lost(void)
+{
+	if (g_mode != DBGIP_MODE_DHCP)
+		return;
+	/* back to the static address if there is one, else off */
+	addr_set(g_fb_ip, g_fb_mask, g_fb_gw, g_fb_ip ? 4u : 0u);
 }
 
 /* "a.b.c.d" at s (stops at the first char that is not a digit or '.'). */
@@ -207,9 +295,10 @@ void dbgip_init(void)
 {
 	volatile char *blk = (volatile char *)DBGIP_CFG_PA;
 	char txt[DBGIP_CFG_MAX + 1];
-	uint32_t n, ip = 0, mask = 0, gw = 0, host = 0, port = 0;
+	uint32_t n, ip = 0, mask = 0, gw = 0, host = 0, port = 0, dhcp = 0;
 
 	emac_hv_mac(g_mac);
+	emac_guest_mac(g_gmac);
 	/* U-Boot wrote this with its D-cache on: push any dirty line out
 	 * before reading (same as the DTB U-Boot loads next to it). */
 	for (uintptr_t a = DBGIP_CFG_PA; a < DBGIP_CFG_PA + DBGIP_CFG_MAX; a += 64)
@@ -242,6 +331,9 @@ void dbgip_init(void)
 			(void)parse_ip(l + 9, &host);
 		else if (key_is(l, "bzdk_dbgport"))
 			port = parse_dec(l + 13);
+		else if (key_is(l, "bzdk_net"))
+			dhcp = (l[9] == 'd' && l[10] == 'h' && l[11] == 'c' &&
+				l[12] == 'p');
 		l = *e ? e + 1 : e;
 	}
 	/* consumed: a later boot that does not export must not see this */
@@ -249,11 +341,22 @@ void dbgip_init(void)
 		blk[n] = 0;
 	__asm__ volatile("dc civac, %0\n\tdsb sy" :: "r"(DBGIP_CFG_PA) : "memory");
 
+	g_fb_ip = ip;
+	g_fb_mask = mask;
+	g_fb_gw = gw;
+	host_set(host, port);
+	if (dhcp) {
+		/* DHCP; U-Boot's static address only after DBGIP_FALLBACK_S
+		 * without a lease (dbgip_tick), DHCP carries on after that. */
+		g_mode = DBGIP_MODE_DHCP;
+		g_st[DBGIP_ST_MODE] = g_mode;
+		g_fb_at = now_ticks() + (uint64_t)DBGIP_FALLBACK_S * freq_hz();
+		dhcpc_start(&g_dh, g_mac, (uint32_t)now_ticks(), now_ms());
+		return;
+	}
 	if (!ip)
 		return;
-	dbgip_set(ip, mask, gw, host, port);
-	g_src = 1;
-	g_st[DBGIP_ST_SRC] = 1;
+	addr_set(ip, mask, gw, 1u);
 }
 
 /* ---- peer record ---------------------------------------------------------- */
@@ -359,16 +462,73 @@ static int arp_rx(const uint8_t *f, uint32_t len)
 	return 0;
 }
 
+/* Unauthenticated "here I am" to serverip:port (dbgip.h ANNOUNCE): one
+ * inner 0x88B5 frame, envelope type 5, nothing in it a host may trust --
+ * the host proves the address with a handshake before using it. */
+static void announce(void)
+{
+	uint8_t *ip = g_tbuf, *u = g_tbuf + 20, *e = g_tbuf + 28, *a;
+	uint32_t ulen = 8u + 14u + DBGIP_ANN_LEN;
+
+	for (uint32_t i = 0; i < sizeof(g_tbuf); i++)
+		g_tbuf[i] = 0;
+	for (int i = 0; i < 6; i++) {
+		e[i] = 0xff;
+		e[6 + i] = g_mac[i];
+	}
+	put16(e + 12, 0x88B5u);
+	a = e + 14;
+	a[1] = 'B'; a[2] = 'Z'; a[3] = 'K';
+	a[4] = DBGIP_ANN_TYPE;
+	a[5] = 1;                           /* version */
+	put32(a + 6, g_ip);
+	put32(a + 10, g_mask);
+	put32(a + 14, g_gw);
+	a[18] = (uint8_t)g_src;
+	a[19] = (uint8_t)g_mode;
+	put32(a + 20, g_guest_ip);
+	for (int i = 0; i < 6; i++)
+		a[24 + i] = g_gmac[i];
+	ip[0] = 0x45;
+	put16(ip + 2, 20u + ulen);
+	put16(ip + 4, g_ipid++);
+	put16(ip + 6, 0x4000);
+	ip[8] = 64;
+	ip[9] = 17;
+	put32(ip + 12, g_ip);
+	put32(ip + 16, g_host);
+	put16(ip + 10, csum_fold(csum_add(0, ip, 20)));
+	put16(u, g_port);
+	put16(u + 2, g_port);
+	put16(u + 4, ulen);
+	(void)emac_send_frame_to(g_nh_mac, ET_IPV4, g_tbuf, (uint16_t)(20u + ulen));
+	g_st[DBGIP_ST_ANNOUNCE]++;
+}
+
 void dbgip_tick(void)
 {
 	uint64_t now, f;
+	uint8_t inner[6];
 
+	now = now_ticks();
+	f = freq_hz();
+	if (g_mode == DBGIP_MODE_DHCP) {
+		dhcpc_tick(&g_dh, now_ms());
+		if (!dhcpc_has_lease(&g_dh) && !g_ip && g_fb_ip && g_fb_at &&
+		    now >= g_fb_at)
+			addr_set(g_fb_ip, g_fb_mask, g_fb_gw, 4u);
+	}
 	if (!g_ip || !g_nh_ip)
 		return;
-	now = now_ticks();
+	/* Announce: at once on an address change (g_ann_next = 0), then every
+	 * DBGIP_ANN_S while no UDP peer is active. */
+	if (g_nh_ok && g_host && now >= g_ann_next) {
+		if (!g_ann_next || !dbgip_peer_active(inner))
+			announce();
+		g_ann_next = now + (uint64_t)DBGIP_ANN_S * f;
+	}
 	if (now < g_nh_next)
 		return;
-	f = freq_hz();
 	/* unresolved: 1 s for a minute, then 10 s; resolved: refresh 10 min */
 	if (g_nh_ok)
 		g_nh_next = now + 600u * f;
@@ -377,6 +537,37 @@ void dbgip_tick(void)
 	{
 		static const uint8_t bc[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 		arp_send(1, 0, g_nh_ip, bc);
+	}
+}
+
+/* The guest's IPv4 address, from what it sends (vnet TX): the sender of
+ * its ARP frames, else the source of its IPv4 packets -- only with the
+ * guest's own MAC as the Ethernet source, and never 0/127/169.254/class D+
+ * (a DHCP DISCOVER's 0.0.0.0, link-local, multicast sources). */
+static int guest_ip_ok(uint32_t a)
+{
+	uint32_t t = a >> 24;
+	return a && t != 0 && t != 127u && t < 224u &&
+	       (a >> 16) != 0xa9feu;
+}
+
+void dbgip_guest_tx(const uint8_t *f, uint32_t len)
+{
+	uint32_t et, a = 0;
+
+	if (len < 42u || !mac_eq(f + 6, g_gmac))
+		return;
+	et = be16(f + 12);
+	if (et == ET_ARP) {
+		if (be16(f + 14) == 1 && be16(f + 16) == ET_IPV4 &&
+		    f[18] == 6 && f[19] == 4 && mac_eq(f + 22, g_gmac))
+			a = be32(f + 28);
+	} else if (et == ET_IPV4 && (f[14] >> 4) == 4) {
+		a = be32(f + 26);
+	}
+	if (guest_ip_ok(a) && a != g_guest_ip) {
+		g_guest_ip = a;
+		g_st[DBGIP_ST_GUEST_IP] = a;
 	}
 }
 
@@ -494,9 +685,18 @@ int dbgip_rx(const uint8_t *f, uint32_t len)
 {
 	uint32_t et;
 
-	if (!g_ip || len < 14)
+	if (len < 14)
 		return 0;
 	et = be16(f + 12);
+	/* DHCP replies naming the HV's MAC; the guest's (chaddr 12:..) and
+	 * everything else go on (dbgdhcp.h). */
+	if (et == ET_IPV4 && g_mode == DBGIP_MODE_DHCP &&
+	    dhcpc_rx(&g_dh, f, len, now_ms()) == DHCPC_TAKEN) {
+		g_st[DBGIP_ST_DHCP_RX]++;
+		return 1;
+	}
+	if (!g_ip)
+		return 0;
 	if (et == ET_ARP)
 		return arp_rx(f, len);
 	if (et == ET_IPV4)
@@ -561,6 +761,133 @@ int dbgip_tx_route(const uint8_t dst[6], uint16_t ethertype,
 
 void dbgip_stats(uint32_t out[DBGIP_ST_N])
 {
+	uint64_t now = now_ms();
+
+	g_st[DBGIP_ST_MODE] = g_mode;
+	g_st[DBGIP_ST_DHCP_STATE] = g_mode == DBGIP_MODE_DHCP ? g_dh.state : 0;
+	g_st[DBGIP_ST_DHCP_SERVER] = dhcpc_has_lease(&g_dh) ? g_dh.lease.server : 0;
+	g_st[DBGIP_ST_LEASE_LEFT] = !dhcpc_has_lease(&g_dh) ? 0 :
+		!g_dh.t_exp ? DHCPC_INFINITE :
+		g_dh.t_exp > now ? (uint32_t)((g_dh.t_exp - now) / 1000u) : 0;
 	for (int i = 0; i < DBGIP_ST_N; i++)
 		out[i] = g_st[i];
+}
+
+uint32_t dbgip_guest_ip(void)
+{
+	return g_guest_ip;
+}
+
+/* ---- the human-readable `ip` line ----------------------------------------- */
+
+struct fmt {
+	char *p;
+	uint32_t left;
+};
+
+static void fs(struct fmt *o, const char *s)
+{
+	while (*s && o->left > 1) {
+		*o->p++ = *s++;
+		o->left--;
+	}
+	*o->p = 0;
+}
+
+static void fd(struct fmt *o, uint32_t v)
+{
+	char t[11];
+	int n = 0;
+
+	do {
+		t[n++] = (char)('0' + v % 10u);
+		v /= 10u;
+	} while (v);
+	while (n && o->left > 1) {
+		*o->p++ = t[--n];
+		o->left--;
+	}
+	*o->p = 0;
+}
+
+static void fip(struct fmt *o, uint32_t a)
+{
+	for (int i = 3; i >= 0; i--) {
+		fd(o, (a >> (8 * i)) & 0xffu);
+		if (i)
+			fs(o, ".");
+	}
+}
+
+static uint32_t mask_len(uint32_t m)
+{
+	uint32_t n = 0;
+	while (m & 0x80000000u) {
+		n++;
+		m <<= 1;
+	}
+	return n;
+}
+
+void dbgip_format(char *buf, uint32_t n)
+{
+	static const char *const src[] = { "off", "env", "dbgmon", "dhcp",
+					   "env-fallback" };
+	struct fmt o = { buf, n };
+	uint32_t st[DBGIP_ST_N];
+
+	if (!n)
+		return;
+	buf[0] = 0;
+	dbgip_stats(st);
+	fs(&o, "net mode=");
+	fs(&o, g_mode == DBGIP_MODE_DHCP ? "dhcp" : "static");
+	fs(&o, " addr=");
+	fip(&o, g_ip);
+	fs(&o, "/");
+	fd(&o, mask_len(g_mask));
+	fs(&o, " gw=");
+	fip(&o, g_gw);
+	fs(&o, " src=");
+	fs(&o, g_src < 5u ? src[g_src] : "?");
+	fs(&o, " host=");
+	fip(&o, g_host);
+	fs(&o, ":");
+	fd(&o, g_port);
+	if (g_mode == DBGIP_MODE_DHCP) {
+		fs(&o, " dhcp=");
+		fs(&o, dhcpc_state_name(g_dh.state));
+		if (dhcpc_has_lease(&g_dh)) {
+			fs(&o, " lease=");
+			fip(&o, g_dh.lease.ip);
+			fs(&o, " server=");
+			fip(&o, g_dh.lease.server);
+			fs(&o, " left=");
+			if (st[DBGIP_ST_LEASE_LEFT] == DHCPC_INFINITE)
+				fs(&o, "inf");
+			else {
+				fd(&o, st[DBGIP_ST_LEASE_LEFT]);
+				fs(&o, "s");
+			}
+			fs(&o, "/");
+			fd(&o, g_dh.lease.lease_s);
+			fs(&o, "s");
+		}
+		fs(&o, " fallback=");
+		fip(&o, g_fb_ip);
+		fs(&o, " tx=");
+		fd(&o, g_dh.n_tx);
+		fs(&o, " offer=");
+		fd(&o, g_dh.n_offer);
+		fs(&o, " ack=");
+		fd(&o, g_dh.n_ack);
+		fs(&o, " nak=");
+		fd(&o, g_dh.n_nak);
+		fs(&o, " stale=");
+		fd(&o, g_dh.n_stale);
+		fs(&o, " lost=");
+		fd(&o, g_dh.n_lost);
+	}
+	fs(&o, " guest=");
+	fip(&o, g_guest_ip);
 }

@@ -642,6 +642,9 @@ static uint32_t g_tx_retries;          /* [32] drains stopped on a full ring */
 static uint32_t g_tx_resumes;          /* [33] drains CPU1 continued */
 static uint32_t g_irq_suppressed;      /* [34] used entries pushed, driver asked for no IRQ */
 
+/* dbgip.c (dbg/dual images): records the guest's IPv4 address. */
+extern void dbgip_guest_tx(const uint8_t *f, uint32_t len) __attribute__((weak));
+
 static int vnet_tx_one(struct vnet_dev *d, uint16_t head)
 {
 	struct vnet_vq *vq = &d->vq[VNET_QUEUE_TX];
@@ -712,8 +715,9 @@ static int vnet_tx_one(struct vnet_dev *d, uint16_t head)
 		len = VNET_ETH_MIN_FRAME;
 	}
 
-	/* Checks on the copy (up to two VLAN tags: 22 bytes). */
-	uint8_t eh[24];
+	/* Checks on the copy (up to two VLAN tags: 22 bytes; 42 so that
+	 * dbgip_guest_tx() sees an ARP body / IPv4 source). */
+	uint8_t eh[44];
 	uint32_t ehl = len < sizeof(eh) ? len : (uint32_t)sizeof(eh);
 	nc_copy(eh, buf, ehl);
 	uint16_t ethertype = (uint16_t)((eh[12] << 8) | eh[13]);
@@ -742,6 +746,8 @@ static int vnet_tx_one(struct vnet_dev *d, uint16_t head)
 	 * IDENTITY NOTE" history at the top of this file). */
 	emac_tx_end(slot, len, 1);
 	vnet_bc(6, ++g_tx_sent);
+	if (dbgip_guest_tx)
+		dbgip_guest_tx(eh, ehl);      /* learn the guest's IPv4 address */
 	return VNET_TX_DONE;
 }
 

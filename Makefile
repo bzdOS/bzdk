@@ -152,7 +152,7 @@ toolchain-check:
 config-check:
 	python3 gen_config.py --dry-run
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vzram_pool test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement test_guest_mem test_dbgauth
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vzram_pool test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement test_guest_mem test_dbgauth test_dbgdhcp
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -178,7 +178,9 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_linker_enforcement
 	./test_guest_mem
 	./test_dbgauth
+	./test_dbgdhcp
 	python3 hvauth.py --selftest
+	python3 bzd_udplink.py --selftest
 	python3 test_automount.py
 	python3 coredump-recv.py selftest
 	python3 snapshot_net.py selftest
@@ -248,6 +250,10 @@ test_guest_mem: test_guest_mem.c guest_mem.h vnet_emac.h stage2.h hv_addrmap.h
 	gcc -Wall -Wextra -O2 -DGUEST_DRAM_2G=1 -DVZRAM=1 -DHV_HDMI -o $@ $<
 
 test_dbgauth: test_dbgauth.c dbgauth.c dbgauth.h hmac_sha256.c hmac_sha256.h
+	gcc -Wall -Wextra -O2 -o $@ $<
+
+# Compiles the REAL dbgdhcp.c (no asm, clock passed in).
+test_dbgdhcp: test_dbgdhcp.c dbgdhcp.c dbgdhcp.h
 	gcc -Wall -Wextra -O2 -o $@ $<
 
 test_linker_enforcement: test_linker_enforcement.c
@@ -509,7 +515,7 @@ endif
 
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o rsbtrap.o vetrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
-            emac.o dbgauth.o dbgip.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
+            emac.o dbgauth.o dbgip.o dbgdhcp.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \
             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o \
@@ -573,7 +579,7 @@ dual: config-check $(DUAL_BIN)
 
 DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
-             emac.o dbgauth.o dbgip.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
+             emac.o dbgauth.o dbgip.o dbgdhcp.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \
              netcon.o rsb.o axp803.o hdmi.o fb.o hud.o fbdump.o \
              gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o \
@@ -1037,4 +1043,4 @@ clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
 	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart \
-	      test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_linker_enforcement test_guest_mem test_dbgauth
+	      test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_linker_enforcement test_guest_mem test_dbgauth test_dbgdhcp
