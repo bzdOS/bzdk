@@ -37,6 +37,7 @@
 #include "cntpct.h"
 #include "gic_timer.h"     /* gic_timer_spi_enable() -- IDMAC queue re-arm */
 #include "stage2.h"        /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
+#include "guest_mem.h" /* guest_gpa_ok()/guest_vring_ok() */
 
 /* OWNER MARKER — linker-level mutual exclusion for the eMMC/virtio-blk
  * block (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner).
@@ -244,14 +245,10 @@ static uint64_t g_bounce_run[EMMC_MULTI_MAX_BLOCKS * VBLK_SECTOR_BYTES / 8]
  * "outside DRAM" and the guest panicked. An instruction in a comment is not a
  * mechanism; the include is.
  *
- * IMPORTANT — what this does NOT do: it does NOT protect the hv-image
- * (0x42000000+) or hv-scratch/breadcrumb (0x50000000+) windows carved out of
- * this SAME DRAM range (see stage2.c's HVIMG_L2_IDX/HVSCR_L2_IDX exclusions).
- * A guest descriptor pointing AT one of those (still nominally "in DRAM")
- * passes this check and would still corrupt HV state. Closing that gap needs
- * real stage-2/DMA isolation for the guest (ROADMAP milestone A1) — out of
- * scope for this fix, which only catches PAs that are clearly, unambiguously
- * outside ALL of guest DRAM (e.g. a wild pointer at 0x0 or 0x1_00000000).
+ * UPDATE: the gap this paragraph used to describe (a descriptor pointing at
+ * the hv-image or hv-scratch window passing because it is "in DRAM") is
+ * closed: gpa_in_range() is now guest_mem.h's guest_gpa_ok(), which also
+ * excludes every HV-owned window, from the same table stage2.c carves.
  * ------------------------------------------------------------------ */
 /* Derived from stage2.h, not copied. These used to be hardcoded 0x40000000
  * pairs in five separate files (vblk_emmc.c, vblk_sd.c, vinput.c, vnet_emac.c
@@ -267,23 +264,15 @@ static uint64_t g_bounce_run[EMMC_MULTI_MAX_BLOCKS * VBLK_SECTOR_BYTES / 8]
  * Same disease soc_a64.h was created to cure earlier the same day: one value,
  * several spellings, and changing one silently breaks the rest. Local names are
  * kept so no use site changes. */
-#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
-#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
-#define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
 
 static uint32_t g_gmem_oob;    /* count of rejected out-of-range accesses */
 
+/* Guest RAM minus every HV-owned window (guest_mem.h): the same table the
+ * guest's stage-2 map is built from, so a buffer the guest cannot write
+ * itself cannot be written through this device either. */
 static inline int gpa_in_range(uint64_t gpa, uint32_t len)
 {
-	if (len == 0u)
-		return 1;                              /* nothing to touch */
-	if ((uint64_t)len > GUEST_DRAM_SIZE)
-		return 0;                              /* pathological length */
-	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
-		return 0;
-	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
-		return 0;                              /* [gpa,gpa+len) runs past DRAM top */
-	return 1;
+	return guest_gpa_ok(gpa, len);
 }
 
 /* ------------------------------------------------------------------ *
@@ -343,6 +332,8 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 {
 	if (!gpa_in_range(gpa, len)) {
+		for (uint32_t i = 0; i < len; i++)   /* never hand back stale bytes */
+			((uint8_t *)dst)[i] = 0;
 		/* D2: never dereference outside guest DRAM. Leave dst untouched —
 		 * every caller already treats gmem_read's output as
 		 * guest/attacker-controlled ring/descriptor data, so a short-circuit
@@ -591,6 +582,8 @@ static void vq_read_desc(struct vblk_vq *vq, uint16_t idx, struct vblk_desc *out
 {
 	struct vring_desc d;
 	uint64_t p = vq->desc + (uint64_t)idx * sizeof(struct vring_desc);
+	if (idx >= vq->num)
+		p = 0;    /* outside the ring: gmem_read refuses and zero-fills */
 	gmem_read(p, &d, sizeof(d));
 	out->addr  = d.addr;
 	out->len   = d.len;
@@ -606,6 +599,8 @@ static int vq_pop_avail(struct vblk_vq *vq, uint16_t *head)
 
 	if (!vq->ready || vq->num == 0)
 		return 0;
+	if (!guest_vring_ok(vq->desc, vq->avail, vq->used, vq->num))
+		return 0;    /* a ring outside guest RAM: serve nothing */
 
 	/* avail->idx is at byte offset 2 (after le16 flags). */
 	avail_idx = gmem_ld16(vq->avail + 2u);

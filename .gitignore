@@ -79,3 +79,4 @@ soak*-mixed-*
 soak*-mixed.out
 test_lz4
 test_vzram_pool
+test_guest_mem

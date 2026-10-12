@@ -15,6 +15,7 @@
 #include "vzram_pool.h"
 #include "hv_addrmap.h"
 #include "stage2.h"
+#include "guest_mem.h" /* guest_gpa_ok()/guest_vring_ok() */
 #include "soc_a64.h"
 
 /* ESR_EL2 field decode -- per-file, as in every sibling device. */
@@ -66,20 +67,13 @@ uint32_t g_zr_reads, g_zr_writes, g_zr_errs, g_zr_grows, g_zr_used_pages,
          g_zr_irq_rearms, g_zr_faults;
 
 /* ---- guest memory: same helpers as vblk_sd.c ---------------------- */
-#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
-#define GUEST_DRAM_END    (GUEST_DRAM_BASE + (uint64_t)STAGE2_DRAM_SIZE)
 
+/* Guest RAM minus every HV-owned window (guest_mem.h): the same table the
+ * guest's stage-2 map is built from, so a buffer the guest cannot write
+ * itself cannot be written through this device either. */
 static inline int gpa_in_range(uint64_t gpa, uint32_t len)
 {
-	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
-		return 0;
-	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
-		return 0;
-	/* Never let a descriptor point the device at its own backing store. */
-	if (gpa < HVMAP_VZRAM_BASE + HVMAP_VZRAM_SIZE &&
-	    gpa + len > HVMAP_VZRAM_BASE)
-		return 0;
-	return 1;
+	return guest_gpa_ok(gpa, len);
 }
 
 static void gmem_cmo(uint64_t gpa, uint32_t len)
@@ -96,8 +90,11 @@ static int gmem_read(uint64_t gpa, void *dst, uint32_t len)
 	const volatile uint8_t *s = (const volatile uint8_t *)(uintptr_t)gpa;
 	uint8_t *d = dst;
 
-	if (!gpa_in_range(gpa, len))
+	if (!gpa_in_range(gpa, len)) {
+		for (uint32_t i = 0; i < len; i++)   /* never hand back stale bytes */
+			d[i] = 0;
 		return -1;
+	}
 	gmem_cmo(gpa, len);
 	for (uint32_t i = 0; i < len; i++)
 		d[i] = s[i];
@@ -176,7 +173,10 @@ struct zr_desc {
 
 static void vq_read_desc(uint16_t idx, struct zr_desc *out)
 {
-	(void)gmem_read(g_zr.vq.desc + (uint64_t)idx * 16u, out, 16u);
+	uint64_t p = g_zr.vq.desc + (uint64_t)idx * 16u;
+	if (idx >= g_zr.vq.num)
+		p = 0;    /* outside the ring: gmem_read refuses and zero-fills */
+	(void)gmem_read(p, out, 16u);
 }
 
 static int vq_pop_avail(uint16_t *head)
@@ -186,6 +186,8 @@ static int vq_pop_avail(uint16_t *head)
 
 	if (!vq->ready || vq->num == 0)
 		return 0;
+	if (!guest_vring_ok(vq->desc, vq->avail, vq->used, vq->num))
+		return 0;    /* a ring outside guest RAM: serve nothing */
 	avail_idx = gmem_ld16(vq->avail + 2u);
 	if (vq->last_avail == avail_idx)
 		return 0;

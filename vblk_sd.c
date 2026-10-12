@@ -13,6 +13,7 @@
 #include "hv_addrmap.h"
 #include "sd_bio.h"
 #include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
+#include "guest_mem.h" /* guest_gpa_ok()/guest_vring_ok() */
 #include "wdt.h"       /* wdt_debug_kick() -- fed during a bounded lock wait */
 #include "cntpct.h"
 #include "gic_timer.h"   /* gic_timer_spi_enable() -- IDMAC queue re-arm */
@@ -133,21 +134,13 @@ static int sd_lock_acquire_bounded(void)
  * Same disease soc_a64.h was created to cure earlier the same day: one value,
  * several spellings, and changing one silently breaks the rest. Local names are
  * kept so no use site changes. */
-#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
-#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
-#define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
 
+/* Guest RAM minus every HV-owned window (guest_mem.h): the same table the
+ * guest's stage-2 map is built from, so a buffer the guest cannot write
+ * itself cannot be written through this device either. */
 static inline int gpa_in_range(uint64_t gpa, uint32_t len)
 {
-	if (len == 0u)
-		return 1;
-	if ((uint64_t)len > GUEST_DRAM_SIZE)
-		return 0;
-	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
-		return 0;
-	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
-		return 0;
-	return 1;
+	return guest_gpa_ok(gpa, len);
 }
 
 static void gmem_cmo(uint64_t gpa, uint32_t len)
@@ -162,6 +155,8 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 {
 	if (!gpa_in_range(gpa, len)) {
+		for (uint32_t i = 0; i < len; i++)   /* never hand back stale bytes */
+			((uint8_t *)dst)[i] = 0;
 		vblk_sd_bc(8, ++g_gmem_oob);
 		return;
 	}
@@ -202,6 +197,8 @@ static void vq_read_desc(struct vblk_sd_vq *vq, uint16_t idx, struct vblk_sd_des
 {
 	struct vblk_sd_vring_desc d;
 	uint64_t p = vq->desc + (uint64_t)idx * sizeof(struct vblk_sd_vring_desc);
+	if (idx >= vq->num)
+		p = 0;    /* outside the ring: gmem_read refuses and zero-fills */
 	gmem_read(p, &d, sizeof(d));
 	out->addr  = d.addr;
 	out->len   = d.len;
@@ -215,6 +212,8 @@ static int vq_pop_avail(struct vblk_sd_vq *vq, uint16_t *head)
 
 	if (!vq->ready || vq->num == 0)
 		return 0;
+	if (!guest_vring_ok(vq->desc, vq->avail, vq->used, vq->num))
+		return 0;    /* a ring outside guest RAM: serve nothing */
 
 	avail_idx = gmem_ld16(vq->avail + 2u);
 	if (vq->last_avail == avail_idx)

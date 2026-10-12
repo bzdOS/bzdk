@@ -16,7 +16,8 @@
  *            regardless of how the guest split it across descriptors) into
  *            a linear HV-local staging buffer;
  *            read the ethertype out of the reassembled Ethernet frame;
- *            if ethertype == 0x88B5 (our own debug protocol): DROP. Never
+ *            if the ethertype is one of the HV's own 0x88B5..0x88B8, bare
+ *              or behind one/two VLAN tags (vnet_tx_is_hv_ethertype()): DROP. Never
  *              calls emac_send_frame(); the guest cannot spoof the debug
  *              channel. Completion is still pushed (len=0) so the guest's
  *              ring drains normally — from the driver's perspective this is
@@ -122,7 +123,7 @@
  */
 #include <stdint.h>
 #include "vnet_emac.h"
-#include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
+#include "guest_mem.h"   /* guest_gpa_ok(): guest RAM minus every HV-owned window */
 #include "emac.h"           /* emac_send_frame() */
 #include "flightrec.h"      /* B4: flightrec_log(FLTR_K_VIRTIO, ...) on QueueNotify */
 
@@ -164,9 +165,19 @@
  *   [17] descriptor W/R flag mismatches observed, NOT enforced (D5(d))
  *   [18] TX QueueNotify seen before DRIVER_OK, NOT enforced (D5(e); RX side
  *        already hard-gates on DRIVER_OK in vnet_emac_rx_frame(), unchanged)
+ *   [19] descriptor chains dropped because a descriptor's buffer is not
+ *        wholly guest RAM, or its index is outside the ring
+ *   [20] QueueReady refused: desc/avail/used ring not wholly guest RAM
+ *   [21] of [7], frames whose HV ethertype sat inside a VLAN tag
+ *
+ * [7] counts every guest frame dropped on TX because its ethertype, bare or
+ * behind one or two 802.1Q/802.1ad tags, is one of the HV's own 0x88B5..0x88B8
+ * (debug console, netcon, dbgtools, snapnet), plus tagged frames too short to
+ * show their inner ethertype.
  * ------------------------------------------------------------------ */
 #define VNET_BC_BASE   0x50030000UL
 #define VNET_BC_MAGIC  0x564E5431u   /* "VNT1" */
+#define VNET_BC_LAST   21u           /* highest slot used above */
 
 static inline void vnet_bc(uint32_t idx, uint32_t v)
 {
@@ -186,6 +197,9 @@ static uint32_t g_rx_queued, g_rx_dropped, g_tx_sent, g_tx_blocked,
 static uint32_t g_bad_queue_num;      /* (b) non-power-of-two QueueNum, refused */
 static uint32_t g_bad_desc_flags;     /* (d) descriptor W/R flag mismatch, NOT enforced */
 static uint32_t g_kick_not_ready;     /* (e) TX kick before DRIVER_OK, NOT enforced */
+static uint32_t g_bad_chain;          /* chain with a non-guest-RAM buffer / bad index */
+static uint32_t g_bad_ring;           /* QueueReady with a non-guest-RAM ring, refused */
+static uint32_t g_tx_blocked_vlan;    /* HV ethertype hidden behind a VLAN tag */
 
 /* HV-local staging buffer for one frame at a time. Only ever touched from
  * ONE core per call (vnet_kick on CPU0, vnet_emac_rx_frame on CPU1), but
@@ -207,35 +221,14 @@ static uint8_t g_rx_stage[VNET_STAGE_BUF_SIZE];
  * this is the exact coherency lesson the task brief calls out as
  * hardware-found and mandatory to reuse.
  * ------------------------------------------------------------------ */
-/* D2 fix: guest-PA range check — see vblk_emmc.c's gpa_in_range() block
- * comment for the full rationale (identical reasoning applies here: desc.addr/
- * avail/used-ring PAs are guest-supplied, EL2 dereferences them directly with
- * no stage-2 protection). Duplicated (not shared) per this file's
- * self-containment convention, same as gmem_cmo/gmem_read/gmem_write
- * themselves. MUST stay in lockstep with stage2.h's STAGE2_DRAM_BASE/
- * STAGE2_DRAM_SIZE (currently 0x40000000 / 0x40000000). Does NOT protect the
- * in-DRAM hv-image/hv-scratch windows (see vblk_emmc.c's comment) — that
- * needs real stage-2/DMA isolation (milestone A1), out of scope here. */
-/* Derived from stage2.h, not copied -- see vblk_emmc.c's note: five files
- * carried this pair hardcoded, none of them followed when STAGE2_DRAM_SIZE was
- * widened, and the guest panicked on a rejected descriptor. */
-#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
-#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
-#define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
-
-static inline int gpa_in_range(uint64_t gpa, uint32_t len)
-{
-	if (len == 0u)
-		return 1;
-	if ((uint64_t)len > GUEST_DRAM_SIZE)
-		return 0;
-	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
-		return 0;
-	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
-		return 0;
-	return 1;
-}
-
+/* Every guest PA this file dereferences is checked with guest_gpa_ok()
+ * (guest_mem.h): wholly inside guest RAM and clear of every HV-owned window
+ * (hv-image, hv-scratch with the EMAC DMA rings and lock words, the HV
+ * framebuffer, the vzram pool / U-Boot tail). The same table builds the
+ * guest's stage-2 map, so a buffer the guest could not write itself cannot be
+ * written through this device either. Rings are checked once at QueueReady and
+ * per pop, descriptor buffers once per chain; gmem_read/gmem_write keep a
+ * per-access check as the backstop and zero the destination on a refusal. */
 static void gmem_cmo(uint64_t gpa, uint32_t len)
 {
 	uint64_t p   = gpa & ~63ULL;
@@ -245,23 +238,26 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
-static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
+static int gmem_read(uint64_t gpa, void *dst, uint32_t len)
 {
-	if (!gpa_in_range(gpa, len)) {
-		vnet_bc(15, ++g_gmem_oob);      /* D2: corrupt/wild guest PA — drop */
-		return;
+	if (!guest_gpa_ok(gpa, len)) {
+		vnet_bc(15, ++g_gmem_oob);      /* not guest RAM: refuse, never guess */
+		for (uint32_t i = 0; i < len; i++)
+			((uint8_t *)dst)[i] = 0;
+		return 0;
 	}
 	const volatile uint8_t *s = (const volatile uint8_t *)(uintptr_t)gpa;
 	uint8_t *d = (uint8_t *)dst;
 	gmem_cmo(gpa, len);                  /* refetch from PoC, never stale */
 	for (uint32_t i = 0; i < len; i++)
 		d[i] = s[i];
+	return 1;
 }
 
 static void gmem_write(uint64_t gpa, const void *src, uint32_t len)
 {
-	if (!gpa_in_range(gpa, len)) {
-		vnet_bc(15, ++g_gmem_oob);      /* D2: corrupt/wild guest PA — drop */
+	if (!guest_gpa_ok(gpa, len)) {
+		vnet_bc(15, ++g_gmem_oob);      /* not guest RAM: drop the write */
 		return;
 	}
 	volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)gpa;
@@ -284,15 +280,25 @@ static inline void gmem_st16(uint64_t gpa, uint16_t v)
  * Virtqueue engine (split ring, VIRTIO 1.x) — generic over EITHER queue
  * (RX=0 or TX=1), unlike vblk_emmc.c which only ever has one queue.
  * ------------------------------------------------------------------ */
-static void vq_read_desc(struct vnet_vq *vq, uint16_t idx, struct vnet_desc *out)
+static int vq_rings_ok(const struct vnet_vq *vq)
+{
+	return guest_vring_ok(vq->desc, vq->avail, vq->used, vq->num);
+}
+
+/* 0 if the descriptor slot is outside the ring or unreadable; *out is then
+ * all-zero, never stale stack. */
+static int vq_read_desc(struct vnet_vq *vq, uint16_t idx, struct vnet_desc *out)
 {
 	struct vnet_vring_desc d;
 	uint64_t p = vq->desc + (uint64_t)idx * sizeof(struct vnet_vring_desc);
-	gmem_read(p, &d, sizeof(d));
+	int ok = idx < vq->num && gmem_read(p, &d, sizeof(d));
+	if (!ok)
+		d.addr = 0, d.len = 0, d.flags = 0, d.next = 0;
 	out->addr  = d.addr;
 	out->len   = d.len;
 	out->flags = d.flags;
 	out->next  = d.next;
+	return ok;
 }
 
 static int vq_pop_avail(struct vnet_vq *vq, uint16_t *head)
@@ -300,6 +306,10 @@ static int vq_pop_avail(struct vnet_vq *vq, uint16_t *head)
 	uint16_t avail_idx;
 
 	if (!vq->ready || vq->num == 0)
+		return 0;
+	/* Ring addresses are registers the guest can rewrite after QueueReady;
+	 * re-check them (three compares each) rather than trust the snapshot. */
+	if (!vq_rings_ok(vq))
 		return 0;
 
 	avail_idx = gmem_ld16(vq->avail + 2u);
@@ -345,7 +355,13 @@ static uint32_t vq_collect_chain(struct vnet_vq *vq, uint16_t head,
 			vnet_bc(13, ++g_tx_truncated);
 			return 0;
 		}
-		vq_read_desc(vq, idx, &chain[n]);
+		if (!vq_read_desc(vq, idx, &chain[n]) ||
+		    !guest_gpa_ok(chain[n].addr, chain[n].len)) {
+			/* Buffer (or the descriptor itself) is not wholly guest
+			 * RAM: drop the whole chain, touch none of it. */
+			vnet_bc(19, ++g_bad_chain);
+			return 0;
+		}
 		if (chain[n].flags & VNET_VRING_DESC_F_INDIRECT)
 			return 0;      /* not handled — advertise off, treat as malformed */
 		uint16_t flags = chain[n].flags;
@@ -462,13 +478,19 @@ static void vnet_tx_one(struct vnet_dev *d, uint16_t head)
 	                                  g_tx_stage[VNET_HDR_LEN + 13]);
 	vnet_bc(11, ethertype);
 
-	if (ethertype == VNET_ETHERTYPE_DEBUG) {
+	int hv_type = vnet_tx_is_hv_ethertype(g_tx_stage + VNET_HDR_LEN,
+	                                       total - VNET_HDR_LEN);
+	if (hv_type) {
 		/* HARD BLOCK: the guest must never be able to inject a frame that
-		 * masquerades as the HV's own debug protocol. Never reaches
+		 * masquerades as one of the HV's own protocols (0x88B5..0x88B8,
+		 * bare or VLAN-wrapped): with the guest's source MAC equal to the
+		 * HV's, host tools could not tell the two apart. Never reaches
 		 * emac_send_frame() / real hardware. Completion still pushed so the
 		 * guest's ring drains — indistinguishable from a real NIC quietly
 		 * dropping a frame. */
 		vnet_bc(7, ++g_tx_blocked);
+		if (hv_type > 1)
+			vnet_bc(21, ++g_tx_blocked_vlan);
 	} else {
 		const uint8_t *payload = g_tx_stage + VNET_HDR_LEN + VNET_ETH_HDR_LEN;
 		uint32_t plen = total - VNET_HDR_LEN - VNET_ETH_HDR_LEN;
@@ -727,7 +749,12 @@ static void vnet_reg_write(struct vnet_dev *d, uint32_t off, uint32_t val)
 	case VNET_R_QUEUE_READY:
 		if (d->queue_sel < VNET_NUM_QUEUES) {
 			struct vnet_vq *vq = &d->vq[d->queue_sel];
-			if (val & 1u) {
+			if ((val & 1u) && !vq_rings_ok(vq)) {
+				/* A ring outside guest RAM: refuse. The queue stays
+				 * not-ready, which the driver sees on read-back. */
+				vnet_bc(20, ++g_bad_ring);
+				vq->ready = 0u;
+			} else if (val & 1u) {
 				vq->last_avail = 0;      /* fresh negotiation */
 				/* Barrier BEFORE the ready store, not after: publish the
 				 * whole vq struct (desc/avail/used/num, all written just
@@ -848,6 +875,13 @@ void vnet_init(void)
 	g_rx_queued = g_rx_dropped = g_tx_sent = g_tx_blocked = g_tx_dropped = 0;
 	g_irqs = g_faults = g_tx_truncated = g_rx_truncated = 0;
 
+	g_gmem_oob = g_bad_queue_num = g_bad_desc_flags = g_kick_not_ready = 0;
+	g_bad_chain = g_bad_ring = g_tx_blocked_vlan = 0;
+
+	/* Every slot, not just the ready bits: the window is not cleared by
+	 * anything else, and a counter that has never fired must read 0, not
+	 * whatever the DRAM held. */
+	for (uint32_t i = 1; i <= VNET_BC_LAST; i++)
+		vnet_bc(i, 0);
 	vnet_bc(0, VNET_BC_MAGIC);
-	vnet_bc(2, 0); vnet_bc(3, 0);
 }

@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "vgicd.h"   /* VGICD_BASE — the GICD trap L3 index is derived from it */
 #include "stage2.h"
+#include "guest_mem.h"  /* hv_dram_holes[]: the HV windows carved out of guest DRAM */
 #include "vblk_emmc.h"   /* VBLK_MMIO_BASE — trapped virtio-mmio window */
 #include "vgic.h"        /* VGIC_GICV_BASE — GICC->GICV redirect target */
 #include "wdogtrap.h"    /* WDOGTRAP_PAGE_BASE — CCU/PIO/WDOG trap L3 index,
@@ -562,8 +563,14 @@ static void stage2_tlb_flush(void);
  * vector() then only overwrites its OWN single entry (index VEC_L2_IDX=52,
  * disjoint from HVIMG_L2_IDX=16 and HVSCR_L2_IDX=128) rather than rebuilding
  * from scratch — see that function's own comment for why. */
-#define HVIMG_BASE      0x42000000UL   /* DTB reserved-memory hv-image@... */
-#define HVSCR_BASE      0x50000000UL   /* DTB reserved-memory hv-scratch@..*/
+#define HVIMG_BASE      HVMAP_HVIMG_BASE   /* DTB reserved-memory hv-image@... */
+#define HVSCR_BASE      HVMAP_HVSCR_BASE   /* DTB reserved-memory hv-scratch@..*/
+
+/* The carve itself is driven by guest_mem.h's hv_dram_holes[], the same table
+ * the emulated devices check guest-supplied addresses against, so the
+ * guest's own view and what the HV will touch on its behalf cannot drift. */
+_Static_assert(GUEST_MEM_BLOCK == STAGE2_L2_BLOCK_SIZE,
+               "guest_mem.h's block size is not the stage-2 L2 block");
 
 #define HVIMG_L2_IDX  ((unsigned)((HVIMG_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
 #define HVSCR_L2_IDX  ((unsigned)((HVSCR_BASE - STAGE2_DRAM_BASE) >> STAGE2_L2_BLOCK_SHIFT))
@@ -683,13 +690,10 @@ stage2_build_dram_table(uint64_t block_base)
 	                        >> STAGE2_BLOCK_SHIFT);
 
 	for (unsigned i = 0; i < STAGE2_L2_ENTRIES; i++) {
-		if (block_base == STAGE2_DRAM_BASE &&
-		    (i == HVIMG_L2_IDX || i == HVSCR_L2_IDX
-#if defined(HV_HDMI) && !HVFB_GUEST_SHARED
-		     || (i >= HVFB_L2_IDX && i < HVFB_L2_IDX + HVFB_L2_COUNT)
-#endif
-		    )) {
-			stage2_l2_dram[b][i] = 0;   /* INVALID: HV image / scratch / framebuffer */
+		if (hv_dram_block_is_hole(block_base +
+		                          (uint64_t)i * STAGE2_L2_BLOCK_SIZE)) {
+			/* INVALID: HV image / scratch / framebuffer / above guest RAM */
+			stage2_l2_dram[b][i] = 0;
 			continue;
 		}
 
@@ -1270,9 +1274,18 @@ stage2_isolation_selfcheck(void)
 	 * control DRAM address still translates (F=0 — proves the check itself isn't
 	 * just faulting on everything). hvfb_want is 1 in every build except the
 	 * shared-display one, where BUF0 reachability IS the intended state. */
+	/* Above the guest's /memory (vzram pool, U-Boot's reserved region with
+	 * the tables EL2 runs on): carved by guest_mem.h's tail hole whenever
+	 * the stage-2 window is larger than guest RAM. */
+#if GUEST_RAM_END < GUEST_STAGE2_END
+	uint32_t tail_f     = (uint32_t)(stage2_at_s12e1w(GUEST_RAM_END) & 1u);
+#else
+	uint32_t tail_f     = 1u;   /* no tail in this build */
+#endif
+
 	uint32_t pass = (hvimg_f == 1u && hvscr_f == 1u &&
 	                 hvfb_f == hvfb_want && hvfb1_f == 1u &&
-	                 control_f == 0u) ? 1u : 0u;
+	                 tail_f == 1u && control_f == 0u) ? 1u : 0u;
 
 	stg2_bc(14, 0x49534f4c);   /* "ISOL" */
 	stg2_bc(15, hvimg_f);
@@ -1281,6 +1294,7 @@ stage2_isolation_selfcheck(void)
 	stg2_bc(18, pass);
 	stg2_bc(10, hvfb_f);       /* BUF0 PAR.F: 1 = carved, 0 = shared on purpose */
 	stg2_bc(11, hvfb1_f);      /* BUF1 PAR.F: must be 1 in every build */
+	stg2_bc(23, tail_f);       /* GUEST_RAM_END PAR.F: must be 1 */
 	return (int)pass;
 }
 

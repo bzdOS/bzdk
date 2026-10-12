@@ -20,6 +20,7 @@
 #include "hv_addrmap.h"
 #include "hdmi.h"
 #include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
+#include "guest_mem.h" /* guest_gpa_ok() */
 
 /* OWNER MARKER — linker-level mutual exclusion for the HDMI/scanout block
  * (same pattern as vcpu3.c/zguest_cpu3.c's bzdos_cpu3_owner).
@@ -239,18 +240,11 @@ static int scanout_decide_flip(struct scanout_dev *d, uint32_t requested,
  * kept so no use site changes. */
 #define SCANOUT_GUEST_DRAM_BASE  ((uint64_t)STAGE2_DRAM_BASE)
 #define SCANOUT_GUEST_DRAM_END   ((uint64_t)(STAGE2_DRAM_BASE + STAGE2_DRAM_SIZE))
-#define SCANOUT_HVIMG_BASE       0x42000000ULL   /* DTB hv-image@42000000  */
-#define SCANOUT_HVIMG_SIZE       0x00200000ULL   /* 2 MiB */
-#define SCANOUT_HVSCR_BASE       0x50000000ULL   /* DTB hv-scratch@50000000 */
-#define SCANOUT_HVSCR_SIZE       0x00200000ULL   /* 2 MiB */
-/* hv_addrmap.h has no symbol for the scratch window's base (it is documented in
- * that file's map comment only), so tie the mirror to a real lane INSIDE it: if
- * HVMAP_VGICD_BC ever stops falling within the range this validates against, the
- * range is wrong and the guest could be handed an address inside hv-scratch. */
-_Static_assert((uint64_t)HVMAP_VGICD_BC >= SCANOUT_HVSCR_BASE &&
-               (uint64_t)HVMAP_VGICD_BC <  SCANOUT_HVSCR_BASE + SCANOUT_HVSCR_SIZE,
-               "a known hv-scratch lane falls outside the hv-scratch range this "
-               "file rejects -- the range is stale");
+/* The hv-image/hv-scratch/vzram exclusions this file used to mirror by hand
+ * now come from guest_mem.h, the table the stage-2 carve itself is built from. */
+_Static_assert((uint64_t)HVMAP_VGICD_BC >= HVMAP_HVSCR_BASE &&
+               (uint64_t)HVMAP_VGICD_BC <  HVMAP_HVSCR_BASE + HVMAP_HVWIN_SIZE,
+               "a known hv-scratch lane falls outside guest_mem.h's hv-scratch hole");
 _Static_assert(SCANOUT_GUEST_DRAM_BASE <= (uint64_t)HVMAP_FB_BASE &&
                (uint64_t)HVMAP_FB_BASE < SCANOUT_GUEST_DRAM_END,
                "hv-fb is not inside the guest DRAM window this validates against");
@@ -269,21 +263,17 @@ int scanout_addr_allowed(uint32_t pa, uint32_t stride, uint32_t height)
 	end = base + len;
 	if (end <= base)                       /* wrapped */
 		return 0;
-	if (base < SCANOUT_GUEST_DRAM_BASE || end > SCANOUT_GUEST_DRAM_END)
+	/* Guest RAM minus every HV window (guest_mem.h: hv-image, hv-scratch,
+	 * the HV framebuffer, the vzram pool and U-Boot tail). */
+	if (!guest_gpa_ok(base, len))
 		return 0;
 
-	/* Overlap test against each HV region: [base,end) vs [r,r+size). */
+	/* Stricter than guest_gpa_ok() on purpose: never scan out of the HV's
+	 * own framebuffer window, even the front buffer a shared-display build
+	 * lends the guest. */
 #define SCANOUT_OVERLAPS(r, sz) \
 	(base < ((uint64_t)(r) + (uint64_t)(sz)) && ((uint64_t)(r)) < end)
-	if (SCANOUT_OVERLAPS(SCANOUT_HVIMG_BASE, SCANOUT_HVIMG_SIZE))
-		return 0;
-	if (SCANOUT_OVERLAPS(SCANOUT_HVSCR_BASE, SCANOUT_HVSCR_SIZE))
-		return 0;
 	if (SCANOUT_OVERLAPS(HVMAP_FB_BASE, HVMAP_FB_WINDOW_SIZE))
-		return 0;
-	/* Not guest memory either, though stage-2 maps it: the vzram backing
-	 * store and U-Boot's no-overwrite top (stage2.h), up to 0xC0000000. */
-	if (SCANOUT_OVERLAPS(HVMAP_VZRAM_BASE, 0xC0000000ULL - HVMAP_VZRAM_BASE))
 		return 0;
 #undef SCANOUT_OVERLAPS
 	return 1;

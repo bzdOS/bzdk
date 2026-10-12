@@ -50,6 +50,7 @@
 #include "vinput.h"
 #include "hv_addrmap.h"
 #include "stage2.h"   /* STAGE2_DRAM_BASE/SIZE -- the one source for the guest DRAM window */
+#include "guest_mem.h" /* guest_gpa_ok()/guest_vring_ok() */
 
 /* ------------------------------------------------------------------ *
  * ESR_EL2.ISS decode for a data abort (EC==0x24) — identical convention to
@@ -108,21 +109,13 @@ static uint32_t g_sent, g_dropped, g_irqs, g_faults, g_gmem_oob;
  * Same disease soc_a64.h was created to cure earlier the same day: one value,
  * several spellings, and changing one silently breaks the rest. Local names are
  * kept so no use site changes. */
-#define GUEST_DRAM_BASE   ((uint64_t)STAGE2_DRAM_BASE)
-#define GUEST_DRAM_SIZE   ((uint64_t)STAGE2_DRAM_SIZE)
-#define GUEST_DRAM_END    (GUEST_DRAM_BASE + GUEST_DRAM_SIZE)
 
+/* Guest RAM minus every HV-owned window (guest_mem.h): the same table the
+ * guest's stage-2 map is built from, so a buffer the guest cannot write
+ * itself cannot be written through this device either. */
 static inline int gpa_in_range(uint64_t gpa, uint32_t len)
 {
-	if (len == 0u)
-		return 1;
-	if ((uint64_t)len > GUEST_DRAM_SIZE)
-		return 0;
-	if (gpa < GUEST_DRAM_BASE || gpa >= GUEST_DRAM_END)
-		return 0;
-	if ((GUEST_DRAM_END - gpa) < (uint64_t)len)
-		return 0;
-	return 1;
+	return guest_gpa_ok(gpa, len);
 }
 
 static void gmem_cmo(uint64_t gpa, uint32_t len)
@@ -137,6 +130,8 @@ static void gmem_cmo(uint64_t gpa, uint32_t len)
 static void gmem_read(uint64_t gpa, void *dst, uint32_t len)
 {
 	if (!gpa_in_range(gpa, len)) {
+		for (uint32_t i = 0; i < len; i++)   /* never hand back stale bytes */
+			((uint8_t *)dst)[i] = 0;
 		vinput_bc(9, ++g_gmem_oob);
 		return;
 	}
@@ -177,6 +172,8 @@ static void vq_read_desc(struct vinput_vq *vq, uint16_t idx, struct vinput_desc 
 {
 	struct vinput_vring_desc d;
 	uint64_t p = vq->desc + (uint64_t)idx * sizeof(struct vinput_vring_desc);
+	if (idx >= vq->num)
+		p = 0;    /* outside the ring: gmem_read refuses and zero-fills */
 	gmem_read(p, &d, sizeof(d));
 	out->addr  = d.addr;
 	out->len   = d.len;
@@ -190,6 +187,8 @@ static int vq_pop_avail(struct vinput_vq *vq, uint16_t *head)
 
 	if (!vq->ready || vq->num == 0)
 		return 0;
+	if (!guest_vring_ok(vq->desc, vq->avail, vq->used, vq->num))
+		return 0;    /* a ring outside guest RAM: serve nothing */
 
 	avail_idx = gmem_ld16(vq->avail + 2u);
 	if (vq->last_avail == avail_idx)
@@ -400,6 +399,11 @@ static int vinput_push_event(uint16_t type, uint16_t code, uint32_t value)
 		return 0;
 
 	vq_read_desc(vq, head, &d);
+	if (!gpa_in_range(d.addr, sizeof(ev))) {
+		vinput_bc(9, ++g_gmem_oob);     /* not guest RAM: complete empty, drop */
+		vq_push_used(vq, head, 0);
+		return 0;
+	}
 	if (!(d.flags & VINPUT_VRING_DESC_F_WRITE) || d.len < sizeof(ev)) {
 		vq_push_used(vq, head, 0);      /* malformed/undersized: complete, drop */
 		return 0;

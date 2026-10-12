@@ -246,6 +246,36 @@ struct vnet_hdr {
  * because emac.c's existing dispatch claims it first, see vnet_emac.c). */
 #define VNET_ETHERTYPE_DEBUG       0x88B5u
 #define VNET_ETHERTYPE_NETCON      0x88B6u
+/* The whole range the HV claims on the wire: 0x88B5 console/dbgmon, 0x88B6
+ * netcon, 0x88B7 dbgtools, 0x88B8 snapnet. vnet TX drops all of them, bare or
+ * inside one or two VLAN tags. */
+#define VNET_ETHERTYPE_HV_FIRST    0x88B5u
+#define VNET_ETHERTYPE_HV_LAST     0x88B8u
+
+/* Does this guest Ethernet frame carry one of the HV's own ethertypes
+ * (0x88B5 console/dbgmon, 0x88B6 netcon, 0x88B7 dbgtools, 0x88B8 snapnet)?
+ * Looks through up to two 802.1Q (0x8100) / 802.1ad (0x88A8) tags, since a
+ * host-side tool or switch that strips tags would otherwise deliver the inner
+ * frame as if the HV had sent it. A tagged frame too short to show its inner
+ * ethertype, or with a third tag, is blocked too. Returns 0 = pass, 1 = bare HV type,
+ * 2 = HV type (or truncation) behind a tag. `len` excludes the virtio header.
+ * Header-inline so test_vnet_hvtype.c exercises this exact code on the host. */
+static inline int vnet_tx_is_hv_ethertype(const uint8_t *eth, uint32_t len)
+{
+	uint32_t off = 12u;
+	for (int tags = 0; ; tags++) {
+		if (len < off + 2u)
+			return tags ? 2 : 0;
+		uint16_t et = (uint16_t)((eth[off] << 8) | eth[off + 1u]);
+		if (et >= VNET_ETHERTYPE_HV_FIRST && et <= VNET_ETHERTYPE_HV_LAST)
+			return tags ? 2 : 1;
+		if (et != 0x8100u && et != 0x88A8u)
+			return 0;
+		if (tags == 2)
+			return 2;            /* a third tag: drop rather than dig on */
+		off += 4u;               /* skip TPID + TCI to the next type field */
+	}
+}
 
 /* Internal linear staging buffer for one frame (header + full Ethernet
  * frame), used both to concatenate a TX descriptor chain before inspecting
