@@ -65,12 +65,10 @@
 #include <stdint.h>
 #include "emac.h"
 #include "soc_a64.h"   /* A64 peripheral addresses, consolidated — see that header */
-#if defined(DBG_AUTH)
-#include "hmac_sha256.h"   /* ROADMAP T5 keyed-auth gate, see dbg_auth_check()
-                            * below and docs/security-notes.md. Only pulled in
-                            * when -DDBG_AUTH is set (EXTRA_CFLAGS); the
-                            * default build never sees this header. */
-#endif
+#include "dbgauth.h"   /* authenticated envelope for every HV debug channel
+                        * (dbgauth.h; docs/security-notes.md). Envelope
+                        * parsing only exists under -DDBG_AUTH, the `dbg`
+                        * default. */
 #include "wdt.h"   /* pet the 16 s WDT during the multi-second autoneg wait —
                     * emac_init() runs BEFORE main_net.c's pet loop, so a
                     * naked seconds-long wait here would trip the watchdog. */
@@ -1311,6 +1309,7 @@ int emac_init(void)
         linked = phy_startup(&duplex_full);
     }
     bc(4, linked ? 1 : 0);
+    dbgauth_entropy(timer_now());        /* autoneg took a variable time */
     if (linked) {
         bc(5, g_speed);
         bc(14, ++g_link_up_events);      /* count the initial link too */
@@ -1734,10 +1733,23 @@ static int tx_frame_raw(const uint8_t dst[6], uint16_t ethertype,
     return tx_frame_raw_src(dst, OUR_MAC, ethertype, payload, plen);
 }
 
-/* Console TX kept byte-identical in behavior: broadcast dst, ETHERTYPE_CONSOLE. */
+/* Reply destination for everything the HV itself originates (console text,
+ * netcon/dbgtools/snapnet replies, coredump/fbdump streams): the source MAC
+ * of the last accepted debug frame (authenticated, or legacy in a COMPAT/
+ * NO_AUTH image), so a debug session's output is not shown to the whole LAN.
+ * Broadcast only until the first such frame of this boot: the boot log and a
+ * crash before any host has spoken (coredump, panic text) still have to
+ * reach the operator's console follower, which cannot have announced itself
+ * yet. */
+static const uint8_t *reply_dst(void)
+{
+    const uint8_t *peer = dbgauth_peer();
+    return peer ? peer : BCAST_MAC;
+}
+
 static void tx_frame(const uint8_t *payload, int plen)
 {
-    (void)tx_frame_raw(BCAST_MAC, ETHERTYPE_CONSOLE, payload, plen);
+    (void)tx_frame_raw(reply_dst(), ETHERTYPE_CONSOLE, payload, plen);
 }
 
 void emac_flush(void)
@@ -1748,13 +1760,13 @@ void emac_flush(void)
     tx_line_len = 0;
 }
 
-/* Public: send ONE raw frame on an arbitrary EtherType (used by netcon.c).
- * Broadcast dst — same as the console, and simplest/most robust for a
- * point-to-point debug link with exactly one host peer. Zero-padded to the
- * 60-byte minimum by tx_frame_raw(). Returns 1 if queued, 0 if dropped. */
+/* Public: send ONE raw frame on an arbitrary EtherType (netcon, dbgtools,
+ * snapnet, coredump, fbdump). Same destination rule as the console, see
+ * reply_dst(). Zero-padded to the 60-byte minimum by tx_frame_raw().
+ * Returns 1 if queued, 0 if dropped. */
 int emac_send_frame(uint16_t ethertype, const uint8_t *payload, uint16_t len)
 {
-    return tx_frame_raw(BCAST_MAC, ethertype, payload, (int)len);
+    return tx_frame_raw(reply_dst(), ethertype, payload, (int)len);
 }
 
 int emac_send_frame_to(const uint8_t dst[6], uint16_t ethertype,
@@ -1784,96 +1796,98 @@ void emac_puts(const char *s)
         emac_putc((unsigned char)*s++);
 }
 
-#if defined(DBG_AUTH)
-/* ------------------------------------------------------------------ *
- * ROADMAP T5 keyed auth (docs/security-notes.md option 1, -DDBG_AUTH).
- * ------------------------------------------------------------------ *
- * Wire envelope for a DBG_AUTH console frame's PAYLOAD (the bytes starting
- * right after the 14-byte Ethernet header, i.e. buf+14 in emac_poll()):
- *
- *   [0..7]   nonce   8 bytes, big-endian uint64, STRICTLY INCREASING
- *   [8..39]  mac     32 bytes, HMAC-SHA256(DBG_AUTH_KEY, nonce || cmd)
- *   [40..]   cmd     the command line bytes — same zero-padded-ASCII
- *                    convention the unauthenticated protocol already uses
- *                    from here on (dbgmon.c / gdbstub.c neither know nor
- *                    care that the bytes they're handed passed a MAC check
- *                    first).
- *
- * See hvdbg.py's HV(key=...) / _send() and gdb-bridge.py's --key for the
- * host-side encoder that produces this envelope; when no key is passed on
- * the host, those tools send the plain unauthenticated frame exactly as
- * before (this board-side gate simply isn't compiled in unless -DDBG_AUTH
- * is set, so there is no behavior to keep in sync in that case).
- */
-#ifndef DBG_AUTH_KEY
-/* No key was supplied via -DDBG_AUTH_KEY="..." (EXTRA_CFLAGS) — fall back to
- * an obviously-not-secret placeholder so the ROADMAP T5 build-verify matrix
- * (`make dbg EXTRA_CFLAGS=-DDBG_AUTH`, no key) still compiles clean. NEVER
- * ship this default key to a real deployment — see docs/security-notes.md. */
-#define DBG_AUTH_KEY "CHANGE-ME-bzdOS-dbg-auth-default-key"
+/* ------------------------------------------------------------------ */
+/* HV debug-plane RX (docs/security-notes.md, dbgauth.h).               */
+/*                                                                      */
+/* -DDBG_AUTH (the `dbg` default): every host->HV debug frame arrives   */
+/* on 0x88B5 inside dbgauth's session envelope, with the channel        */
+/* (console, netcon, dbgtools, snapnet) named in the authenticated      */
+/* header. Unauthenticated frames on 0x88B5..0x88B8 are counted and     */
+/* dropped; 0x88B6..0x88B8 then stop being HV channels on receive and   */
+/* go to the guest like any other ethertype (0x88B7/0x88B8 are public   */
+/* IEEE assignments). The HV still TRANSMITS netcon/dbgtools/snapnet    */
+/* replies on their old ethertypes, which is all the host receivers     */
+/* listen for.                                                          */
+/* -DDBG_AUTH -DDBG_AUTH_COMPAT: transition image, accepts both, counts */
+/* the unauthenticated accepts.                                         */
+/* neither (DBG_NO_AUTH=1): the legacy open protocol.                   */
+/* -DPROD_NO_DBG: nothing is accepted on any of the four.               */
+/* ------------------------------------------------------------------ */
+#if defined(DBG_AUTH) && !defined(DBG_AUTH_COMPAT)
+#define HV_LEGACY_ETYPES_TO_GUEST 1
+#else
+#define HV_LEGACY_ETYPES_TO_GUEST 0
 #endif
 
-#define DBG_AUTH_NONCE_LEN 8u
-#define DBG_AUTH_MAC_LEN   32u
-#define DBG_AUTH_HDR_LEN   (DBG_AUTH_NONCE_LEN + DBG_AUTH_MAC_LEN)
-#define DBG_AUTH_MAX_CMD   300u   /* CHUNK in gdb-bridge.py is 256; dbgmon.c's
-                                   * own DBGMON_LINE_MAX is 128 — 300 covers
-                                   * both with headroom, staged on the stack
-                                   * below (bounded, never overflowed). */
-
-/* Monotonic replay guard: only nonces STRICTLY GREATER than the last one
- * accepted are honored. Resets to 0 on every HV boot — a replayed frame
- * from a previous power cycle is exactly the threat this stops. Single-
- * owner: RX is always serviced from one core at a time (see this file's own
- * "RX demux hook" reasoning above emac_poll()'s TX cross-core comment). */
-static uint64_t g_dbg_auth_last_nonce;
-
-/* Returns 1 and advances g_dbg_auth_last_nonce iff `payload` (the frame
- * bytes after the Ethernet header, `paylen` of them) carries a valid
- * DBG_AUTH envelope. Returns 0 for anything else (short frame, stale/
- * replayed nonce, bad MAC) — caller drops the frame silently, same as an
- * unrecognized ethertype. */
-static int dbg_auth_check(const uint8_t *payload, uint32_t paylen)
+#if !defined(PROD_NO_DBG)
+static void hv_dispatch(uint8_t chan, const uint8_t *p, uint32_t n)
 {
-    static const uint8_t key[] = DBG_AUTH_KEY;
-    uint64_t nonce;
-    uint8_t  mac[DBG_AUTH_MAC_LEN];
-    uint8_t  expect[DBG_AUTH_MAC_LEN];
-    uint8_t  staged[DBG_AUTH_NONCE_LEN + DBG_AUTH_MAX_CMD];
-    uint32_t cmd_len, msg_len;
-    uint32_t i;
-
-    if (paylen < DBG_AUTH_HDR_LEN)
-        return 0;
-
-    nonce = 0;
-    for (i = 0; i < DBG_AUTH_NONCE_LEN; i++)
-        nonce = (nonce << 8) | payload[i];
-    if (nonce <= g_dbg_auth_last_nonce)
-        return 0;                      /* stale or replayed */
-
-    for (i = 0; i < DBG_AUTH_MAC_LEN; i++)
-        mac[i] = payload[DBG_AUTH_NONCE_LEN + i];
-
-    cmd_len = paylen - DBG_AUTH_HDR_LEN;
-    if (cmd_len > DBG_AUTH_MAX_CMD)
-        cmd_len = DBG_AUTH_MAX_CMD;    /* never read/hash past staged[] */
-
-    for (i = 0; i < DBG_AUTH_NONCE_LEN; i++)
-        staged[i] = payload[i];
-    for (i = 0; i < cmd_len; i++)
-        staged[DBG_AUTH_NONCE_LEN + i] = payload[DBG_AUTH_HDR_LEN + i];
-    msg_len = DBG_AUTH_NONCE_LEN + cmd_len;
-
-    hmac_sha256(key, (uint32_t)(sizeof(key) - 1), staged, msg_len, expect);
-
-    if (!hmac_sha256_equal(mac, expect))
-        return 0;
-
-    g_dbg_auth_last_nonce = nonce;
-    return 1;
+    switch (chan) {
+    case DBGAUTH_CHAN_CONSOLE:
+        for (uint32_t i = 0; i < n; i++) {
+            if (p[i] == 0)               /* stop at zero padding */
+                break;
+            rx_push(p[i]);
+        }
+        break;
+    case DBGAUTH_CHAN_NETCON:
+        netcon_rx_frame(p, (uint16_t)n);
+        break;
+    case DBGAUTH_CHAN_SNAPNET:
+        snapshot_net_rx_frame(p, (uint16_t)n);
+        break;
+    case DBGAUTH_CHAN_DBGTOOLS:
+        dbgtools_rx_frame(p, (uint16_t)n);
+        break;
+    default:
+        dbgauth_count(DBGAUTH_ST_MALFORMED);
+        return;
+    }
+    note_rx_frame();
 }
-#endif /* DBG_AUTH */
+#endif
+
+/* Returns 1 if the frame was the HV's (dispatched, answered or dropped),
+ * 0 if it should continue to the guest (vnet). Only called for the four HV
+ * ethertypes, addressed to OUR_MAC or broadcast. */
+static int hv_rx_frame(const uint8_t *buf, int length, uint16_t et)
+{
+#if defined(PROD_NO_DBG)
+    (void)buf; (void)length; (void)et;
+    return 1;
+#else
+    uint8_t chan = DBGAUTH_CHAN_CONSOLE;
+
+    if (et == ETHERTYPE_CONSOLE) {
+        const uint8_t *inner;
+        uint32_t n;
+        int r = dbgauth_rx(buf, (uint32_t)length, &chan, &inner, &n);
+        if (r == DBGAUTH_ACCEPT) {
+            hv_dispatch(chan, inner, n);
+            return 1;
+        }
+        if (r == DBGAUTH_CONSUMED)
+            return 1;
+    }
+#if defined(DBG_AUTH) && !defined(DBG_AUTH_COMPAT)
+    dbgauth_count(DBGAUTH_ST_LEGACY_DROP);
+    return et == ETHERTYPE_CONSOLE;
+#else
+#if defined(DBG_AUTH)
+    dbgauth_count(DBGAUTH_ST_LEGACY_OK);
+#endif
+    if (et == ETHERTYPE_NETCON)
+        chan = DBGAUTH_CHAN_NETCON;
+    else if (et == ETHERTYPE_SNAPNET)
+        chan = DBGAUTH_CHAN_SNAPNET;
+    else if (et == ETHERTYPE_DBGRAW)
+        chan = DBGAUTH_CHAN_DBGTOOLS;
+    dbgauth_set_peer(buf + 6);
+    hv_dispatch(chan, buf + 14, (uint32_t)(length - 14));
+    return 1;
+#endif
+#endif
+}
 
 /* ------------------------------------------------------------------ */
 /* RX — drain the ring into the getc byte buffer                        */
@@ -1921,76 +1935,15 @@ void emac_poll(void)
                 if (buf[i] != OUR_MAC[i]) to_us = 0;
                 if (buf[i] != 0xff)       bcast = 0;
             }
-            if (et == ETHERTYPE_CONSOLE && (to_us || bcast)) {
-#if defined(PROD_NO_DBG)
-                /* ROADMAP T5 prod lockout (docs/security-notes.md option 2,
-                 * -DPROD_NO_DBG): the debug console's COMMAND DISPATCH is
-                 * compiled out of this build entirely. Reject every 0x88B5
-                 * console frame right here at the RX-accept edge — not one
-                 * byte of it reaches the byte ring dbgmon_service()'s/
-                 * gdb_getc()'s callers read from, so there is no dispatcher
-                 * left to drive even if bytes somehow got in some other
-                 * way. The board runs everything else (guest, HDMI,
-                 * virtio, netcon, snapnet, ...) completely unchanged; only
-                 * this one LAN-facing peek/poke/call/gdb surface is gone. */
-#elif defined(DBG_AUTH)
-                /* ROADMAP T5 keyed auth (docs/security-notes.md option 1,
-                 * -DDBG_AUTH): only accept the frame onto the console byte
-                 * ring if dbg_auth_check() verifies its HMAC-SHA256 envelope
-                 * (see the function's doc comment above emac_poll()). A
-                 * frame that fails (bad MAC, replayed/stale nonce, too
-                 * short) is dropped silently — same as a frame that failed
-                 * the to_us/bcast/ethertype filter above. */
-                if (dbg_auth_check(buf + 14, (uint32_t)(length - 14))) {
-                    const uint8_t *cmd = buf + 14 + DBG_AUTH_HDR_LEN;
-                    int cmd_len = length - 14 - (int)DBG_AUTH_HDR_LEN;
-                    for (int i = 0; i < cmd_len; i++) {
-                        uint8_t b = cmd[i];
-                        if (b == 0)       /* stop at zero padding */
-                            break;
-                        rx_push(b);
-                    }
-                    note_rx_frame();
-                }
-#else
-                for (int i = 14; i < length; i++) {
-                    uint8_t b = buf[i];
-                    if (b == 0)           /* stop at zero padding */
-                        break;
-                    rx_push(b);
-                }
-                note_rx_frame();
-#endif
-            } else if (et == ETHERTYPE_NETCON && (to_us || bcast)) {
-                /* Reliable-datagram channel: NEVER feed these bytes into the
-                 * console ring (they are binary, not zero-terminated ASCII).
-                 * Hand the whole payload to netcon.c's parser instead. The
-                 * netcon frame header carries its own chunk_len, so — unlike
-                 * the console path — we pass the full Ethernet payload
-                 * (length - 14) and let netcon_rx_frame() figure out how much
-                 * of it (including the zero-padding tail) is real. */
-                netcon_rx_frame(buf + 14, (uint16_t)(length - 14));
-                note_rx_frame();
-            } else if (et == ETHERTYPE_SNAPNET && (to_us || bcast)) {
-                /* Bulk snapshot-stream channel: same "strip the 14-byte
-                 * Ethernet header, hand the rest to the module's own parser"
-                 * convention as netcon above. NEVER falls through to the
-                 * vnet_emac muxer below (that hook is for the ROADMAP C1
-                 * virtio-net device and expects IP-ish traffic, not our raw
-                 * framing). */
-                snapshot_net_rx_frame(buf + 14, (uint16_t)(length - 14));
-                note_rx_frame();
-            } else if (et == ETHERTYPE_DBGRAW && (to_us || bcast)) {
-                /* Raw dbgtools peek (see dbgtools.h): serviced HERE, directly
-                 * inside emac_poll(), so it answers regardless of whether
-                 * CPU1's for(;;) loop (smp.c) is currently inside
-                 * dbgmon_service() or gdbstub_poll()/command_loop() — both
-                 * call emac_poll() (via console_poll()/gdb_getc()) on every
-                 * pass, so this branch is reachable from either. */
-                dbgtools_rx_frame(buf + 14, (uint16_t)(length - 14));
-                note_rx_frame();
-            } else if (et != ETHERTYPE_CONSOLE && et != ETHERTYPE_NETCON &&
-                       et != ETHERTYPE_SNAPNET && et != ETHERTYPE_DBGRAW) {
+            /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
+            dbgauth_entropy(((uint64_t)status << 32) ^ (uint32_t)length);
+            int hv_et = (et == ETHERTYPE_CONSOLE || et == ETHERTYPE_NETCON ||
+                         et == ETHERTYPE_SNAPNET || et == ETHERTYPE_DBGRAW);
+            if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
+                /* consumed by the HV debug plane (see hv_rx_frame()) */
+            } else if (et != ETHERTYPE_CONSOLE &&
+                       (!hv_et || HV_LEGACY_ETYPES_TO_GUEST)) {
+
                 /* Not our debug protocol, not netcon: ROADMAP C1 hook —
                  * hand the whole frame to the virtio-net-over-EMAC
                  * multiplexer (vnet_emac.c) instead of silently dropping

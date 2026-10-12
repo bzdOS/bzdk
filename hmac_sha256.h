@@ -2,12 +2,9 @@
 
 /* hmac_sha256.h -- compact freestanding SHA-256 / HMAC-SHA256, no libc.
  *
- * Part of ROADMAP.md T5 ("HMAC on debug-protocol либо его compile-out") /
- * docs/security-notes.md option 1: a keyed-auth gate for the EMAC 0x88B5
- * debug console, built ONLY when -DDBG_AUTH is passed (see Makefile's
- * EXTRA_CFLAGS). Default build (no -DDBG_AUTH) never calls into this file's
- * logic from emac.c, so this header/its .o existing in DBG_OBJS is inert
- * unless the flag is set.
+ * Part of ROADMAP.md T5 / docs/security-notes.md: the keyed envelope that
+ * dbgauth.c puts on every LAN-facing HV debug channel. Built only under
+ * -DDBG_AUTH (on by default for `make dbg`; `DBG_NO_AUTH=1` opts out).
  *
  * No malloc, no floating point, no libc string.h dependency -- every helper
  * below is self-contained arithmetic over fixed-size local buffers, safe
@@ -27,6 +24,12 @@
 void hmac_sha256(const uint8_t *key, uint32_t key_len,
                   const uint8_t *msg, uint32_t msg_len,
                   uint8_t out[SHA256_DIGEST_LEN]);
+
+/* As hmac_sha256(), over the concatenation a | b. */
+void hmac_sha256_2(const uint8_t *key, uint32_t key_len,
+                   const uint8_t *a, uint32_t alen,
+                   const uint8_t *b, uint32_t blen,
+                   uint8_t out[SHA256_DIGEST_LEN]);
 
 /* Constant-time-ish compare of two 32-byte MACs (no early-out branch on the
  * first mismatching byte, to avoid a naive timing side channel over the LAN

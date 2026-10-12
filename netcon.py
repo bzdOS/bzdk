@@ -43,6 +43,8 @@ import socket
 import struct
 import binascii
 
+import hvauth
+
 IFACE = "br0"
 NC_ETHERTYPE = 0x88B6
 BOARD_MAC = bytes.fromhex("02bd05000001")
@@ -113,6 +115,22 @@ def _eth_frame(src_mac, dst_mac, payload):
     return dst_mac + src_mac + struct.pack("!H", NC_ETHERTYPE) + payload
 
 
+_channels = {}
+
+
+def _send_nc(sock, dst_mac, payload):
+    """Host -> board netcon frame through hvauth (authenticated envelope on
+    0x88B5 with the key file, else the legacy 0x88B6 frame). Wrapped afresh
+    on every call, so a retransmit carries a new counter instead of being a
+    replay. Board replies still arrive on 0x88B6 on `sock`."""
+    iface = sock.getsockname()[0]
+    ch = _channels.get(iface)
+    if ch is None:
+        ch = _channels[iface] = hvauth.Channel(iface)
+    ch.check_nak()
+    ch.send(hvauth.CH_NETCON, payload, dst=dst_mac)
+
+
 def _recv_one(sock, timeout):
     """Return one parsed+validated netcon frame (dict, plus 'chunk' bytes),
     or None if nothing matching arrives within `timeout` seconds. Drops
@@ -160,7 +178,6 @@ def send_blob(sock, blob, addr_hint=None, dst_mac=BOARD_MAC, verbose=True):
     have bailed out of its own bounded netcon_recv() timeout)."""
     if len(blob) > MAX_LEN:
         raise ValueError(f"blob too large: {len(blob)} > {MAX_LEN} (NETCON_MAX_LEN)")
-    src = sock.getsockname()[4]
     total = len(blob)
     off = 0
     seq = 0
@@ -174,11 +191,9 @@ def send_blob(sock, blob, addr_hint=None, dst_mac=BOARD_MAC, verbose=True):
         is_last = (off + len(chunk)) >= total
         flags = NC_FLAG_LAST if is_last else 0
         hdr = pack_hdr(NC_DATA, flags, seq, total, off, len(chunk), _crc32(chunk))
-        frame = _eth_frame(src, dst_mac, hdr + chunk)
-
         acked = False
         for _attempt in range(MAX_RETRIES):
-            sock.send(frame)
+            _send_nc(sock, dst_mac, hdr + chunk)
             reply = _recv_one(sock, ACK_TIMEOUT)
             if reply and reply["seq"] == seq:
                 if reply["type"] == NC_ACK:
@@ -214,7 +229,6 @@ def recv_blob(sock, timeout=RECV_IDLE_TIMEOUT, max_len=MAX_LEN, dst_mac=BOARD_MA
     handling), reassembles by offset, and stops on the LAST-flagged chunk or
     after `timeout` seconds of silence (a lost tail returns whatever arrived
     so far rather than hanging). Returns the reassembled bytes."""
-    src = sock.getsockname()[4]
     buf = bytearray()
     seen = set()
     total_len = None
@@ -229,7 +243,7 @@ def recv_blob(sock, timeout=RECV_IDLE_TIMEOUT, max_len=MAX_LEN, dst_mac=BOARD_MA
             break                      # refuse an absurd/garbage total_len
 
         ack = pack_hdr(NC_ACK, 0, h["seq"], total_len, 0, 0, 0)
-        sock.send(_eth_frame(src, dst_mac, ack))
+        _send_nc(sock, dst_mac, ack)
 
         if h["seq"] not in seen:
             seen.add(h["seq"])

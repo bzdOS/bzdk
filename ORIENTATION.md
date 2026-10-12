@@ -99,6 +99,14 @@ python3 bzdctl.py ledger          # the v1 "100 clean boots" gate counter
   exclusive at LINK TIME (a duplicate `bzdos_cpu3_owner` symbol), not merely by
   convention.
 
+## Debug-channel key
+
+The board image only accepts authenticated debug frames. Every host tool
+(hvdbg/triage/bzdctl/gdb-bridge/netcon/...) reads the shared key from
+`~/.config/bzdk/dbg.key` (never committed), and `make dbg`/`make hv-uimage`
+refuse to build without it. `python3 hvauth.py` checks the handshake; dbgmon
+`auth` shows the counters. Details: `docs/security-notes.md`.
+
 ## Talking to the guest
 
 ```sh

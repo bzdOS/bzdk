@@ -22,6 +22,7 @@
 #include "vcpu1.h"
 #include "vcpu3.h"
 #include "vinput.h"
+#include "dbgauth.h"
 #include "hv_addrmap.h"
 #include "hv_addrmap.h"
 
@@ -1785,6 +1786,28 @@ static void exec_line(char *line, struct el2_frame *frame)
 	}
 	if (streq(cmd, "t")) {
 		cmd_t();
+		return;
+	}
+	if (streq(cmd, "auth")) {
+		/* dbgauth.h counters, in enum order:
+		 * ok hello badtag replay nosess malformed legacy_ok legacy_drop
+		 * naks evict verify_ticks verify_len (hvauth.board_stats()) */
+		const volatile uint32_t *st = dbgauth_stats();
+		uint32_t i;
+#if defined(DBG_AUTH) && defined(DBG_AUTH_COMPAT)
+		const char *mode = "auth=compat";
+#elif defined(DBG_AUTH)
+		const char *mode = "auth=strict";
+#else
+		const char *mode = "auth=off";
+#endif
+		while (*mode)
+			dc_putc(*mode++);
+		for (i = 0; i < DBGAUTH_ST_N; i++) {
+			dc_putc(' ');
+			print_hex32(st[i]);
+		}
+		newline();
 		return;
 	}
 	if (streq(cmd, "gdb")) {

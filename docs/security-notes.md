@@ -1,212 +1,195 @@
-# Security notes: the debug protocol has no authentication (by default)
+# Security notes: the hypervisor's LAN-facing debug surfaces
 
-This started as a clear-eyed writeup of a known, accepted risk, per
-ROADMAP.md T5 ("Debug-протокол без аутентификации — любой в LAN может
-peek/poke память"). As of 2026-07-25 **both options named below are now
-implemented, each behind a compile flag that defaults OFF** — see
-"Implementation status" below. Everything above that heading describes the
-risk as it stands with NO flag set, which remains this project's default,
-unchanged build.
+Since 2026-10-12 the board image (`make dbg` / `make hv-uimage`) only acts on
+debug frames that carry a valid HMAC-SHA256 session envelope. Before that the
+whole debug plane was open to anyone on the board's L2 segment; that history
+and the threat it describes are kept at the end of this file because they
+still describe an image built with `DBG_NO_AUTH=1`.
 
-## What the protocol actually is
+## What is exposed, and to whom
 
-`emac.c`'s header comment describes it plainly: a from-scratch raw-Ethernet
-console, no IP stack, at **ethertype `0x88B5`** (`ETHERTYPE_CONSOLE` in
-`emac.c`). `dbgmon.c` services it as a tiny non-blocking, line-oriented
-command console running in the EL2 tick handler. The host-side client is
-`hvdbg.py`: it opens a raw `AF_PACKET` socket bound to that ethertype on a
-given interface (`br0` by default) and sends broadcast-destination frames —
-see `hvdbg.py`'s own module docstring and its `_send()` (broadcast dst MAC,
-plaintext command line, no envelope beyond the Ethernet header).
+The hypervisor owns four ethertypes on the EMAC:
 
-There is:
+| ethertype | channel | what a sender can do |
+|---|---|---|
+| `0x88B5` | dbgmon console / gdbstub RSP (`dbgmon.c`, `gdbstub.c`) | read/write any physical address (`r`/`w`), call any HV function (`call`), patch code, set breakpoints, reset the board |
+| `0x88B6` | netcon (`netcon.c`) | land bytes at an operator-chosen address during `netcon_recv()` |
+| `0x88B7` | dbgtools (`dbgtools.c`) | read CPU1 heartbeat, hold/release flags and the build id |
+| `0x88B8` | snapnet (`snapshot_net.c`) | write guest RAM during a snapshot restore |
 
-- **No authentication.** Any frame with ethertype `0x88B5` reaching the
-  hypervisor's EMAC RX path is serviced as a command, from whoever sent it.
-- **No encryption.** Commands and responses are plaintext ASCII on the wire.
-- **No source-address checking.** The protocol is framed as broadcast
-  (`BCAST_MAC`) by convention, not restricted to a specific host — anything
-  on the same L2 broadcast domain that sends a well-formed frame is treated
-  identically to the legitimate operator.
-- **A second sibling channel** at ethertype `0x88B6` (`ETHERTYPE_NETCON`,
-  the `netcon.c` reliable-datagram channel) shares the same "any L2 peer can
-  send" trust model.
+Everything on all four is now authenticated (below). The HV also transmits
+on `0x88B7` (coredump stream, `coredump.c`) and `0x88B9` (fbdump,
+`fbdump.c`); those are output only.
 
-## What an attacker on the same LAN segment could actually do
+## The envelope (`dbgauth.c`, `dbgauth.h`, host side `hvauth.py`)
 
-This is not a narrow information leak — the command set gives near-total
-control of the hypervisor:
+All host-to-HV debug traffic now travels on `0x88B5`, inside one envelope
+that names the channel in its authenticated header; after verification
+`emac.c`'s `hv_rx_frame()` dispatches it to the console ring, netcon,
+dbgtools or snapnet exactly as the bare ethertypes used to. Payload layout
+(after the 14-byte Ethernet header, integers big-endian):
 
-- **Arbitrary physical memory read/write** — `dbgmon.c`'s `r`/`rb` (read
-  words/bytes) and `w`/`wb` (write word/byte) commands take a raw physical
-  address with **no bounds or permission checking at all**
-  (`cmd_read_words`/`cmd_write_word` in `dbgmon.c` dereference the address
-  directly). This includes the guest's entire memory (stage-2 today is an
-  identity map covering all of guest DRAM — see `stage2.h`'s own isolation
-  caveat) and the hypervisor's own code, data, and breadcrumb/ring buffers.
-- **Arbitrary hypervisor function invocation** — the `call` command
-  (`cmd_call` in `dbgmon.c`) invokes any 4-argument function whose address
-  falls inside the HV's own `.text` section (validated against
-  `_text_start`/`_text_end` from `link.ld` — this one check *is* present).
-  In practice that still means calling any hypervisor-internal routine —
-  `musb_init`, `vconsole_dump`, `gic_timer_init`, register pokes via `sw`,
-  etc. — with attacker-chosen arguments. Combined with unrestricted memory
-  write, an attacker can stage arbitrary data in DRAM and then call a
-  function that acts on it.
-- **Guest control and DoS** — commands exist to set/clear hardware
-  breakpoints and watchpoints, single-step the guest, dump/alter guest
-  registers, inject bytes into the guest's virtual console RX (`vconsole_rx_push`,
-  used by the built-in `poweroff` command), and force a watchdog reset. An
-  attacker can freeze, corrupt, or repeatedly reboot the guest at will.
-- **No board-presence proof needed.** Because this is a raw L2 broadcast
-  protocol, anyone on the same LAN segment/VLAN/switch as the board — not
-  just someone with physical access — has all of the above. A compromised
-  or malicious host on the same network segment is equivalent to an
-  operator standing at the board's own debug console.
+    HELLO host->HV  00 'B' 'Z' 'K' | 01 | 00   | Nh[16]
+    CHAL  HV->host  00 'B' 'Z' 'K' | 02 | 00   | sess[4] | Sb[16] | Nh[16] | proof[16]
+    DATA  host->HV  00 'B' 'Z' 'K' | 03 | chan | sess[4] | ctr[8] | len[2] | tag[16] | inner[len]
+    NAK   HV->host  00 'B' 'Z' 'K' | 04 | chan | sess[4]
 
-## Scope of the exposure
+    Ks    = HMAC-SHA256(K, "BZK1/sess" | Sb | sess | Nh)
+    proof = HMAC-SHA256(K, "BZK1/chal" | Sb | sess | Nh)[:16]
+    tag   = HMAC-SHA256(Ks, payload[0..19] | inner)[:16]
 
-- **Blast radius:** the whole hypervisor and the whole guest VM. There is no
-  privilege separation inside the debug protocol itself — every command is
-  available to every sender.
-- **Network scope:** limited to whatever L2 broadcast domain the board's
-  EMAC is bridged into (`br0` on the host side, per `hvdbg.py`/`chimpd.py`).
-  Not routable/reachable from outside that segment without a bridging
-  misconfiguration elsewhere (e.g. a switch mirroring the broadcast domain,
-  or the host's `br0` including an untrusted uplink) — this document does
-  not evaluate any particular deployment's network topology, only the
-  protocol itself.
-- **Persistence:** none of this requires the attacker to have ever touched
-  the board; it's purely a network-reachability condition.
+- `K` is the shared key (see "The key" below). `Nh` is a fresh random host
+  nonce per handshake.
+- `Sb` is a **per-boot board nonce**. The HV derives it, keyed with `K`, on
+  the first HELLO of a boot from an entropy pool that has absorbed the
+  arrival time (CNTPCT, 41.7 ns resolution) of every frame received since
+  boot plus the duration of the PHY autoneg at init. There is no hardware RNG
+  in use; what matters here is that `Sb` does not repeat across boots, and
+  the arrival time of the first HELLO alone varies by far more than the
+  tick. Session numbers also start at a per-boot random value.
+- `ctr` must strictly increase within a session. Up to 16 sessions are live
+  at once (several host tools run concurrently: triage, the console
+  followers, gdb-bridge); a 17th HELLO evicts the least recently used.
+- **Replay across reboots** fails because a frame from an earlier boot names
+  a session (and so a key derived from an earlier `Sb`) that this boot never
+  issued. **Replay within a boot** fails on `ctr`. A replayed HELLO creates a
+  new session with a new key, so it does not reopen an old one. Nothing is
+  persisted, and nothing resets to a predictable state at boot -- the old
+  `DBG_AUTH` counter that restarted at 0 on every boot is gone.
+- A DATA frame naming an unknown session or carrying a bad tag is answered
+  with a NAK to its source MAC (at most one per 20 ms); `hvauth.py` then
+  re-handshakes on its next frame. That is how long-lived host tools (the
+  `bzdctl.py console --follow` followers, gdb-bridge) survive an HV reload.
+- The leading `0x00` keeps every envelope invisible to the host's text
+  console readers, which cut each frame at the first NUL.
+- Counters: dbgmon `auth` prints the mode (`strict`/`compat`/`off`) and
+  `ok hello badtag replay nosess malformed legacy_ok legacy_drop naks evict
+  verify_ticks verify_len`; `hvauth.board_stats(hv)` parses it.
 
-## Future work (named in ROADMAP.md, not decided or implemented here)
+What the envelope does **not** do: it does not encrypt (commands and replies
+are readable on the wire) and the HV's replies are not authenticated (a LAN
+host can forge console output or NAKs -- a nuisance, not a way in). It does
+not rate-limit HELLOs; a LAN host can churn the session table and force the
+real tools to re-handshake (denial of service only).
 
-ROADMAP.md T5 names exactly two options; both remain open project-owner
-decisions, not something this pass implements:
+### Build modes (Makefile)
 
-1. **Add authentication to the protocol** — e.g. an HMAC over each frame
-   with a pre-shared key, replay protection (sequence numbers/nonces), and
-   probably scoping down the unrestricted `r`/`w`/`call` primitives with
-   some notion of allowed ranges. This is a real protocol-design change
-   that needs live board testing to get the framing/timing right (the
-   console is serviced from a tick handler with no blocking I/O) — not
-   something to bolt on without hardware validation.
-2. **Compile it out entirely for a "prod" build** — i.e. a build target
-   that omits `dbgmon.c`/`emac.c`'s console path (or the whole EMAC debug
-   plane) so the LAN-facing surface doesn't exist at all outside a
-   debug/dev image. This trades away the project's headline feature (debug
-   a fallen guest over the network without physical access) for the
-   hardened build, so it's a product-shape decision, not a pure
-   engineering one.
+    make hv-uimage                      # DEFAULT: auth only ("strict")
+    make hv-uimage DBG_AUTH_COMPAT=1    # transition: auth + legacy, legacy counted
+    make dbg DBG_NO_AUTH=1              # explicit opt-out (QEMU/CI): legacy, open
+    make dbg EXTRA_CFLAGS=-DPROD_NO_DBG # nothing accepted on any HV ethertype
 
-Absent either flag (i.e. the project's default build), treat any board
-running this hypervisor as fully open to anyone on its LAN segment — the
-same trust level as an unlocked physical debug console, just reachable
-without a cable.
+In strict mode an unauthenticated frame on `0x88B5`..`0x88B8` is counted
+(`legacy_drop`) and dropped; `0x88B6`..`0x88B8` stop being HV channels on
+receive and are handed to the guest like any other ethertype (`0x88B7` and
+`0x88B8` are public IEEE assignments -- OUI-extended and IEC 61850 GOOSE --
+that the HV used to swallow). Only the `dbg` target gets auth by default;
+`gdb`, `repl`, `dual` and the other images still speak the legacy protocol.
 
-## Implementation status (2026-07-25)
+### The key
 
-Both options above are now implemented, board-side, each behind a
-DEFAULT-OFF compile flag. **Neither has been exercised on live hardware
-yet** — board testing was explicitly deferred for this pass (the board was
-in concurrent use for HDMI work); everything below is build-verified only
-(`make clean && make dbg [EXTRA_CFLAGS=...]`, `make gdb`, `make qemu`,
-`make test` all green, and the default no-flag `make dbg`/`make gdb`
-binaries are confirmed **byte-for-byte identical** to before this change —
-see the git history for the commit that landed this).
+`$(DBG_AUTH_KEY_FILE)`, default `~/.config/bzdk/dbg.key`: 16..64 random bytes
+as hex, mode 600, never committed. Create it with
 
-### Option 2 — prod compile-out: `-DPROD_NO_DBG`
+    mkdir -p ~/.config/bzdk && umask 077 && \
+      python3 -c "import secrets; print(secrets.token_hex(32))" > ~/.config/bzdk/dbg.key
 
-The simplest, highest-assurance lockout. Two gates, belt-and-suspenders:
+The build renders it into the untracked, gitignored `dbg_auth_key.h` (never
+onto a compiler command line, so it is not in `.flagstamp` or `ps`); a
+missing key file stops the build with an error naming the opt-out. Host
+tools read the same file through `hvauth.py` (`$BZDK_DBG_KEY_FILE`
+overrides the path, `HV(key=...)` / `gdb-bridge.py --key` override the
+file). Rotating the key = new file, rebuild, redeploy; the host tools pick
+it up on their next start.
 
-- **`emac.c`, RX-accept edge** (`emac_poll()`'s `ETHERTYPE_CONSOLE` branch):
-  under `-DPROD_NO_DBG` the branch drops the frame outright — not one byte
-  of it is pushed into the byte ring `dbgmon.c`'s `console_getc()`/
-  `gdbstub.c`'s `gdb_getc()` read from. This alone makes both `dbgmon.c`'s
-  command dispatch AND `gdbstub.c` (which shares the exact same RX byte
-  ring — confirmed by reading `gdbstub.c`'s `gdb_getc()` contract) fully
-  unreachable: no bytes ever arrive for either to act on.
-- **`dbgmon.c`'s `exec_line()`**: also gated directly (early-return before
-  tokenizing/dispatch) as defense in depth, in case some other path ever
-  feeds the console ring. This includes the `gdb` hand-off command itself
-  (the one dbgmon.c command that would otherwise switch the channel over to
-  `gdbstub.c`), so under this flag the RSP hand-off cannot happen either.
+**The key is in the HV image.** `microkernel-dbg.uimg` is served by
+`in.tftpd -s /opt/bzdos/tftpboot` to anyone who can reach the host's TFTP
+port, and the binary contains the key, so anyone on the LAN who fetches the
+image can extract it. The envelope protects against LAN peers only once the
+TFTP server is restricted to the board (host firewall rule for udp/69 from
+the board's U-Boot address only) or the image is delivered another way.
+This is the most important open item.
 
-Net effect: the board still runs everything else (guest, HDMI, virtio,
-netcon, snapshot-net, ...) completely unchanged; only the `dbgmon`/`gdb`
-peek/poke/call/step/breakpoint surface on ethertype `0x88B5` is gone. Build:
+### Host tools
 
-    make clean && make dbg EXTRA_CFLAGS=-DPROD_NO_DBG
+Every host tool that sends to the HV goes through `hvauth.Channel`:
+`hvdbg.py` (and through it `triage.py`, `orient.py`, `bzdctl.py`,
+`bmc_client.py`, `safemode.py`, `screenshot.py`, `reliable_load.py`,
+`vetrace.py`), `gdb-bridge.py` (and `gdbstub_client.py`), `rsp_bridge.py`,
+`chimpd.py`'s `NetCon`, `netcon.py`, `snapshot_net.py`. With the key file
+present a tool authenticates; if the board does not answer the handshake at
+all (an older image) the tool falls back to legacy frames with a warning,
+which an auth-only image ignores, so a rollback to an older image stays
+debuggable. `BZDK_DBG_AUTH=require` turns the fallback off, and
+`BZDK_DBG_NOAUTH=1` forces legacy frames (for a `DBG_NO_AUTH=1` image).
+`push.py`, `hotload.py`, `repl-client.py` and `repl-cmd.py` talk to the
+`repl` image, which is not authenticated, and are unchanged.
+`gdb-bridge.py` now listens on 127.0.0.1 by default (it used to listen on
+0.0.0.0, which would have handed the authenticated channel to the LAN).
 
-### Option 1 — keyed auth: `-DDBG_AUTH` (+ optional `-DDBG_AUTH_KEY="..."`)
+### Replies: unicast instead of broadcast
 
-A shared-secret HMAC-SHA256 gate on the same `emac.c` RX-accept edge, so a
-console frame is only pushed onto the byte ring (for `dbgmon.c` OR
-`gdbstub.c` — same single choke point as above) if it carries a valid MAC
-over a strictly-increasing nonce.
+Everything the HV originates -- console text, netcon/dbgtools/snapnet
+replies, coredump and fbdump streams -- goes to the source MAC of the last
+accepted debug frame (`emac.c` `reply_dst()`), so a session's output is no
+longer shown to the whole segment. HELLO answers and NAKs go to the
+requester. Broadcast remains only until the first accepted frame of a boot:
+the boot log, and a panic or coredump before any host has spoken, still
+have to reach the operator's console follower, which cannot have announced
+itself yet. The dbgtools probe no longer answers unauthenticated requests,
+so the build id is not handed to anyone who asks.
 
-**Wire envelope** (the frame payload, i.e. bytes right after the 14-byte
-Ethernet header — see `emac.c`'s `dbg_auth_check()` doc comment):
+### Cost (measured on the board, 2026-10-12)
 
-    [0..7]   nonce   8 bytes, big-endian uint64, STRICTLY INCREASING
-    [8..39]  mac     32 bytes, HMAC-SHA256(key, nonce || cmd)
-    [40..]   cmd     command bytes — same zero-padded-ASCII convention the
-                     unauthenticated protocol already used
+dbgauth records the CNTPCT ticks its last tag check took (`verify_ticks`,
+24 MHz). Minimum of six samples per size:
 
-- **Replay protection**: a single monotonic `g_dbg_auth_last_nonce` in
-  `emac.c`, reset to 0 at boot; only nonces strictly greater than the last
-  *accepted* one are honored. This is single-client-shaped (matches the
-  existing "one operator on the link at a time" model of this protocol) —
-  it does not attempt to arbitrate between two host tools signing frames
-  concurrently with independently-seeded nonces.
-- **HMAC-SHA256 implementation**: `hmac_sha256.c`/`.h`, a compact freestanding
-  FIPS 180-4 SHA-256 core + RFC 2104 HMAC wrapper — no libc, no malloc, no
-  float, plain fixed-size-buffer arithmetic (same constraints as the rest of
-  the tree, `-ffreestanding -mgeneral-regs-only`). Verified against the RFC
-  4231 HMAC-SHA256 test vectors on the host (gcc, x86_64) before board-side
-  integration — both vectors matched exactly. The entire translation unit is
-  wrapped in `#if defined(DBG_AUTH)` so linking `hmac_sha256.o`
-  unconditionally into `DBG_OBJS` (Makefile requires new dbg-build objects be
-  appended there) is a true no-op — zero bytes added — when the flag isn't set.
-- **Key**: `-DDBG_AUTH_KEY="your-shared-secret"` (falls back to an
-  obviously-fake default, `CHANGE-ME-bzdOS-dbg-auth-default-key`, only so the
-  build-verify matrix compiles without a key — **never ship that default**).
+| inner bytes | 5 | 64 | 128 | 256 | 512 | 1005 |
+|---|---|---|---|---|---|---|
+| verify, us | 18.6 | 23.6 | 27.0 | 34.2 | 47.5 | 76.0 |
 
-Build (note the escaped inner quotes — `DBG_AUTH_KEY` expands to a C string
-literal, so the value itself needs to arrive at the compiler already
-quoted):
+About 18 us fixed plus 0.057 us per byte, so a full snapnet frame (1416
+bytes) costs about 100 us on CPU1. At the link's measured inbound ceiling
+(~170 KB/s, ~120 such frames per second) that is about 1.2% of CPU1; a
+dbgmon command adds ~20 us to a round trip of ~70 ms. A session handshake
+is one extra round trip per tool start. Not optimised further: the per-
+session HMAC pad states could be cached to save about 3 us per frame.
 
-    make clean && make dbg EXTRA_CFLAGS='-DDBG_AUTH -DDBG_AUTH_KEY=\"your-shared-secret\"'
+### Verified on hardware (2026-10-12)
 
-Host side: `hvdbg.py`'s `HV(key="<hex>")` and `gdb-bridge.py`'s `--key <hex>`
-sign every outgoing frame with the matching envelope when a key is passed;
-omitting `key`/`--key` (the default) sends byte-for-byte the same
-unauthenticated frames as always — neither tool's default code path changed.
+Staged deploy: a `DBG_AUTH_COMPAT=1` image first, all host tools switched to
+the envelope while `legacy_ok` was watched until it stopped moving (it found
+two long-running `bzdctl.py console --follow` processes with the old code,
+restarted), then the strict image. On the strict image: triage, `bzdctl.py status`,
+orient's HV section, hvdbg read/write, dbgtools peek, gdb-bridge (`$?` ->
+`T05`, `$g`, `$D`) all work (`bzdctl.py status` and orient only while the
+two console followers are paused: every host tool shares one console, and a
+follower's `dbg>` prompt ends another tool's reply drain early -- this
+predates the envelope); an unauthenticated frame on each of `0x88B5`..`0x88B8`, broadcast
+and unicast, is dropped (`legacy_drop` +1, a `w` it carried did not execute,
+no DBGT reply); an authenticated frame on each channel replayed byte for byte
+is rejected (`replay` +1, no effect); a forged tag is rejected (`badtag` +1,
+NAK); authenticated frames saved on one boot and sent after an HV reload are
+rejected (`nosess`); replies carry the host's MAC as destination.
+`test_dbgauth` (in `make test`) and `hvauth.py --selftest` check the same
+DATA vector from both sides.
 
-**Known limitations / follow-ups** (not board-tested, listed honestly):
+## Before 2026-10-12, and any `DBG_NO_AUTH=1` image
 
-- Scoped to the `dbg` (dbgmon) Makefile target's object list (`DBG_OBJS`),
-  per this pass's explicit constraint ("add to `DBG_OBJS` only"). The
-  standalone `gdb` (gdbstub-only) build target's own object list
-  (`GDB_OBJS`) does NOT yet list `hmac_sha256.o`, so
-  `make gdb EXTRA_CFLAGS=-DDBG_AUTH` currently fails to link (undefined
-  reference to `hmac_sha256`/`hmac_sha256_equal`) — plain `make gdb` (no
-  flags, the build-verify requirement for this pass) is unaffected and
-  green. Extending `DBG_AUTH` to the `gdb` target only needs appending
-  `hmac_sha256.o` to `GDB_OBJS` — left as a follow-up.
-- Replay protection is a single global counter, not per-peer — fine for the
-  existing single-operator link model, not a general multi-client design.
-- Framing/timing has NOT been validated live: the console is serviced from
-  a non-blocking tick handler (see `dbgmon.c`'s header comment), and this
-  gate now does an HMAC computation on that same path for every accepted
-  frame. It's a small, fixed-size computation (one to a few SHA-256 blocks
-  per command line) so it's expected to be cheap, but "expected" is not
-  "measured on hardware" — that measurement is the deferred board-testing
-  step.
-- The staged per-frame command buffer in `dbg_auth_check()` is capped at 300
-  bytes (covers `gdb-bridge.py`'s 256-byte RSP chunk size and `dbgmon.c`'s
-  128-byte line cap with headroom); a command frame carrying more payload
-  than that is truncated before hashing, which would only ever cause a
-  legitimate oversized frame to fail its own MAC check (fails closed, not
-  open) — but it means DBG_AUTH does not currently support arbitrarily large
-  single frames.
+The legacy protocol has no authentication, no encryption and no source
+checking. Any frame on `0x88B5` reaching the EMAC is serviced as a dbgmon
+command, which means arbitrary physical memory read/write (`r`/`rb`/`w`/`wb`
+dereference the address with no checks), calling any function in the HV's
+`.text` with chosen arguments, breakpoints, single-step, register edits,
+console injection into the guest and a watchdog reset -- the whole
+hypervisor and the whole guest. `0x88B6` lets a sender land bytes during a
+`netcon_recv()`, `0x88B8` writes guest RAM during a snapshot restore, and a
+broadcast `0x88B7` probe returned the build id to anyone. All HV output was
+broadcast. Treat such a board as an unlocked physical debug console that is
+reachable from the whole L2 segment.
+
+The first attempt at option 1 (`-DDBG_AUTH`, 2026-07-25) only gated
+`0x88B5`, used a single replay counter that restarted at 0 on every boot (a
+frame captured before a reboot replayed after it), compiled in a placeholder
+key when none was given, and was never enabled or tested on hardware. It is
+replaced by the envelope above.

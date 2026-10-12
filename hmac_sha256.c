@@ -7,16 +7,10 @@
  */
 #include "hmac_sha256.h"
 
-/* This whole translation unit is a no-op unless -DDBG_AUTH is set: emac.c
- * only ever calls into it from behind its own matching #if defined(DBG_AUTH)
- * gate (see emac.c's dbg_auth_check()), and the Makefile's DBG_OBJS/GDB_OBJS
- * lists link hmac_sha256.o UNCONDITIONALLY (append-only, no per-flag object
- * selection). Without this guard, the default (no -D) `make dbg`/`make gdb`
- * builds would silently grow by this file's compiled code -- dead, unreached
- * code, but still bytes added to .text -- which breaks the "default build is
- * byte-for-byte unchanged" requirement (ROADMAP T5). Guarding the entire body
- * keeps the object file empty (no symbols) in every build that doesn't ask
- * for DBG_AUTH, so linking it in is a true no-op. */
+/* Compiled only under -DDBG_AUTH (the `dbg` default since 2026-10-12, see
+ * the Makefile's DBG_NO_AUTH opt-out): its one caller is dbgauth.c, which
+ * has the same gate, and hmac_sha256.o is linked unconditionally, so in an
+ * opt-out build this object stays empty. */
 #if defined(DBG_AUTH)
 
 /* ------------------------------------------------------------------ *
@@ -178,13 +172,16 @@ static void sha256_final(struct sha256_ctx *c, uint8_t out[SHA256_DIGEST_LEN])
  * HMAC-SHA256 (RFC 2104), built on the core above.
  * ------------------------------------------------------------------ */
 
-void hmac_sha256(const uint8_t *key, uint32_t key_len,
-                  const uint8_t *msg, uint32_t msg_len,
-                  uint8_t out[SHA256_DIGEST_LEN])
+/* HMAC-SHA256 over the concatenation a[0..alen) | b[0..blen), without
+ * staging the two parts in one buffer (dbgauth.c tags a header plus a
+ * payload that sits right behind it in the RX DMA buffer). */
+void hmac_sha256_2(const uint8_t *key, uint32_t key_len,
+                   const uint8_t *a, uint32_t alen,
+                   const uint8_t *b, uint32_t blen,
+                   uint8_t out[SHA256_DIGEST_LEN])
 {
 	uint8_t k0[SHA256_BLOCK_LEN];
-	uint8_t ipad[SHA256_BLOCK_LEN];
-	uint8_t opad[SHA256_BLOCK_LEN];
+	uint8_t pad[SHA256_BLOCK_LEN];
 	uint8_t inner_hash[SHA256_DIGEST_LEN];
 	struct sha256_ctx ctx;
 	uint32_t i;
@@ -203,22 +200,30 @@ void hmac_sha256(const uint8_t *key, uint32_t key_len,
 			k0[i] = key[i];
 	}
 
-	for (i = 0; i < SHA256_BLOCK_LEN; i++) {
-		ipad[i] = (uint8_t)(k0[i] ^ 0x36u);
-		opad[i] = (uint8_t)(k0[i] ^ 0x5cu);
-	}
-
-	/* inner = H(ipad || msg) */
+	/* inner = H((k0 ^ ipad) || a || b) */
+	for (i = 0; i < SHA256_BLOCK_LEN; i++)
+		pad[i] = (uint8_t)(k0[i] ^ 0x36u);
 	sha256_init(&ctx);
-	sha256_update(&ctx, ipad, SHA256_BLOCK_LEN);
-	sha256_update(&ctx, msg, msg_len);
+	sha256_update(&ctx, pad, SHA256_BLOCK_LEN);
+	sha256_update(&ctx, a, alen);
+	if (blen)
+		sha256_update(&ctx, b, blen);
 	sha256_final(&ctx, inner_hash);
 
-	/* outer = H(opad || inner) */
+	/* outer = H((k0 ^ opad) || inner) */
+	for (i = 0; i < SHA256_BLOCK_LEN; i++)
+		pad[i] = (uint8_t)(k0[i] ^ 0x5cu);
 	sha256_init(&ctx);
-	sha256_update(&ctx, opad, SHA256_BLOCK_LEN);
+	sha256_update(&ctx, pad, SHA256_BLOCK_LEN);
 	sha256_update(&ctx, inner_hash, SHA256_DIGEST_LEN);
 	sha256_final(&ctx, out);
+}
+
+void hmac_sha256(const uint8_t *key, uint32_t key_len,
+                  const uint8_t *msg, uint32_t msg_len,
+                  uint8_t out[SHA256_DIGEST_LEN])
+{
+	hmac_sha256_2(key, key_len, msg, msg_len, msg, 0, out);
 }
 
 int hmac_sha256_equal(const uint8_t a[SHA256_DIGEST_LEN],

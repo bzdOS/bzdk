@@ -19,25 +19,17 @@ Usage:
         0x46000000, 0x44abe252, 0x46abe252, 48)
     hv.reenter_guest()               # restart guest without board reset
 
-DBG_AUTH (ROADMAP T5, optional — docs/security-notes.md option 1): if the
-board was built with -DDBG_AUTH (see Makefile/emac.c's dbg_auth_check()), it
-only acts on console frames carrying a valid HMAC-SHA256 envelope. Pass the
-same key here to talk to such a board:
-
-    hv = HV(key="a1b2c3...")         # hex-encoded key, same bytes as the
-                                      # board's -DDBG_AUTH_KEY="..."
-    hv.cmd('gr')                     # frames are now signed automatically
-
-Passing NO key (the default) sends byte-for-byte the same unauthenticated
-frames as always -- nothing about this class's default behavior changed.
-Only pass `key` when talking to a board actually built with -DDBG_AUTH and
-that board's own -DDBG_AUTH_KEY; a default (no-flag) board has no envelope
-parser at all, so signed frames sent to it would just show up as a command
-line starting with 40 bytes of binary junk (harmless -- console_getc()'s
-own zero-terminated-line convention still applies, it'd just be gibberish).
+Authentication (docs/security-notes.md, hvauth.py): every frame this class
+sends goes through hvauth.Channel. With the shared key in
+~/.config/bzdk/dbg.key (or $BZDK_DBG_KEY_FILE) -- the default -- it opens
+an authenticated session with the board and wraps every command in the
+envelope the `dbg` image requires. `HV(key="hex...")` overrides the file;
+with no key at all the legacy unauthenticated frames go out (only an image
+built with DBG_NO_AUTH=1 still accepts those).
 """
-import os, sys, socket, struct, time, re, subprocess, hmac, hashlib
+import os, sys, socket, struct, time, re, subprocess
 import bzd_board as B
+import hvauth
 
 IFACE     = B.IFACE
 ETYPE     = B.ETYPE
@@ -45,21 +37,11 @@ BOARD_MAC = B.BOARD_MAC
 BCAST     = B.BCAST
 CSI       = re.compile(rb'\x1b\[[0-9;?]*[a-zA-Z]')
 
-# DBG_AUTH wire envelope (must match emac.c's dbg_auth_check() exactly):
-#   [0:8]   nonce, 8 bytes big-endian uint64, strictly increasing
-#   [8:40]  mac,   32 bytes HMAC-SHA256(key, nonce || cmd)
-#   [40:]   cmd,   the command bytes, unchanged from the unauthenticated wire
-DBG_AUTH_NONCE_LEN = 8
-DBG_AUTH_MAC_LEN   = 32
-
 class HV:
     """Connection to the running hypervisor debug monitor over EMAC."""
     def __init__(self, iface=IFACE, timeout=3, key=None):
-        """`key`: optional hex string. When None (the default), behavior is
-        UNCHANGED from before DBG_AUTH existed -- plain unauthenticated
-        frames. When set, every outgoing frame is signed per the DBG_AUTH
-        envelope above; only meaningful against a board built with
-        -DDBG_AUTH and the SAME key (see emac.c/Makefile)."""
+        """`key`: optional hex string overriding the key file (see the
+        module docstring and hvauth.py)."""
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                   socket.htons(ETYPE))
         self.sock.bind((iface, ETYPE))
@@ -72,34 +54,18 @@ class HV:
                                    # so it NEVER receives frames of any other
                                    # ethertype no matter what's on the wire.
         self.timeout = timeout
-        self._auth_key = bytes.fromhex(key) if key else None
-        # Any strictly-increasing start point works (the board's own replay
-        # counter resets to 0 at boot); seed from the wall clock so re-
-        # running this script never re-uses a nonce from an earlier run.
-        self._nonce = time.time_ns()
+        self.auth = hvauth.Channel(iface, key=key)
         self._drain(0.3)
 
     def close(self):
         try: self.sock.close()
         except: pass
+        self.auth.close()
 
     # ── low-level ──────────────────────────────────────────────────────
-    def _sign(self, cmd_bytes):
-        """Build the DBG_AUTH envelope for `cmd_bytes` (see module
-        docstring). Only called when self._auth_key is set."""
-        self._nonce += 1
-        nonce = self._nonce.to_bytes(DBG_AUTH_NONCE_LEN, "big")
-        mac = hmac.new(self._auth_key, nonce + cmd_bytes, hashlib.sha256).digest()
-        assert len(mac) == DBG_AUTH_MAC_LEN
-        return nonce + mac + cmd_bytes
-
     def _send(self, text):
         p = (text + "\r").encode("latin1", "replace")
-        if self._auth_key is not None:
-            p = self._sign(p)
-        if len(p) < 46:
-            p += b"\x00" * (46 - len(p))
-        self.sock.send(BCAST + self.src_mac + struct.pack("!H", ETYPE) + p)
+        self.sock.send(self.auth.frame(hvauth.CH_CONSOLE, p))
 
     def _drain(self, secs, early_prompt=b"dbg>"):
         """Collect board replies for up to `secs` seconds. Exits EARLY when
@@ -127,13 +93,22 @@ class HV:
         if wait is None: wait = self.timeout
         self._drain(0.05)  # quick flush (was 0.2 — too slow)
         self._send(command)
-        return self._drain(wait).decode("latin1", "replace")
+        r = self._drain(wait)
+        if not r and self.auth.check_nak():
+            # the board forgot our session (it rebooted): re-handshake once
+            self._send(command)
+            r = self._drain(wait)
+        return r.decode("latin1", "replace")
 
     def alive(self, timeout=2):
         """Quick liveness check."""
         self._drain(0.1)
         self._send("t")
-        return bool(self._drain(timeout).strip())
+        r = self._drain(timeout).strip()
+        if not r and self.auth.check_nak():
+            self._send("t")
+            r = self._drain(timeout).strip()
+        return bool(r)
 
     # dbgmon's `r` reply is drained as a stream of EMAC frames; measured
     # live 2026-07-29 on this board: n=4, n=256 and n=512 all complete in
@@ -613,10 +588,11 @@ class HV:
             s.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
             self._dbgraw_sock = s
         sock = self._dbgraw_sock
-        frame = (BCAST + self.src_mac +
-                 struct.pack("!H", self.DBGRAW_ETHERTYPE) +
-                 b"\x00" * 46)
         for _ in range(tries):
+            # a fresh envelope per try (each carries a new counter); the
+            # request itself has no fields
+            self.auth.check_nak()
+            frame = self.auth.frame(hvauth.CH_DBGTOOLS, b"")
             sock.settimeout(0.02)
             try:
                 while True:

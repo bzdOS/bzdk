@@ -437,7 +437,7 @@ Deep dives, all in this tree:
 | `snapshot-restore-design.md` / `-integration.md` | guest checkpoint/restore |
 | `guest-dtb.md` | what is authoritative about the guest's DTB, and how to edit it (never `dtc`) |
 | `guest-rootfs-persistence.md` / `guest-ro-root.md` | guest rootfs layout and the read-only-root variant |
-| `security-notes.md` | the debug protocol has no authentication, by default — and what that means |
+| `security-notes.md` | how the debug channels are authenticated (key, envelope, build modes) and what is still open |
 | `qemu-ci.md` | the board-free QEMU `virt` target |
 | `sessions/` | frozen session snapshots, including `SESSION-HANDOFF.md` |
 
@@ -559,10 +559,10 @@ patching anything on disk), `BRING-UP.md`, `TOOLCHAIN.md`,
 
 - **72 h soak is the last open numeric gate.** Everything else in ROADMAP §2 is
   closed or cannot be self-certified.
-- **The debug protocol has no authentication.** Anyone on the LAN can peek and
-  poke memory over ethertype `0x88B5`. `hmac_sha256.c` exists; the two options
-  (HMAC on the protocol, or compiling it out of a "prod" build) are named in
-  `docs/security-notes.md` and not yet chosen.
+- **The debug key ships inside the HV image.** The board image authenticates
+  every debug frame (HMAC-SHA256 sessions, `docs/security-notes.md`), but the
+  key is compiled in and the image is served over TFTP: until TFTP is limited
+  to the board, a LAN host can fetch the image and extract the key.
 - **One SoC, one board.** Pins are hardcoded for the A64. QEMU-virt is the second
   target and it models no caches, which is exactly the class of bug the hardware
   keeps finding.

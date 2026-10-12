@@ -58,6 +58,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import netcon  # noqa: E402  (see module docstring: reused unmodified)
+import hvauth  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # Constants — MUST mirror snapshot_net.h / snapshot.h exactly (same
@@ -352,12 +353,15 @@ def _cli_push(args):
           f"({len(chunks) * CHUNK / (1024 * 1024):.1f} MiB) to send")
 
     bulk_sock, src = open_bulk_socket(iface)
+    bulk_auth = hvauth.Channel(iface)
     nc_sock, _ = netcon.open_netcon_socket(iface)
 
     def send_chunk(seq):
         data = chunks[seq]
         hdr = pack_hdr(seq, len(data), _crc32(data))
-        bulk_sock.send(_eth_frame(src, BOARD_MAC, hdr + data))
+        # hvauth: authenticated envelope on 0x88B5 (key file), else the
+        # legacy 0x88B8 frame -- see hvauth.py
+        bulk_auth.send(hvauth.CH_SNAPNET, hdr + data, dst=BOARD_MAC)
 
     print("[snapnet] streaming bulk pass -- make sure snapshot_net_recv() "
           "is already running (or about to run) on the board")

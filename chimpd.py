@@ -49,6 +49,7 @@ USAGE:
 """
 import os, sys, time, re, socket, struct, select, subprocess, argparse, signal
 import bzd_board as B
+import hvauth
 
 # ── load loady_over_acm as a library (USB serial + TFTP preflight) ──────────
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -170,12 +171,13 @@ class NetCon:
         self.sock.bind((IFACE, ETYPE))
         self.src_mac = self.sock.getsockname()[4]
         self.sock.settimeout(0.3)
+        self.auth = hvauth.Channel(IFACE)
 
     def send_cmd(self, text):
-        p = (text + "\r").encode("latin1", "replace")
-        if len(p) < 46:
-            p += b"\x00" * (46 - len(p))
-        self.sock.send(BCAST + self.src_mac + struct.pack("!H", ETYPE) + p)
+        # hvauth: authenticated envelope with the key file (see hvauth.py)
+        self.auth.check_nak()
+        self.auth.send(hvauth.CH_CONSOLE,
+                       (text + "\r").encode("latin1", "replace"))
 
     def drain(self, secs):
         """Collect all board replies for `secs` seconds."""

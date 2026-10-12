@@ -25,6 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hvdbg import HV, BCAST, BOARD_MAC, ETYPE  # noqa: E402
+import hvauth  # noqa: E402
 
 PORT = 12345
 
@@ -60,12 +61,10 @@ def main():
                 print("gdb closed", flush=True)
                 break
             if data:
+                hv.auth.check_nak()
                 for off in range(0, len(data), 64):
-                    chunk = data[off:off + 64]
-                    if len(chunk) < 46:
-                        chunk = chunk + b"\x00" * (46 - len(chunk))
-                    hv.sock.send(BCAST + hv.src_mac +
-                                 struct.pack("!H", ETYPE) + chunk)
+                    # hvauth: authenticated envelope (or legacy, padded)
+                    hv.auth.send(hvauth.CH_CONSOLE, data[off:off + 64])
         except socket.timeout:
             pass
 

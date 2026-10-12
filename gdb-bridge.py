@@ -29,21 +29,20 @@ Then, on the host:
 See docs/gdbstub-design.md for the full protocol and the PSTATE.D / watchdog
 caveats around when a live attach is viable.
 
-DBG_AUTH (ROADMAP T5, optional — docs/security-notes.md option 1): if the
-board was built with -DDBG_AUTH, pass the same key here so RSP frames are
-accepted:
-    sudo ./gdb-bridge.py --key a1b2c3...
-Omitting --key (the default) sends byte-for-byte the same unauthenticated
-frames as before -- nothing about the default path changed.
+Authentication: frames go through hvauth.Channel, i.e. inside the
+authenticated session envelope keyed by ~/.config/bzdk/dbg.key (or
+$BZDK_DBG_KEY_FILE); --key HEX overrides the file. The TCP side listens on
+127.0.0.1 only by default -- an open port here would hand the authenticated
+channel to anyone who can reach it (--bind to change that deliberately).
 """
 import argparse
-import hashlib
-import hmac
 import selectors
 import socket
 import struct
 import sys
 import time
+
+import hvauth
 
 ETYPE     = 0x88B5
 BOARD_MAC = bytes.fromhex("02bd05000001")
@@ -51,51 +50,28 @@ BCAST     = b"\xff" * 6
 CHUNK     = 256          # keep each frame's payload under one Ethernet frame
 MINPAY    = 46           # Ethernet minimum payload; board pads/relies on this
 
-# DBG_AUTH wire envelope (must match emac.c's dbg_auth_check() exactly):
-#   [0:8]   nonce, 8 bytes big-endian uint64, strictly increasing
-#   [8:40]  mac,   32 bytes HMAC-SHA256(key, nonce || cmd)
-#   [40:]   cmd,   the frame's payload bytes, unchanged from the plain wire
-DBG_AUTH_NONCE_LEN = 8
-DBG_AUTH_MAC_LEN   = 32
-
-
 class EmacLink:
     """Raw-Ethernet 0x88B5 link to the board, mirroring hvdbg.py."""
 
     def __init__(self, iface, key=None):
-        """`key`: optional hex string (see module docstring). None (the
-        default) is byte-for-byte the pre-DBG_AUTH behavior."""
+        """`key`: optional hex string overriding the key file."""
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                   socket.htons(ETYPE))
         self.sock.bind((iface, ETYPE))
         self.src_mac = self.sock.getsockname()[4]
         self.sock.setblocking(False)
-        self._auth_key = bytes.fromhex(key) if key else None
-        self._nonce = time.time_ns()
+        self.auth = hvauth.Channel(iface, key=key)
 
     def fileno(self):
         return self.sock.fileno()
-
-    def _sign(self, data):
-        """Prepend the DBG_AUTH envelope to one frame's worth of `data`.
-        Only called when self._auth_key is set."""
-        self._nonce += 1
-        nonce = self._nonce.to_bytes(DBG_AUTH_NONCE_LEN, "big")
-        mac = hmac.new(self._auth_key, nonce + data, hashlib.sha256).digest()
-        assert len(mac) == DBG_AUTH_MAC_LEN
-        return nonce + mac + data
 
     def send_bytes(self, data):
         """Ship `data` to the board as one or more 0x88B5 frames. RSP text has
         no embedded NUL, so zero-padding to the 46-byte minimum is transparent
         (the board's emac_getc stops at the first NUL)."""
+        self.auth.check_nak()       # a NAKed session re-opens on this send
         for i in range(0, len(data), CHUNK):
-            p = data[i:i + CHUNK]
-            if self._auth_key is not None:
-                p = self._sign(p)
-            if len(p) < MINPAY:
-                p = p + b"\x00" * (MINPAY - len(p))
-            self.sock.send(BCAST + self.src_mac + struct.pack("!H", ETYPE) + p)
+            self.auth.send(hvauth.CH_CONSOLE, data[i:i + CHUNK])
 
     def recv_bytes(self):
         """Drain all queued RX frames from the board; return concatenated RSP
@@ -116,12 +92,8 @@ class EmacLink:
     def send_text_line(self, line):
         """Send a dbgmon-style text command line (CR-terminated, NUL-padded) —
         used only for the optional `--arm` hand-off before RSP takes over."""
-        p = (line + "\r").encode("latin1", "replace")
-        if self._auth_key is not None:
-            p = self._sign(p)
-        if len(p) < MINPAY:
-            p = p + b"\x00" * (MINPAY - len(p))
-        self.sock.send(BCAST + self.src_mac + struct.pack("!H", ETYPE) + p)
+        self.auth.send(hvauth.CH_CONSOLE,
+                       (line + "\r").encode("latin1", "replace"))
 
 
 def main():
@@ -132,9 +104,10 @@ def main():
                     help="send the dbgmon `gdb` hand-off line before relaying "
                          "(flips the 0x88B5 channel from text dbgmon to RSP)")
     ap.add_argument("--key", default=None,
-                    help="hex-encoded DBG_AUTH key (ROADMAP T5, optional) -- "
-                         "only needed against a board built with -DDBG_AUTH; "
-                         "omit for the default unauthenticated protocol")
+                    help="hex debug-channel key (default: the key file, "
+                         "see hvauth.py)")
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="TCP listen address (default 127.0.0.1)")
     args = ap.parse_args()
 
     link = EmacLink(args.iface, key=args.key)
@@ -151,7 +124,7 @@ def main():
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", args.port))
+    srv.bind((args.bind, args.port))
     srv.listen(1)
     print("gdb-bridge: waiting for `target remote :%d` ..." % args.port, flush=True)
 

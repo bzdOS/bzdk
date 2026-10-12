@@ -152,7 +152,7 @@ toolchain-check:
 config-check:
 	python3 gen_config.py --dry-run
 
-test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vzram_pool test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement test_guest_mem
+test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_lz4 test_vzram_pool test_vconsole_uart test_vconsole_pm test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_sd_bio_addr test_snapshot_fmt test_bmc_arm_gate test_coredump_elf test_scanout_regs test_linker_enforcement test_guest_mem test_dbgauth
 	./test_vblk_ring
 	./test_vblk_stitch
 	./test_stage2_tables
@@ -177,6 +177,8 @@ test: toolchain-check test_vblk_ring test_vblk_stitch test_stage2_tables test_vn
 	./test_scanout_regs
 	./test_linker_enforcement
 	./test_guest_mem
+	./test_dbgauth
+	python3 hvauth.py --selftest
 	python3 test_automount.py
 	python3 coredump-recv.py selftest
 	python3 snapshot_net.py selftest
@@ -245,6 +247,9 @@ test_scanout_regs: test_scanout_regs.c
 test_guest_mem: test_guest_mem.c guest_mem.h vnet_emac.h stage2.h hv_addrmap.h
 	gcc -Wall -Wextra -O2 -DGUEST_DRAM_2G=1 -DVZRAM=1 -DHV_HDMI -o $@ $<
 
+test_dbgauth: test_dbgauth.c dbgauth.c dbgauth.h hmac_sha256.c hmac_sha256.h
+	gcc -Wall -Wextra -O2 -o $@ $<
+
 test_linker_enforcement: test_linker_enforcement.c
 	gcc -Wall -Wextra -O2 -o $@ $<
 
@@ -287,8 +292,8 @@ $(MAIN_BIN): $(MAIN_ELF)
 
 # --- Ethernet (sun8i-emac) console test firmware: independent of musb.o ---
 # start.o + main_net.o + emac.o + wdt.o, linked at 0x42000000 via link.ld.
-$(NET_ELF): start.o main_net.o emac.o wdt.o smp.o timer.o libmin.o link.ld
-	$(CC) $(LDFLAGS) -o $@ start.o main_net.o emac.o wdt.o smp.o timer.o libmin.o
+$(NET_ELF): start.o main_net.o emac.o dbgauth.o wdt.o smp.o timer.o libmin.o link.ld
+	$(CC) $(LDFLAGS) -o $@ start.o main_net.o emac.o dbgauth.o wdt.o smp.o timer.o libmin.o
 	$(SIZE) $@
 
 $(NET_BIN): $(NET_ELF)
@@ -298,7 +303,7 @@ $(NET_BIN): $(NET_ELF)
 # EMAC is the REPL's own console channel; MUSB is the device-under-test the
 # REPL pokes at (mi/mp/mpN). start.o + main_repl.o + repl.o + emac.o + musb.o
 # + wdt.o, linked at 0x42000000 via link.ld.
-REPL_OBJS := start.o main_repl.o repl.o emac.o musb.o wdt.o exceptions.o el2_exc.o \
+REPL_OBJS := start.o main_repl.o repl.o emac.o dbgauth.o musb.o wdt.o exceptions.o el2_exc.o \
              timer.o ring.o alloc.o gic_timer.o netcon.o sched.o guest.o libmin.o stage2.o vgicd.o wdogtrap.o kload.o vconsole.o gtrace.o reboot.o hdmi.o fb.o hud.o smp.o hwbp.o backtrace.o ksym.o ktimer.o ksync.o wcet.o firstfault.o onebp.o flightrec.o vgic.o usbacm.o rsb.o
 $(REPL_ELF): $(REPL_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(REPL_OBJS)
@@ -438,6 +443,46 @@ ifeq ($(HDMI_MODE_1080P),1)
 # display, not of which image happens to be built.
 CFLAGS += -DHDMI_MODE_1080P
 endif
+# Debug-channel authentication (dbgauth.c, docs/security-notes.md). DEFAULT
+# ON for the board image: every host->HV debug frame (console/dbgmon/gdb,
+# netcon, dbgtools, snapnet) must carry an HMAC-SHA256 session envelope keyed
+# with the secret in DBG_AUTH_KEY_FILE -- a local, untracked file holding 32+
+# random bytes as hex (`python3 -c "import secrets;print(secrets.token_hex(32))"
+# > ~/.config/bzdk/dbg.key; chmod 600`). The host tools read the same file
+# (hvauth.py). A missing key file FAILS the build; there is no built-in key.
+#   DBG_NO_AUTH=1      explicit opt-out (QEMU/CI, a board without the key):
+#                      the legacy unauthenticated protocol, open to the LAN.
+#   DBG_AUTH_COMPAT=1  transition image: authenticated frames AND legacy
+#                      unauthenticated ones are accepted; the latter are
+#                      counted (dbgmon `auth`, legacy_ok) so a deploy can prove
+#                      every host tool has switched before going strict.
+DBG_AUTH_KEY_FILE ?= $(HOME)/.config/bzdk/dbg.key
+DBG_NO_AUTH ?= 0
+DBG_AUTH_COMPAT ?= 0
+ifeq ($(DBG_NO_AUTH),0)
+dbg: CFLAGS += -DDBG_AUTH
+ifeq ($(DBG_AUTH_COMPAT),1)
+dbg: CFLAGS += -DDBG_AUTH_COMPAT
+endif
+ifneq ($(filter dbg hv-uimage,$(MAKECMDGOALS)),)
+ifeq ($(wildcard $(DBG_AUTH_KEY_FILE)),)
+$(error debug-channel key $(DBG_AUTH_KEY_FILE) is missing: create it (see the DBG_AUTH comment in the Makefile) or build an UNAUTHENTICATED image explicitly with DBG_NO_AUTH=1)
+endif
+dbgauth.o: dbg_auth_key.h
+endif
+endif
+# The key never goes on a compiler command line (it would land in .flagstamp
+# and in `ps`): it is rendered into this untracked header, rewritten only when
+# the key file changes.
+dbg_auth_key.h: FORCE
+	@python3 -c 'import sys,re; t=open(sys.argv[1]).read().strip(); \
+	  (re.fullmatch(r"[0-9a-fA-F]{32,128}", t) and len(t)%2==0) or sys.exit("dbg_auth_key.h: "+sys.argv[1]+" must hold 16..64 bytes as hex"); \
+	  k=bytes.fromhex(t); \
+	  open(sys.argv[2],"w").write("/* GENERATED from the untracked key file -- never commit */\n#define DBGAUTH_KEY_LEN %du\nstatic const uint8_t dbgauth_key[%d] = {%s};\n" % (len(k), len(k), ",".join("0x%02x"%b for b in k)))' \
+	  '$(DBG_AUTH_KEY_FILE)' $@.new
+	@chmod 600 $@.new
+	@if cmp -s $@.new $@; then rm -f $@.new; else mv $@.new $@; fi
+
 dbg: config-check $(DBG_BIN)
 
 # snapshot.o/snapshot_net.o are conditional: GUEST_DRAM_2G hands the high GiB to
@@ -464,7 +509,7 @@ endif
 
 DBG_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o rsbtrap.o vetrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
-            emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
+            emac.o dbgauth.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \
             netcon.o rsb.o axp803.o hdmi.o fb.o hud.o scanout.o fbdump.o \
             gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o trace.o profiler.o vcpu2.o vcpu1.o vcpu3.o \
@@ -528,7 +573,7 @@ dual: config-check $(DUAL_BIN)
 
 DUAL_OBJS := start.o main_dbg.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
              gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
-             emac.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
+             emac.o dbgauth.o dbgmon.o bmc.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
              musb.o usbacm.o emmc_bio.o sd_bio.o vblk_emmc.o vblk_async.o vnet_emac.o vinput.o vblk_sd.o sdbox.o el2_ncmap.o flightrec.o coredump.o \
              netcon.o rsb.o axp803.o hdmi.o fb.o hud.o fbdump.o \
              gdbstub.o gdbstub_hw.o hmac_sha256.o dbgtools.o \
@@ -547,7 +592,7 @@ gdb: config-check $(GDB_BIN)
 
 GDB_OBJS := start.o main_gdb.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o \
-            emac.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
+            emac.o dbgauth.o gdbstub.o gdbstub_hw.o reboot.o hwbp.o backtrace.o ksym.o smp.o firstfault.o onebp.o vgic.o \
             musb.o usbacm.o emmc_bio.o vblk_emmc.o el2_ncmap.o flightrec.o coredump.o dbgtools.o rsb.o
 $(GDB_ELF): $(GDB_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(GDB_OBJS)
@@ -558,7 +603,7 @@ $(GDB_BIN): $(GDB_ELF)
 fbsd: config-check $(FBSD_BIN)
 
 FBSD_OBJS := start.o main_fbsd.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
-             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o rsb.o
+             gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgauth.o rsb.o
 $(FBSD_ELF): $(FBSD_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(FBSD_OBJS)
 	$(SIZE) $@
@@ -575,7 +620,7 @@ $(FBSD_BIN): $(FBSD_ELF)
 zephyr: config-check $(ZEPHYR_BIN)
 
 ZEPHYR_OBJS := start.o main_zephyr.o exceptions.o el2_exc.o kload.o stage2.o vgicd.o wdogtrap.o guest.o \
-               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgmon.o bmc.o dbgtools.o rsb.o axp803.o vinput.o
+               gic_timer.o sched.o timer.o wdt.o libmin.o vconsole.o gtrace.o reboot.o smp.o hwbp.o backtrace.o ksym.o firstfault.o onebp.o flightrec.o vgic.o musb.o usbacm.o emac.o dbgauth.o dbgmon.o bmc.o dbgtools.o rsb.o axp803.o vinput.o
 $(ZEPHYR_ELF): $(ZEPHYR_OBJS) link.ld
 	$(CC) $(LDFLAGS) -o $@ $(ZEPHYR_OBJS)
 	$(SIZE) $@
@@ -992,4 +1037,4 @@ clean: clean-qemu clean-dual-qemu clean-dual2-qemu clean-dual-zephyr-qemu clean-
 	      $(GDB_ELF) $(GDB_BIN) $(HDMI_ELF) $(HDMI_BIN) \
 	      $(ZEPHYR_ELF) $(ZEPHYR_BIN) \
 	      test_vblk_ring test_vblk_stitch test_stage2_tables test_vnet_ring test_kload_modinfo test_zload2_parsing test_zstage test_vconsole_uart \
-	      test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_linker_enforcement test_guest_mem
+	      test_gdbstub_resolve test_gdbstub_hwop test_gdbstub_wdt_kick test_vgic_pendq test_vgicd test_wdogtrap test_linker_enforcement test_guest_mem test_dbgauth
