@@ -569,7 +569,7 @@ static inline void udelay_spin(uint32_t n)
  *  [25] rx_overflow  RX FIFO overflow events (INT_STA RX_OVERFLOW)
  *  [26] wd_test_mode / [27] wd_test_skips (emac_wd_test_mode())
  *  [28] rx_irq_frames frames drained from the interrupt rather than the tick
- *  [29] rx_irq_deferred IRQ drains that stopped at an HV debug frame
+ *  [29] rx_irq_hv    HV debug-plane frames handled from the IRQ
  *  [30] rx_max_batch most descriptors drained in one pass
  *  [32] tx_lock_contended  sticky 1 if the cross-core TX lock (added for
  *                     vnet_emac.c, EMAC_TX_LOCK_PA) was ever seen already
@@ -2564,8 +2564,8 @@ static uint32_t g_rx_irqs;         /* bc[23] EMAC RX interrupts serviced    */
 static uint32_t g_rx_buf_ua;       /* bc[24] RX ring-full (DMA suspended)   */
 static uint32_t g_rx_overflow;     /* bc[25] RX FIFO overflow events        */
 static uint32_t g_rx_irq_frames;   /* bc[28] frames drained from the IRQ    */
-static uint32_t g_rx_irq_deferred; /* bc[29] IRQ drains that stopped at an HV
-                                    * debug frame and left it to the tick  */
+static uint32_t g_rx_irq_hv;       /* bc[29] HV debug-plane frames taken
+                                    * from the IRQ rather than the tick    */
 static uint32_t g_rx_max_batch;    /* bc[30] most frames drained at once    */
 static uint32_t g_tx_ints;         /* TX_INT seen (TX_INT_CTL frames sent)  */
 
@@ -2589,12 +2589,14 @@ static void emac_int_latch(void)
 }
 
 /* Walk the RX ring. `from_irq`: called from emac_rx_irq() rather than the
- * tick's emac_poll(). The IRQ path takes only frames the HV does not act on
- * (guest traffic, frames to the HV MAC that are just counted) and stops at
- * the first HV debug-plane frame, leaving it -- and everything behind it --
- * for the tick, so the debug channel (console bytes, netcon, snapnet,
- * dbgtools) is serviced exactly where and when it always was. Returns the
- * number of descriptors consumed. */
+ * tick's emac_poll(). Both run on CPU1 inside gic_timer_irq() with EL2 IRQs
+ * masked, so an HV debug-plane frame taken here is handled in the same
+ * context as from the tick: console bytes still wait in rx_ring for the
+ * tick's dbgmon, netcon/snapnet/dbgtools run as they would there.
+ * (A first version stopped at the first HV frame and left the rest of the
+ * ring to the tick; with a host polling the board a few times a second that
+ * put up to 10 ms on ~3% of guest frames -- measured as a ping p99 of
+ * 9.7 ms.) Returns the number of descriptors consumed. */
 static int emac_rx_drain(int from_irq)
 {
     int done = 0;
@@ -2626,10 +2628,8 @@ static int emac_rx_drain(int from_irq)
             }
             int hv_et = (et == ETHERTYPE_CONSOLE || et == ETHERTYPE_NETCON ||
                          et == ETHERTYPE_SNAPNET || et == ETHERTYPE_DBGRAW);
-            if (from_irq && hv_et && (to_us || bcast)) {
-                bc(29, ++g_rx_irq_deferred);
-                break;                /* the tick's emac_poll() takes it */
-            }
+            if (from_irq && hv_et && (to_us || bcast))
+                bc(29, ++g_rx_irq_hv);
             /* Every frame's arrival time feeds dbgauth's board-nonce pool. */
             dbgauth_entropy(((uint64_t)status << 32) ^ (uint32_t)length);
             if (hv_et && (to_us || bcast) && hv_rx_frame(buf, length, et)) {
@@ -2742,7 +2742,7 @@ void emac_perf_stats(uint32_t out[EMAC_PERF_NSTATS])
     out[0] = g_rx_count;
     out[1] = g_rx_irqs;
     out[2] = g_rx_irq_frames;
-    out[3] = g_rx_irq_deferred;
+    out[3] = g_rx_irq_hv;
     out[4] = g_rx_max_batch;
     out[5] = g_rx_buf_ua;
     out[6] = g_rx_overflow;

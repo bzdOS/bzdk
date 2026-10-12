@@ -1497,7 +1497,7 @@ static void exec_line(char *line, struct el2_frame *frame)
 	}
 	if (streq(cmd, "netstat")) {
 		static const char *const names[17] = {
-			"rx", "irqs", "rx_irq_frames", "irq_deferred", "max_batch",
+			"rx", "irqs", "rx_irq_frames", "irq_hv_frames", "max_batch",
 			"rx_ring_full", "rx_fifo_ovf", "tx", "tx_drops", "rx_ring",
 			"tx_ring", "tx_ring_busy", "tx_ints", "rx_filter",
 			"irq_armed", "irq_throttles", "irq_wrong_core" };

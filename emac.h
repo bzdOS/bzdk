@@ -51,7 +51,7 @@ void emac_poll(void);
 void emac_rx_irq(void);
 
 /* RX/TX performance counters for dbgmon `netstat`: [0] rx frames [1] rx irqs
- * [2] rx irq frames [3] irq drains deferred to the tick [4] max batch
+ * [2] rx irq frames [3] HV debug frames taken from the IRQ [4] max batch
  * [5] rx ring-full events [6] rx fifo overflows [7] tx frames [8] tx drops
  * [9] rx ring size [10] tx ring size [11] guest TX found the ring full
  * [12] TX_INT interrupts seen [13] receive filter mode (emac_rx_filter_mode()) */
